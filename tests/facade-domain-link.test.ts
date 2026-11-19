@@ -68,6 +68,9 @@ import {
   installSessionAuthority,
 } from '#engine/tenant/session-authority.ts';
 import { queueBadge } from '#engine/server/push-queue.ts';
+import { applyPushPublication } from '#engine/server/notifications.ts';
+import { notificationOperations } from '#engine/server/notification-operations.ts';
+import { onEventStream } from '#engine/server/stream.ts';
 import { startPushSender } from '#engine/push/sender.ts';
 import { setAvatarUrl, setDisplayName } from '#engine/tenant/users.ts';
 import { Journal } from '#engine/facade/journal.ts';
@@ -244,6 +247,229 @@ async function fixture() {
     },
   };
 }
+
+Deno.test('domain notifications: signed selected-account inventory and suffix preserve originals without dispatch across reopen', async () => {
+  const f = await fixture();
+  try {
+    const home = await f.home.server(), edge = await f.edge.server();
+    for (const [db, seq] of [[home, 5], [edge, 71]] as const) {
+      await db.execute(
+        "INSERT INTO event_index(event,room,pos,standing,grounding,seq) VALUES('$saved','!saved:logical.test',1,'accepted','grounded',?)",
+        [seq],
+      );
+    }
+    await home.tx((conn) =>
+      applyPushPublication(conn, '!saved:logical.test', '$saved', 5, 1, {
+        sender: '@sender:logical.test',
+        decisions: ['alice', 'bob'].map((name) => ({
+          tenant: 'logical.test',
+          user: '@' + name + ':logical.test',
+          ruleRevision: 7,
+          ignoreRevision: 3,
+          decision: {
+            kind: 'underride',
+            ruleId: 'saved-rule',
+            notify: true,
+            actions: ['notify'],
+            highlight: false,
+            tweaks: {},
+          },
+        })),
+      }, 1000)
+    );
+    const [original] = await home.tx((conn) =>
+      notificationOperations(conn, '@alice:logical.test')
+    );
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    const payload = records.at(-1)!.payload as {
+      body: { notifications?: unknown[] };
+    };
+    assertEquals(
+      payload.body.notifications?.length,
+      1,
+      'missing notification inventory',
+    );
+    assertEquals(JSON.stringify(records).includes('@bob:logical.test'), false);
+    let wakes = 0;
+    const off = onEventStream((path) => {
+      if (path === edge.path) wakes++;
+    });
+    try {
+      await f.toEdge(records);
+    } finally {
+      off();
+    }
+    assert(
+      wakes > 0,
+      'saved notification import did not wake its local consumers',
+    );
+    assertEquals(
+      await edge.tx((conn) =>
+        notificationOperations(conn, '@alice:logical.test')
+      ),
+      [original],
+    );
+    assertEquals(
+      await edge.query(
+        'SELECT event_seq,actions,created_ms FROM notifications',
+      ),
+      [{ event_seq: 71, actions: '["notify"]', created_ms: 1000 }],
+    );
+    assertEquals(await edge.query('SELECT * FROM push_delivery'), []);
+    assertEquals(await edge.query('SELECT * FROM push_badges'), []);
+    assertEquals(
+      (await edge.query(
+        "SELECT ready FROM facade_scopes WHERE scope='notifications:@alice:logical.test'",
+      ))[0]?.ready,
+      1,
+    );
+    // A second saved decision uses the same signed account stream, not another
+    // bootstrap or foreign count/position. Missing event evidence stays pending.
+    await home.tx((conn) =>
+      applyPushPublication(conn, '!saved:logical.test', '$later', 6, 2, {
+        sender: '@sender:logical.test',
+        decisions: [{
+          tenant: 'logical.test',
+          user: '@alice:logical.test',
+          ruleRevision: 8,
+          ignoreRevision: 3,
+          decision: null,
+        }],
+      }, 2000)
+    );
+    await f.toEdge(await f.hs.export('alice', f.bundle.id));
+    assertEquals(
+      (await edge.tx((conn) =>
+        notificationOperations(conn, '@alice:logical.test')
+      )).length,
+      2,
+    );
+    await edge.tx((conn) =>
+      applyPushPublication(conn, '!saved:logical.test', '$saved', 71, 1, {
+        sender: '@sender:logical.test',
+        decisions: [{
+          tenant: 'logical.test',
+          user: '@alice:logical.test',
+          ruleRevision: 9,
+          ignoreRevision: 3,
+          decision: null,
+        }],
+      }, 3000)
+    );
+    const homeExports = await f.hs.export('alice', f.bundle.id);
+    for (const record of await f.es.export('alice')) {
+      await f.hj.receive(f.node.node, [record]);
+      await f.hs.apply(f.hj, record, f.bundle.id);
+    }
+    assertEquals(
+      await f.hs.export('alice', f.bundle.id),
+      homeExports,
+      'import authored an echo',
+    );
+    assertEquals(
+      (await home.query('SELECT actions FROM notifications'))[0].actions,
+      '["notify"]',
+    );
+    assertEquals(await edge.query('SELECT * FROM notifications'), []);
+    assertEquals(
+      (await home.tx((conn) =>
+        notificationOperations(conn, '@alice:logical.test')
+      )).length,
+      3,
+    );
+    await f.edge.close();
+    const reopened = await f.open('edge');
+    try {
+      const cold = await reopened.server();
+      assertEquals(
+        (await cold.tx((conn) =>
+          notificationOperations(conn, '@alice:logical.test')
+        )).length,
+        3,
+      );
+      assertEquals(
+        (await cold.query('SELECT unread FROM notification_counts'))[0].unread,
+        0,
+      );
+      assertEquals(await cold.query('SELECT * FROM push_delivery'), []);
+      assertEquals(await cold.query('SELECT * FROM push_badges'), []);
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain notifications: absent signed inventory is not an explicit empty inventory', async (t) => {
+  for (const present of [false, true]) {
+    await t.step(String(present), async () => {
+      const f = await fixture();
+      try {
+        const records = structuredClone(
+          await f.hs.bootstrap('alice', f.bundle.id),
+        );
+        const last = records.at(-1)!;
+        const payload = last.payload as {
+          body: DomainBootstrap & { notifications?: unknown[] };
+          signature: string;
+        };
+        if (present) payload.body.notifications = [];
+        else delete payload.body.notifications;
+        payload.signature = await f.ht.signer().sign(
+          canonicalJson(payload.body),
+        );
+        last.operationId = 'domain-bootstrap:' +
+          createHash('sha256').update(canonicalJson(payload.body)).digest(
+            'hex',
+          );
+        const { hash: _, ...unsigned } = last;
+        last.hash = recordHash(unsigned);
+        await f.toEdge(records);
+        assertEquals(
+          (await (await f.edge.server()).query(
+            "SELECT ready FROM facade_scopes WHERE scope='notifications:@alice:logical.test'",
+          ))[0]?.ready,
+          present ? 1 : 0,
+        );
+        const authority = new FacadeAuth(
+          await f.edge.server(),
+          f.fp,
+          f.node,
+          new AuthLinkHealth({ notify: 'poll', pollseconds: 5 }),
+          {
+            replicatecredentials: true,
+            allowstaleauth: true,
+            authmaxstalehours: 0,
+          },
+        );
+        const tenant = await enrolledTenant(
+          f.edge,
+          f.fp,
+          'logical.test',
+          'edge_a',
+          authority,
+        );
+        const admit = () =>
+          tenant.tx((tx) =>
+            tx.ingress.check({
+              kind: 'domain',
+              localpart: 'alice',
+              feature: 'notifications',
+            })
+          );
+        if (present) await admit();
+        else {await assertRejects(
+            admit,
+            MatrixError,
+            'domain snapshot unavailable',
+          );}
+      } finally {
+        await f.close();
+      }
+    });
+  }
+});
 
 Deno.test('domain pushers: append=false reaches home and affected selected accounts without disclosing unselected registrations', async () => {
   const f = await fixture();

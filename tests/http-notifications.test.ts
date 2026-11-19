@@ -2,6 +2,8 @@ import { assert, assertEquals } from '@std/assert';
 import { httpSuite } from '#tests/http-app.ts';
 import { setConfigForTests } from '#engine/config.ts';
 import { theApp } from '#engine/app.ts';
+import { captureNotificationOperations } from '#engine/server/notification-operations.ts';
+import { reconcileNotificationEvent } from '#engine/server/notifications.ts';
 
 type Json = Record<string, unknown>;
 const suite = httpSuite('HTTP notification history');
@@ -286,4 +288,123 @@ suite.test('bounded hidden-row scans advance cursors without leaking unavailable
   assert(events.includes(event));
   assert(!events.some((id) => String(id).startsWith('$hidden-')));
   assertEquals(visible.next_token, undefined);
+});
+
+suite.test('saved notifying context with missing receiver evidence is unavailable, not empty history', async () => {
+  const a = await suite.registerTestUser('pending-history-a', 'pw');
+  const b = await suite.registerTestUser('pending-history-b', 'pw');
+  const room = String(
+    (await call('createRoom', a.access_token!, { invite: [b.user_id] }))
+      .room_id,
+  );
+  const base = 'rooms/' + encodeURIComponent(room);
+  await call(base + '/join', b.access_token!, {});
+  const event = String(
+    (await call(base + '/send/m.room.message/saved-context', a.access_token!, {
+      body: 'saved context',
+    }, 'PUT')).event_id,
+  );
+  const original =
+    ((await call('notifications', b.access_token!)).notifications as Json[])
+      .find((n) => (n.event as Json).event_id === event)!;
+  assert(original);
+  const db = theApp().server;
+  const [domain] = await db.query(
+    'SELECT node,incarnation FROM publication_domain',
+  );
+  const own = {
+    node: String(domain?.node ?? 'home'),
+    incarnation: String(domain?.incarnation ?? 'readiness-store'),
+  };
+  await db.tx(async (conn) => {
+    if (!domain) {
+      await conn.execute(
+        "INSERT INTO publication_domain VALUES(1,?,?,'readiness-domain')",
+        [own.node, own.incarnation],
+      );
+    }
+    await conn.execute('INSERT INTO facade_owner_controls VALUES(?,1,?,?)', [
+      'notification-readiness',
+      'hash',
+      JSON.stringify({
+        body: {
+          server: b.user_id.slice(b.user_id.indexOf(':') + 1),
+          nodes: [own],
+        },
+      }),
+    ]);
+    await conn.execute(
+      "INSERT INTO facade_owner_activation VALUES('notification-readiness',1,'hash')",
+    );
+    await captureNotificationOperations(conn, b.user_id);
+  });
+  const [indexed] = await db.query('SELECT * FROM event_index WHERE event=?', [
+    event,
+  ]);
+  const facts = await db.query(
+    "SELECT * FROM domain_operations WHERE kind='notification' AND json_extract(payload_json,'$.user')=?",
+    [b.user_id],
+  );
+  const badges = await db.query('SELECT * FROM push_badges ORDER BY user');
+  await db.tx(async (conn) => {
+    // An authentic retained original can precede the receiver's public rows and
+    // event evidence. Simulate that legitimate import cut, not changed source bytes.
+    await conn.execute(
+      'DELETE FROM notification_history WHERE user=? AND seq IN (SELECT seq FROM notifications WHERE event=?)',
+      [b.user_id, event],
+    );
+    await conn.execute('DELETE FROM notifications WHERE user=? AND event=?', [
+      b.user_id,
+      event,
+    ]);
+    await conn.execute('DELETE FROM notification_counts WHERE user=?', [
+      b.user_id,
+    ]);
+    await conn.execute(
+      'DELETE FROM push_evaluations WHERE user=? AND event=?',
+      [b.user_id, event],
+    );
+    await conn.execute('DELETE FROM event_index WHERE event=?', [event]);
+  });
+  try {
+    await call('notifications', b.access_token!, undefined, undefined, 503);
+    assertEquals(
+      await db.query(
+        "SELECT * FROM domain_operations WHERE kind='notification' AND json_extract(payload_json,'$.user')=?",
+        [b.user_id],
+      ),
+      facts,
+    );
+    await db.tx(async (conn) => {
+      const columns = Object.keys(indexed);
+      await conn.execute(
+        'INSERT INTO event_index(' + columns.join(',') + ') VALUES(' +
+          columns.map(() => '?').join(',') + ')',
+        columns.map((column) => indexed[column]),
+      );
+      await reconcileNotificationEvent(conn, room, event, Date.now());
+    });
+    const restored =
+      ((await call('notifications', b.access_token!)).notifications as Json[])
+        .find((n) => (n.event as Json).event_id === event);
+    assert(restored);
+    assertEquals(restored.ts, original.ts);
+    assertEquals(restored.actions, original.actions);
+    assertEquals(
+      await db.query('SELECT * FROM push_badges ORDER BY user'),
+      badges,
+    );
+    // Listing retention is deliberate absence, not missing evaluation evidence.
+    await db.execute('DELETE FROM notification_history WHERE user=?', [
+      b.user_id,
+    ]);
+    assertEquals(
+      (await call('notifications', b.access_token!)).notifications,
+      [],
+    );
+  } finally {
+    await db.execute(
+      "DELETE FROM facade_owner_activation WHERE pairing='notification-readiness'",
+    );
+  }
 });

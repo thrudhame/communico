@@ -34,6 +34,11 @@ import {
 } from '#engine/server/reports.ts';
 import { importReceiptOperation } from '#engine/server/ephemeral.ts';
 import {
+  captureNotificationOperations,
+  notificationOperations,
+} from '#engine/server/notification-operations.ts';
+import { receiveNotificationOperation } from '#engine/server/notifications.ts';
+import {
   captureForgetOperations,
   forgetOperations,
   importForgetOperation,
@@ -70,6 +75,7 @@ export type DomainBootstrap = DomainBinding & {
   forget?: Fact[];
   pushers?: Fact[];
   pusherChoices?: Fact[];
+  notifications?: Fact[];
 };
 
 function facts(operations: Fact[]): Fact[] {
@@ -124,6 +130,9 @@ function bootstrapOf(raw: unknown): DomainBootstrap {
     ...(row.pusherChoices !== undefined
       ? { pusherChoices: refs(row.pusherChoices) }
       : {}),
+    ...(row.notifications !== undefined
+      ? { notifications: refs(row.notifications) }
+      : {}),
   };
   if (canonicalJson(view) !== canonicalJson(raw) || view.source !== 'home') {
     mismatch('unexpected domain bootstrap material');
@@ -146,7 +155,8 @@ async function requireFacts(
     | 'reports'
     | 'forget'
     | 'pushers'
-    | 'pusherChoices',
+    | 'pusherChoices'
+    | 'notifications',
 ) {
   const keys = new Set<string>();
   for (const fact of view[file] ?? []) {
@@ -188,6 +198,8 @@ async function requireFacts(
           ? ['pusher']
           : file === 'pusherChoices'
           ? ['pusher-choice']
+          : file === 'notifications'
+          ? ['notification']
           : ['account-data', 'tags', 'profile', 'push-rules']).includes(
             String(row.kind),
           )
@@ -291,6 +303,7 @@ function viewOf(raw: unknown): DomainOperation | DomainHistory {
         'forget',
         'pusher',
         'pusher-choice',
+        'notification',
       ]
         .includes(
           String(expected),
@@ -460,6 +473,9 @@ export class DomainOperations {
       ...await db.tx((conn) =>
         forgetOperations(conn, '@' + localpart + ':' + context.server)
       ),
+      ...await db.tx((conn) =>
+        notificationOperations(conn, '@' + localpart + ':' + context.server)
+      ),
     );
     const records = [];
     for (const operation of operations) {
@@ -566,6 +582,14 @@ export class DomainOperations {
     });
     // Legacy capture must precede export, otherwise the completeness declaration
     // could overtake the source records it names.
+    const notificationFacts = await server.tx(async (conn) => {
+      await this.selected(conn, grant, localpart);
+      await requireDomainControl(conn, binding);
+      return await captureNotificationOperations(
+        conn,
+        '@' + localpart + ':' + context.server,
+      );
+    });
     const records = await this.export(localpart, pairing);
     // Ordinary export never echoes replica intent. Bootstrap separately attests
     // exactly the authentic history home retained, including a receiver's own
@@ -576,6 +600,7 @@ export class DomainOperations {
         ...receiptFacts,
         ...reportFacts,
         ...forgetFacts,
+        ...notificationFacts,
       ]
     ) {
       if (
@@ -613,6 +638,7 @@ export class DomainOperations {
       pusherChoices: facts(
         tenantFacts.filter((op) => op.kind === 'pusher-choice'),
       ),
+      notifications: facts(notificationFacts),
     });
     records.push(await this.publish(body, grant));
     return records;
@@ -704,6 +730,16 @@ export class DomainOperations {
         await requireFacts(conn, view, 'receipts');
         await requireFacts(conn, view, 'reports');
         await requireFacts(conn, view, 'forget');
+        await requireFacts(conn, view, 'notifications');
+        await conn.execute(
+          'INSERT INTO facade_scopes(incarnation,scope,source_cut,ready,pending_hash) VALUES(?,?,?,?,NULL) ON CONFLICT(incarnation,scope) DO UPDATE SET source_cut=excluded.source_cut,ready=excluded.ready,pending_hash=NULL',
+          [
+            view.pairing,
+            'notifications:@' + view.localpart + ':' + view.server,
+            record.sequence,
+            view.notifications !== undefined ? 1 : 0,
+          ],
+        );
         if (view.forget !== undefined) {
           await installForgetInventory(
             conn,
@@ -772,7 +808,14 @@ export class DomainOperations {
         context.home.publicKey,
       )
       : undefined;
-    if (view.operation.kind === 'forget') {
+    if (view.operation.kind === 'notification') {
+      await receiveNotificationOperation(
+        await this.store.server(),
+        view.operation,
+        check,
+        history,
+      );
+    } else if (view.operation.kind === 'forget') {
       await importForgetOperation(
         await this.store.server(),
         view.operation,

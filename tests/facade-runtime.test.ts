@@ -2216,6 +2216,41 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       room_version: '11',
     }, departure.body.access_token);
     assertEquals(departureRoom.status, 200);
+    const legacyRoomPath = 'rooms/' +
+      encodeURIComponent(departureRoom.body.room_id);
+    assertEquals(
+      (await api(
+        'home',
+        legacyRoomPath + '/join',
+        {},
+        registered.body.access_token,
+      )).status,
+      200,
+    );
+    const legacyCiphertext = {
+      algorithm: 'm.megolm.v1.aes-sha2',
+      ciphertext: 'saved-home-notification-ciphertext',
+      session_id: 'saved-home-session',
+    };
+    const legacyNotice = await api(
+      'home',
+      legacyRoomPath + '/send/m.room.encrypted/notification-baseline',
+      legacyCiphertext,
+      departure.body.access_token,
+      'PUT',
+    );
+    assertEquals(legacyNotice.status, 200);
+    const homeNotifications = await api(
+      'home',
+      'notifications',
+      undefined,
+      registered.body.access_token,
+    );
+    assertEquals(homeNotifications.status, 200);
+    const originalNotice = homeNotifications.body.notifications.find((
+      item: { event: { event_id: string } },
+    ) => item.event.event_id === legacyNotice.body.event_id);
+    assert(originalNotice, 'home baseline has no saved notification');
     const paired = await adminCall(
       tls.dir + '/home-public-auth.sock',
       'facade/pair',
@@ -2325,6 +2360,22 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       'domain:@outside:logical.test',
       'domain:@departure:logical.test',
     ]);
+    const importedHistory = await api(
+      'facade',
+      'notifications',
+      undefined,
+      session.body.access_token,
+    );
+    assertEquals(importedHistory.status, 200);
+    const importedNotices = importedHistory.body.notifications.filter((
+      item: { event: { event_id: string } },
+    ) => item.event.event_id === legacyNotice.body.event_id);
+    assertEquals(
+      importedNotices.length,
+      1,
+      'cold facade lost signed saved notification history',
+    );
+    assertEquals(importedNotices[0].event.content, legacyCiphertext);
     for (
       const [path, body] of [['notifications', undefined], [
         'pushers',
@@ -2573,6 +2624,19 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       schemas: { room: roomSchema, server: serverSchema, tenant: tenantSchema },
     });
     try {
+      const savedServer = await sentStore.server();
+      const sourceFacts = await savedServer.query(
+        "SELECT payload_json FROM domain_operations WHERE kind='notification' AND source='home' AND json_extract(payload_json,'$.user')='@outside:logical.test' AND json_extract(payload_json,'$.event')=?",
+        [legacyNotice.body.event_id],
+      );
+      assertEquals(
+        sourceFacts.length,
+        1,
+        'cold public reader has no retained original home context',
+      );
+      const originalFact = JSON.parse(String(sourceFacts[0].payload_json));
+      assertEquals(originalFact.createdMs, originalNotice.ts);
+      assertEquals(originalFact.actions, originalNotice.actions);
       const db = await sentStore.tenant('logical.test');
       assertEquals(
         (await db.query(

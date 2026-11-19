@@ -14,6 +14,8 @@ import {
 } from './notification-operations.ts';
 import type { PublicationDecision } from './push-project.ts';
 import type { PushKind } from '#engine/push/defaults.ts';
+import { eventStreamTx } from './stream.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
 import {
   graphNotificationRead,
   graphReadClosure,
@@ -733,6 +735,55 @@ export async function importNotificationOperation(
 ) {
   const value = await acceptNotificationOperation(tx, operation, history);
   await projectImportedNotificationEvent(tx, value.room, value.event, now);
+}
+
+/** The existing server stream owns post-commit consumer wakes, as for imported
+ * receipts. Authorization and all retained/projection facts share its attempt. */
+export async function receiveNotificationOperation(
+  server: Database,
+  operation: RegisterOperation,
+  authorize: (conn: Conn) => Promise<void>,
+  history?: DomainHistoryProof,
+) {
+  await eventStreamTx(server, async (conn) => {
+    await authorize(conn);
+    await importNotificationOperation(conn, operation, Date.now(), history);
+  });
+}
+
+/** Inventory presence cannot prove an empty public history while the selected
+ * saved notifying context still awaits receiver evidence. Native evaluations,
+ * suppressions and deliberately retired facts keep their ordinary meanings. */
+export async function requireNotificationHistory(
+  server: Database,
+  user: string,
+) {
+  await server.tx(async (conn) => {
+    const keys = await conn.query(
+      `SELECT DISTINCT o.semantic_key FROM domain_operations o
+       WHERE o.kind='notification' AND o.applied<>-1
+       AND json_extract(o.payload_json,'$.user')=?
+       AND json_extract(o.payload_json,'$.notify')=1
+       AND NOT EXISTS (SELECT 1 FROM notification_retired_users r WHERE r.user=?)
+       AND NOT EXISTS (SELECT 1 FROM push_evaluations e
+         WHERE e.tenant=json_extract(o.payload_json,'$.tenant')
+         AND e.user=? AND e.event=json_extract(o.payload_json,'$.event'))`,
+      [user, user, user],
+    );
+    for (const row of keys) {
+      const selected = await selectedNotificationOperation(
+        conn,
+        String(row.semantic_key),
+      );
+      if (selected && savedNotification(selected).notify) {
+        throw new MatrixError(
+          503,
+          'M_UNAVAILABLE',
+          'saved notification evidence unavailable',
+        );
+      }
+    }
+  });
 }
 
 /** Source facts may precede room evidence. Event projection revisits only the

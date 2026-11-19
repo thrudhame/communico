@@ -8,6 +8,7 @@ import {
   notificationSnapshot,
   reconcileNotificationEvent,
   removeNotificationFacts,
+  requireNotificationHistory,
   roomNotificationCounts,
 } from '#engine/server/notifications.ts';
 import {
@@ -642,6 +643,63 @@ Deno.test('facade notifications: native context and terminal lifecycle survive c
       importNotificationOperation(conn, operation, 4000)
     );
     assertEquals(await reopened.query('SELECT * FROM notifications'), []);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade notifications: evidence admission follows the selected context, not losing originals or retired rows', async () => {
+  const f = await fixture();
+  try {
+    await f.home.tx((conn) =>
+      applyPushPublication(
+        conn,
+        '!room:test',
+        '$event',
+        5,
+        17,
+        publication(false),
+        1000,
+      )
+    );
+    await f.edge.tx((conn) =>
+      applyPushPublication(
+        conn,
+        '!room:test',
+        '$event',
+        71,
+        3,
+        publication(true),
+        2000,
+      )
+    );
+    const [home] = await f.home.tx((conn) =>
+      notificationOperations(conn, '@bob:test')
+    );
+    const [edge] = await f.edge.tx((conn) =>
+      notificationOperations(conn, '@bob:test')
+    );
+    await f.recovered.execute('DELETE FROM event_index');
+    await f.recovered.tx((conn) =>
+      importNotificationOperation(conn, edge, 3000)
+    );
+    await assertRejects(
+      () => requireNotificationHistory(f.recovered, '@bob:test'),
+      Error,
+      'saved notification evidence unavailable',
+    );
+    await f.recovered.tx((conn) =>
+      importNotificationOperation(conn, home, 3000)
+    );
+    await requireNotificationHistory(f.recovered, '@bob:test');
+    await f.edge.execute('DELETE FROM event_index');
+    await requireNotificationHistory(f.edge, '@bob:test');
+    await f.recovered.tx((conn) =>
+      removeNotificationFacts(conn, { user: '@bob:test' })
+    );
+    await requireNotificationHistory(f.recovered, '@bob:test');
+    assertEquals(await f.recovered.query('SELECT * FROM push_delivery'), []);
+    assertEquals(await f.recovered.query('SELECT * FROM push_badges'), []);
   } finally {
     await f.close();
   }
