@@ -23,7 +23,12 @@ export type FacadeObservation =
     hash?: string;
   }
   | { kind: 'publication'; name: string; state: 'armed' | 'held' | 'released' }
-  | { kind: 'failure'; operation: string; error: string };
+  | {
+    kind: 'failure' | 'blocked';
+    operation: string;
+    error: string;
+    scope?: Stream & { peer: string };
+  };
 
 export type PublicationCommand =
   | { action: 'hold' | 'release'; name: string }
@@ -123,6 +128,7 @@ export class FacadeObservations {
   private readonly history: FacadeObservation[] = [];
   private readonly waiting = new Set<{
     matches(event: FacadeObservation): boolean;
+    failureMatches(scope: Stream & { peer: string }): boolean;
     resolve(event: FacadeObservation): void;
     reject(error: Error): void;
   }>();
@@ -130,7 +136,17 @@ export class FacadeObservations {
 
   accept(event: FacadeObservation) {
     if (event.kind === 'failure') {
-      this.close(new Error(`${event.operation}: ${event.error}`));
+      const error = new Error(`${event.operation}: ${event.error}`);
+      if (!event.scope) this.close(error);
+      else {
+        this.history.push(event);
+        for (const pending of this.waiting) {
+          if (pending.failureMatches(event.scope)) {
+            this.waiting.delete(pending);
+            pending.reject(error);
+          }
+        }
+      }
       return;
     }
     this.history.push(event);
@@ -152,12 +168,27 @@ export class FacadeObservations {
     return this.history.length;
   }
 
-  wait(matches: (event: FacadeObservation) => boolean, after = 0) {
+  wait(
+    matches: (event: FacadeObservation) => boolean,
+    after = 0,
+    failureMatches: (scope: Stream & { peer: string }) => boolean = () => false,
+  ) {
     if (this.failure) return Promise.reject(this.failure);
-    const held = this.history.slice(after).find(matches);
+    const history = this.history.slice(after);
+    const held = history.find(matches);
     if (held) return Promise.resolve(held);
+    // A later durable completion supersedes an earlier rejected attempt. If
+    // this caller's fact is still missing, retain and surface its own refusal.
+    const refusal = history.find((event) =>
+      event.kind === 'failure' && event.scope && failureMatches(event.scope)
+    );
+    if (refusal && (refusal.kind === 'failure')) {
+      return Promise.reject(
+        new Error(`${refusal.operation}: ${refusal.error}`),
+      );
+    }
     return new Promise<FacadeObservation>((resolve, reject) => {
-      this.waiting.add({ matches, resolve, reject });
+      this.waiting.add({ matches, failureMatches, resolve, reject });
     });
   }
 
@@ -171,6 +202,7 @@ export class FacadeObservations {
         event.kind === 'applied' && event.record.stream === stream &&
         matches(event.record),
       after,
+      (scope) => scope.stream === stream,
     );
     assert(event.kind === 'applied');
     return event.record;
@@ -188,6 +220,10 @@ export class FacadeObservations {
         event.record.incarnation === identity.incarnation &&
         event.record.stream === identity.stream && matches(event.record),
       after,
+      (scope) =>
+        scope.peer === identity.peer && scope.source === identity.source &&
+        scope.incarnation === identity.incarnation &&
+        scope.stream === identity.stream,
     );
     assert(event.kind === 'applied');
     return event.record;

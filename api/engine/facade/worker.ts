@@ -316,94 +316,116 @@ export function startHomeLinkWorker(
 
 /** Facade application is local and independent of the home socket. The same
  * explicit domain completion contract is used by both runtime roles. */
-export function startInboxWorker(options: {
+type InboxOptions = {
   journal: Journal;
   peer: string;
   pollseconds: number;
   apply(stream: Stream): Promise<boolean>;
   changed(): void;
   failed(error: unknown, stream?: Stream): void;
-}) {
-  let stopped = false;
-  let scanning: Promise<void> | undefined;
-  const running = new Map<string, Promise<void>>();
-  const rerun = new Set<string>();
-  let dirty = false;
-  const scan = () => {
-    dirty = true;
-    return scanning ??= (async () => {
-      try {
-        do {
-          dirty = false;
-          try {
-            for (
-              const stream of await options.journal.streams(options.peer, 'in')
-            ) {
-              const id = key(stream);
-              if (stopped) break;
-              if (running.has(id)) {
-                rerun.add(id);
-                continue;
-              }
-              const work = (async () => {
-                try {
-                  do {
-                    rerun.delete(id);
-                    try {
-                      let applied = (await options.journal.heads(
-                        options.peer,
-                        'in',
-                        stream,
-                      ))
-                        .applied.sequence;
-                      while (!stopped && await options.apply(stream)) {
-                        const next = await options.journal.heads(
+};
+
+export function startInboxWorker(options: InboxOptions) {
+  return new InboxWorker(options);
+}
+
+export class InboxWorker {
+  readonly wake: () => void;
+  readonly close: () => Promise<void>;
+
+  get peer(): string {
+    return this.options.peer;
+  }
+
+  /** One failure boundary includes domain validation before Journal.apply as
+   * well as transaction failures. Callers must not infer failure from logging. */
+  failed(error: unknown, stream?: Stream): void {
+    this.options.failed(error, stream);
+  }
+
+  constructor(private readonly options: InboxOptions) {
+    let stopped = false;
+    let scanning: Promise<void> | undefined;
+    const running = new Map<string, Promise<void>>();
+    const rerun = new Set<string>();
+    let dirty = false;
+    const scan = () => {
+      dirty = true;
+      return scanning ??= (async () => {
+        try {
+          do {
+            dirty = false;
+            try {
+              for (
+                const stream of await options.journal.streams(
+                  options.peer,
+                  'in',
+                )
+              ) {
+                const id = key(stream);
+                if (stopped) break;
+                if (running.has(id)) {
+                  rerun.add(id);
+                  continue;
+                }
+                const work = (async () => {
+                  try {
+                    do {
+                      rerun.delete(id);
+                      try {
+                        let applied = (await options.journal.heads(
                           options.peer,
                           'in',
                           stream,
-                        );
-                        if (next.applied.sequence <= applied) {
-                          throw new LinkError(
-                            'LINK_DIVERGED',
-                            'domain reported application without durable completion',
+                        ))
+                          .applied.sequence;
+                        while (!stopped && await options.apply(stream)) {
+                          const next = await options.journal.heads(
+                            options.peer,
+                            'in',
+                            stream,
                           );
+                          if (next.applied.sequence <= applied) {
+                            throw new LinkError(
+                              'LINK_DIVERGED',
+                              'domain reported application without durable completion',
+                            );
+                          }
+                          applied = next.applied.sequence;
+                          options.changed();
                         }
-                        applied = next.applied.sequence;
-                        options.changed();
+                      } catch (error) {
+                        this.failed(error, stream);
                       }
-                    } catch (error) {
-                      options.failed(error, stream);
-                    }
-                  } while (!stopped && rerun.delete(id));
-                } finally {
-                  running.delete(id);
-                }
-              })();
-              running.set(id, work);
+                    } while (!stopped && rerun.delete(id));
+                  } finally {
+                    running.delete(id);
+                  }
+                })();
+                running.set(id, work);
+              }
+            } catch (error) {
+              this.failed(error);
             }
-          } catch (error) {
-            options.failed(error);
-          }
-        } while (!stopped && dirty);
-      } finally {
-        scanning = undefined;
-      }
-    })();
-  };
-  const timer = setInterval(() => void scan(), options.pollseconds * 1000);
-  void scan();
-  let closed: Promise<void> | undefined;
-  return {
-    wake: () => {
+          } while (!stopped && dirty);
+        } finally {
+          scanning = undefined;
+        }
+      })();
+    };
+    const timer = setInterval(() => void scan(), options.pollseconds * 1000);
+    void scan();
+    let closed: Promise<void> | undefined;
+    this.wake = () => {
       if (!stopped) void scan();
-    },
-    close() {
+    };
+    this.close = () => {
       return closed ??= (async () => {
         stopped = true;
         clearInterval(timer);
         await scanning;
         await Promise.all(running.values());
       })();
-    },
-  };
+    };
+  }
 }

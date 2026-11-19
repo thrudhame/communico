@@ -5,9 +5,11 @@ import { Pairings } from '#engine/facade/pairing.ts';
 import { AuthLinkHealth } from '#engine/facade/auth.ts';
 import { FacadeKeys } from '#engine/facade/control.ts';
 import { HomeEgress } from '#engine/facade/home-egress.ts';
+import { InboxWorker } from '#engine/facade/worker.ts';
 import { noticeHeads } from '#engine/facade/notices.ts';
 import {
   type Cut,
+  LinkError,
   type LinkRecord,
   object,
   text,
@@ -31,13 +33,40 @@ function emit(event: FacadeObservation) {
     written += Deno.stdout.writeSync(bytes.subarray(written));
   }
 }
-function failure(operation: string, error: unknown) {
+function failure(
+  operation: string,
+  error: unknown,
+  kind: 'failure' | 'blocked' = 'failure',
+  scope?: import('#engine/facade/protocol.ts').Stream & { peer: string },
+) {
   emit({
-    kind: 'failure',
+    kind,
+    ...(scope ? { scope } : {}),
     operation,
-    error: error instanceof Error ? error.name : 'unknown error',
+    error: error instanceof LinkError
+      ? error.code
+      : error instanceof Error
+      ? error.name
+      : 'unknown error',
   });
 }
+
+// Domain validation can refuse before entering Journal.apply/complete. Observe
+// the inbox owner's complete failure boundary, not only its transaction subset.
+const inboxFailed = InboxWorker.prototype.failed;
+InboxWorker.prototype.failed = function (error, stream) {
+  // Independent streams may legitimately await their control/history facts.
+  // Retain that typed retry observation without declaring a terminal refusal.
+  failure(
+    'inbox ' + (stream?.stream ?? 'scan'),
+    error,
+    error instanceof LinkError && error.code === 'LINK_UNAVAILABLE'
+      ? 'blocked'
+      : 'failure',
+    stream ? { ...stream, peer: this.peer } : undefined,
+  );
+  inboxFailed.call(this, error, stream);
+};
 
 for (const name of JSON.parse(Deno.env.get('FACADE_TEST_HOLDS') ?? '[]')) {
   publicationCommand({ action: 'hold', name }, emit);

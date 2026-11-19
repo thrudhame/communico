@@ -99,6 +99,53 @@ Deno.test('facade observations reject pending observations when their child exit
   await pending;
 });
 
+Deno.test('facade dependency waits remain observable without becoming terminal rejections', async () => {
+  const observations = new FacadeObservations();
+  const expected = record('directory');
+  const pending = observations.applied('directory');
+  observations.accept({
+    kind: 'blocked',
+    operation: 'inbox directory',
+    error: 'LINK_UNAVAILABLE',
+  });
+  await observations.wait((event) => event.kind === 'blocked');
+  observations.accept({ kind: 'applied', peer: 'home', record: expected });
+  assertEquals(await pending, expected);
+});
+
+Deno.test('inbox rejections fail their own tail without poisoning independent stream callers', async () => {
+  const observations = new FacadeObservations();
+  const expected = record('auth:@alice:logical.test');
+  const independent = observations.applied(expected.stream).catch((error) =>
+    error
+  );
+  const rejected = assertRejects(
+    () => observations.applied('directory'),
+    Error,
+    'LINK_BAD_RECORD',
+  );
+  const refusal = {
+    kind: 'failure' as const,
+    operation: 'inbox directory',
+    error: 'LINK_BAD_RECORD',
+    scope: {
+      peer: 'home',
+      source: 'home',
+      incarnation: 'pairing',
+      stream: 'directory',
+    },
+  };
+  observations.accept(refusal);
+  await rejected;
+  await assertRejects(
+    () => observations.applied('directory'),
+    Error,
+    'LINK_BAD_RECORD',
+  );
+  observations.accept({ kind: 'applied', peer: 'home', record: expected });
+  assertEquals(await independent, expected);
+});
+
 Deno.test('facade observations bind fact completion to the peer and source incarnation', async () => {
   const observations = new FacadeObservations();
   const expected = record();

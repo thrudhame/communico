@@ -25,7 +25,11 @@ import {
   seedServer,
 } from './federation/doc-helper.ts';
 import { fedCaller } from './http-federation.ts';
-import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
+import {
+  certificatePin,
+  enrolledTenant,
+  initializeNode,
+} from '#engine/facade/identity.ts';
 import {
   exportPublicReplica,
   PublicReplicas,
@@ -82,6 +86,8 @@ import {
 } from './fixtures/remote.ts';
 import { makeFakeRoom } from './fixtures/remote-room.ts';
 import { createRoom } from '#engine/room/create.ts';
+import { facadeProcess } from './helpers/facade-process.ts';
+import { facadeTls } from './support/facade-tls.ts';
 import { object, recordHash } from '#engine/facade/protocol.ts';
 
 async function fixture(seedServer = serverSchema, facadePin = 'b'.repeat(64)) {
@@ -365,6 +371,51 @@ Deno.test('directory inventory rejects malformed room identities', async (t) => 
         await f.close();
       }
     });
+  }
+});
+
+Deno.test('cold inbox rejection before Journal.apply rejects the finite tail promptly', async () => {
+  const tls = await facadeTls();
+  const f = await fixture(serverSchema, certificatePin(tls.facade.cert));
+  let child: Awaited<ReturnType<typeof facadeProcess>> | undefined;
+  try {
+    const record = await f.directoryExport();
+    assert(record);
+    const payload = object(record.payload), view = object(payload.view);
+    const bad = {
+      ...record,
+      payload: { ...payload, view: { ...view, rooms: ['!invalid'] } },
+    };
+    const { hash, ...unsigned } = bad;
+    assert(hash);
+    bad.hash = recordHash(unsigned);
+    const journal = await f.journal();
+    await journal.receive('home', [bad]);
+    await f.edgeStore().close();
+    const path = tls.dir + '/rejection.toml';
+    await Deno.writeTextFile(
+      path,
+      `[server]\nname="logical.test"\nrole="facade"\nport=0\n[store]\ndir="${f.dir}/edge"\n[media]\nroot="${f.dir}/media"\n[admin]\nsocket="${tls.dir}/reject.sock"\n[federation]\nenabled=false\n[facade]\nnodeid="edge_a"\nurl="https://facade.test"\nlinkport=0\nlinkcert="${tls.dir}/facade.crt"\nlinkkey="${tls.dir}/facade.key"\nlinkcacerts=["${tls.dir}/ca.crt"]\npollseconds=1\n`,
+    );
+    child = await facadeProcess(path, 'facade: link/local admin ready');
+    const observing = child;
+    await assertRejects(
+      () =>
+        bounded(
+          observing.observations.tail('home', [{
+            ...bad,
+            received: { sequence: bad.sequence, hash: bad.hash },
+          }]),
+          2000,
+        ),
+      Error,
+      'inbox directory',
+    );
+    await child.stop();
+  } finally {
+    await child?.dispose();
+    await tls.close();
+    await f.close();
   }
 });
 
