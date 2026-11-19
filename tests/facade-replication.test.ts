@@ -29,7 +29,9 @@ import { admit } from '#engine/federation/gate.ts';
 import { federationPolicy } from '#engine/federation/policy.ts';
 import { keyStore } from '#engine/federation/keys.ts';
 import { inviteDependencies } from '#engine/federation/dependencies.ts';
+import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
 import { exportKeyRoster, FacadeKeys } from '#engine/facade/control.ts';
+import { startInboxWorker } from '#engine/facade/worker.ts';
 import * as serving from '#engine/federation/serve.ts';
 import { pathfinder } from '@pathfinder/pathfinder';
 import {
@@ -117,7 +119,12 @@ import {
 } from './fixtures/remote.ts';
 import { makeFakeRoom } from './fixtures/remote-room.ts';
 import { createRoom } from '#engine/room/create.ts';
-import { facadeProcess } from './helpers/facade-process.ts';
+import {
+  applicationScope,
+  facadeFailure,
+  FacadeObservations,
+  facadeProcess,
+} from './helpers/facade-process.ts';
 import { facadeTls } from './support/facade-tls.ts';
 import { object, recordHash } from '#engine/facade/protocol.ts';
 
@@ -1800,6 +1807,140 @@ Deno.test('reverse room bootstrap requires selected authentic participation and 
       'accepted',
     );
   } finally {
+    await f.close();
+  }
+});
+
+Deno.test('room readiness waits for missing and held verification authority without refusing its consumer or moving its cut', async () => {
+  const f = await fixture();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let applying: Promise<boolean> | undefined;
+  let worker: ReturnType<typeof startInboxWorker> | undefined;
+  const observations = new FacadeObservations();
+  try {
+    const created = await createRoom(f.home, {
+      creator: '@ready:logical.test',
+      version: '11',
+    }, f.tenant.signer());
+    const room = await openRoom(f.home, created.roomId);
+    const record = await exportRoomReplica(
+      f.home,
+      room,
+      f.tenant.serverName,
+      f.node.node,
+      f.bundle.id,
+    );
+    assert(record);
+    const journal = await f.journal();
+    await journal.receive('home', [record]);
+    const server = await f.edgeServer();
+    const keys = new FacadeKeys(
+      server,
+      f.node.signer(),
+      f.node.publicKey,
+      await f.edgePairings(),
+    );
+    const replicas = new RoomReplicas(
+      f.edgeStore(),
+      await f.edgePairings(),
+      f.tenant.serverName,
+      productionKeyResolver(keys.verificationKeys()),
+    );
+    let finished = false;
+    const consumer = observations.fact(
+      applicationScope('home', record, 0),
+      () => true,
+    )
+      .then((value) => {
+        finished = true;
+        return value;
+      }, (error) => {
+        finished = true;
+        return error;
+      });
+    let attempt = Promise.withResolvers<ReturnType<typeof facadeFailure>>();
+    worker = startInboxWorker({
+      journal,
+      peer: 'home',
+      pollseconds: 3600,
+      apply: async (stream) => {
+        if (stream.stream !== record.stream) return false;
+        const applied = await replicas.apply(journal, stream);
+        if (applied) {
+          observations.accept({ kind: 'applied', peer: 'home', record });
+        }
+        return applied;
+      },
+      changed() {},
+      failed(error, stream, after) {
+        const event = facadeFailure(
+          'inbox room',
+          error,
+          stream && applicationScope('home', stream, after),
+        );
+        observations.accept(event);
+        attempt.resolve(event);
+      },
+    });
+    assertEquals((await bounded(attempt.promise, 5000)).kind, 'blocked');
+    assertEquals(finished, false);
+    assertEquals(
+      (await journal.heads('home', 'in', record)).applied.sequence,
+      0,
+    );
+    assertEquals((await replicas.status(created.roomId))?.ready, false);
+    const control = await exportKeyRoster(
+      f.home,
+      f.tenant,
+      f.node.node,
+      f.bundle.id,
+      (_id, doc) => keys.cosign(doc),
+    );
+    await journal.receive('home', [control]);
+    let calls = 0;
+    const held: Database = {
+      ...server,
+      async tx(fn, options) {
+        if (++calls === 2) {
+          entered.resolve();
+          await release.promise;
+        }
+        return server.tx(fn, options);
+      },
+    };
+    applying = keys.apply(new Journal(held, LINK_CAPABILITIES), control);
+    await bounded(entered.promise, 5000);
+    attempt = Promise.withResolvers<ReturnType<typeof facadeFailure>>();
+    worker.wake();
+    assertEquals((await bounded(attempt.promise, 5000)).kind, 'blocked');
+    assertEquals(finished, false);
+    assertEquals(
+      (await journal.heads('home', 'in', record)).applied.sequence,
+      0,
+    );
+    assertEquals((await replicas.status(created.roomId))?.ready, false);
+    release.resolve();
+    await applying;
+    worker.wake();
+    assertEquals(await bounded(consumer, 5000), record);
+    assertEquals(
+      (await journal.heads('home', 'in', record)).applied.sequence,
+      1,
+    );
+    assertEquals((await replicas.status(created.roomId))?.ready, true);
+    const replica = await openRoom(f.edgeStore(), created.roomId);
+    assertEquals(
+      await replica.tx(async (tx) =>
+        (await tx.events.getStatus(created.createEventId))?.standing
+      ),
+      'accepted',
+    );
+  } finally {
+    release.resolve();
+    await applying;
+    await worker?.close();
+    observations.close(new Error('test finished'));
     await f.close();
   }
 });

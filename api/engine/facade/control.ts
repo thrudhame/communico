@@ -27,7 +27,12 @@ import type { Store } from '#engine/store/index.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { appendRecord, type Journal } from './journal.ts';
 import { homePublicKeys, type Pairings } from './pairing.ts';
-import { changeSigningAuthority, signingFence } from './signing-authority.ts';
+import {
+  changeSigningAuthority,
+  signingFence,
+  verificationFence,
+  VerificationUnavailable,
+} from './signing-authority.ts';
 import {
   integer,
   LinkError,
@@ -133,10 +138,21 @@ function approvedVerificationKeys(
       if (name !== signer.serverName) {
         return await remote.getVerifyKey(name, keyId, floor, purpose, context);
       }
-      const unchanged = signingFence(db);
+      const unchanged = verificationFence(db);
       unchanged();
       const { roster, document: raw } = await load();
-      const key = roster?.keys.find((key) => key.keyId === keyId);
+      unchanged();
+      if (roster === null) {
+        throw new VerificationUnavailable('key roster not ready');
+      }
+      const key = roster.keys.find((key) =>
+        key.keyId === keyId &&
+        (key.retiredAt === null ||
+          (purpose !== 'request' && floor <= key.retiredAt))
+      );
+      if (roster.server === name && key && raw === null) {
+        throw new VerificationUnavailable('key document not ready');
+      }
       let document: KeyDoc | null = null;
       if (roster && raw !== null) {
         try {
@@ -145,11 +161,10 @@ function approvedVerificationKeys(
           // An older partial publication confers no key authority.
         }
       }
+      unchanged();
       if (
-        !roster || roster.server !== name || !key || !document ||
-        floor > document.valid_until_ts ||
-        (key.retiredAt !== null &&
-          (purpose === 'request' || floor > key.retiredAt))
+        roster.server !== name || !key || !document ||
+        floor > document.valid_until_ts
       ) {
         throw new UpstreamError('validation', {
           phase: 'key-lookup',
@@ -184,11 +199,19 @@ export function homeVerificationKeys(
     const [held] = await db.query(
       'SELECT revision,roster_json,document_json FROM facade_key_roster WHERE singleton=1',
     );
+    const retained = rosterAt(held, roster.revision);
+    if (
+      retained !== null &&
+      (Number(held.revision) !== roster.revision ||
+        canonicalJson(retained) !== canonicalJson(roster))
+    ) {
+      throw new UpstreamError('validation', {
+        phase: 'key-lookup',
+        reason: 'local key roster differs from enrollment authority',
+      });
+    }
     return {
-      roster: Number(held.revision) === roster.revision &&
-          held.roster_json === canonicalJson(roster)
-        ? roster
-        : null,
+      roster: retained,
       document: held.document_json === null ? null : String(held.document_json),
     };
   });
