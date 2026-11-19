@@ -505,7 +505,11 @@ export class FacadeKeys {
         if (roster === null) {
           throw new VerificationUnavailable('key roster not ready');
         }
-        const key = roster?.keys.find((key) => key.keyId === keyId);
+        const key = roster.keys.find((key) =>
+          key.keyId === keyId &&
+          (key.retiredAt === null ||
+            (purpose !== 'request' && floor <= key.retiredAt))
+        );
         if (roster.server === name && key && held.document_json === null) {
           throw new VerificationUnavailable('key document not ready');
         }
@@ -523,9 +527,7 @@ export class FacadeKeys {
         unchanged();
         if (
           !roster || roster.server !== name ||
-          !key || !document || floor > document.valid_until_ts ||
-          (key.retiredAt !== null &&
-            (purpose === 'request' || floor > key.retiredAt))
+          !key || !document || floor > document.valid_until_ts
         ) {
           throw new UpstreamError('validation', {
             phase: 'key-lookup',

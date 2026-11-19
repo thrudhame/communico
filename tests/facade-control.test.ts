@@ -784,6 +784,47 @@ Deno.test('roster retirement is preserved, and changed or forged control cannot 
           ),
         UpstreamError,
       );
+      await f.server().execute(
+        'UPDATE facade_key_roster SET document_json=NULL WHERE singleton=1',
+      );
+      try {
+        await assertRejects(
+          () =>
+            verification.getVerifyKey(
+              'logical.test',
+              node.keyId,
+              retiredAt - 1,
+              'request',
+            ),
+          UpstreamError,
+        );
+        await assertRejects(
+          () =>
+            verification.getVerifyKey(
+              'logical.test',
+              node.keyId,
+              retiredAt + 1,
+              'event',
+            ),
+          UpstreamError,
+        );
+        await assertRejects(
+          () =>
+            verification.getVerifyKey(
+              'logical.test',
+              node.keyId,
+              retiredAt,
+              'event',
+            ),
+          VerificationUnavailable,
+          'not ready',
+        );
+      } finally {
+        await f.server().execute(
+          'UPDATE facade_key_roster SET document_json=? WHERE singleton=1',
+          [canonicalJson(doc)],
+        );
+      }
     } finally {
       await otherStore.close();
       await Deno.remove(otherDir, { recursive: true });
