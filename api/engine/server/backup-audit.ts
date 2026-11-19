@@ -27,6 +27,25 @@ export async function auditServer(
 ) {
   return await snapshot.read(server, async (db) => {
     const heads = await counters(db);
+    // Native and fallback projections retain the original semantic identity.
+    // A null pointer is a pre-semantic local evaluation, never an imported one.
+    for await (
+      const row of scan(db, 'push_evaluations', '*', 'operation_id IS NOT NULL')
+    ) {
+      const [fact] = await db.query(
+        "SELECT payload_json FROM domain_operations WHERE operation_id=? AND kind='notification'",
+        [String(row.operation_id)],
+      );
+      const value = fact ? JSON.parse(String(fact.payload_json)) : null;
+      if (
+        !value || value.tenant !== row.tenant || value.user !== row.user ||
+        value.event !== row.event || value.room !== row.room ||
+        value.ruleRevision !== Number(row.rule_revision) ||
+        value.ignoreRevision !== Number(row.ignore_revision)
+      ) {
+        auditFailure('notification source identity differs');
+      }
+    }
     // reports.report_id and its original semantic facts are durable identity,
     // not reconstructed page numbers. Unenrolled legacy rows may remain null.
     for await (const row of scan(db, 'reports', '*', 'report_id IS NOT NULL')) {

@@ -445,8 +445,15 @@ ALTER TABLE event_index ADD COLUMN local_join_user TEXT;
 CREATE INDEX event_index_local_participation ON event_index(room,local_join_user) WHERE local_join_user IS NOT NULL;
 `;
 
+const NOTIFICATION_CONTEXT_SQL = `
+ALTER TABLE push_evaluations ADD COLUMN operation_id TEXT;
+ALTER TABLE push_evaluations ADD COLUMN native INTEGER NOT NULL DEFAULT 1;
+CREATE TABLE notification_retired_users(user TEXT PRIMARY KEY NOT NULL);
+CREATE INDEX notification_operations_event ON domain_operations(json_extract(payload_json,'$.room'),json_extract(payload_json,'$.event')) WHERE kind='notification';
+`;
+
 export const serverSchema: SchemaProvider = {
-  version: 52,
+  version: 53,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -505,6 +512,7 @@ export const serverSchema: SchemaProvider = {
       'ALTER TABLE prejoin_memberships ADD COLUMN source_binding TEXT',
     );
     await db.exec(PREJOIN_JOBS_SQL);
+    await db.exec(NOTIFICATION_CONTEXT_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -588,5 +596,6 @@ INSERT INTO device_publication_predecessors SELECT DISTINCT p.subject,p.destinat
       await migratePrejoinJobs(conn);
     },
     51: (conn) => conn.exec(REPORT_IDENTITY_SQL),
+    52: (conn) => conn.exec(NOTIFICATION_CONTEXT_SQL),
   },
 };

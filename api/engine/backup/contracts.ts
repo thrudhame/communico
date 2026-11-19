@@ -204,12 +204,16 @@ export const tableContracts = {
       'public_signing_keys',
       'remote_signing_keys',
       'federation_batches',
+      // operation_id binds each public evaluation to its retained notification
+      // source context; auditServer checks that durable pointer below.
       'push_evaluations',
       'notification_counts',
       'notification_horizons',
       'notification_receipt_refs',
       'notification_own_events',
       'notification_history',
+      // Terminal account lifecycle projection; original source facts survive.
+      'notification_retired_users',
       'push_targets',
       'push_rejections',
       'push_delivery',
