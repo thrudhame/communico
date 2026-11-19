@@ -2,7 +2,12 @@
 // and in memory; diagnostics must never print their credential-bearing payloads.
 import { assert, assertEquals } from '@std/assert';
 import metadata from '#root/deno.json' with { type: 'json' };
-import type { Cut, LinkRecord, Stream } from '#engine/facade/protocol.ts';
+import {
+  type Cut,
+  LinkError,
+  type LinkRecord,
+  type Stream,
+} from '#engine/facade/protocol.ts';
 import type { Journal } from '#engine/facade/journal.ts';
 import { bounded, pause } from './server-process.ts';
 import { childDiagnostics } from './child-diagnostics.ts';
@@ -34,6 +39,45 @@ export type FacadeObservation =
 export type PublicationCommand =
   | { action: 'hold' | 'release'; name: string }
   | { action: 'fence'; id: string };
+
+export function facadeFailure(
+  operation: string,
+  error: unknown,
+  scope?: ObservationScope,
+): FacadeObservation {
+  return {
+    kind: error instanceof LinkError && error.code === 'LINK_UNAVAILABLE'
+      ? 'blocked'
+      : 'failure',
+    operation,
+    error: error instanceof LinkError
+      ? error.code
+      : error instanceof Error
+      ? error.name
+      : 'unknown error',
+    ...(scope ? { scope } : {}),
+  };
+}
+
+type FailureReporter = (
+  operation: string,
+  error: unknown,
+  scope?: ObservationScope,
+) => void;
+
+export function applicationScope(
+  peer: string,
+  stream: Stream,
+  after?: number,
+): ObservationScope {
+  return {
+    peer,
+    source: stream.source,
+    incarnation: stream.incarnation,
+    stream: stream.stream,
+    after,
+  };
+}
 const publications = new Map<
   string,
   ReturnType<typeof Promise.withResolvers<void>>
@@ -78,12 +122,14 @@ export function publicationCommand(
 export function observeJournalApplication(
   apply: Journal['apply'],
   completed: (peer: string, record: LinkRecord) => void,
-  failure: (operation: string, error: unknown) => void,
+  failure: FailureReporter,
 ): Journal['apply'] {
   return async function (this: Journal, ...args) {
     const [peer, stream, handler] = args;
     let committed: LinkRecord | undefined;
+    let after: number | undefined;
     try {
+      after = (await this.heads(peer, 'in', stream)).applied.sequence;
       args[2] = async (conn, record) => {
         committed = undefined;
         const result = await handler(conn, record);
@@ -94,7 +140,42 @@ export function observeJournalApplication(
       if (result && committed) completed(peer, committed);
       return result;
     } catch (error) {
-      failure('journal apply ' + stream.stream, error);
+      failure(
+        'journal apply ' + stream.stream,
+        error,
+        applicationScope(peer, stream, after),
+      );
+      throw error;
+    }
+  };
+}
+
+export function observeJournalCompletion(
+  complete: Journal['complete'],
+  completed: (peer: string, record: LinkRecord) => void,
+  failure: FailureReporter,
+): Journal['complete'] {
+  return async function (this: Journal, peer, stream, cut, result) {
+    let after: number | undefined;
+    try {
+      after = (await this.heads(peer, 'in', stream)).applied.sequence;
+      const heads = await complete.call(this, peer, stream, cut, result);
+      const page = await this.page(peer, 'in', stream, cut.sequence - 1, {
+        maxItems: 1,
+        maxBytes: Number.MAX_SAFE_INTEGER,
+      });
+      const record = page.records[0];
+      if (!record || record.hash !== cut.hash) {
+        throw new Error('completed record disappeared');
+      }
+      completed(peer, record);
+      return heads;
+    } catch (error) {
+      failure(
+        'journal complete ' + stream.stream,
+        error,
+        applicationScope(peer, stream, after),
+      );
       throw error;
     }
   };

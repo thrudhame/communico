@@ -102,6 +102,11 @@ Deno.test('backup audit: ordinary v12 identity is create-derived and corrupt roo
             additional_creators: ['@other:logical.test'],
           },
         }],
+        ['missing create version', create, { content: {} }],
+        ['numeric create version', create, { content: { room_version: 12 } }],
+        ['unsupported create version', create, {
+          content: { room_version: 'unknown' },
+        }],
         ['create room field', create, { room_id: '!wrong:elsewhere.test' }],
         ['member room field', member, { room_id: '!wrong:elsewhere.test' }],
         ['missing member room', member, { room_id: undefined }],

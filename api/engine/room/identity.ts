@@ -3,7 +3,7 @@
 import { eventIdFor } from '#engine/eventid.ts';
 import { splitId, validEventUserId } from '#engine/ids.ts';
 import type { Pdu } from '#engine/pdu.ts';
-import { getRulebook } from '#engine/rulebook/index.ts';
+import { getRulebook, supportedRoomVersions } from '#engine/rulebook/index.ts';
 
 export function validRoomId(value: unknown): value is string {
   if (typeof value !== 'string' || !value.startsWith('!')) return false;
@@ -18,6 +18,11 @@ export function validRoomId(value: unknown): value is string {
 export async function eventRoomId(pdu: Pdu): Promise<string | undefined> {
   if (pdu.type === 'm.room.create') {
     const version = pdu.content?.room_version;
+    if (
+      typeof version !== 'string' || !supportedRoomVersions().includes(version)
+    ) {
+      return undefined;
+    }
     if (getRulebook(version).spec.roomIdFromCreateEvent) {
       if (Object.hasOwn(pdu, 'room_id')) return undefined;
       const id = await eventIdFor(

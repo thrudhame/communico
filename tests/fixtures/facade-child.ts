@@ -9,18 +9,20 @@ import { InboxWorker } from '#engine/facade/worker.ts';
 import { noticeHeads } from '#engine/facade/notices.ts';
 import {
   type Cut,
-  LinkError,
   type LinkRecord,
   object,
   text,
 } from '#engine/facade/protocol.ts';
 import {
+  applicationScope,
   beforeFacadePublication,
+  facadeFailure,
   FacadeHealthConnections,
   type FacadeObservation,
   observationPrefix,
   type ObservationScope,
   observeJournalApplication,
+  observeJournalCompletion,
   publicationCommand,
 } from '#tests/helpers/facade-process.ts';
 
@@ -37,19 +39,9 @@ function emit(event: FacadeObservation) {
 function failure(
   operation: string,
   error: unknown,
-  kind: 'failure' | 'blocked' = 'failure',
   scope?: ObservationScope,
 ) {
-  emit({
-    kind,
-    ...(scope ? { scope } : {}),
-    operation,
-    error: error instanceof LinkError
-      ? error.code
-      : error instanceof Error
-      ? error.name
-      : 'unknown error',
-  });
+  emit(facadeFailure(operation, error, scope));
 }
 
 // Domain validation can refuse before entering Journal.apply/complete. Observe
@@ -61,10 +53,7 @@ InboxWorker.prototype.failed = function (error, stream, after) {
   failure(
     'inbox ' + (stream?.stream ?? 'scan'),
     error,
-    error instanceof LinkError && error.code === 'LINK_UNAVAILABLE'
-      ? 'blocked'
-      : 'failure',
-    stream ? { ...stream, peer: this.peer, after } : undefined,
+    stream ? applicationScope(this.peer, stream, after) : undefined,
   );
   inboxFailed.call(this, error, stream, after);
 };
@@ -178,25 +167,11 @@ HomeEgress.prototype.dispatch = async function (...args) {
   emit({ kind: 'egress', ...args[0] });
   return result;
 };
-const complete = Journal.prototype.complete;
-Journal.prototype.complete = async function (peer, stream, cut, result) {
-  try {
-    const heads = await complete.call(this, peer, stream, cut, result);
-    const page = await this.page(peer, 'in', stream, cut.sequence - 1, {
-      maxItems: 1,
-      maxBytes: Number.MAX_SAFE_INTEGER,
-    });
-    const record = page.records[0];
-    if (!record || record.hash !== cut.hash) {
-      throw new Error('completed record disappeared');
-    }
-    completed(peer, record);
-    return heads;
-  } catch (error) {
-    failure('journal complete ' + stream.stream, error);
-    throw error;
-  }
-};
+Journal.prototype.complete = observeJournalCompletion(
+  Journal.prototype.complete,
+  completed,
+  failure,
+);
 // A cold restart can already hold the required completion. Observe its durable
 // record through the real journal owner, never open a competing store instance.
 const streams = Journal.prototype.streams;
