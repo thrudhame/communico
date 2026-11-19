@@ -6,13 +6,75 @@ import type { Tenant } from '#engine/tenant/index.ts';
 import { nextCounter } from '#engine/tenant/accountdata.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { validatePusher } from '#engine/push/registration.ts';
-import { requireSessionAuthority } from '#engine/tenant/session-authority.ts';
+import {
+  ownerUnavailable,
+  requireSessionAuthority,
+  tenantAuthority,
+} from '#engine/tenant/session-authority.ts';
+import { writeRegister } from '#engine/facade/registers.ts';
+
+/** This is protected semantic source intent, not the executable sender target
+ * projection below. Lifecycle removals address one immutable incarnation;
+ * refresh changes its recovery digest, never its identity or original time. */
+async function recordPusherOperation(
+  conn: Conn,
+  row: Record<string, unknown>,
+  deleted: boolean,
+): Promise<void> {
+  const authority = await tenantAuthority(conn);
+  if (!authority) return;
+  if (!deleted) {
+    const [session] = await conn.query(
+      'SELECT s.node,s.incarnation,s.localpart FROM session_authority s JOIN access_tokens a ON a.token=s.hash AND a.localpart=s.localpart WHERE s.hash=? AND s.refresh=0',
+      [String(row.access_token)],
+    );
+    // A live mutation must have source authority; do not acknowledge an
+    // executable registration while silently omitting its export obligation.
+    if (!session || session.localpart !== row.localpart) {
+      throw new MatrixError(401, 'M_UNKNOWN_TOKEN', 'Invalid pusher session');
+    }
+    if (
+      session.node !== authority.node ||
+      session.incarnation !== authority.incarnation
+    ) ownerUnavailable();
+  }
+  await writeRegister(
+    conn,
+    { source: authority.node, incarnation: authority.incarnation },
+    JSON.stringify([
+      'pusher',
+      row.localpart,
+      row.app_id,
+      row.pushkey,
+      row.incarnation,
+    ]),
+    'pusher',
+    JSON.stringify(
+      deleted ? null : {
+        registration: {
+          app_id: row.app_id,
+          pushkey: row.pushkey,
+          kind: row.kind,
+          app_display_name: row.app_display_name,
+          device_display_name: row.device_display_name,
+          profile_tag: row.profile_tag ?? null,
+          lang: row.lang,
+          data: JSON.parse(String(row.data)),
+        },
+        accessHash: row.access_token,
+        addedMs: row.added_ms,
+      },
+    ),
+  );
+}
 
 export async function recordPusherChange(
   conn: Conn,
   row: Record<string, unknown>,
   deleted: boolean,
 ): Promise<void> {
+  // Projection replay (including historical schema upgrades) must not acquire
+  // registration authorship or depend on later authority/domain schemas.
   await conn.execute(
     'INSERT INTO pusher_changes(pos,localpart,app_id,pushkey,incarnation,payload) VALUES(?,?,?,?,?,?)',
     [
@@ -37,7 +99,10 @@ async function deleteMatching(
   args: (string | number)[],
 ): Promise<void> {
   const rows = await conn.query('SELECT * FROM pushers WHERE ' + where, args);
-  for (const row of rows) await recordPusherChange(conn, row, true);
+  for (const row of rows) {
+    await recordPusherOperation(conn, row, true);
+    await recordPusherChange(conn, row, true);
+  }
   await conn.execute('DELETE FROM pushers WHERE ' + where, args);
 }
 
@@ -47,10 +112,16 @@ export async function movePusherToken(
   oldHash: string,
   newHash: string,
 ): Promise<void> {
+  const rows = await conn.query('SELECT * FROM pushers WHERE access_token=?', [
+    oldHash,
+  ]);
   await conn.execute(
     'UPDATE pushers SET access_token = ? WHERE access_token = ?',
     [newHash, oldHash],
   );
+  for (const row of rows) {
+    await recordPusherOperation(conn, { ...row, access_token: newHash }, false);
+  }
 }
 
 export async function deletePushersForToken(
@@ -127,6 +198,14 @@ export async function upsertPusherRow(
   accessHash: string,
 ): Promise<void> {
   await requireSessionAuthority(conn, accessHash, false);
+  // Replacing a row must retain the exact old incarnation's removal before
+  // overwriting it. The local sender projection still needs only the new row.
+  for (
+    const row of await conn.query(
+      'SELECT * FROM pushers WHERE localpart=? AND app_id=? AND pushkey=?',
+      [localpart, pusher.app_id, pusher.pushkey],
+    )
+  ) await recordPusherOperation(conn, row, true);
   const incarnation = crypto.randomUUID();
   const added = Date.now();
   await conn.execute(
@@ -153,13 +232,16 @@ export async function upsertPusherRow(
       added,
     ],
   );
-  await recordPusherChange(conn, {
+  const row = {
     localpart,
     ...pusher,
     incarnation,
     added_ms: added,
+    access_token: accessHash,
     data: JSON.stringify(pusher.data),
-  }, false);
+  };
+  await recordPusherOperation(conn, row, false);
+  await recordPusherChange(conn, row, false);
 }
 
 export async function pushersOfUser(
