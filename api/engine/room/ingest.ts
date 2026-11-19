@@ -33,6 +33,7 @@ import {
   admitLocalJoin,
   completeRoomWrite,
   enrollCompletion,
+  prepareJoinObservation,
   prepareMembershipAdmission,
   requireCompletionOwner,
   withMembershipFence,
@@ -272,6 +273,9 @@ async function submitLocal(
         if (joiningUser !== undefined) {
           await admitLocalJoin(room.store, room.id, joiningUser);
         }
+        const observation = joiningUser === undefined
+          ? undefined
+          : await prepareJoinObservation(room.store, room.id, joiningUser);
         let prepared = await submission?.lookup() ?? null;
         // Exact committed work needs completion repair, not fresh scope. The
         // new-work fence still covers a prepared event that has not committed.
@@ -303,9 +307,18 @@ async function submitLocal(
             withMembershipFence(admission, async () => {
               const pdu = await build(tx, permit);
               await assertLocalAnnotation(tx, pdu);
-              return await ingestInTx(tx, room.id, pdu, {
+              const transition = await tx.joinObservations.transition(
+                joiningUser,
+                observation,
+              );
+              const result = await ingestInTx(tx, room.id, pdu, {
                 self: signer.serverName,
               });
+              if (
+                !result.receipt && result.standing === 'accepted' &&
+                pdu.content?.membership === 'join'
+              ) await tx.joinObservations.complete(result.eventId, transition);
+              return result;
             })
           );
           return committed;
@@ -327,6 +340,13 @@ async function submitLocal(
                 pdu as BuildPartial,
                 signer.serverName,
               );
+              if (pdu.content?.membership === 'join') {
+                await tx.joinObservations.retain(
+                  String(pdu.event_id),
+                  joiningUser,
+                  observation,
+                );
+              }
               return pdu;
             })
           );
@@ -350,9 +370,14 @@ async function submitLocal(
               throw new Error('E_SUBMISSION_ID_MISMATCH');
             }
             await assertLocalAnnotation(tx, prepared.pdu);
-            return await ingestInTx(tx, room.id, prepared.pdu, {
+            const result = await ingestInTx(tx, room.id, prepared.pdu, {
               self: signer.serverName,
             });
+            if (
+              !result.receipt && result.standing === 'accepted' &&
+              prepared.pdu.content?.membership === 'join'
+            ) await tx.joinObservations.complete(result.eventId);
+            return result;
           });
         });
         committed = result;
@@ -399,6 +424,9 @@ export async function ingestLocal(
     async () => {
       const user = localJoiningUser(pdu as BuildPartial);
       if (user !== undefined) await admitLocalJoin(room.store, room.id, user);
+      const observation = user === undefined
+        ? undefined
+        : await prepareJoinObservation(room.store, room.id, user);
       const membership = localMembershipAuthor(pdu as BuildPartial, self);
       const scope = membership
         ? await prepareMembershipAdmission(
@@ -411,7 +439,16 @@ export async function ingestLocal(
       return await room.tx((tx) =>
         withMembershipFence(scope, async () => {
           await admission?.(tx);
-          return await ingestInTx(tx, room.id, pdu, { self });
+          const transition = await tx.joinObservations.transition(
+            user,
+            observation,
+          );
+          const result = await ingestInTx(tx, room.id, pdu, { self });
+          if (
+            !result.receipt && result.standing === 'accepted' &&
+            pdu.content?.membership === 'join'
+          ) await tx.joinObservations.complete(result.eventId, transition);
+          return result;
         })
       );
     },

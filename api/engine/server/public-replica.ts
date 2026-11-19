@@ -156,7 +156,9 @@ export async function installDirectoryFacts(
     );
   }
   const rooms = new Set(facts.publication.map((entry) => entry.roomId));
-  for (const table of ['visibility', 'directory']) {
+  const f2 =
+    (await conn.query('SELECT 1 FROM facade_owner_activation')).length > 0;
+  for (const table of f2 ? ['visibility'] : ['visibility', 'directory']) {
     for (const row of await conn.query('SELECT room_id FROM ' + table)) {
       if (!rooms.has(String(row.room_id))) {
         await conn.execute('DELETE FROM ' + table + ' WHERE room_id=?', [
@@ -171,11 +173,23 @@ export async function installDirectoryFacts(
         changedColumns('visibility', 'visibility'),
       [entry.roomId, entry.visibility],
     );
-    await conn.execute(
-      'INSERT INTO directory(room_id,purgeable_ms) VALUES(?,?) ON CONFLICT(room_id) DO UPDATE SET purgeable_ms=excluded.purgeable_ms WHERE ' +
-        changedColumns('directory', 'purgeable_ms'),
-      [entry.roomId, entry.purgeable],
-    );
+    if (f2) {
+      // Home publishes visibility, not this receiver's participation/forget cut.
+      await conn.execute(
+        'INSERT INTO directory(room_id,purgeable_ms) VALUES(?,NULL) ON CONFLICT(room_id) DO NOTHING',
+        [entry.roomId],
+      );
+    } else {
+      await conn.execute(
+        'INSERT INTO directory(room_id,purgeable_ms) VALUES(?,?) ON CONFLICT(room_id) DO UPDATE SET purgeable_ms=excluded.purgeable_ms WHERE ' +
+          changedColumns('directory', 'purgeable_ms'),
+        [entry.roomId, entry.purgeable],
+      );
+    }
+  }
+  // F1's wholesale display replacement is not authority over F2 causal intent.
+  if (f2) {
+    return;
   }
   const forgotten = new Set(
     facts.forgotten.map((entry) => JSON.stringify([entry.user, entry.roomId])),

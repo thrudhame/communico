@@ -16,6 +16,8 @@ import * as state from '#engine/room/state.ts';
 import * as waits from '#engine/room/waits.ts';
 import * as remoteBatches from '#engine/room/remote-batches.ts';
 import * as membershipReceipts from '#engine/room/membership-receipts.ts';
+import * as joinObservations from '#engine/room/join-observations.ts';
+import type { LocalJoinObservation } from '#engine/room/hooks.ts';
 import * as completion from '#engine/room/completion.ts';
 import type { RemoteOutcome } from '#engine/room/remote.ts';
 import { orderKeys } from '#engine/room/topology.ts';
@@ -41,6 +43,19 @@ function bind(
 ) {
   return {
     diagnostics: { resolutions: 0 },
+    joinObservations: {
+      transition: (
+        user: string | undefined,
+        data: LocalJoinObservation | undefined,
+      ) => joinObservations.transitionObservation(conn, user, data),
+      retain: (
+        event: string,
+        user: string | undefined,
+        data: LocalJoinObservation | undefined,
+      ) => joinObservations.retainJoinObservation(conn, event, user, data),
+      complete: (event: string, data?: LocalJoinObservation) =>
+        joinObservations.completeJoinObservation(conn, event, data),
+    },
     completion: {
       state: () => completion.completionState(conn),
       capture: () => completion.captureCompletionCut(conn, roomId),

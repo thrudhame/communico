@@ -25,6 +25,34 @@ import {
 } from '#engine/facade/identity.ts';
 import { AuthLinkHealth, FacadeAuth } from '#engine/facade/auth.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import {
+  clearPurgeable,
+  forget,
+  forgetOperations,
+  importForgetOperation,
+  prepareRejoin,
+  projectRejoin,
+  type RejoinObservation,
+} from '#engine/server/membership.ts';
+import {
+  membershipOf,
+  roomsFor,
+  slidingListSnapshot,
+} from '#engine/server/read.ts';
+import { installDirectoryFacts } from '#engine/server/public-replica.ts';
+import { installJoinAdmission } from '#engine/server/join-attempts.ts';
+import { setJoinObservation } from '#engine/room/hooks.ts';
+import {
+  join as joinLocal,
+  leave as leaveLocal,
+} from '#engine/room/membership.ts';
+import { project } from '#engine/server/project.ts';
+import {
+  ingestLocal,
+  type PreparedSubmission,
+  sendLocal,
+} from '#engine/room/ingest.ts';
+import { buildInTx } from '#engine/room/build.ts';
 import { loadFilter, storeFilter } from '#engine/tenant/filters.ts';
 import { issueOpenIdToken, openIdUserInfo } from '#engine/tenant/openid.ts';
 import { hashToken, lookupToken } from '#engine/tenant/auth.ts';
@@ -203,6 +231,506 @@ async function fixture() {
     },
   };
 }
+
+Deno.test('facade forget: F2 directory import preserves receiver purgeability and local-only rooms', async () => {
+  const f = await fixture();
+  try {
+    const db = await f.edge.server();
+    await db.execute(
+      'INSERT INTO directory(room_id,purgeable_ms) VALUES(?,NULL),(?,NULL)',
+      ['!active:logical.test', '!local:logical.test'],
+    );
+    await db.tx((tx) =>
+      installDirectoryFacts(tx, {
+        aliases: [],
+        publication: [{
+          roomId: '!active:logical.test',
+          visibility: 'public',
+          purgeable: 123,
+        }],
+        forgotten: [],
+      }, 'logical.test')
+    );
+    assertEquals(
+      await db.query(
+        'SELECT room_id,purgeable_ms FROM directory ORDER BY room_id',
+      ),
+      [
+        { room_id: '!active:logical.test', purgeable_ms: null },
+        { room_id: '!local:logical.test', purgeable_ms: null },
+      ],
+    );
+    assertEquals(
+      (await db.query('SELECT visibility FROM visibility WHERE room_id=?', [
+        '!active:logical.test',
+      ]))[0].visibility,
+      'public',
+    );
+    // The pre-F2 snapshot contract is unchanged.
+    await db.execute('DELETE FROM facade_owner_activation');
+    await db.tx((tx) =>
+      installDirectoryFacts(tx, {
+        aliases: [],
+        publication: [{
+          roomId: '!active:logical.test',
+          visibility: 'private',
+          purgeable: 456,
+        }],
+        forgotten: [],
+      }, 'logical.test')
+    );
+    assertEquals(await db.query('SELECT room_id,purgeable_ms FROM directory'), [
+      { room_id: '!active:logical.test', purgeable_ms: 456 },
+    ]);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade forget: imported join projection clears purgeability without clearing concurrent intent', async () => {
+  const f = await fixture();
+  try {
+    const db = await f.edge.server();
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    const received = await makeFakeRoom({
+      roomId: '!imported-forget:logical.test',
+      creator: '@alice:logical.test',
+      server: await makeRemoteServer('logical.test'),
+    });
+    const events = [...received.events.values()];
+    await db.execute(
+      "INSERT INTO memberships(user,room,membership,event,seq) VALUES(?,?,'leave',?,1)",
+      ['@alice:logical.test', received.roomId, '$prior-leave'],
+    );
+    await forget(db, received.roomId, '@alice:logical.test', 'logical.test');
+    assertEquals(
+      typeof (await db.query(
+        'SELECT purgeable_ms FROM directory WHERE room_id=?',
+        [received.roomId],
+      ))[0].purgeable_ms,
+      'number',
+    );
+    await importReplicaGenesis(f.edge, {
+      roomId: received.roomId,
+      roomVersion: received.version,
+      self: 'logical.test',
+      keys: fakeKeyResolver(received.server),
+      create: events[0],
+      join: events[1],
+    });
+    await project(f.edge, received.roomId);
+    assertEquals(
+      (await membershipOf(db, received.roomId, '@alice:logical.test'))!
+        .membership,
+      'join',
+    );
+    assertEquals(
+      (await membershipOf(db, received.roomId, '@alice:logical.test'))!
+        .forgotten,
+      true,
+    );
+    assertEquals(
+      (await db.query('SELECT purgeable_ms FROM directory WHERE room_id=?', [
+        received.roomId,
+      ]))[0].purgeable_ms,
+      null,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade forget: profile-style self joins do not observe a rejoin', async (t) => {
+  for (const mode of ['direct local', 'prepared client', 'raw local']) {
+    await t.step(mode, async () => {
+      const f = await fixture();
+      try {
+        installJoinAdmission(f.home);
+        const user = '@alice:logical.test';
+        const created = await createRoom(f.home, {
+          creator: '@bob:logical.test',
+          preset: 'public_chat',
+        }, f.ht.signer());
+        const room = await openRoom(f.home, created.roomId),
+          hd = await f.home.server(),
+          ed = await f.edge.server();
+        await joinLocal(room, user, f.ht.signer());
+        await project(f.home, room.id);
+        await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+        await ed.execute(
+          "INSERT INTO memberships(user,room,membership,event,seq) VALUES(?,?,'leave',?,1)",
+          [user, room.id, '$other-branch-leave'],
+        );
+        await forget(ed, room.id, user, 'logical.test');
+        for (const op of await ed.tx((tx) => forgetOperations(tx, user))) {
+          await importForgetOperation(hd, op, async () => {});
+        }
+        assertEquals((await membershipOf(hd, room.id, user))!.forgotten, true);
+        let retained: PreparedSubmission | null = null;
+        const event = {
+          type: 'm.room.member',
+          sender: user,
+          state_key: user,
+          content: { membership: 'join', displayname: 'Updated profile' },
+        };
+        if (mode === 'raw local') {
+          const pdu = await room.tx((tx) =>
+            buildInTx(tx, room.id, event, f.ht.signer())
+          );
+          await ingestLocal(room, pdu, 'logical.test');
+        } else {await sendLocal(
+            room,
+            event,
+            f.ht.signer(),
+            mode === 'prepared client'
+              ? {
+                lookup: () => Promise.resolve(retained),
+                prepare: (pdu) =>
+                  Promise.resolve(
+                    retained = { eventId: String(pdu.event_id), pdu },
+                  ),
+                finish: async () => {},
+              }
+              : undefined,
+          );}
+        await project(f.home, room.id);
+        assertEquals(
+          (await membershipOf(hd, room.id, user))!.forgotten,
+          true,
+          'profile update cleared concurrent forget',
+        );
+      } finally {
+        await f.close();
+      }
+    });
+  }
+});
+
+Deno.test('facade forget: acceptance retains a same-transaction export fact', async () => {
+  const f = await fixture();
+  try {
+    const db = await f.edge.server();
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    await db.execute(
+      "INSERT INTO memberships(user,room,membership,event,seq) VALUES(?,?,'leave',?,1)",
+      ['@alice:logical.test', '!forgot:logical.test', '$leave'],
+    );
+    await forget(
+      db,
+      '!forgot:logical.test',
+      '@alice:logical.test',
+      'logical.test',
+    );
+    assertEquals(
+      (await db.query("SELECT * FROM domain_operations WHERE kind='forget'"))
+        .length,
+      1,
+      'accepted forget has no durable export fact',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade forget: invite and knock housekeeping cannot erase user intent', async () => {
+  const f = await fixture();
+  try {
+    const db = await f.edge.server();
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    await db.execute(
+      "INSERT INTO memberships(user,room,membership,event,seq) VALUES(?,?,'leave',?,1)",
+      ['@alice:logical.test', '!forgot:logical.test', '$leave'],
+    );
+    await forget(
+      db,
+      '!forgot:logical.test',
+      '@alice:logical.test',
+      'logical.test',
+    );
+    await clearPurgeable(db, '!forgot:logical.test', '@alice:logical.test');
+    assertEquals(
+      (await db.query('SELECT * FROM forgotten')).length,
+      1,
+      'housekeeping erased forget without observed rejoin',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade forget: delayed rejoin clears only admission-observed facts and converges out of order', async () => {
+  const f = await fixture();
+  const room = '!forgot:logical.test', user = '@alice:logical.test';
+  try {
+    const hd = await f.home.server(), ed = await f.edge.server();
+    for (const db of [hd, ed]) {
+      await db.execute(
+        "INSERT INTO memberships(user,room,membership,event,seq) VALUES(?,?,'leave',?,1)",
+        [user, room, '$leave'],
+      );
+    }
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    await forget(ed, room, user, 'logical.test');
+    const before = await prepareRejoin(ed, room, user) as RejoinObservation;
+    await forget(hd, room, user, 'logical.test');
+    await f.toEdge(await f.hs.export('alice', f.bundle.id));
+    // Its late projection observes a newer fact, but the join itself did not.
+    await ed.tx((tx) =>
+      projectRejoin(tx, room, '$rejoin-before', before, 'logical.test')
+    );
+    assertEquals((await membershipOf(ed, room, user))!.forgotten, true);
+    const unresolved = await ed.tx((tx) => forgetOperations(tx, user));
+    for (const op of unresolved.toReversed()) {
+      await importForgetOperation(hd, op, async () => {});
+    }
+    assertEquals((await membershipOf(hd, room, user))!.forgotten, true);
+    const after = await prepareRejoin(ed, room, user) as RejoinObservation;
+    await ed.tx((tx) =>
+      projectRejoin(tx, room, '$rejoin-after', after, 'logical.test')
+    );
+    const facts = await ed.tx((tx) => forgetOperations(tx, user));
+    for (const op of facts.toReversed()) {
+      await importForgetOperation(hd, op, async () => {});
+    }
+    assertEquals((await membershipOf(hd, room, user))!.forgotten, false);
+    assertEquals((await membershipOf(ed, room, user))!.forgotten, false);
+    await ed.tx((tx) =>
+      projectRejoin(tx, room, '$rejoin-before', before, 'logical.test')
+    );
+    assertEquals(
+      (await ed.tx((tx) => forgetOperations(tx, user))).length,
+      facts.length,
+      'replay invented a new observation',
+    );
+    await forget(ed, room, user, 'logical.test');
+    await ed.tx((tx) =>
+      installDirectoryFacts(
+        tx,
+        { aliases: [], publication: [], forgotten: [] },
+        'logical.test',
+      )
+    );
+    assertEquals(
+      (await membershipOf(ed, room, user))!.forgotten,
+      true,
+      'F1 snapshot removed F2 intent',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade forget: explicit legacy inventory repairs F1 rows and guards every membership consumer', async () => {
+  const f = await fixture();
+  const room = '!forgot:logical.test', user = '@alice:logical.test';
+  try {
+    const hd = await f.home.server(), ed = await f.edge.server();
+    await hd.execute('INSERT INTO forgotten(user,room) VALUES(?,?)', [
+      user,
+      room,
+    ]);
+    await ed.execute('INSERT INTO forgotten(user,room) VALUES(?,?)', [
+      user,
+      '!stale:logical.test',
+    ]);
+    await ed.execute(
+      "INSERT INTO memberships(user,room,membership,event,seq) VALUES(?,?,'leave',?,1)",
+      [user, room, '$leave'],
+    );
+    for (
+      const read of [
+        () => membershipOf(ed, room, user),
+        () => roomsFor(ed, user),
+        () => slidingListSnapshot(ed, user),
+      ]
+    ) await assertRejects(read, MatrixError, 'forget snapshot unavailable');
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    assertEquals((await membershipOf(ed, room, user))!.forgotten, true);
+    assertEquals(
+      (await ed.query('SELECT room FROM forgotten WHERE user=?', [user])).map((
+        row,
+      ) => row.room),
+      [room],
+    );
+    const source = await hd.tx((tx) => forgetOperations(tx, user));
+    assertEquals(source.length, 1);
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    assertEquals(
+      (await hd.tx((tx) => forgetOperations(tx, user))).length,
+      1,
+      'bootstrap reauthored a legacy fact',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade forget: visibility failure rolls back the source fact and imported intent', async () => {
+  const f = await fixture();
+  const room = '!forgot:logical.test', user = '@alice:logical.test';
+  try {
+    const hd = await f.home.server(), ed = await f.edge.server();
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    for (const db of [hd, ed]) {
+      await db.execute(
+        "INSERT INTO memberships(user,room,membership,event,seq) VALUES(?,?,'leave',?,1)",
+        [user, room, '$leave'],
+      );
+    }
+    await ed.exec(
+      "CREATE TRIGGER forget_fail BEFORE INSERT ON forgotten BEGIN SELECT RAISE(ABORT,'forget rollback'); END",
+    );
+    await assertRejects(
+      () => forget(ed, room, user, 'logical.test'),
+      Error,
+      'forget rollback',
+    );
+    assertEquals(await ed.tx((tx) => forgetOperations(tx, user)), []);
+    await forget(hd, room, user, 'logical.test');
+    const [op] = await hd.tx((tx) => forgetOperations(tx, user));
+    await assertRejects(
+      () => importForgetOperation(ed, op, async () => {}),
+      Error,
+      'forget rollback',
+    );
+    assertEquals(await ed.tx((tx) => forgetOperations(tx, user)), []);
+    await ed.exec('DROP TRIGGER forget_fail');
+    await importForgetOperation(ed, op, async () => {});
+    assertEquals((await ed.query('SELECT room FROM forgotten')).length, 1);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade forget: actual local join retains admission context across cold projection and idempotent retry', async () => {
+  const f = await fixture();
+  const user = '@alice:logical.test';
+  try {
+    installJoinAdmission(f.home);
+    const created = await createRoom(f.home, {
+      creator: '@bob:logical.test',
+      preset: 'public_chat',
+    }, f.ht.signer());
+    const room = await openRoom(f.home, created.roomId),
+      db = await f.home.server();
+    await joinLocal(room, user, f.ht.signer());
+    await project(f.home, room.id);
+    await leaveLocal(room, user, f.ht.signer());
+    await project(f.home, room.id);
+    await forget(db, room.id, user, 'logical.test');
+    setJoinObservation(f.home, async (roomId, userId) => {
+      const captured = await prepareRejoin(db, roomId, userId);
+      await forget(db, roomId, userId, 'logical.test');
+      return captured;
+    });
+    const joined = await joinLocal(room, user, f.ht.signer());
+    assertEquals(joined.created, true);
+    // Explicit cold roll-forward uses room-retained context, not a fresh read.
+    await f.home.close();
+    const reopened = await f.open('home');
+    try {
+      await recoverServer(reopened);
+      const server = await reopened.server(),
+        retainedRoom = await openRoom(reopened, room.id);
+      assertEquals(
+        (await membershipOf(server, room.id, user))!.forgotten,
+        true,
+      );
+      const count = (await server.tx((tx) =>
+        forgetOperations(tx, user)
+      )).length;
+      assertEquals(
+        (await joinLocal(retainedRoom, user, f.ht.signer())).created,
+        false,
+      );
+      await project(reopened, room.id);
+      assertEquals(
+        (await server.tx((tx) => forgetOperations(tx, user))).length,
+        count,
+      );
+      assertEquals(
+        (await membershipOf(server, room.id, user))!.forgotten,
+        true,
+      );
+      await leaveLocal(retainedRoom, user, f.ht.signer());
+      await project(reopened, room.id);
+      await joinLocal(retainedRoom, user, f.ht.signer());
+      await project(reopened, room.id);
+      assertEquals(
+        (await membershipOf(server, room.id, user))!.forgotten,
+        false,
+      );
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade forget: prepared client membership retry retains its original observation before room commit', async () => {
+  const f = await fixture();
+  const user = '@alice:logical.test';
+  try {
+    installJoinAdmission(f.home);
+    const created = await createRoom(f.home, {
+      creator: '@bob:logical.test',
+      preset: 'public_chat',
+    }, f.ht.signer());
+    const room = await openRoom(f.home, created.roomId),
+      db = await f.home.server();
+    await joinLocal(room, user, f.ht.signer());
+    await leaveLocal(room, user, f.ht.signer());
+    await project(f.home, room.id);
+    await forget(db, room.id, user, 'logical.test');
+    let retained: PreparedSubmission | null = null;
+    const event = {
+      type: 'm.room.member',
+      sender: user,
+      state_key: user,
+      content: { membership: 'join' },
+    };
+    const submission = {
+      lookup: () => Promise.resolve(retained),
+      prepare: (
+        pdu: import('#engine/pdu.ts').Pdu,
+      ): Promise<PreparedSubmission> => {
+        retained = { eventId: String(pdu.event_id), pdu };
+        return Promise.reject(new Error('prepared interruption'));
+      },
+      finish: async () => {},
+    };
+    await assertRejects(
+      () => sendLocal(room, event, f.ht.signer(), submission),
+      Error,
+      'prepared interruption',
+    );
+    await forget(db, room.id, user, 'logical.test');
+    await f.home.close();
+    const reopened = await f.open('home');
+    try {
+      installJoinAdmission(reopened);
+      const replayRoom = await openRoom(reopened, room.id);
+      const result = await sendLocal(
+        replayRoom,
+        event,
+        f.ht.signer(),
+        submission,
+      );
+      assertEquals(result.eventId, retained!.eventId);
+      await project(reopened, room.id);
+      assertEquals(
+        (await membershipOf(await reopened.server(), room.id, user))!.forgotten,
+        true,
+        'retry replaced original context with a new observation',
+      );
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('facade reports: accepted submission retains an atomic immutable export fact', async () => {
   const f = await fixture();

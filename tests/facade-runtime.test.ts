@@ -1076,6 +1076,26 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     }
     await edge.listening(facadePort);
     // Real public authoring while home is absent and federation is disabled.
+    const forgottenRoom = await edgeApi('createRoom', {
+      preset: 'public_chat',
+      initial_state: [{
+        type: 'm.room.encryption',
+        state_key: '',
+        content: { algorithm: 'm.megolm.v1.aes-sha2' },
+      }],
+    });
+    assertEquals(forgottenRoom.status, 200, JSON.stringify(forgottenRoom));
+    const forgottenPath = 'rooms/' +
+      encodeURIComponent(forgottenRoom.body.room_id);
+    assertEquals((await edgeApi(forgottenPath + '/leave', {})).status, 200);
+    assertEquals(await edgeApi(forgottenPath + '/forget', {}), {
+      status: 200,
+      body: {},
+    });
+    assertEquals(
+      (await edgeApi(forgottenPath + '/messages?dir=b')).status,
+      403,
+    );
     const reportPaths = [
       roomPath + '/report',
       roomPath + '/report/' + encodeURIComponent(edgeEventId),
@@ -1877,6 +1897,15 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       'room:' + fresh.body.room_id,
     ]);
     await edge.listening(facadePort);
+    assertEquals(
+      (await edgeApi(forgottenPath + '/messages?dir=b')).status,
+      403,
+    );
+    assertEquals((await edgeApi(forgottenPath + '/join', {})).status, 200);
+    assertEquals(
+      (await edgeApi(forgottenPath + '/messages?dir=b')).status,
+      200,
+    );
     assertEquals(await edgeApi(filterPath + '/' + edgeFilter.body.filter_id), {
       status: 200,
       body: edgeFilterBody,

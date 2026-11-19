@@ -152,5 +152,9 @@ export type RemoteDeps = {
   ungroundedMs: number;
   // Explicit local participation intent after a resident remote-vouch dance.
   // Ordinary remote receipt never acquires local policy from event content.
-  localJoin?: { eventId: string; userId: string };
+  localJoin?: {
+    eventId: string;
+    userId: string;
+    observation?: import('./hooks.ts').LocalJoinObservation;
+  };
 };

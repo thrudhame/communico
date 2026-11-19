@@ -27,6 +27,24 @@ export type RoomHooks = {
 };
 
 let hooks: RoomHooks | null = null;
+export type LocalJoinObservation = Record<string, unknown>;
+const joinObservations = new WeakMap<
+  Store,
+  (roomId: string, userId: string) => Promise<LocalJoinObservation>
+>();
+export function setJoinObservation(
+  store: Store,
+  prepare: (roomId: string, userId: string) => Promise<LocalJoinObservation>,
+) {
+  joinObservations.set(store, prepare);
+}
+export async function prepareJoinObservation(
+  store: Store,
+  roomId: string,
+  userId: string,
+) {
+  return await joinObservations.get(store)?.(roomId, userId);
+}
 const joinAdmissions = new WeakMap<
   Store,
   (roomId: string, userId: string, eventId?: string) => Promise<void>

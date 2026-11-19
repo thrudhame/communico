@@ -1051,6 +1051,10 @@ export async function ingestRemote(
               status?.standing === 'accepted' && status.grounding === 'grounded'
             ) {
               await tx.changes.localParticipation(eventId, userId);
+              await tx.joinObservations.complete(
+                eventId,
+                deps.localJoin.observation,
+              );
             }
           }
           const completed = outcomes.map((outcome, index) =>

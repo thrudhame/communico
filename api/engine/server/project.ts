@@ -25,6 +25,7 @@ import { roomSource } from '#engine/store/projection-sources.ts';
 import { queueBadge } from '#engine/server/push-queue.ts';
 import { advance, get } from '#engine/store/watermark.ts';
 import { changedColumns } from '#engine/store/changed.ts';
+import { domainOf } from '#engine/ids.ts';
 import { eventStreamTx, nextEventSeq } from '#engine/server/stream.ts';
 import { finishRoomRemoval, type Removal } from '#engine/server/removal.ts';
 import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
@@ -35,6 +36,7 @@ import {
   receiptMembership,
 } from '#engine/server/receipt-frontier.ts';
 import { reconcileReceiptMarks } from '#engine/server/ephemeral.ts';
+import { projectRejoin, type RejoinObservation } from './membership.ts';
 import {
   capturePushesAt,
   prepareCapturedPush,
@@ -672,6 +674,7 @@ type Prepared =
     | { kind: 'delivery'; destinations: string[] }
     | { kind: 'signature' }
     | { kind: 'local-participation'; user: string }
+    | { kind: 'rejoin-observation'; observation: RejoinObservation }
   );
 
 function eventPayloadOf(change: Change): EventPayload {
@@ -865,6 +868,24 @@ async function prepare(
             push: null,
             pushCapture: null,
           });
+          break;
+        }
+        case 'rejoin-observation': {
+          const observation = JSON.parse(change.data) as RejoinObservation;
+          const row = change.event === null
+            ? null
+            : await tx.events.get(change.event);
+          const status = change.event === null
+            ? null
+            : await tx.events.getStatus(change.event);
+          const pdu = row === null ? null : JSON.parse(row.pdu) as Pdu;
+          if (
+            pdu?.type !== 'm.room.member' || pdu.sender !== observation.user ||
+            pdu.state_key !== observation.user ||
+            pdu.content?.membership !== 'join' ||
+            status?.standing !== 'accepted' || status.grounding !== 'grounded'
+          ) throw new Error('invalid rejoin observation');
+          out.push({ change, kind: 'rejoin-observation', observation });
           break;
         }
         case 'local-participation': {
@@ -1108,6 +1129,19 @@ async function apply(
 ): Promise<void> {
   const { change } = item;
   switch (item.kind) {
+    case 'rejoin-observation':
+      for (const self of localServers) {
+        if (item.observation.user.endsWith(':' + self)) {
+          await projectRejoin(
+            tx,
+            roomId,
+            change.event!,
+            item.observation,
+            self,
+          );
+        }
+      }
+      return;
     case 'local-participation':
       await tx.execute(
         'UPDATE event_index SET local_join_user=? WHERE room=? AND event=? AND local_join_user IS NOT ?',
@@ -1242,7 +1276,15 @@ async function apply(
       const eventId = item.toId ?? change.event!;
       const seq = (await seqOf(tx, roomId, eventId)) ??
         (await feedSeqOf(tx, roomId, change.event!));
-      await applyMember(tx, roomId, item.user, item.to, eventId, seq);
+      await applyMember(
+        tx,
+        roomId,
+        item.user,
+        item.to,
+        eventId,
+        seq,
+        localServers,
+      );
       return;
     }
     case 'redaction': {
@@ -1347,7 +1389,15 @@ async function applyPublication(
       continue;
     }
     const seq = first ? cut : (await seqOf(tx, roomId, member.toId)) ?? cut;
-    await applyMember(tx, roomId, member.user, member.to, member.toId, seq);
+    await applyMember(
+      tx,
+      roomId,
+      member.user,
+      member.to,
+      member.toId,
+      seq,
+      localServers,
+    );
   }
   await applyDevicePublication(tx, roomId, publication, pos, localServers);
 }
@@ -1383,6 +1433,7 @@ async function applyMember(
   membership: string,
   eventId: string,
   seq: number | null,
+  localServers: string[],
 ): Promise<void> {
   const changed = await tx.execute(
     `INSERT INTO memberships(user, room, membership, event, seq)
@@ -1393,6 +1444,13 @@ async function applyMember(
     [user, roomId, membership, eventId, seq],
   );
   if (changed) await queueBadge(tx, user);
+  // Participation protects the room even when a concurrent forget still hides
+  // it from this user. Only retained local admission can remove that intent.
+  if (membership === 'join' && localServers.includes(domainOf(user))) {
+    await tx.execute('UPDATE directory SET purgeable_ms=NULL WHERE room_id=?', [
+      roomId,
+    ]);
+  }
 }
 
 async function feedSeqAtPos(

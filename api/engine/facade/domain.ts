@@ -28,6 +28,12 @@ import {
   reportOperations,
 } from '#engine/server/reports.ts';
 import { importReceiptOperation } from '#engine/server/ephemeral.ts';
+import {
+  captureForgetOperations,
+  forgetOperations,
+  importForgetOperation,
+  installForgetInventory,
+} from '#engine/server/membership.ts';
 import type { NodeIdentity } from './identity.ts';
 import { appendRecord, type Journal } from './journal.ts';
 import type { OwnerControl } from './ownership.ts';
@@ -56,6 +62,7 @@ export type DomainBootstrap = DomainBinding & {
   openid?: Fact[];
   backups?: Fact[];
   reports?: Fact[];
+  forget?: Fact[];
 };
 
 function facts(operations: Fact[]): Fact[] {
@@ -105,6 +112,7 @@ function bootstrapOf(raw: unknown): DomainBootstrap {
     ...(row.openid !== undefined ? { openid: refs(row.openid) } : {}),
     ...(row.backups !== undefined ? { backups: refs(row.backups) } : {}),
     ...(row.reports !== undefined ? { reports: refs(row.reports) } : {}),
+    ...(row.forget !== undefined ? { forget: refs(row.forget) } : {}),
   };
   if (canonicalJson(view) !== canonicalJson(raw) || view.source !== 'home') {
     mismatch('unexpected domain bootstrap material');
@@ -118,7 +126,14 @@ function bootstrapOf(raw: unknown): DomainBootstrap {
 async function requireFacts(
   conn: Conn,
   view: DomainBootstrap,
-  file: 'tenant' | 'receipts' | 'filters' | 'openid' | 'backups' | 'reports',
+  file:
+    | 'tenant'
+    | 'receipts'
+    | 'filters'
+    | 'openid'
+    | 'backups'
+    | 'reports'
+    | 'forget',
 ) {
   const keys = new Set<string>();
   for (const fact of view[file] ?? []) {
@@ -154,6 +169,8 @@ async function requireFacts(
           ? ['backup']
           : file === 'reports'
           ? ['report', 'report-resolution']
+          : file === 'forget'
+          ? ['forget']
           : ['account-data', 'tags', 'profile', 'push-rules']).includes(
             String(row.kind),
           )
@@ -254,6 +271,7 @@ function viewOf(raw: unknown): DomainOperation | DomainHistory {
         'backup',
         'report',
         'report-resolution',
+        'forget',
       ]
         .includes(
           String(expected),
@@ -418,6 +436,9 @@ export class DomainOperations {
       ...await db.tx((conn) =>
         reportOperations(conn, '@' + localpart + ':' + context.server)
       ),
+      ...await db.tx((conn) =>
+        forgetOperations(conn, '@' + localpart + ':' + context.server)
+      ),
     );
     const records = [];
     for (const operation of operations) {
@@ -512,12 +533,28 @@ export class DomainOperations {
       );
     });
     // Legacy capture must precede export, otherwise the completeness declaration
+    const forgetFacts = await server.tx(async (conn) => {
+      await this.selected(conn, grant, localpart);
+      await requireDomainControl(conn, binding);
+      return await captureForgetOperations(
+        conn,
+        '@' + localpart + ':' + context.server,
+      );
+    });
+    // Legacy capture must precede export, otherwise the completeness declaration
     // could overtake the source records it names.
     const records = await this.export(localpart, pairing);
     // Ordinary export never echoes replica intent. Bootstrap separately attests
     // exactly the authentic history home retained, including a receiver's own
     // prior dots and prior incarnations. No dot, payload or context is rebased.
-    for (const operation of [...tenantFacts, ...receiptFacts, ...reportFacts]) {
+    for (
+      const operation of [
+        ...tenantFacts,
+        ...receiptFacts,
+        ...reportFacts,
+        ...forgetFacts,
+      ]
+    ) {
       if (
         operation.source === source.node &&
         operation.incarnation === source.incarnation
@@ -546,6 +583,7 @@ export class DomainOperations {
       openid: facts(tenantFacts.filter((op) => op.kind === 'openid')),
       backups: facts(tenantFacts.filter((op) => op.kind === 'backup')),
       reports: facts(reportFacts),
+      forget: facts(forgetFacts),
     });
     records.push(await this.publish(body, grant));
     return records;
@@ -631,6 +669,23 @@ export class DomainOperations {
         }
         await requireFacts(conn, view, 'receipts');
         await requireFacts(conn, view, 'reports');
+        await requireFacts(conn, view, 'forget');
+        if (view.forget !== undefined) {
+          await installForgetInventory(
+            conn,
+            '@' + view.localpart + ':' + view.server,
+            view.server,
+          );
+        }
+        await conn.execute(
+          'INSERT INTO facade_scopes(incarnation,scope,source_cut,ready,pending_hash) VALUES(?,?,?,?,NULL) ON CONFLICT(incarnation,scope) DO UPDATE SET source_cut=excluded.source_cut,ready=excluded.ready,pending_hash=NULL',
+          [
+            view.pairing,
+            'forget:@' + view.localpart + ':' + view.server,
+            record.sequence,
+            view.forget !== undefined ? 1 : 0,
+          ],
+        );
         await conn.execute(
           'INSERT INTO facade_scopes(incarnation,scope,source_cut,ready,pending_hash) VALUES(?,?,?,1,NULL) ON CONFLICT(incarnation,scope) DO UPDATE SET source_cut=excluded.source_cut,ready=1,pending_hash=NULL',
           [view.pairing, record.stream, record.sequence],
@@ -672,7 +727,14 @@ export class DomainOperations {
         context.home.publicKey,
       )
       : undefined;
-    if (view.operation.kind === 'receipt') {
+    if (view.operation.kind === 'forget') {
+      await importForgetOperation(
+        await this.store.server(),
+        view.operation,
+        check,
+        history,
+      );
+    } else if (view.operation.kind === 'receipt') {
       await importReceiptOperation(
         await this.store.server(),
         view.operation as RegisterOperation & { kind: 'receipt' },

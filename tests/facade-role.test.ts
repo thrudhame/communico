@@ -239,6 +239,7 @@ Deno.test('F2 manifest enables delivered auth, registers and device keys without
       ['v3/user/%40alice%3Atest/openid/request_token', 'POST'],
       ['v3/users/%40alice%3Atest/report', 'POST'],
       ['v3/rooms/room/report', 'POST'],
+      ['v3/rooms/room/forget', 'POST'],
       ['v3/rooms/room/report/event', 'POST'],
     ]
   ) assertEquals(facade.gate(request(path, method), () => true), null);
@@ -480,7 +481,6 @@ Deno.test('F2 membership activates only delivered methods and their independent 
       ['PUT', '/_matrix/federation/v1/3pid/onbind'],
       ['GET', '/_matrix/federation/v1/make_join/room'],
       ['POST', '/_matrix/client/v3/join/room/extra'],
-      ['POST', '/_matrix/client/v3/rooms/room/forget'],
       ['GET', '/_matrix/client/v3/joined_rooms'],
       ['GET', '/_matrix/client/v3/sync'],
     ]
