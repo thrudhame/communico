@@ -19,6 +19,7 @@ import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { historicalServerSchema } from './fixtures/server-schema-history.ts';
 import { installServerHooks } from '#engine/server/startup.ts';
+import { setRoomHooks } from '#engine/room/hooks.ts';
 import type { Conn, Database } from '#engine/store/db.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
@@ -63,10 +64,21 @@ async function fixture(seedServer = serverSchema) {
     });
   let home = await open('home', seedServer);
   let edge = await open('edge', seedServer);
-  const g = await genesis(edge, {
-    roomId: '!mailbox:test',
-    joinRule: 'public',
-  });
+  let g: Awaited<ReturnType<typeof genesis>>;
+  try {
+    if (seedServer.version !== serverSchema.version) {
+      // This is an offline historical fixture, not a running old server with
+      // current projection code. Author room truth now; reopen below upgrades
+      // the real old schema before the current startup owner publishes it.
+      setRoomHooks({ project: async () => {}, register: async () => {} });
+    }
+    g = await genesis(edge, {
+      roomId: '!mailbox:test',
+      joinRule: 'public',
+    });
+  } finally {
+    installServerHooks();
+  }
   const self = g.signer.serverName;
   const tenant = await openTenant(home, self, { create: true });
   const node = await initializeNode(await edge.server(), self, 'edge_a');
@@ -429,8 +441,8 @@ Deno.test('mailbox F2 admission survives downgrade and child retry with an addit
   }
 });
 
-Deno.test('mailbox logical policy upgrades actual pending v44 evidence without running its child', async () => {
-  const f = await fixture(historicalServerSchema(44));
+Deno.test('mailbox logical policy upgrades actual pending v45 evidence without running its child', async () => {
+  const f = await fixture(historicalServerSchema(45));
   try {
     const edus = [{
       edu_type: 'm.direct_to_device',

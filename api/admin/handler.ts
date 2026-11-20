@@ -2,6 +2,7 @@
 import { AdminError, type Operation } from './protocol.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { LinkError } from '#engine/facade/protocol.ts';
+import { requestFailure } from '#engine/request-diagnostics.ts';
 
 export function operationHandler(
   operations: Record<string, Operation>,
@@ -32,7 +33,7 @@ export function operationHandler(
     } catch (error) {
       const known = error instanceof AdminError ||
         error instanceof MatrixError || error instanceof LinkError;
-      if (!known) console.error('admin:', error);
+      if (!known || error.status >= 500) requestFailure(request, error);
       return Response.json({
         ok: false,
         error: {

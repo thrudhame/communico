@@ -42,6 +42,8 @@ import * as media from '#engine/tenant/media.ts';
 import * as pushers from '#engine/tenant/pushers.ts';
 import * as pushrules from '#engine/tenant/pushrules.ts';
 import * as txns from '#engine/tenant/txns.ts';
+import * as completion from '#engine/tenant/completion.ts';
+import type { CompletionTarget } from '#engine/room/completion.ts';
 import * as delayedEvents from '#engine/tenant/delayed-events.ts';
 import * as uia from '#engine/tenant/uia.ts';
 import * as slidingSync from '#engine/tenant/sliding-sync.ts';
@@ -56,9 +58,9 @@ import type { ErasureCut } from '#engine/room/state.ts';
 import { writeCertificate } from '#engine/tenant/certificate.ts';
 import {
   type DomainBinding,
+  requireAccountSelection,
   requireDomainControl,
 } from '#engine/facade/domain-control.ts';
-import { LinkError } from '#engine/facade/protocol.ts';
 import {
   b32encode,
   b64decode,
@@ -157,20 +159,11 @@ function bind(
       ) => {
         await requireDomainControl(conn, view);
         if (!selected) return;
-        const [row] = await conn.query(
-          'SELECT pairing,grant_revision FROM account_auth_snapshots WHERE localpart=?',
-          [view.localpart],
-        );
-        if (
-          row?.pairing !== selected.pairing ||
-          Number(row.grant_revision) !== selected.revision
-        ) {
-          throw new LinkError(
-            'LINK_IDENTITY_MISMATCH',
-            'domain account not selected',
-            403,
-          );
-        }
+        await requireAccountSelection(conn, {
+          localpart: view.localpart,
+          pairing: selected.pairing,
+          grantRevision: selected.revision,
+        });
       },
     },
     publicReplica: {
@@ -864,6 +857,14 @@ function bind(
       prepare: (id: string, pdu: Pdu) => delayedEvents.prepare(conn, id, pdu),
       finish: (id: string) => delayedEvents.finish(conn, id),
     },
+    completion: {
+      pending: (device: devices.DeviceIdentity) =>
+        completion.pendingCompletions(conn, device),
+      retire: (
+        device: devices.DeviceIdentity,
+        captured: completion.PendingCompletion,
+      ) => completion.retireCompletion(conn, device, captured),
+    },
     txns: {
       submission: (
         deviceId: devices.DeviceIdentity,
@@ -882,6 +883,7 @@ function bind(
         txnId: string,
         eventId: string,
         accepted: boolean,
+        target?: CompletionTarget,
       ) =>
         txns.finishSubmission(
           conn,
@@ -890,6 +892,7 @@ function bind(
           txnId,
           eventId,
           accepted,
+          target,
         ),
       forEvent: (
         deviceId: devices.DeviceIdentity,

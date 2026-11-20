@@ -52,7 +52,12 @@ import {
   type KeyOperation,
   retainKeyBootstrap,
 } from '#engine/tenant/key-bootstrap.ts';
-import { type DomainBinding, requireDomainControl } from './domain-control.ts';
+import {
+  type DomainBinding,
+  requireAccountExport,
+  requireAccountSelection,
+  requireDomainControl,
+} from './domain-control.ts';
 import type { NodeIdentity } from './identity.ts';
 import { appendRecord, type Journal } from './journal.ts';
 import type { OwnerControl } from './ownership.ts';
@@ -255,27 +260,20 @@ export class DeviceOperations {
     if (row?.state !== 'paired' || row.grant_json !== canonicalJson(grant)) {
       mismatch('device exchange grant changed');
     }
-    if (
-      !this.node && !(await conn.query(
-        'SELECT 1 FROM facade_exports WHERE peer=? AND incarnation=? AND scope=?',
-        [context.node, context.id, 'auth:@' + localpart + ':' + context.server],
-      )).length
-    ) mismatch('device account not selected');
+    if (!this.node) {
+      await requireAccountExport(conn, {
+        peer: context.node,
+        pairing: context.id,
+        server: context.server,
+        localpart,
+      });
+    }
   }
 
   private async tenantSelected(conn: Conn, view: DomainBinding) {
     await requireDomainControl(conn, view);
     if (!this.node) return;
-    const [row] = await conn.query(
-      'SELECT pairing,grant_revision FROM account_auth_snapshots WHERE localpart=?',
-      [view.localpart],
-    );
-    if (
-      row?.pairing !== view.pairing ||
-      Number(row.grant_revision) !== view.grantRevision
-    ) {
-      mismatch('device account not selected');
-    }
+    await requireAccountSelection(conn, view);
   }
 
   /** Export original local owner intent only. Full bootstrap/history and public

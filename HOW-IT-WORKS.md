@@ -249,6 +249,30 @@ rows. Ordinary room helpers still await their existing post-commit boundary.
 Backup audits and restored-work inspection retain the new identity, receipt and
 progress facts. (`api/engine/room/completion.ts`, `server/project.ts`)
 
+Device-backed local message sends return after the room event and the tenant's
+transaction receipt, exact completion target and client pending cut are durable.
+One store-owned completion service enrolls committed room targets even if tenant
+finish fails. It settles ready dependencies, publishes immutable prefixes and
+completes required callbacks independently of the HTTP request. Fixed smaller
+waiters can finish before later room work; cancellation removes only a waiter.
+Failures carry room/cut/cause, reject required waiters with 503 and remain logged
+and owned for automatic retry without another arrival. Schema-enabled startup
+discovers lost wakes and publication/completion gaps after the restore-report
+gate. Store shutdown closes new acceptance, drains admitted submissions and
+completion, then releases service callbacks and native storage.
+(`api/engine/server/{completion,startup}.ts`, `store/index.ts`, `tenant/completion.ts`)
+
+Internal local/state/membership/redaction, remote/history and replica helpers
+retain their awaited completion boundary. Explicit room retirement rechecks full
+completion under lifecycle serialization, reconciles satisfied client markers
+while the original generation remains held, then unlinks. Historical completed
+transaction receipts survive that intentional lifecycle; missing or replaced
+outstanding targets are never satisfied by an equal numeric position.
+Their exact completion rows carry a retirement witness written only after the
+original generation's completed publication is checked, so reuse of its room ID
+cannot turn an old receipt into an obligation on the replacement room.
+(`api/engine/room/{ingest,operator}.ts`, `server/removal.ts`)
+
 The room transaction records its mutations and delivery destinations in
 `changes`. After that transaction commits, an injected hook projects them
 into the server file. Projection failure leaves the room write committed;
@@ -258,8 +282,11 @@ the next projection or startup rolls forward from its watermark.
 
 Each room has one store-lifetime projection capture owner. Independent rooms
 prepare immutable room facts outside the global mutation queue. The existing
-500-change page bounds capture, not writer ownership: uncontended changes batch,
-but queued writer demand ends the turn at the next complete change. A caller's
+500-change page bounds capture, extending only to finish its final event/effect
+unit. Uncontended units batch, but queued writer demand ends the turn after a
+complete event and its accepted membership, redaction and delivery effects.
+Policy inputs belong to that turn; its committed prefix reconciles once before
+the next queued writer runs. A caller's
 room capability and head are captured at admission, before waiting for an earlier
 room owner; later writes cannot enlarge that queued caller's obligation. Application rechecks both
 watermarks and the original room capability's incarnation before writing.
@@ -290,6 +317,25 @@ body/name/topic text without altering the PDU.
 `api/engine/server/project.ts:578-587`, `api/engine/server/project.ts:419-467`)
 
 ## Client reads and sync
+
+Both ordinary and sliding sync first capture the authenticated device generation's
+pending cuts and their room audience's accepted cuts, release the transactions and
+await those exact publications. This precedes ordinary stream-head clamping and sliding list/lease
+selection, including timeout-zero, initial, full-state, list-only and encryption
+requests. Only successful rendering conditionally retires each captured revision;
+failed/cancelled consumers and concurrently higher revisions retain their markers.
+The pending-marker revision allocator is scoped to the device generation and
+room incarnation, not shared by independent sends across the tenant. It survives
+marker retirement to fence stale syncs and exact replay, and is removed with the
+device's receipts. Existing global revisions remain valid; first scoped use starts
+above the retained legacy ceiling without rewriting it.
+Shared effect-read admission captures the explicit room or the search/notification
+audience before event/relation/search/receipt/peek selection, regardless of sender,
+leaving client marker retirement to sync. A later acceptance cannot extend a
+captured target, and unrelated rooms or account reads acquire no global drain.
+Existing filters, visibility, limits and explicit historical tokens retain their
+meaning; completion does not inject an event into a filtered or trimmed response.
+(`api/engine/client/completion.ts`, `auth-context.ts`, `syncfeed.ts`, `sliding-sync/index.ts`)
 
 Client state disclosure has one admission owner, separate from raw state reads
 and event serialization. A grant names the room, viewer and exact publication
@@ -625,6 +671,14 @@ account-data stream markers belong to the tenant.
 `api/engine/typing.ts:1-48`, `api/engine/server/schema.ts:115-132`,
 `api/engine/tenant/schema.ts:72-108`)
 
+Presence disclosure requires self or a currently shared joined room, as in
+Synapse. Client GET and sync capture eligibility and presence values in one
+server transaction; invitations and departed memberships grant no access.
+Client GET first admits complete replica room scopes and accepted publication
+cuts. Federation audiences reuse the same shared-join owner; raw presence
+storage reads remain internal.
+(`api/engine/client/presence.ts`, `api/engine/server/ephemeral.ts`)
+
 Receipts are keyed by room, user, public/private type and thread. Sync exposes
 public receipts plus the viewer's private receipts; federation consumes only
 public receipts. Thread identity survives both sync and federation, with
@@ -951,6 +1005,13 @@ third-party invitation state keys, before both the head and completion lines.
 Malformed/miss paths cross the same boundary. The real routing/authentication
 request is unchanged; this adds neither log lines nor IP/user-agent collection.
 (`api/engine/access-log.ts`)
+
+Application-owned admin and link HTTP/pre-upgrade failure handlers emit one
+request-correlated diagnostic record with method, redacted path and exception
+name/message/stack. They reuse the access-log disclosure owner and never
+serialize headers, bodies, queries or arbitrary exception properties/causes.
+This does not add an observer to Pathfinder's internal error handling.
+(`api/engine/request-diagnostics.ts`, `api/admin/handler.ts`, `api/engine/facade/transport.ts`)
 
 Encrypted backup ciphertext, per-room entry sizes and per-version restore bytes
 share one tenant transaction. PUT capacity checks use those exact UTF-8 JSON
@@ -1423,6 +1484,22 @@ The listener gives each admitted handler an operation signal that observes
 disconnects and forced listener aborts. Graceful drain still permits readable
 bodies to finish. Transport completion alone cannot release a running callback;
 shutdown retains the store until both handler and transport ownership settle.
+At grace expiry the listener cancels operation signals and derived body reads
+before closing transports. Fully read cancelled requests get retryable 503s
+when delivery completes within grace; after forced transport closure, EOF/reset
+is also retryable, as in Synapse. Unread native bodies likewise end in EOF/reset.
+Returned response streams share operation cancellation. Shutdown first waits
+for handler work, then aborts expired transports without waiting for delivery,
+so a client that stops reading cannot hold that phase open. A response already
+started ends retryably; newly rendered cancellation responses use 503 when the
+transport can still deliver it. Cancellation before federation dispatch leaves
+no effects or cached success; retrying that ID applies the effects once and caches
+the completed answer. Cancellation after EDU dispatch does not roll back earlier
+EDU effects, which can repeat on retry; the replay cache covers completed sends.
+Storage remains owned until transport settlement and asynchronous response-source
+cancellation have both completed.
+Clean storage closure exits successfully even when cancellation was needed;
+fatal rejection and storage-close failures retain their non-zero outcomes.
 (`api/server-lifetime.ts`, `main.ts`)
 
 ## Discovery, TURN and whois

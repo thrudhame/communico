@@ -46,6 +46,10 @@ import {
 } from './protocol.ts';
 import { applyReplicaScope } from './scopes.ts';
 import { onTenantStream, syncStreamHeads } from '#engine/tenant/streams.ts';
+import {
+  requireAccountExport,
+  requireAccountSelection,
+} from './domain-control.ts';
 
 type AuthorityCut = AccountAuth['authority'];
 type SessionAuthority = {
@@ -211,16 +215,11 @@ export async function exportSessionAuthority(
   ) mismatch('wrong exporting authority');
   const db = await store.tenant(tenant.serverName);
   const authority = await db.tx(async (conn) => {
-    const [snapshot] = await conn.query(
-      'SELECT pairing,grant_revision FROM account_auth_snapshots WHERE localpart=?',
-      [localpart],
-    );
-    if (
-      snapshot?.pairing !== context.id ||
-      Number(snapshot.grant_revision) !== grant.body.revision
-    ) {
-      mismatch('session authority account not selected');
-    }
+    await requireAccountSelection(conn, {
+      localpart,
+      pairing: context.id,
+      grantRevision: grant.body.revision,
+    });
     const view = await captureSessionAuthority(conn, localpart);
     return {
       facts: view.facts.filter((fact) =>
@@ -454,11 +453,12 @@ export class AccountSnapshots {
     const check = async (conn: Conn) => {
       await assertBinding(conn, grant, 'home');
       await requireControl(conn, view);
-      const [selected] = await conn.query(
-        'SELECT source_cut FROM facade_exports WHERE peer=? AND incarnation=? AND scope=?',
-        [context.node, pairing, 'auth:@' + view.localpart + ':' + view.server],
-      );
-      if (!selected) mismatch('session authority account not selected');
+      await requireAccountExport(conn, {
+        peer: context.node,
+        pairing,
+        server: view.server,
+        localpart: view.localpart,
+      });
     };
     await (await this.store.server()).tx(check);
     const cuts =

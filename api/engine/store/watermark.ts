@@ -39,6 +39,26 @@ export async function advance(
   );
 }
 
+/** Independent source cuts advance atomically in their publication's commit. */
+export async function advanceAll(
+  tx: Conn,
+  cuts: readonly (readonly [string, number])[],
+): Promise<void> {
+  for (const [, position] of cuts) {
+    if (!Number.isSafeInteger(position) || position < 0) {
+      throw new TypeError(
+        'watermark position must be a non-negative safe integer',
+      );
+    }
+  }
+  if (!cuts.length) return;
+  await tx.execute(
+    `INSERT INTO watermarks(source,position) SELECT json_extract(value,'$[0]'),json_extract(value,'$[1]') FROM json_each(?) WHERE 1
+    ON CONFLICT(source) DO UPDATE SET position=excluded.position WHERE excluded.position>watermarks.position`,
+    [JSON.stringify(cuts)],
+  );
+}
+
 export async function sources(db: Db): Promise<string[]> {
   const rows = await db.query('SELECT source FROM watermarks ORDER BY source');
   return rows.map((row) => {

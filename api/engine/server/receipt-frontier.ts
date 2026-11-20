@@ -2,6 +2,7 @@
 // counter. Project immutable accepted prev edges before using the server copy.
 import type { Conn } from '#engine/store/db.ts';
 import { receiptTargetInThread } from '#engine/server/read.ts';
+import { insertPublicationRows } from './publication-rows.ts';
 
 export const RECEIPT_GRAPH_SQL = `
 CREATE TABLE receipt_dag_nodes(room TEXT NOT NULL,event TEXT NOT NULL,PRIMARY KEY(room,event));
@@ -61,6 +62,39 @@ export async function projectReceiptGraph(
       [room, event, membership.user, membership.membership],
     );
   }
+}
+
+/** Independent room facts share their owning transaction, not scalar FFI trips. */
+export async function projectReceiptGraphs(
+  tx: Conn,
+  facts: readonly {
+    room: string;
+    event: string;
+    prevs: readonly string[];
+    membership: ReceiptMembership | null;
+  }[],
+): Promise<void> {
+  await insertPublicationRows(
+    tx,
+    'receipt_dag_nodes',
+    ['room', 'event'],
+    facts.map((f) => [f.room, f.event]),
+  );
+  await insertPublicationRows(tx, 'receipt_dag_edges', [
+    'room',
+    'event',
+    'parent',
+  ], facts.flatMap((f) => f.prevs.map((p) => [f.room, f.event, p])));
+  await insertPublicationRows(
+    tx,
+    'receipt_membership_events',
+    ['room', 'event', 'user', 'membership'],
+    facts.flatMap((f) =>
+      f.membership === null
+        ? []
+        : [[f.room, f.event, f.membership.user, f.membership.membership]]
+    ),
+  );
 }
 
 // UNION, not UNION ALL: malformed cycles cannot make a read walk unbounded.

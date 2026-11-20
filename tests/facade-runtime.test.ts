@@ -1,7 +1,14 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import metadata from '#root/deno.json' with { type: 'json' };
 import { adminCall } from './admin-client.ts';
-import { bounded, pause } from './helpers/server-process.ts';
+import { facadeProcess as process } from './helpers/facade-process.ts';
+import { type LinkRecord, object } from '#engine/facade/protocol.ts';
+import type { AccountAuth } from '#engine/tenant/account-auth.ts';
+import type { DeviceOperation } from '#engine/tenant/device-source.ts';
+import type { SigningOperation } from '#engine/tenant/signing-operations.ts';
+import type { SignatureOperation } from '#engine/tenant/signature-operations.ts';
+import type { ToDeviceOperation } from '#engine/tenant/todevice-routing.ts';
+import type { ReplicaRoom } from '#engine/room/replica-export.ts';
 import { ColdAuthTimings } from './helpers/cold-auth-timings.ts';
 import { facadeTls } from './support/facade-tls.ts';
 import { openStore } from '#engine/store/index.ts';
@@ -14,7 +21,7 @@ import { makeServer, seedServer } from './federation/doc-helper.ts';
 import { fedCaller } from './http-federation.ts';
 import { setConfigForTests } from '#engine/config.ts';
 import { loginUser, verifyUserPassword } from '#engine/tenant/users.ts';
-import { lookupToken } from '#engine/tenant/auth.ts';
+import { hashToken, lookupToken } from '#engine/tenant/auth.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { getAccountData, putAccountData } from '#engine/tenant/accountdata.ts';
 import { membershipOf } from '#engine/room/membership.ts';
@@ -38,6 +45,14 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
   setConfigForTests({ server: { name: 'logical.test' } });
   const tls = await facadeTls();
   const outbound: { path: string; body: string; authorization: string }[] = [];
+  const waitOutbound = async (marker: string) => {
+    assert(home);
+    await home.observations.wait((event) =>
+      event.kind === 'egress' &&
+      event.destination === destination &&
+      event.body.includes(`"marker":"${marker}"`)
+    );
+  };
   const receiver = Deno.serve({
     hostname: '127.0.0.1',
     port: 0,
@@ -127,19 +142,7 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
       null,
     );
     home = await process(homeConfig, 'federation: enabled');
-    await until(async () => {
-      try {
-        const connection = await Deno.connect({
-          hostname: '127.0.0.1',
-          port: homePort,
-        });
-        connection.close();
-        return true;
-      } catch (error) {
-        if (!(error instanceof Deno.errors.ConnectionRefused)) throw error;
-        return false;
-      }
-    });
+    await home.listening(homePort);
     const api = async (
       path: string,
       body: unknown,
@@ -193,14 +196,24 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
       })).status,
       200,
     );
-    await until(async () => (await status()).body.result.enrolled === true);
-    await until(async () =>
-      (await status()).body.result.keyRoster?.ready === true
+    const pairing = paired.body.result.id;
+    await facade.observations.wait((event) =>
+      event.kind === 'pairing' && event.id === pairing &&
+      event.state === 'paired'
     );
+    assertEquals((await status()).body.result.enrolled, true);
+    await homeFact(
+      facade,
+      pairing,
+      'control',
+      (record) => object(record.payload).kind === 'key-roster',
+    );
+    assertEquals((await status()).body.result.keyRoster.ready, true);
     const roster = (await status()).body.result.keyRoster;
     assert(roster.revision > 0);
     assert(roster.lastHome > 0);
-    await until(async () => (await status()).body.result.matrix === true);
+    await facade.listening(facadePort);
+    assertEquals((await status()).body.result.matrix, true);
     const sendOutbound = async (marker: string) => {
       const result = await api(
         `sendToDevice/m.egress.test/${marker}`,
@@ -213,21 +226,41 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
     const observedOutbound = (marker: string) =>
       outbound.filter((entry) => entry.body.includes(`"marker":"${marker}"`));
     await sendOutbound('direct');
-    await until(() => Promise.resolve(observedOutbound('direct').length === 1));
+    await waitOutbound('direct');
+    assertEquals(observedOutbound('direct').length, 1);
     const roomScope = async () =>
       (await status()).body.result.scopes.find((scope: { scope: string }) =>
         scope.scope === 'room:' + roomId
       );
-    await until(async () => (await roomScope())?.ready === true);
+    await homeFact(
+      facade,
+      pairing,
+      'room:' + roomId,
+      (record) => roomView(record).roomId === roomId,
+    );
+    assertEquals((await roomScope()).ready, true);
     const publicScope = async () =>
       (await status()).body.result.scopes.find((scope: { scope: string }) =>
         scope.scope === 'public:@replica:logical.test'
       );
-    await until(async () => (await publicScope())?.ready === true);
-    await until(async () =>
+    await homeFact(
+      facade,
+      pairing,
+      'public:@replica:logical.test',
+      (record) =>
+        object(object(record.payload).view).userId === '@replica:logical.test',
+    );
+    assertEquals((await publicScope()).ready, true);
+    await homeFact(
+      facade,
+      pairing,
+      'directory',
+      (record) => object(record.payload).kind === 'directory-replica',
+    );
+    assert(
       (await status()).body.result.scopes.some((
         scope: { scope: string; ready: boolean },
-      ) => scope.scope === 'directory' && scope.ready)
+      ) => scope.scope === 'directory' && scope.ready),
     );
     const publicGet = (path: string) =>
       fetch(`http://127.0.0.1:${facadePort}${path}`);
@@ -305,7 +338,16 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
     const inbox = async () =>
       (await api('sync?timeout=0', undefined, token, 'GET')).body.to_device
         ?.events ?? [];
-    await until(async () => (await inbox()).length === 1);
+    const facadeIncarnation = (await status()).body.result.incarnation;
+    await home.observations.fact(
+      {
+        peer: 'edge_a',
+        source: 'edge_a',
+        incarnation: facadeIncarnation,
+        stream: 'ingress:remote.test',
+      },
+      (record) => object(object(record.payload).evidence).request !== undefined,
+    );
     assertEquals(await inbox(), [{
       sender: '@sender:remote.test',
       type: 'm.room.encrypted',
@@ -322,15 +364,33 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
       )).status,
       200,
     );
-    await until(async () =>
-      (await publicScope())?.cut > publicCut &&
-      (await publicScope())?.ready === true
+    await homeFact(
+      facade,
+      pairing,
+      'public:@replica:logical.test',
+      (record) =>
+        object(object(object(record.payload).view).profile).displayname ===
+          'Linked profile',
+    );
+    assert(
+      (await publicScope()).cut > publicCut && (await publicScope()).ready,
     );
     // A profile change also authors a real room membership event. Observe that
     // separate room suffix before using its next cut to wait for the message.
-    await until(async () =>
-      (await roomScope())?.cut > beforeProfileRoomCut &&
-      (await roomScope())?.ready === true
+    await homeFact(
+      facade,
+      pairing,
+      'room:' + roomId,
+      (record) =>
+        roomView(record).events.some((event) =>
+          event.type === 'm.room.member' &&
+          event.state_key === '@replica:logical.test' &&
+          event.content.displayname === 'Linked profile'
+        ),
+    );
+    assert(
+      (await roomScope()).cut > beforeProfileRoomCut &&
+        (await roomScope()).ready,
     );
     const initialCut = (await roomScope()).cut;
     const sent = await api(
@@ -340,10 +400,16 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
       'PUT',
     );
     assertEquals(sent.status, 200);
-    await until(async () =>
-      (await roomScope())?.cut > initialCut &&
-      (await roomScope())?.ready === true
+    await homeFact(
+      facade,
+      pairing,
+      'room:' + roomId,
+      (record) =>
+        roomView(record).steps.some((step) =>
+          step.eventId === sent.body.event_id
+        ),
     );
+    assert((await roomScope()).cut > initialCut && (await roomScope()).ready);
     const replicatedCut = (await roomScope()).cut;
     const connection = await Deno.connect({
       hostname: '127.0.0.1',
@@ -372,22 +438,9 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
     assertEquals(outbound.length, beforeOfflineSend);
     facade = await process(facadeConfig, 'facade: link/local admin ready');
     home = await process(homeConfig, 'federation: enabled');
-    await until(() =>
-      Promise.resolve(observedOutbound('offline').length === 1)
-    );
-    await until(async () => {
-      try {
-        const connection = await Deno.connect({
-          hostname: '127.0.0.1',
-          port: homePort,
-        });
-        connection.close();
-        return true;
-      } catch (error) {
-        if (error instanceof Deno.errors.ConnectionRefused) return false;
-        throw error;
-      }
-    });
+    await waitOutbound('offline');
+    assertEquals(observedOutbound('offline').length, 1);
+    await home.listening(homePort);
     assertEquals(await call('PUT', sendPath, sendBody), saved);
     assertEquals((await inbox()).length, 1);
     assertEquals((await status()).body.result.keyId, initialized.keyId);
@@ -405,29 +458,21 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
       await Deno.readTextFile(homeConfig) + '\noutbound="facade"\n',
     );
     home = await process(homeConfig, 'federation: enabled');
-    await until(async () => {
-      try {
-        const connection = await Deno.connect({
-          hostname: '127.0.0.1',
-          port: homePort,
-        });
-        connection.close();
-        return true;
-      } catch (error) {
-        if (error instanceof Deno.errors.ConnectionRefused) return false;
-        throw error;
-      }
-    });
+    await home.listening(homePort);
     await sendOutbound('facade');
-    await until(() => Promise.resolve(observedOutbound('facade').length === 1));
+    await waitOutbound('facade');
+    assertEquals(observedOutbound('facade').length, 1);
     await sendOutbound('barrier');
-    await until(() =>
-      Promise.resolve(observedOutbound('barrier').length === 1)
-    );
+    await waitOutbound('barrier');
+    assertEquals(observedOutbound('barrier').length, 1);
     await adminCall(tls.dir + '/home.sock', 'facade/revoke', {
       id: paired.body.result.id,
     });
-    await until(async () => (await status()).body.result.enrolled === false);
+    await facade.observations.wait((event) =>
+      event.kind === 'pairing' && event.id === pairing &&
+      event.state === 'revoked'
+    );
+    assertEquals((await status()).body.result.enrolled, false);
     const revoked = await publicGet('/_matrix/key/v2/server');
     assertEquals(revoked.status, 503);
     await revoked.body?.cancel();
@@ -661,13 +706,8 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     edge = await process(file('facade'), 'facade: link/local admin ready');
     await adminCall(tls.dir + '/facade-auth.sock', 'facade/initialize');
     home = await process(file('home'), 'federation: disabled');
-    await until(async () => {
-      try {
-        return (await api('login')).status === 200;
-      } catch {
-        return false;
-      }
-    });
+    await home.listening(homePort);
+    assertEquals((await api('login')).status, 200);
     const registration = { username: 'outside', password: 'offline-password' };
     const challenge = await api('register', registration);
     const registered = await api('register', {
@@ -757,40 +797,69 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       })).status,
       200,
     );
-    await until(async () => {
-      const response = await adminCall(
-        tls.dir + '/facade-auth.sock',
-        'facade/status',
-      );
-      const scopes = response.body.result.scopes;
-      return scopes.some((
-        scope: { scope: string; ready: boolean },
-      ) => scope.scope === 'auth:@outside:logical.test' && scope.ready) &&
-        scopes.some((scope: { scope: string; ready: boolean }) =>
-          scope.scope === 'domain:@outside:logical.test' && scope.ready
-        ) && scopes.some((scope: { scope: string; ready: boolean }) =>
-          scope.scope === 'room:' + roomId && scope.ready
-        );
-    });
+    const pairing = paired.body.result.id;
+    await homeFact(
+      edge,
+      pairing,
+      'auth:@outside:logical.test',
+      (record) =>
+        authView(record).localpart === 'outside' &&
+        authView(record).credentials,
+    );
+    await homeFact(
+      edge,
+      pairing,
+      'domain:@outside:logical.test',
+      (record) =>
+        object(object(record.payload).body).kind === 'domain-bootstrap',
+    );
+    await homeFact(
+      edge,
+      pairing,
+      'room:' + roomId,
+      (record) =>
+        roomView(record).steps.some((step) => step.eventId === eventId),
+    );
     // Observe actual received/applied semantic streams, not merely the older F1
     // public snapshot. No test calls the link exporters or importers directly.
-    await until(async () => {
-      const state =
-        (await adminCall(tls.dir + '/facade-auth.sock', 'facade/status'))
-          .body.result;
-      return ['devices:', 'signing:', 'signatures:'].every((prefix) =>
-        state.streams.some((stream: {
-          stream: string;
-          received: { sequence: number; hash: string };
-          applied: { sequence: number; hash: string };
-        }) =>
-          stream.stream === prefix + user && stream.applied.sequence > 0 &&
-          stream.received.sequence === stream.applied.sequence &&
-          stream.received.hash === stream.applied.hash
-        )
+    await homeFact(edge, pairing, 'devices:' + user, (record) => {
+      const operation = object(object(record.payload).body)
+        .operation as DeviceOperation;
+      return operation.deviceId === homeDevice &&
+        object(object(operation.value?.keys ?? {}).keys ?? {})[
+            'ed25519:' + homeDevice
+          ] === homePublic;
+    });
+    await homeFact(edge, pairing, 'signing:' + user, (record) => {
+      const operation = object(object(record.payload).body)
+        .operation as SigningOperation;
+      return operation.keys.some((item) =>
+        item.usage === 'master' &&
+        object(item.key.keys)['ed25519:' + masterPublic] === masterPublic
       );
     });
+    const homeSignature = (master as typeof master & {
+      signatures: Record<string, Record<string, string>>;
+    }).signatures[user]['ed25519:' + homeDevice];
+    await homeFact(edge, pairing, 'signatures:' + user, (record) => {
+      const operation = object(object(record.payload).body)
+        .operation as SignatureOperation;
+      return operation.target.user === user &&
+        operation.target.id === masterPublic &&
+        operation.signers.some((item) =>
+          item.signer.key === 'ed25519:' + homeDevice &&
+          item.signature === homeSignature
+        );
+    });
     await home.stop();
+    await edge.stop();
+    // Join every admitted receive before selecting the offline key-stream cut.
+    edge = await process(file('facade'), 'facade: link/local admin ready');
+    await finiteStreams(
+      edge,
+      tls.dir + '/facade-auth.sock',
+      ['devices:', 'signing:', 'signatures:'].map((prefix) => prefix + user),
+    );
     await edge.stop();
     const offline = await open('facade');
     let token: string;
@@ -898,23 +967,28 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       encodeURIComponent(roomId);
     // Home is absent, federation is disabled, and this is the ordinary public
     // listener, not an in-process tenant call or the local-admin adapter.
-    await until(async () => {
-      const state =
-        (await adminCall(tls.dir + '/facade-auth.sock', 'facade/status')).body
-          .result;
-      return ['domain:@outside:logical.test', 'room:' + roomId].every(
-        (scope) => {
-          const held = state.scopes.find((row: { scope: string }) =>
-            row.scope === scope
-          );
-          const stream = state.streams.find((row: { stream: string }) =>
-            row.stream === scope
-          );
-          return held?.ready && held.pending === null && stream &&
-            stream.received.sequence === stream.applied.sequence;
-        },
+    await finiteTail(edge, tls.dir + '/facade-auth.sock', [
+      'auth:@outside:logical.test',
+      'domain:@outside:logical.test',
+      'room:' + roomId,
+    ]);
+    const scopes =
+      (await adminCall(tls.dir + '/facade-auth.sock', 'facade/status')).body
+        .result.scopes;
+    for (
+      const required of [
+        'auth:@outside:logical.test',
+        'domain:@outside:logical.test',
+        'room:' + roomId,
+      ]
+    ) {
+      assert(
+        scopes.some((scope: { scope: string; ready: boolean }) =>
+          scope.scope === required && scope.ready
+        ),
       );
-    });
+    }
+    await edge.listening(facadePort);
     assertEquals(await edgeApi(accountPath), {
       status: 200,
       body: { ciphertext: 'edge-recovered' },
@@ -1083,69 +1157,118 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       ciphertext: 'edge-public',
     });
     home = await process(file('home'), 'federation: disabled');
-    await until(async () => {
-      try {
-        const value = await api(
-          'user/%40outside%3Alogical.test/account_data/m.secret_storage.key',
-          undefined,
-          registered.body.access_token,
-        );
-        return value.status === 200 &&
-          value.body.ciphertext === 'edge-public';
-      } catch {
-        return false;
-      }
+    await home.listening(homePort);
+    const edgeIncarnation =
+      (await adminCall(tls.dir + '/facade-auth.sock', 'facade/status')).body
+        .result.incarnation;
+    const edgeIdentity = {
+      peer: 'edge_a',
+      source: 'edge_a',
+      incarnation: edgeIncarnation,
+    };
+    await home.observations.fact({
+      ...edgeIdentity,
+      stream: 'domain:@outside:logical.test',
+    }, (record) => {
+      const operation = object(object(object(record.payload).body).operation);
+      return operation.semanticKey ===
+          JSON.stringify([
+            'account-data',
+            'outside',
+            '',
+            'm.secret_storage.key',
+          ]) &&
+        JSON.parse(String(operation.payload)).ciphertext === 'edge-public';
     });
-    await until(async () => {
-      try {
-        return (await api('account/whoami', undefined, token)).status === 503;
-      } catch {
-        return false;
-      }
-    });
+    assertEquals(
+      await api(
+        'user/%40outside%3Alogical.test/account_data/m.secret_storage.key',
+        undefined,
+        registered.body.access_token,
+      ),
+      { status: 200, body: { ciphertext: 'edge-public' } },
+    );
+    const tokenHash = await hashToken(token);
+    await home.observations.fact(
+      { ...edgeIdentity, stream: 'authority:@outside:logical.test' },
+      (record) =>
+        authorityView(record).authority.sessions.some((session) =>
+          session.hash === tokenHash
+        ),
+    );
+    assertEquals((await api('account/whoami', undefined, token)).status, 503);
     // A normal home Matrix consumer observes the cold-recovered facade overlay.
     // Its device basis requires the independent authority and device streams;
     // stream startup or a stored unverified signature alone cannot satisfy this.
-    await until(async () => {
-      const query = await api(
-        'keys/query',
-        { device_keys: { [user]: [] } },
-        registered.body.access_token,
-      );
-      return query.status === 200 && query.body.master_keys?.[user]
-            ?.signatures?.[user]?.['ed25519:outside-device'] ===
-          (signedByEdge as typeof signedByEdge & {
-            signatures: Record<string, Record<string, string>>;
-          }).signatures[user]['ed25519:outside-device'];
+    const edgeDeviceRecord = await home.observations.fact({
+      ...edgeIdentity,
+      stream: 'devices:' + user,
+    }, (record) => {
+      const operation = object(object(record.payload).body)
+        .operation as DeviceOperation;
+      return operation.deviceId === 'outside-device' &&
+        object(object(operation.value?.keys ?? {}).keys ?? {})[
+            'ed25519:outside-device'
+          ] === edgePublic;
     });
-    // The independent to-device lane must export durable work authored with both
-    // processes closed. Neither this test nor its consumer calls a link adapter.
-    await until(async () => {
-      const sync = await api(
-        'sync?timeout=0',
-        undefined,
-        registered.body.access_token,
-      );
-      return sync.status === 200 && sync.body.to_device.events.some(
-        (event: { type: string; content: { request_id?: string } }) =>
-          event.type === 'm.room_key_request' &&
-          event.content.request_id === 'cold-runtime-key',
-      );
+    const edgeDevice = object(object(edgeDeviceRecord.payload).body)
+      .operation as DeviceOperation;
+    await home.observations.fact(
+      { ...edgeIdentity, stream: 'authority:' + user },
+      (record) =>
+        authorityView(record).authority.facts.some((fact) =>
+          fact.kind === 'device' && fact.id === edgeDevice.deviceIncarnation
+        ),
+    );
+    const edgeSignature = (signedByEdge as typeof signedByEdge & {
+      signatures: Record<string, Record<string, string>>;
+    }).signatures[user]['ed25519:outside-device'];
+    await home.observations.fact({
+      ...edgeIdentity,
+      stream: 'signatures:' + user,
+    }, (record) => {
+      const operation = object(object(record.payload).body)
+        .operation as SignatureOperation;
+      return operation.target.user === user &&
+        operation.target.id === masterPublic &&
+        operation.signers.some((item) =>
+          item.signer.key === 'ed25519:outside-device' &&
+          item.signature === edgeSignature
+        );
     });
-    let homeToDeviceCut = 0;
-    await until(async () => {
-      const state =
-        (await adminCall(tls.dir + '/facade-auth.sock', 'facade/status'))
-          .body.result;
-      const stream = state.streams.find((stream: {
-        stream: string;
-        received: { sequence: number };
-        applied: { sequence: number };
-      }) => stream.stream === 'to-device:' + user);
-      homeToDeviceCut = stream?.applied.sequence ?? 0;
-      return homeToDeviceCut > 0 &&
-        stream.received.sequence === homeToDeviceCut;
+    const query = await api(
+      'keys/query',
+      { device_keys: { [user]: [] } },
+      registered.body.access_token,
+    );
+    assertEquals(query.status, 200);
+    assertEquals(
+      query.body.master_keys?.[user]?.signatures?.[user]
+        ?.['ed25519:outside-device'],
+      edgeSignature,
+    );
+    // Match the actual home-owned route before consuming cold-authored work.
+    await home.observations.fact({
+      ...edgeIdentity,
+      stream: 'to-device:' + user,
+    }, (record) => {
+      const operation = toDeviceView(record);
+      return operation.kind === 'route' && operation.value.owner === 'home' &&
+        operation.value.selectors.some((selector) =>
+          selector.content.request_id === 'cold-runtime-key'
+        );
     });
+    const keySync = await api(
+      'sync?timeout=0',
+      undefined,
+      registered.body.access_token,
+    );
+    assertEquals(keySync.status, 200, JSON.stringify(keySync));
+    assert(keySync.body.to_device.events.some(
+      (event: { type: string; content: { request_id?: string } }) =>
+        event.type === 'm.room_key_request' &&
+        event.content.request_id === 'cold-runtime-key',
+    ));
     assertEquals(
       (await api(
         'sendToDevice/m.room_key_request/runtime-reply',
@@ -1159,19 +1282,14 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       )).status,
       200,
     );
-    // This exact explicit-device send retains two owner routes and home's empty
-    // expansion. An older wildcard expansion is not evidence of this reply.
-    await until(async () => {
-      const state =
-        (await adminCall(tls.dir + '/facade-auth.sock', 'facade/status'))
-          .body.result;
-      return state.streams.some((stream: {
-        stream: string;
-        applied: { sequence: number };
-      }) =>
-        stream.stream === 'to-device:' + user &&
-        stream.applied.sequence >= homeToDeviceCut + 3
-      );
+    // The exact reply, not an older wildcard or unrelated larger cut, is proof.
+    await homeFact(edge, pairing, 'to-device:' + user, (record) => {
+      const operation = toDeviceView(record);
+      return operation.kind === 'route' && operation.value.owner === 'edge_a' &&
+        operation.value.selectors.some((selector) =>
+          selector.id === 'outside-device' &&
+          selector.content.request_id === 'home-runtime-key'
+        );
     });
     await edge.stop();
     const delivered = await open('facade');
@@ -1207,30 +1325,27 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       (await api('logout/all', {}, registered.body.access_token)).status,
       200,
     );
-    await until(async () => {
-      const response = await adminCall(
-        tls.dir + '/facade-auth.sock',
-        'facade/status',
-      );
-      // One capture may already be in flight at logout; its successor is taken
-      // after that mutation by the account's serialized export owner.
-      return response.body.result.scopes.some((
-        scope: { scope: string; ready: boolean; cut: number },
-      ) =>
-        scope.scope === 'auth:@outside:logical.test' && scope.ready &&
-        scope.cut > before + 1
-      );
-    });
+    await homeFact(
+      edge,
+      pairing,
+      'auth:@outside:logical.test',
+      (record) =>
+        authView(record).sourceCut > before &&
+        authView(record).authority.facts.some((fact) =>
+          fact.kind === 'barrier'
+        ),
+    );
     // Captures already queued before logout can advance a numeric cut too.
     // Observe revocation at the actual authenticated consumer before closing.
-    await until(async () => {
+    {
       const response = await fetch(
         `http://127.0.0.1:${facadePort}/_matrix/client/v3/account/whoami`,
         { headers: { authorization: 'Bearer ' + token } },
       );
       const body = await response.json();
-      return response.status === 401 && body.errcode === 'M_UNKNOWN_TOKEN';
-    });
+      assertEquals(response.status, 401);
+      assertEquals(body.errcode, 'M_UNKNOWN_TOKEN');
+    }
     await home.stop();
     await edge.stop();
     const closedHome = await open('home'), closedEdge = await open('facade');
@@ -1326,35 +1441,19 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
     // Permissive auth may use a complete older cut. Observe the journal through
     // its owning process instead; home is stopped so its received tail is finite.
     // Never open a second store while the child owns its lock.
-    await until(async () => {
-      const status =
-        (await adminCall(tls.dir + '/facade-public-auth.sock', 'facade/status'))
-          .body.result;
-      return localparts.every((localpart) => {
-        const scope = 'auth:@' + localpart + ':logical.test';
-        const held = status.scopes.find((row: { scope: string }) =>
-          row.scope === scope
-        );
-        const stream = status.streams.find((row: { stream: string }) =>
-          row.stream === scope
-        );
-        return held?.ready && held.pending === null && stream &&
-          stream.received.sequence === stream.applied.sequence &&
-          stream.received.hash === stream.applied.hash;
-      });
-    });
+    assert(edge);
+    await finiteTail(
+      edge,
+      tls.dir + '/facade-public-auth.sock',
+      localparts.map((localpart) => 'auth:@' + localpart + ':logical.test'),
+    );
   };
   try {
     edge = await process(file('facade'), 'facade: link/local admin ready');
     await adminCall(tls.dir + '/facade-public-auth.sock', 'facade/initialize');
     home = await process(file('home'), 'federation: disabled');
-    await until(async () => {
-      try {
-        return (await api('home', 'login')).status === 200;
-      } catch {
-        return false;
-      }
-    });
+    await home.listening(homePort);
+    assertEquals((await api('home', 'login')).status, 200);
     const registration = {
       username: 'outside',
       password: 'offline-password',
@@ -1386,36 +1485,41 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       room_version: '11',
     }, departure.body.access_token);
     assertEquals(departureRoom.status, 200);
-    assertEquals(
-      (await adminCall(tls.dir + '/home-public-auth.sock', 'facade/pair', {
+    const paired = await adminCall(
+      tls.dir + '/home-public-auth.sock',
+      'facade/pair',
+      {
         node: 'edge_a',
         url: `https://127.0.0.1:${linkPort}`,
         facadePin: tls.facadePin,
         expires: Date.now() + 60000,
         bundlefile,
-      })).status,
-      200,
+      },
     );
+    assertEquals(paired.status, 200);
+    const pairing = paired.body.result.id;
     assertEquals(
       (await adminCall(tls.dir + '/facade-public-auth.sock', 'facade/accept', {
         bundlefile,
       })).status,
       200,
     );
-    await until(async () => {
-      const scopes =
-        (await adminCall(tls.dir + '/facade-public-auth.sock', 'facade/status'))
-          .body.result.scopes;
-      return [
-        'auth:@outside:logical.test',
-        'auth:@departure:logical.test',
-        'room:' + departureRoom.body.room_id,
-      ].every((required) =>
-        scopes.some((scope: { scope: string; ready: boolean }) =>
-          scope.scope === required && scope.ready
-        )
+    for (const localpart of ['outside', 'departure']) {
+      await homeFact(
+        edge,
+        pairing,
+        'auth:@' + localpart + ':logical.test',
+        (record) =>
+          authView(record).credentials && authView(record).phc !== null &&
+          !authView(record).deactivated,
       );
-    });
+    }
+    await homeFact(
+      edge,
+      pairing,
+      'room:' + departureRoom.body.room_id,
+      (record) => roomView(record).roomId === departureRoom.body.room_id,
+    );
     await home.stop();
     // Shutdown stops between records; it does not drain the received tail.
     // With home stopped, restart and observe the actual finite auth apply cut
@@ -1423,6 +1527,28 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
     await edge.stop();
     edge = await process(file('facade'), 'facade: link/local admin ready');
     await authTail(['outside', 'departure']);
+    await finiteTail(edge, tls.dir + '/facade-public-auth.sock', [
+      'room:' + departureRoom.body.room_id,
+    ]);
+    // Assert the same status consumer on the selected finite prefix. A later
+    // periodic auth publication may otherwise make live readiness false again
+    // between its completion event and this read, without losing that fact.
+    const initialScopes =
+      (await adminCall(tls.dir + '/facade-public-auth.sock', 'facade/status'))
+        .body.result.scopes;
+    for (
+      const required of [
+        'auth:@outside:logical.test',
+        'auth:@departure:logical.test',
+        'room:' + departureRoom.body.room_id,
+      ]
+    ) {
+      assert(
+        initialScopes.some((scope: { scope: string; ready: boolean }) =>
+          scope.scope === required && scope.ready
+        ),
+      );
+    }
     assertEquals((await api('facade', 'login')).body, {
       flows: [{ type: 'm.login.password' }],
     });
@@ -1569,27 +1695,48 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       unavailable,
     );
     home = await process(file('home'), 'federation: disabled');
-    await until(async () => {
-      try {
-        return (await api('home', 'login')).status === 200;
-      } catch {
-        return false;
-      }
-    });
-    await until(async () =>
-      (await api(
-        'facade',
-        'login',
-        login('online-strict-device'),
-      )).status === 200
+    await home.listening(homePort);
+    assertEquals((await api('home', 'login')).status, 200);
+    await edge.observations.wait((event) =>
+      event.kind === 'health' && event.pairing === pairing &&
+      event.stream === 'auth:@outside:logical.test' && event.online
     );
+    // Keep the live connection, but fence the next source page before it can
+    // declare or deliver a newer auth cut. Strict admission requires a complete
+    // received prefix, not merely a previously completed reconciliation.
+    const strictPublication = await home.holdPublication(
+      'stream:auth:@outside:logical.test',
+    );
+    try {
+      await strictPublication.held();
+      await finiteTail(edge, tls.dir + '/facade-public-auth.sock', [
+        'auth:@outside:logical.test',
+      ]);
+      assertEquals(
+        (await api(
+          'facade',
+          'login',
+          login('online-strict-device'),
+        )).status,
+        200,
+      );
+    } finally {
+      await strictPublication.release();
+    }
+    const connectedMark = edge.observations.mark();
     await home.stop();
-    await until(async () =>
+    await edge.observations.wait(
+      (event) =>
+        event.kind === 'health' && event.pairing === pairing && !event.online,
+      connectedMark,
+    );
+    assertEquals(
       (await api(
         'facade',
         'login',
         login('offline-strict-probe', 'not-the-password'),
-      )).status === 503
+      )).status,
+      503,
     );
     assertEquals(
       await api('facade', 'login', login('offline-strict-device')),
@@ -1683,13 +1830,8 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       200,
     );
     home = await process(file('home'), 'federation: disabled');
-    await until(async () => {
-      try {
-        return (await api('home', 'login')).status === 200;
-      } catch {
-        return false;
-      }
-    });
+    await home.listening(homePort);
+    assertEquals((await api('home', 'login')).status, 200);
     assertEquals(
       await api('facade', 'login', login('still-disabled')),
       unavailable,
@@ -1706,57 +1848,77 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
     await home.stop();
     await configure('home', 'replicatecredentials=false\n');
     home = await process(file('home'), 'federation: disabled');
-    await until(async () => {
-      try {
-        return (await api('home', 'login')).status === 200;
-      } catch {
-        return false;
-      }
-    });
+    await home.listening(homePort);
+    assertEquals((await api('home', 'login')).status, 200);
     // Observe capability withdrawal without issuing new sessions while waiting.
     // A successful login is a mutation and feeds the account replication loop.
-    await until(async () =>
-      (await api('facade', 'login')).body.flows.length === 0
-    );
+    for (const localpart of ['outside', 'departure']) {
+      await homeFact(
+        edge,
+        pairing,
+        'auth:@' + localpart + ':logical.test',
+        (record) =>
+          !authView(record).credentials && authView(record).phc === null,
+      );
+    }
+    assertEquals((await api('facade', 'login')).body.flows.length, 0);
     assertEquals(
       await api('facade', 'login', login('home-kept-verifier')),
       unavailable,
     );
     await home.stop();
-    await until(async () =>
-      (await api(
-          'facade',
-          'account/whoami',
-          undefined,
-          retried.body.access_token,
-        )).status === 200 &&
-      (await api('facade', 'login')).body.flows.length === 0
-    );
+    // The source's cancelled request can leave an admitted receive callback at
+    // the facade. Its graceful close joins those handlers; a cold reopen then
+    // has a genuinely finite received prefix, not a moving status capture.
+    await edge.stop();
+    edge = await process(file('facade'), 'facade: link/local admin ready');
+    await authTail(['outside', 'departure']);
     assertEquals(
-      await api('facade', 'login', login('home-kept-verifier')),
-      unavailable,
-    );
-    assertEquals((await api('facade', 'login')).body, { flows: [] });
-    await configure('home');
-    home = await process(file('home'), 'federation: disabled');
-    await until(async () => {
-      try {
-        return (await api('home', 'login')).status === 200;
-      } catch {
-        return false;
-      }
-    });
-    await until(async () =>
-      (await api('facade', 'login', login('verifier-restored'))).status === 200
-    );
-    await home.stop();
-    await until(async () =>
       (await api(
         'facade',
         'account/whoami',
         undefined,
         retried.body.access_token,
-      )).status === 200
+      )).status,
+      200,
+    );
+    assertEquals((await api('facade', 'login')).body.flows.length, 0);
+    assertEquals(
+      await api('facade', 'login', login('home-kept-verifier')),
+      unavailable,
+    );
+    assertEquals((await api('facade', 'login')).body, { flows: [] });
+    const restoreMark = edge.observations.mark();
+    await configure('home');
+    home = await process(file('home'), 'federation: disabled');
+    await home.listening(homePort);
+    assertEquals((await api('home', 'login')).status, 200);
+    for (const localpart of ['outside', 'departure']) {
+      await homeFact(
+        edge,
+        pairing,
+        'auth:@' + localpart + ':logical.test',
+        (record) =>
+          authView(record).credentials && authView(record).phc !== null,
+        restoreMark,
+      );
+    }
+    assertEquals(
+      (await api('facade', 'login', login('verifier-restored'))).status,
+      200,
+    );
+    await home.stop();
+    await edge.stop();
+    edge = await process(file('facade'), 'facade: link/local admin ready');
+    await authTail(['outside', 'departure']);
+    assertEquals(
+      (await api(
+        'facade',
+        'account/whoami',
+        undefined,
+        retried.body.access_token,
+      )).status,
+      200,
     );
     const crossDelete = await api(
       'facade',
@@ -1769,20 +1931,31 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
     );
     assertEquals(crossDelete.status, 200, JSON.stringify(crossDelete));
     home = await process(file('home'), 'federation: disabled');
-    await until(async () => {
-      try {
-        return (await api('home', 'login')).status === 200;
-      } catch {
-        return false;
-      }
-    });
-    await until(async () =>
+    await home.listening(homePort);
+    const edgeIncarnation =
+      (await adminCall(tls.dir + '/facade-public-auth.sock', 'facade/status'))
+        .body.result.incarnation;
+    const edgeIdentity = {
+      peer: 'edge_a',
+      source: 'edge_a',
+      incarnation: edgeIncarnation,
+      stream: 'authority:@outside:logical.test',
+    };
+    await home.observations.fact(
+      edgeIdentity,
+      (record) =>
+        authorityView(record).authority.facts.some((fact) =>
+          fact.kind === 'delete' && fact.deviceId === 'home-device'
+        ),
+    );
+    assertEquals(
       (await api(
         'home',
         'account/whoami',
         undefined,
         registered.body.access_token,
-      )).status === 401
+      )).status,
+      401,
     );
     timings.phase('home deactivation login');
     const homeLogin = await api('home', 'login', login('later-home-device'));
@@ -1795,27 +1968,41 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       200,
     );
     timings.phase('facade observes home deactivation');
-    await until(async () =>
+    await homeFact(
+      edge,
+      pairing,
+      'auth:@outside:logical.test',
+      (record) =>
+        authView(record).deactivated &&
+        authView(record).authority.facts.some((fact) =>
+          fact.kind === 'deactivate'
+        ),
+    );
+    assertEquals(
       (await api(
         'facade',
         'login',
         login('after-deactivation'),
       )).body
-        .errcode === 'M_FORBIDDEN'
+        .errcode,
+      'M_FORBIDDEN',
     );
     timings.phase('home deactivation shutdown');
     await home.stop();
     // Home shutdown can finish after another capture was received but before
     // its independent facade owner commits the apply/result. Drain that cut.
     timings.phase('facade drains deactivation tail offline');
-    await until(async () =>
+    await edge.stop();
+    edge = await process(file('facade'), 'facade: link/local admin ready');
+    await authTail(['outside']);
+    assertEquals(
       (await api(
         'facade',
         'login',
         login('offline-deactivated', 'not-the-password'),
       )).body
-        .errcode ===
-        'M_FORBIDDEN'
+        .errcode,
+      'M_FORBIDDEN',
     );
     assertEquals(
       (await api('facade', 'login', login('offline-deactivated'))).body.errcode,
@@ -1837,11 +2024,12 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
     // The preceding verifier-withdrawal/restoration exercise covers every
     // served account asynchronously. Observe this account's restored verifier
     // without minting a new session while its last received cut drains.
-    await until(async () =>
+    assertEquals(
       (await api('facade', 'login', {
         ...departureLogin,
         password: 'not-the-password',
-      })).status === 403
+      })).status,
+      403,
     );
     timings.phase('departure login and UIA');
     const departureSession = await api('facade', 'login', departureLogin);
@@ -1941,14 +2129,18 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
     timings.phase('departure home restart');
     home = await process(file('home'), 'federation: disabled');
     timings.phase('home observes facade deactivation');
-    await until(async () => {
-      try {
-        return (await api('home', 'login', departureLogin)).body.errcode ===
-          'M_FORBIDDEN';
-      } catch {
-        return false;
-      }
-    });
+    await home.listening(homePort);
+    await home.observations.fact(
+      { ...edgeIdentity, stream: 'authority:@departure:logical.test' },
+      (record) =>
+        authorityView(record).authority.facts.some((fact) =>
+          fact.kind === 'deactivate'
+        ),
+    );
+    assertEquals(
+      (await api('home', 'login', departureLogin)).body.errcode,
+      'M_FORBIDDEN',
+    );
   } catch (error) {
     const owners = await Promise.all(['home', 'facade'].map(async (side) => {
       try {
@@ -1976,60 +2168,72 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
   }
 });
 
-async function until(probe: () => Promise<boolean>) {
-  const deadline = Date.now() + 20000;
-  while (!await probe()) {
-    assert(Date.now() < deadline, 'runtime observation deadline');
-    await pause(10);
+function homeFact(
+  child: Awaited<ReturnType<typeof process>>,
+  pairing: string,
+  stream: string,
+  matches: (record: LinkRecord) => boolean,
+  after = 0,
+) {
+  return child.observations.fact(
+    { peer: 'home', source: 'home', incarnation: pairing, stream },
+    matches,
+    after,
+  );
+}
+
+function authView(record: LinkRecord): AccountAuth {
+  return object(object(record.payload).signed).body as AccountAuth;
+}
+
+function authorityView(
+  record: LinkRecord,
+): { authority: AccountAuth['authority'] } {
+  return object(record.payload).body as { authority: AccountAuth['authority'] };
+}
+
+function toDeviceView(record: LinkRecord): ToDeviceOperation {
+  return object(object(record.payload).body).operation as ToDeviceOperation;
+}
+
+function roomView(record: LinkRecord): ReplicaRoom {
+  return object(record.payload).manifest as ReplicaRoom;
+}
+
+async function finiteTail(
+  child: Awaited<ReturnType<typeof process>>,
+  socket: string,
+  scopes: string[],
+) {
+  const applied = await finiteStreams(child, socket, scopes);
+  for (const scope of scopes) {
+    const held = applied.scopes.find((row: { scope: string }) =>
+      row.scope === scope
+    );
+    assert(held?.ready && held.pending === null);
   }
 }
 
-async function process(config: string, ready: string) {
-  const child = new Deno.Command(Deno.execPath(), {
-    args: metadata.tasks.start.split(' ').slice(1),
-    env: { COMMUNICO_CONFIG: config, DENO_NO_PROMPT: '1' },
-    stdout: 'piped',
-    stderr: 'piped',
-  }).spawn();
-  let out = '', err = '', ended = false;
-  const read = async (
-    body: ReadableStream<Uint8Array>,
-    save: (text: string) => void,
-  ) => {
-    for await (const chunk of body.pipeThrough(new TextDecoderStream())) {
-      save(chunk);
-    }
-  };
-  const output = Promise.all([
-    child.status,
-    read(child.stdout, (text) => out += text),
-    read(child.stderr, (text) => err += text),
-  ]).then(([status]) => {
-    ended = true;
-    return status;
+async function finiteStreams(
+  child: Awaited<ReturnType<typeof process>>,
+  socket: string,
+  scopes: string[],
+) {
+  const state = (await adminCall(socket, 'facade/status')).body.result;
+  const streams = scopes.map((scope) => {
+    const stream = state.streams.find((row: { stream: string }) =>
+      row.stream === scope
+    );
+    assert(stream, 'required finite tail is absent: ' + scope);
+    return stream;
   });
-  const dispose = async () => {
-    if (!ended) {
-      child.kill('SIGKILL');
-      await bounded(output);
-    }
-  };
-  try {
-    await until(async () => {
-      assert(!ended, out + '\n' + err);
-      return await Promise.resolve(out.includes(ready));
-    });
-  } catch (error) {
-    await dispose();
-    throw error;
+  await child.observations.tail('home', streams);
+  const applied = (await adminCall(socket, 'facade/status')).body.result;
+  for (const scope of scopes) {
+    const stream = applied.streams.find((row: { stream: string }) =>
+      row.stream === scope
+    );
+    assertEquals(stream.received, stream.applied);
   }
-  return {
-    async stop() {
-      if (!ended) child.kill('SIGTERM');
-      const status = await bounded(output);
-      assertEquals(status.code, 0, out + '\n' + err);
-      assert(out.includes('shutdown: store closed'));
-    },
-    dispose,
-  };
+  return applied;
 }

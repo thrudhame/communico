@@ -20,6 +20,7 @@ import {
   TO_DEVICE_ROUTING_SQL,
 } from '#engine/tenant/todevice-routing.ts';
 import { UIA_BINDING_SQL } from '#engine/tenant/uia.ts';
+import { CLIENT_COMPLETION_SQL } from '#engine/tenant/completion.ts';
 import { PROFILE_FANOUT_SQL } from '#engine/tenant/profile-fanout.ts';
 import { KEY_CONSUMPTIONS_SQL } from '#engine/tenant/e2ee.ts';
 import { DEVICE_OPERATIONS_SQL } from '#engine/tenant/device-operations.ts';
@@ -294,7 +295,7 @@ INSERT INTO deactivation_work SELECT localpart,EXISTS(SELECT 1 FROM erased_users
 `;
 
 export const tenantSchema: SchemaProvider = {
-  version: 39,
+  version: 40,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
     await db.exec(E2EE_SQL);
@@ -321,6 +322,7 @@ export const tenantSchema: SchemaProvider = {
     await db.exec(DEACTIVATION_WORK_SQL);
     await db.exec(PROFILE_FANOUT_SQL);
     await db.exec(ACCOUNT_AUTH_PUBLICATION_SQL);
+    await db.exec(CLIENT_COMPLETION_SQL);
     await db.exec(KEY_CONSUMPTIONS_SQL);
     await db.exec(DEVICE_OPERATIONS_SQL);
     await db.exec(SIGNING_OPERATIONS_SQL);
@@ -334,17 +336,18 @@ export const tenantSchema: SchemaProvider = {
     await db.exec(TO_DEVICE_ADMISSION_POLICY_SQL);
   },
   migrations: {
-    38: (conn) => conn.exec(TO_DEVICE_ADMISSION_POLICY_SQL),
-    37: (conn) => conn.exec(TO_DEVICE_ROUTING_SQL),
-    36: (conn) => conn.exec(DEVICE_CHECKPOINT_SQL),
-    35: (conn) => conn.exec(DEVICE_STREAM_SQL),
-    34: (conn) => conn.exec(DEVICE_CREATION_HISTORY_SQL),
-    33: (conn) => conn.exec(KEY_BOOTSTRAP_SQL),
-    32: (conn) => conn.exec(SIGNATURE_OPERATIONS_SQL),
-    31: (conn) => conn.exec(LINK_APPLICATIONS_SQL),
-    30: (conn) => conn.exec(SIGNING_OPERATIONS_SQL),
-    29: (conn) => conn.exec(DEVICE_OPERATIONS_SQL),
-    28: (conn) => conn.exec(KEY_CONSUMPTIONS_SQL),
+    39: (conn) => conn.exec(TO_DEVICE_ADMISSION_POLICY_SQL),
+    38: (conn) => conn.exec(TO_DEVICE_ROUTING_SQL),
+    37: (conn) => conn.exec(DEVICE_CHECKPOINT_SQL),
+    36: (conn) => conn.exec(DEVICE_STREAM_SQL),
+    35: (conn) => conn.exec(DEVICE_CREATION_HISTORY_SQL),
+    34: (conn) => conn.exec(KEY_BOOTSTRAP_SQL),
+    33: (conn) => conn.exec(SIGNATURE_OPERATIONS_SQL),
+    32: (conn) => conn.exec(LINK_APPLICATIONS_SQL),
+    31: (conn) => conn.exec(SIGNING_OPERATIONS_SQL),
+    30: (conn) => conn.exec(DEVICE_OPERATIONS_SQL),
+    29: (conn) => conn.exec(KEY_CONSUMPTIONS_SQL),
+    28: (conn) => conn.exec(CLIENT_COMPLETION_SQL),
     27: (conn) => conn.exec(ACCOUNT_AUTH_PUBLICATION_SQL),
     26: (conn) => conn.exec(PROFILE_FANOUT_SQL),
     25: (conn) => conn.exec(DEACTIVATION_WORK_SQL),

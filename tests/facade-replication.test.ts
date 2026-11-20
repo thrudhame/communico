@@ -16,6 +16,9 @@ import { serveEvent } from '#engine/federation/serve.ts';
 import { admit } from '#engine/federation/gate.ts';
 import { federationPolicy } from '#engine/federation/policy.ts';
 import { keyStore } from '#engine/federation/keys.ts';
+import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
+import { exportKeyRoster, FacadeKeys } from '#engine/facade/control.ts';
+import { startInboxWorker } from '#engine/facade/worker.ts';
 import * as serving from '#engine/federation/serve.ts';
 import { pathfinder } from '@pathfinder/pathfinder';
 import {
@@ -25,7 +28,11 @@ import {
   seedServer,
 } from './federation/doc-helper.ts';
 import { fedCaller } from './http-federation.ts';
-import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
+import {
+  certificatePin,
+  enrolledTenant,
+  initializeNode,
+} from '#engine/facade/identity.ts';
 import {
   exportPublicReplica,
   PublicReplicas,
@@ -70,6 +77,7 @@ import { ingestRemote } from '#engine/room/remote.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { historicalServerSchema } from './fixtures/server-schema-history.ts';
 import { roomOf } from '#engine/server/read.ts';
+import { directoryFactsOf } from '#engine/server/public-replica.ts';
 import { recoverServer } from '#engine/server/startup.ts';
 import { project } from '#engine/server/project.ts';
 import { openStore } from '#engine/store/index.ts';
@@ -80,8 +88,17 @@ import {
   makeRemoteServer,
 } from './fixtures/remote.ts';
 import { makeFakeRoom } from './fixtures/remote-room.ts';
+import { createRoom } from '#engine/room/create.ts';
+import {
+  applicationScope,
+  facadeFailure,
+  FacadeObservations,
+  facadeProcess,
+} from './helpers/facade-process.ts';
+import { facadeTls } from './support/facade-tls.ts';
+import { object, recordHash } from '#engine/facade/protocol.ts';
 
-async function fixture(seedServer = serverSchema) {
+async function fixture(seedServer = serverSchema, facadePin = 'b'.repeat(64)) {
   const dir = await Deno.makeTempDir({ prefix: 'facade-replication-' });
   const open = (name: string, schema = serverSchema) =>
     openStore({
@@ -112,14 +129,14 @@ async function fixture(seedServer = serverSchema) {
       await edge.server(),
       node.signer(),
       node.publicKey,
-      'b'.repeat(64),
+      facadePin,
       node,
     );
   const fp = await edgePairings();
   const bundle = await hp.create({
     node: node.node,
     url: 'https://facade.test',
-    facadePin: 'b'.repeat(64),
+    facadePin,
     expires: Date.now() + 60000,
     required: [...LINK_CAPABILITIES],
   });
@@ -164,6 +181,7 @@ async function fixture(seedServer = serverSchema) {
   const replicas = async () =>
     new RoomReplicas(edge, await edgePairings(), signing.name, keys);
   return {
+    dir,
     home,
     source,
     room,
@@ -227,6 +245,188 @@ async function fixture(seedServer = serverSchema) {
   };
 }
 
+Deno.test('ordinary v12 room directory inventory applies without an upgrade journal', async () => {
+  const f = await fixture();
+  try {
+    const created = await createRoom(f.home, {
+      creator: '@ordinary:logical.test',
+      version: '12',
+      alias: 'ordinary',
+      visibility: 'public',
+    }, f.tenant.signer());
+    await registerAlias(
+      await f.home.server(),
+      '#ordinary:logical.test',
+      created.roomId,
+      '@ordinary:logical.test',
+    );
+    await setVisibility(await f.home.server(), created.roomId, 'public');
+    assert(!created.roomId.includes(':'));
+    const server = await f.home.server();
+    const journalTables = await server.query(
+      "SELECT name FROM sqlite_master WHERE name='room_upgrades'",
+    );
+    assertEquals(
+      journalTables.length
+        ? await server.query('SELECT * FROM room_upgrades')
+        : [],
+      [],
+    );
+    const record = await f.directoryExport();
+    assert(record);
+    const journal = await f.journal();
+    await journal.receive('home', [record]);
+    const owner = await f.directoryOwner();
+    assert(await owner.apply(journal, record));
+    assert((await owner.snapshot())?.rooms.includes(created.roomId));
+    const directory = (await owner.snapshot())!.directory;
+    assertEquals(
+      directory.aliases.find((entry) =>
+        entry.alias === '#ordinary:logical.test'
+      )?.roomId,
+      created.roomId,
+    );
+    assertEquals(
+      directory.publication.find((entry) => entry.roomId === created.roomId)
+        ?.visibility,
+      'public',
+    );
+    assertEquals(
+      directoryFactsOf({
+        ...directory,
+        forgotten: [{ user: '@ordinary:logical.test', roomId: created.roomId }],
+      }, 'logical.test').forgotten[0].roomId,
+      created.roomId,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('directory inventory rejects malformed room identities', async (t) => {
+  for (
+    const id of [
+      '!bad',
+      '!',
+      '!room:',
+      '!:server',
+      '@room:server',
+      '!' + 'x'.repeat(42),
+      '!' + '/'.repeat(43),
+    ]
+  ) {
+    await t.step(id, async () => {
+      for (
+        const facts of [
+          {
+            aliases: [{
+              alias: '#bad:logical.test',
+              roomId: id,
+              creator: null,
+            }],
+            publication: [],
+            forgotten: [],
+          },
+          {
+            aliases: [],
+            publication: [{
+              roomId: id,
+              visibility: 'public',
+              purgeable: null,
+            }],
+            forgotten: [],
+          },
+          {
+            aliases: [],
+            publication: [],
+            forgotten: [{ user: '@ordinary:logical.test', roomId: id }],
+          },
+        ]
+      ) {
+        assertThrows(
+          () => directoryFactsOf(facts, 'logical.test'),
+          MatrixError,
+          'invalid public directory facts',
+        );
+      }
+      const f = await fixture();
+      try {
+        const record = await f.directoryExport();
+        assert(record);
+        const payload = object(record.payload), view = object(payload.view);
+        const bad = {
+          ...record,
+          payload: {
+            ...payload,
+            view: { ...view, rooms: [id], cuts: { ['room:' + id]: 0 } },
+          },
+        };
+        const { hash, ...unsigned } = bad;
+        assert(hash);
+        bad.hash = recordHash(unsigned);
+        const journal = await f.journal();
+        await journal.receive('home', [bad]);
+        await assertRejects(
+          () => f.directoryOwner().then((owner) => owner.apply(journal, bad)),
+          Error,
+          'invalid scope inventory',
+        );
+        assertEquals(
+          (await journal.heads('home', 'in', bad)).applied.sequence,
+          0,
+        );
+      } finally {
+        await f.close();
+      }
+    });
+  }
+});
+
+Deno.test('cold inbox rejection before Journal.apply rejects the finite tail promptly', async () => {
+  const tls = await facadeTls();
+  const f = await fixture(serverSchema, certificatePin(tls.facade.cert));
+  let child: Awaited<ReturnType<typeof facadeProcess>> | undefined;
+  try {
+    const record = await f.directoryExport();
+    assert(record);
+    const payload = object(record.payload), view = object(payload.view);
+    const bad = {
+      ...record,
+      payload: { ...payload, view: { ...view, rooms: ['!invalid'] } },
+    };
+    const { hash, ...unsigned } = bad;
+    assert(hash);
+    bad.hash = recordHash(unsigned);
+    const journal = await f.journal();
+    await journal.receive('home', [bad]);
+    await f.edgeStore().close();
+    const path = tls.dir + '/rejection.toml';
+    await Deno.writeTextFile(
+      path,
+      `[server]\nname="logical.test"\nrole="facade"\nport=0\n[store]\ndir="${f.dir}/edge"\n[media]\nroot="${f.dir}/media"\n[admin]\nsocket="${tls.dir}/reject.sock"\n[federation]\nenabled=false\n[facade]\nnodeid="edge_a"\nurl="https://facade.test"\nlinkport=0\nlinkcert="${tls.dir}/facade.crt"\nlinkkey="${tls.dir}/facade.key"\nlinkcacerts=["${tls.dir}/ca.crt"]\npollseconds=1\n`,
+    );
+    child = await facadeProcess(path, 'facade: link/local admin ready');
+    const observing = child;
+    await assertRejects(
+      () =>
+        bounded(
+          observing.observations.tail('home', [{
+            ...bad,
+            received: { sequence: bad.sequence, hash: bad.hash },
+          }]),
+          2000,
+        ),
+      Error,
+      'inbox directory',
+    );
+    await child.stop();
+  } finally {
+    await child?.dispose();
+    await tls.close();
+    await f.close();
+  }
+});
+
 Deno.test('room replication pins bootstrap, applies only durable semantic suffixes, and completes readiness with its journal result', async () => {
   const f = await fixture();
   try {
@@ -283,6 +483,140 @@ Deno.test('room replication pins bootstrap, applies only durable semantic suffix
       2,
     );
   } finally {
+    await f.close();
+  }
+});
+
+Deno.test('room readiness waits for missing and held verification authority without refusing its consumer or moving its cut', async () => {
+  const f = await fixture();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let applying: Promise<boolean> | undefined;
+  let worker: ReturnType<typeof startInboxWorker> | undefined;
+  const observations = new FacadeObservations();
+  try {
+    const created = await createRoom(f.home, {
+      creator: '@ready:logical.test',
+      version: '11',
+    }, f.tenant.signer());
+    const room = await openRoom(f.home, created.roomId);
+    const record = await exportRoomReplica(
+      f.home,
+      room,
+      f.tenant.serverName,
+      f.node.node,
+      f.bundle.id,
+    );
+    assert(record);
+    const journal = await f.journal();
+    await journal.receive('home', [record]);
+    const server = await f.edgeServer();
+    const keys = new FacadeKeys(
+      server,
+      f.node.signer(),
+      f.node.publicKey,
+      await f.edgePairings(),
+    );
+    const replicas = new RoomReplicas(
+      f.edgeStore(),
+      await f.edgePairings(),
+      f.tenant.serverName,
+      productionKeyResolver(server, f.node.signer(), keys.verificationKeys()),
+    );
+    let finished = false;
+    const consumer = observations.fact(
+      applicationScope('home', record, 0),
+      () => true,
+    )
+      .then((value) => {
+        finished = true;
+        return value;
+      }, (error) => {
+        finished = true;
+        return error;
+      });
+    let attempt = Promise.withResolvers<ReturnType<typeof facadeFailure>>();
+    worker = startInboxWorker({
+      journal,
+      peer: 'home',
+      pollseconds: 3600,
+      apply: async (stream) => {
+        if (stream.stream !== record.stream) return false;
+        const applied = await replicas.apply(journal, stream);
+        if (applied) {
+          observations.accept({ kind: 'applied', peer: 'home', record });
+        }
+        return applied;
+      },
+      changed() {},
+      failed(error, stream, after) {
+        const event = facadeFailure(
+          'inbox room',
+          error,
+          stream && applicationScope('home', stream, after),
+        );
+        observations.accept(event);
+        attempt.resolve(event);
+      },
+    });
+    assertEquals((await bounded(attempt.promise, 5000)).kind, 'blocked');
+    assertEquals(finished, false);
+    assertEquals(
+      (await journal.heads('home', 'in', record)).applied.sequence,
+      0,
+    );
+    assertEquals((await replicas.status(created.roomId))?.ready, false);
+    const control = await exportKeyRoster(
+      f.home,
+      f.tenant,
+      f.node.node,
+      f.bundle.id,
+      (_id, doc) => keys.cosign(doc),
+    );
+    await journal.receive('home', [control]);
+    let calls = 0;
+    const held: Database = {
+      ...server,
+      async tx(fn, options) {
+        if (++calls === 2) {
+          entered.resolve();
+          await release.promise;
+        }
+        return server.tx(fn, options);
+      },
+    };
+    applying = keys.apply(new Journal(held, LINK_CAPABILITIES), control);
+    await bounded(entered.promise, 5000);
+    attempt = Promise.withResolvers<ReturnType<typeof facadeFailure>>();
+    worker.wake();
+    assertEquals((await bounded(attempt.promise, 5000)).kind, 'blocked');
+    assertEquals(finished, false);
+    assertEquals(
+      (await journal.heads('home', 'in', record)).applied.sequence,
+      0,
+    );
+    assertEquals((await replicas.status(created.roomId))?.ready, false);
+    release.resolve();
+    await applying;
+    worker.wake();
+    assertEquals(await bounded(consumer, 5000), record);
+    assertEquals(
+      (await journal.heads('home', 'in', record)).applied.sequence,
+      1,
+    );
+    assertEquals((await replicas.status(created.roomId))?.ready, true);
+    const replica = await openRoom(f.edgeStore(), created.roomId);
+    assertEquals(
+      await replica.tx(async (tx) =>
+        (await tx.events.getStatus(created.createEventId))?.standing
+      ),
+      'accepted',
+    );
+  } finally {
+    release.resolve();
+    await applying;
+    await worker?.close();
+    observations.close(new Error('test finished'));
     await f.close();
   }
 });

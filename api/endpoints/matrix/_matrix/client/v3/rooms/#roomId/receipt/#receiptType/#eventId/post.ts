@@ -23,7 +23,10 @@ export default async function (
     context.state.user as string,
     receiptType,
     request.params.eventId as string,
-    { threadId: (body as Record<string, unknown>).thread_id },
+    {
+      threadId: (body as Record<string, unknown>).thread_id,
+      signal: request._raw.signal,
+    },
   );
   return {};
 }

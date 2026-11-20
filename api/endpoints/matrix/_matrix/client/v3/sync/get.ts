@@ -19,6 +19,7 @@ export default async function (
     userId,
     deviceId,
     deviceGeneration: context.state.deviceGeneration,
+    signal: request._raw.signal,
     ...decoded,
     filter,
   });

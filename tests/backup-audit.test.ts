@@ -10,7 +10,7 @@ import { describePayload } from '#engine/backup/manifest.ts';
 import { roomProjectionSources } from '#engine/store/projection-sources.ts';
 import { recoverServer } from '#engine/server/startup.ts';
 
-async function fixture() {
+async function fixture(version = '11') {
   const root = await Deno.makeTempDir({ prefix: 'backup-audit-' });
   const storage = {
     dir: join(root, 'live'),
@@ -26,7 +26,7 @@ async function fixture() {
     localpart: 'audit',
     password: 'pw',
   });
-  const room = await createRoom({ creator: user.user_id });
+  const room = await createRoom({ creator: user.user_id, version });
   const tenant = await openTenant(app.store, 'inactive.test', { create: true });
   await tenant.tx(async (tx) => {
     await tx.users.insert('inactive', 'Inactive');
@@ -64,6 +64,74 @@ async function fixture() {
     },
   };
 }
+
+Deno.test('backup audit: ordinary v12 identity is create-derived and corrupt room fields stay refused', async (t) => {
+  const f = await fixture('12');
+  try {
+    assert(!f.room.includes(':'));
+    const db = await f.app.store.room(f.room);
+    const rows = await db.query('SELECT id,pdu FROM events ORDER BY id');
+    const create = rows.find((row) =>
+      JSON.parse(String(row.pdu)).type === 'm.room.create'
+    )!;
+    const member = rows.find((row) =>
+      JSON.parse(String(row.pdu)).type === 'm.room.member'
+    )!;
+    await t.step(
+      'ordinary room without an upgrade journal audits',
+      async () => {
+        const server = await f.app.store.server();
+        const journalTables = await server.query(
+          "SELECT name FROM sqlite_master WHERE name='room_upgrades'",
+        );
+        assertEquals(
+          journalTables.length
+            ? await server.query('SELECT * FROM room_upgrades')
+            : [],
+          [],
+        );
+        await f.audit();
+      },
+    );
+    for (
+      const [name, row, change] of [
+        ['create reference', create, { event_id: '$' + 'A'.repeat(43) }],
+        ['create reference hash', create, {
+          content: {
+            room_version: '12',
+            additional_creators: ['@other:logical.test'],
+          },
+        }],
+        ['missing create version', create, { content: {} }],
+        ['numeric create version', create, { content: { room_version: 12 } }],
+        ['unsupported create version', create, {
+          content: { room_version: 'unknown' },
+        }],
+        ['create room field', create, { room_id: '!wrong:elsewhere.test' }],
+        ['member room field', member, { room_id: '!wrong:elsewhere.test' }],
+        ['missing member room', member, { room_id: undefined }],
+        ['indexed field', member, { sender: '@wrong:elsewhere.test' }],
+      ] as const
+    ) {
+      await t.step(name, async () => {
+        await db.execute('UPDATE events SET pdu=? WHERE id=?', [
+          JSON.stringify({ ...JSON.parse(String(row.pdu)), ...change }),
+          row.id,
+        ]);
+        try {
+          await assertRejects(f.audit, Error, 'room PDU/index mismatch');
+        } finally {
+          await db.execute('UPDATE events SET pdu=? WHERE id=?', [
+            row.pdu,
+            row.id,
+          ]);
+        }
+      });
+    }
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('backup audit: captured-only identity, streams and uploaded media include inactive tenants without modifying the cut', async () => {
   const f = await fixture();
@@ -133,9 +201,14 @@ Deno.test('backup audit: projection lag is recoverable, projection ahead of the 
   const f = await fixture();
   try {
     const server = await f.app.store.server();
+    const room = await f.app.store.room(f.room);
+    // A completed callback witness cannot be ahead of publication. Rewinding
+    // only the old watermark now models corruption, not recoverable lag.
     await server.execute('UPDATE watermarks SET position=0 WHERE source=?', [
       'room:' + f.room,
     ]);
+    await assertRejects(f.audit, Error, 'completion progress past publication');
+    await room.execute('UPDATE completion_state SET completed_through=0');
     await f.audit();
     await server.execute(
       'UPDATE watermarks SET position=999999 WHERE source=?',

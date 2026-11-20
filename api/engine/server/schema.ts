@@ -425,8 +425,18 @@ const OUTBOX_PENDING_SQL =
 const FEDERATION_TXNS_RECEIVED_SQL =
   'CREATE INDEX federation_txns_received ON federation_txns(received_ms)';
 
+// Publication captures probe the input event/room sets, including references
+// recorded against another room. Existing composite keys have other prefixes.
+const PUBLICATION_CAPTURE_SQL = `
+CREATE INDEX relations_target ON relations(relates_to);
+CREATE INDEX notification_receipt_refs_room ON notification_receipt_refs(room,event);
+CREATE INDEX push_evaluations_event ON push_evaluations(event);
+CREATE INDEX notification_own_events_event ON notification_own_events(event);
+CREATE INDEX notification_horizons_room ON notification_horizons(room);
+`;
+
 export const serverSchema: SchemaProvider = {
-  version: 45,
+  version: 46,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -472,6 +482,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(RECEIPT_GRAPH_SQL);
     await db.exec(RECEIPT_ADMISSION_SQL);
     await db.exec(DEVICE_PUBLICATIONS_SQL);
+    await db.exec(PUBLICATION_CAPTURE_SQL);
     await db.exec(FACADE_INGRESS_PHASE_SQL);
     await db.exec(FACADE_INGRESS_POLICY_SQL);
   },
@@ -528,6 +539,7 @@ export const serverSchema: SchemaProvider = {
         "DELETE FROM watermarks WHERE source LIKE 'receipt-graph:%'",
       );
     },
+    43: (conn) => conn.exec(PUBLICATION_CAPTURE_SQL),
     42: async (conn) => {
       await conn.exec(DEVICE_PUBLICATIONS_SQL);
       // The old scalar describes only the old serial chain's anchor. Preserve
@@ -539,7 +551,7 @@ INSERT INTO device_publications SELECT json_extract(payload,'$.user_id'),destina
 INSERT INTO device_publication_predecessors SELECT DISTINCT p.subject,p.destination,p.epoch,p.stream_id,j.value FROM device_publications p,json_each(p.content,'$.prev_id') j;
 `);
     },
-    43: (conn) => conn.exec(FACADE_INGRESS_PHASE_SQL),
-    44: (conn) => conn.exec(FACADE_INGRESS_POLICY_SQL),
+    44: (conn) => conn.exec(FACADE_INGRESS_PHASE_SQL),
+    45: (conn) => conn.exec(FACADE_INGRESS_POLICY_SQL),
   },
 };

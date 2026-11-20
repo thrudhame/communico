@@ -5,6 +5,7 @@ import {
   counterCeiling,
   counters,
   nonnegative,
+  scan,
 } from '#engine/backup/checks.ts';
 import { nativeNameFor } from './index.ts';
 import {
@@ -14,6 +15,7 @@ import {
 } from '#engine/signing-primitives.js';
 import type { Manifest } from '#engine/backup/manifest.ts';
 import { tenantProjectionSources } from '#engine/store/projection-sources.ts';
+import { completionCounterName } from './completion.ts';
 
 export async function auditTenant(db: CapturedQuery, id: string) {
   const rows = await db.query(
@@ -76,6 +78,59 @@ export async function auditTenant(db: CapturedQuery, id: string) {
       ['cross_signing', 'cross_signing_keys', 'revision'],
     ]
   ) await counterCeiling(db, heads, counter, table, column);
+  for (const table of ['transaction_completions', 'client_completion_cuts']) {
+    for await (const target of scan(db, table, '*')) {
+      const devices = await db.query(
+        'SELECT 1 FROM devices WHERE localpart=? AND device_id=? AND generation=?',
+        [target.localpart, target.device_id, target.generation],
+      );
+      if (
+        devices.length !== 1 || typeof target.room_id !== 'string' ||
+        target.room_id.length === 0 ||
+        typeof target.room_generation !== 'string' ||
+        target.room_generation.length === 0 ||
+        nonnegative(target.through, 'completion cut') === 0
+      ) auditFailure('completion target ownership');
+      if (table === 'client_completion_cuts') {
+        const counter = completionCounterName({
+          localpart: String(target.localpart),
+          deviceId: String(target.device_id),
+          generation: Number(target.generation),
+        }, {
+          roomId: String(target.room_id),
+          generation: String(target.room_generation),
+          through: Number(target.through),
+        });
+        const revision = nonnegative(target.revision, 'completion revision');
+        // Unchanged legacy markers still belong to the old global allocator;
+        // first mutation of a scope durably switches it to its own ceiling.
+        if (
+          revision === 0 ||
+          revision > (heads[counter] ?? heads.client_completion ?? 0)
+        ) {
+          auditFailure('completion revision');
+        }
+      } else {
+        if (target.retired !== 0 && target.retired !== 1) {
+          auditFailure('completion retirement witness');
+        }
+        const receipt = await db.query(
+          'SELECT event_id,room_id,completed FROM transactions WHERE localpart=? AND device_id=? AND generation=? AND endpoint=? AND txn_id=?',
+          [
+            target.localpart,
+            target.device_id,
+            target.generation,
+            target.endpoint,
+            target.txn_id,
+          ],
+        );
+        if (
+          receipt.length !== 1 || receipt[0].event_id !== target.event_id ||
+          receipt[0].room_id !== target.room_id || receipt[0].completed !== 1
+        ) auditFailure('completion transaction receipt');
+      }
+    }
+  }
   const media = (await db.query(
     "SELECT media_id,size_bytes FROM media WHERE state='uploaded' ORDER BY media_id",
   )).map((m) => {
