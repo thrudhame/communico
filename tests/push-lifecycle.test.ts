@@ -155,7 +155,7 @@ Deno.test('push lifecycle: deactivation rolls notification cleanup forward after
   });
 });
 
-Deno.test('push reconciliation uses event-leading indexes in fresh stores', async () => {
+Deno.test('push reconciliation probes the complete event/room identity in fresh stores', async () => {
   await withStore(async (store) => {
     const db = await store.server();
     for (const table of ['notifications', 'notification_receipt_refs']) {
@@ -165,7 +165,11 @@ Deno.test('push reconciliation uses event-leading indexes in fresh stores', asyn
           ['$e', '!r:test'],
         ),
       );
-      assert(plan.includes(table + '_event'), plan);
+      assert(
+        plan.includes('(event=? AND room=?)') ||
+          plan.includes('(room=? AND event=?)'),
+        plan,
+      );
     }
   });
 });

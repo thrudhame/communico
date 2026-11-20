@@ -30,6 +30,8 @@ import {
   type DomainBinding,
   type DomainHistory,
   DomainHistoryProof,
+  requireAccountExport,
+  requireAccountSelection,
   requireDomainControl,
 } from './domain-control.ts';
 
@@ -276,26 +278,25 @@ export class DomainOperations {
     if (row?.state !== 'paired' || row.grant_json !== canonicalJson(grant)) {
       mismatch('domain exchange grant changed');
     }
-    if (
-      !this.node && !(await conn.query(
-        'SELECT 1 FROM facade_exports WHERE peer=? AND incarnation=? AND scope=?',
-        [context.node, context.id, 'auth:@' + localpart + ':' + context.server],
-      )).length
-    ) mismatch('domain account not selected');
+    if (!this.node) {
+      await requireAccountExport(conn, {
+        peer: context.node,
+        pairing: context.id,
+        server: context.server,
+        localpart,
+      });
+    }
   }
 
   private async tenantSelected(localpart: string, grant: Grant) {
     if (!this.node) return;
-    const [row] = await (await this.store.tenant(this.tenant.serverName)).query(
-      'SELECT pairing,grant_revision FROM account_auth_snapshots WHERE localpart=?',
-      [localpart],
+    await (await this.store.tenant(this.tenant.serverName)).tx((conn) =>
+      requireAccountSelection(conn, {
+        localpart,
+        pairing: grant.body.transcript.body.context.id,
+        grantRevision: grant.body.revision,
+      })
     );
-    if (
-      row?.pairing !== grant.body.transcript.body.context.id ||
-      Number(row.grant_revision) !== grant.body.revision
-    ) {
-      mismatch('domain account not selected');
-    }
   }
 
   private async publish(
@@ -543,14 +544,7 @@ export class DomainOperations {
       if (!this.node) mismatch('facade cannot declare domain bootstrap');
       await (await this.store.tenant(view.server)).tx(async (conn) => {
         await requireDomainControl(conn, view);
-        const [selected] = await conn.query(
-          'SELECT pairing,grant_revision FROM account_auth_snapshots WHERE localpart=?',
-          [view.localpart],
-        );
-        if (
-          selected?.pairing !== view.pairing ||
-          Number(selected.grant_revision) !== view.grantRevision
-        ) mismatch('bootstrap account not selected');
+        await requireAccountSelection(conn, view);
         await requireFacts(conn, view, 'tenant');
       });
       return await journal.apply(peer, stream, async (conn, current) => {

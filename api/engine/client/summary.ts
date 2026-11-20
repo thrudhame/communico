@@ -5,7 +5,11 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import { getRulebook } from '#engine/rulebook/index.ts';
 import { joinedUsers } from '#engine/server/directory.ts';
 import { renderStateEvents } from './render.ts';
-import { requireRoom } from './room.ts';
+import {
+  requireRoom,
+  requireRoomForAdmission,
+  type RoomAccess,
+} from './room.ts';
 import { admitState } from './state-admission.ts';
 
 const SUMMARY_TYPES = [
@@ -19,8 +23,13 @@ const SUMMARY_TYPES = [
   'm.room.avatar',
   'm.room.encryption',
 ];
-export async function heldRoomSummary(roomId: string) {
-  const room = await requireRoom(roomId);
+export async function heldRoomSummary(
+  roomId: string,
+  access: RoomAccess = 'read',
+) {
+  const room = access === 'read'
+    ? await requireRoom(roomId)
+    : await requireRoomForAdmission(roomId);
   const content = new Map<string, Record<string, unknown>>();
   const admission = await admitState(room, { userId: null, discovery: true });
   const rows = admission.rows.filter((row) =>
@@ -82,8 +91,11 @@ export async function heldRoomSummary(roomId: string) {
   return summary;
 }
 
-export async function publicRoomSummary(roomId: string) {
-  const summary = await heldRoomSummary(roomId);
+export async function publicRoomSummary(
+  roomId: string,
+  access: RoomAccess = 'read',
+) {
+  const summary = await heldRoomSummary(roomId, access);
   return Object.fromEntries(
     Object.entries(summary).filter(([key]) =>
       !['encryption', 'room_version', 'allowed_room_ids'].includes(key)

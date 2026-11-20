@@ -563,7 +563,7 @@ export async function captureAccountData(
   global: AccountDataRow[];
   rooms: Map<string, AccountDataRow[]>;
 }> {
-  await tx.ingress.check({ kind: 'domain', localpart });
+  await tx.ingress.check({ kind: 'domain-read', localpart });
   const pushSeq = await tx.pushRules.streamSeq(localpart);
   const seq = Math.max(await tx.accountData.maxSeq(localpart), pushSeq);
   const global = await tx.accountData.ofRoom(localpart, '', since ?? -1, seq);
@@ -629,7 +629,7 @@ export async function getAccountData(
   type: string,
 ): Promise<unknown | null> {
   const content = await tenant.tx(async (tx) => {
-    await tx.ingress.check({ kind: 'domain', localpart });
+    await tx.ingress.check({ kind: 'domain-read', localpart });
     return await tx.accountData.get(localpart, roomId, type);
   });
   return content === null ? null : JSON.parse(content);
@@ -641,7 +641,7 @@ export async function listGlobalAccountData(
   localpart: string,
 ): Promise<AccountDataRow[]> {
   return await tenant.tx(async (tx) => {
-    await tx.ingress.check({ kind: 'domain', localpart });
+    await tx.ingress.check({ kind: 'domain-read', localpart });
     return await tx.accountData.ofRoom(localpart, '');
   });
 }
@@ -653,7 +653,7 @@ export async function listRoomAccountData(
   roomId: string,
 ): Promise<AccountDataRow[]> {
   return await tenant.tx(async (tx) => {
-    await tx.ingress.check({ kind: 'domain', localpart });
+    await tx.ingress.check({ kind: 'domain-read', localpart });
     return await tx.accountData.ofRoom(localpart, roomId);
   });
 }
@@ -666,7 +666,7 @@ export async function listGlobalAccountDataSince(
   aSeq: number,
 ): Promise<AccountDataRow[]> {
   return await tenant.tx(async (tx) => {
-    await tx.ingress.check({ kind: 'domain', localpart });
+    await tx.ingress.check({ kind: 'domain-read', localpart });
     return await tx.accountData.globalSince(localpart, aSeq);
   });
 }
@@ -678,7 +678,7 @@ export async function accountDataMax(
   localpart: string,
 ): Promise<number> {
   return await tenant.tx(async (tx) => {
-    await tx.ingress.check({ kind: 'domain', localpart });
+    await tx.ingress.check({ kind: 'domain-read', localpart });
     const data = await tx.accountData.maxSeq(localpart);
     const push = await tx.pushRules.streamSeq(localpart);
     return Math.max(data, push);

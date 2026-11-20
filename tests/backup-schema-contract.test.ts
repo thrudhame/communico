@@ -47,6 +47,26 @@ for (const migrated of [false, true]) {
           ['rooms', await store.room('!schema:test', { create: true })],
         ] as const
       ) {
+        if (kind === 'server') {
+          // Index-only publication migration: no new durable table disposition.
+          // Register its access paths here for both fresh and upgraded backups.
+          const indexes = [
+            'notification_horizons_room',
+            'notification_own_events_event',
+            'notification_receipt_refs_room',
+            'push_evaluations_event',
+            'relations_target',
+          ];
+          assertEquals(
+            (await db.query(
+              `SELECT name FROM sqlite_master WHERE type='index' AND name IN (${
+                indexes.map(() => '?').join(',')
+              }) ORDER BY name`,
+              indexes,
+            )).map((row) => row.name),
+            indexes,
+          );
+        }
         await auditTables(db, kind);
         await db.exec('CREATE TABLE unregistered_durable_state(value TEXT)');
         await assertRejects(

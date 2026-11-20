@@ -7,7 +7,6 @@ import type {
 import type { Conn } from '#engine/store/db.ts';
 import type { DeviceIdentity } from './devices.ts';
 import { deviceById } from './devices.ts';
-import { nextCounter } from './accountdata.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 
 export const CLIENT_COMPLETION_SQL = `
@@ -32,6 +31,42 @@ export type PendingCompletion = CompletionCut & Readonly<{ revision: number }>;
 
 function scope(device: DeviceIdentity): [string, string, number] {
   return [device.localpart, device.deviceId, device.generation];
+}
+
+// A revision fences only this client's marker for one room incarnation. It is
+// not a tenant stream: independent rooms/devices must never advance one row.
+export function completionCounterName(
+  device: DeviceIdentity,
+  cut: CompletionCut,
+): string {
+  return JSON.stringify([
+    'client_completion',
+    ...scope(device),
+    cut.roomId,
+    cut.generation,
+  ]);
+}
+
+async function nextRevision(
+  conn: Conn,
+  device: DeviceIdentity,
+  target: CompletionTarget,
+): Promise<number> {
+  const name = completionCounterName(device, target);
+  // The legacy global ceiling is read, never rewritten. First use starts above
+  // every legacy marker, including an already-retired marker a sync may hold.
+  // Keep the scoped allocator after retirement so exact replay cannot reuse a
+  // revision (ABA). Its lifetime is the device's retained transaction receipts.
+  await conn.execute(
+    `INSERT INTO counters(name,value)
+    SELECT ?,COALESCE((SELECT value FROM counters WHERE name='client_completion'),0)+1
+    ON CONFLICT(name) DO UPDATE SET value=counters.value+1`,
+    [name],
+  );
+  const [row] = await conn.query('SELECT value FROM counters WHERE name=?', [
+    name,
+  ]);
+  return Number(row.value);
 }
 
 async function requireDevice(
@@ -93,7 +128,7 @@ export async function finishCompletion(
   if (pending !== undefined && Number(pending.through) >= target.through) {
     return;
   }
-  const revision = await nextCounter(conn, 'client_completion');
+  const revision = await nextRevision(conn, device, target);
   await conn.execute(
     `INSERT INTO client_completion_cuts VALUES(?,?,?,?,?,?,?)
     ON CONFLICT(localpart,device_id,generation,room_id,room_generation)
@@ -141,6 +176,13 @@ export async function forgetClientCompletions(
   localpart: string,
   deviceId: string,
 ): Promise<void> {
+  await conn.execute(
+    `DELETE FROM counters WHERE name IN (
+      SELECT json_array('client_completion',localpart,device_id,generation,room_id,room_generation)
+      FROM transaction_completions WHERE localpart=? AND device_id=?
+    )`,
+    [localpart, deviceId],
+  );
   for (const table of ['transaction_completions', 'client_completion_cuts']) {
     await conn.execute(
       `DELETE FROM ${table} WHERE localpart=? AND device_id=?`,

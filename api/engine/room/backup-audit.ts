@@ -3,6 +3,7 @@
 import type { CapturedQuery } from '#engine/store/inspect.ts';
 import { absent, nonnegative, scan } from '#engine/backup/checks.ts';
 import { edgeIds } from './events.ts';
+import { eventRoomId } from './identity.ts';
 
 export async function auditRoom(
   db: CapturedQuery,
@@ -80,7 +81,8 @@ export async function auditRoom(
   ) {
     const pdu = JSON.parse(String(row.pdu));
     if (
-      pdu.room_id !== id || pdu.event_id !== row.id || pdu.type !== row.type ||
+      await eventRoomId(pdu) !== id || pdu.event_id !== row.id ||
+      pdu.type !== row.type ||
       (pdu.state_key ?? null) !== row.state_key || pdu.sender !== row.sender ||
       pdu.depth !== row.depth || pdu.origin_server_ts !== row.origin_ts
     ) {

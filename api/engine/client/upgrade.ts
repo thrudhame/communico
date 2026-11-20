@@ -6,7 +6,7 @@ import {
 } from '#engine/room/creation-input.ts';
 import { moveAliases, roomAliases } from '#engine/server/aliases.ts';
 import { migrateRoomRules } from '#engine/tenant/pushrules.ts';
-import { requireRoom, stateAtSeq } from './room.ts';
+import { requireRoomForAdmission, stateAtSeq } from './room.ts';
 import { powerFor } from './directory.ts';
 import { createRoom, writeStateKey } from './write.ts';
 const TRANSFER = [
@@ -31,12 +31,12 @@ export async function upgradeRoom(
     'new_version',
   );
   const additionalCreators = creationCreators(spec, requestedCreators);
-  const room = await requireRoom(oldRoomId);
+  const room = await requireRoomForAdmission(oldRoomId);
   const power = await powerFor(oldRoomId, userId, 'm.room.tombstone');
   if (power.level < power.need) {
     throw new MatrixError(403, 'M_FORBIDDEN', 'You cannot upgrade this room');
   }
-  const state = await stateAtSeq(oldRoomId, null),
+  const state = await stateAtSeq(oldRoomId, null, undefined, 'admission'),
     oldCreate =
       state.find((r) => r.type === 'm.room.create' && r.stateKey === '')
         ?.content ?? {},

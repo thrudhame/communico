@@ -37,7 +37,12 @@ import { syncStreamHeads } from '#engine/server/stream.ts';
 import type { DeviceIdentity } from '#engine/tenant/devices.ts';
 import type { Room } from '#engine/room/index.ts';
 import { formatCursor } from '#engine/room/segments.ts';
-import { feedAfter, feedBefore, roomsFor } from '#engine/server/read.ts';
+import {
+  feedAfter,
+  feedBefore,
+  relevantFeedChanged,
+  roomsFor,
+} from '#engine/server/read.ts';
 import {
   notificationChanged,
   notificationSnapshot,
@@ -53,11 +58,10 @@ import {
 import { filterEvents, type RoomFilter } from '#engine/tenant/filters.ts';
 import { waitForSync } from '#engine/sync-wait.ts';
 import {
-  getPresence,
+  presenceFor,
   receiptRoomsSince,
   receiptSnapshot,
   setPresenceValue,
-  sharedUsers,
 } from '#engine/server/ephemeral.ts';
 import {
   captureTyping,
@@ -273,17 +277,8 @@ async function relevantChanged(
       (await tx.e2ee.status(device)).seq > i.since!.kSeq
     )
   ) return true;
-  const rows = await app.server.query(
-    `SELECT MAX(seq) AS m FROM (
-       SELECT f.seq FROM feed f JOIN memberships m ON m.room = f.room WHERE m.user = ?
-       UNION ALL SELECT seq FROM prejoin_memberships p WHERE user_id = ? AND status NOT IN ('attempting','failed-attempt') AND ${
-      visiblePrejoin('p')
-    }
-     )`,
-    [i.userId, i.userId],
-  );
   if (
-    Number(rows[0].m ?? 0) > i.since.eSeq ||
+    await relevantFeedChanged(app.server, i.userId, i.since.eSeq) ||
     await accountDataMax(app.tenant, localpartOf(i.userId)) > i.since.aSeq
   ) return true;
   const joined = await roomsFor(app.server, i.userId);
@@ -295,8 +290,8 @@ async function relevantChanged(
   if (
     (await receiptRoomsSince(app.server, i.userId, i.since.rSeq)).size > 0
   ) return true;
-  for (const u of await sharedUsers(app.server, i.userId)) {
-    if ((await getPresence(app.server, u)).seq > i.since.pSeq) return true;
+  for (const row of (await presenceFor(app.server, i.userId)).values()) {
+    if (row.seq > i.since.pSeq) return true;
   }
   return false;
 }
@@ -627,9 +622,10 @@ async function assembleSync(i: SyncInputs): Promise<Record<string, unknown>> {
     for (const u of result.joiners) allJoiners.add(u);
   }
   const presenceEvents = new Map<string, Record<string, unknown>>();
-  const shared = await sharedUsers(app.server, i.userId);
-  const includePresence = async (u: string) => {
-    const row = await getPresence(app.server, u);
+  const visiblePresence = await presenceFor(app.server, i.userId);
+  const includePresence = (u: string) => {
+    const row = visiblePresence.get(u);
+    if (row === undefined) return;
     const content: Record<string, unknown> = { presence: row.presence };
     if (row.statusMsg !== null) content.status_msg = row.statusMsg;
     if (row.presence !== 'offline' && row.lastActiveMs > 0) {
@@ -637,16 +633,16 @@ async function assembleSync(i: SyncInputs): Promise<Record<string, unknown>> {
     }
     presenceEvents.set(u, { type: 'm.presence', sender: u, content });
   };
-  for (const u of shared) {
+  for (const [u, row] of visiblePresence) {
     if (
       i.since === null ||
-      (await getPresence(app.server, u)).seq > i.since.pSeq ||
+      row.seq > i.since.pSeq ||
       allJoiners.has(i.userId)
-    ) await includePresence(u);
+    ) includePresence(u);
   }
   if (i.since !== null) {
     for (const u of allJoiners) {
-      await includePresence(u);
+      includePresence(u);
     }
   }
   const deviceLists = recoveryReset

@@ -89,7 +89,11 @@ Deno.test('push publication: v13 migration preserves old feed and receipts witho
           ['$e', '!r:test'],
         ),
       );
-      assert(plan.includes(table + '_event'), plan);
+      assert(
+        plan.includes('(event=? AND room=?)') ||
+          plan.includes('(room=? AND event=?)'),
+        plan,
+      );
     }
     assertEquals((await db.query('SELECT event,seq FROM relations'))[0], {
       event: old.eventId,
