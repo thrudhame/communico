@@ -604,11 +604,11 @@ export async function putAccountData(
   roomId: string,
   type: string,
   content: unknown,
-  authorize?: () => void,
+  authorize?: import('#engine/store/commit.ts').CommitCheck,
 ): Promise<void> {
   await tenant.tx(async (tx) => {
     await tx.ingress.check({ kind: 'domain', localpart });
-    authorize?.();
+    if (authorize) tx.admit(authorize);
     const seq = await tx.counters.nextStream();
     await tx.accountData.put(
       localpart,
@@ -617,7 +617,6 @@ export async function putAccountData(
       JSON.stringify(content),
       seq,
     );
-    authorize?.();
   });
 }
 

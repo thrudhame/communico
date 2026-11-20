@@ -5,6 +5,7 @@
 import type { Store } from '#engine/store/index.ts';
 import type { ErasureCut } from '#engine/room/state.ts';
 import type { Conn, Database } from '#engine/store/db.ts';
+import type { CommitCheck } from '#engine/store/commit.ts';
 import * as changes from '#engine/room/changes.ts';
 import * as events from '#engine/room/events.ts';
 import { type EdgeOverlay, roomEdges } from '#engine/room/edges.ts';
@@ -39,6 +40,7 @@ function bind(
   rows: events.EventReads,
 ) {
   return {
+    admit: (check: CommitCheck) => conn.admit(check),
     diagnostics: { resolutions: 0 },
     completion: {
       state: () => completion.completionState(conn),
@@ -240,12 +242,15 @@ export function initializeRoom<T>(
   store: Store,
   roomId: string,
   fn: (tx: RoomTx) => Promise<T>,
+  admit?: CommitCheck,
 ): Promise<T> {
+  admit?.();
   return roomTransaction(
     store,
     roomId,
     fn,
     (body) => store.initializeRoom(roomId, (db) => db.tx(body)),
+    admit,
   );
 }
 
@@ -256,6 +261,7 @@ async function roomTransaction<T>(
   roomId: string,
   fn: (tx: RoomTx) => Promise<T>,
   run: <R>(body: (conn: Conn) => Promise<R>) => Promise<R>,
+  admit?: CommitCheck,
 ): Promise<T> {
   const cutoff = roomEdges.cutoff();
   const { result, resolutions, edges } = await run(async (conn) => {
@@ -264,6 +270,7 @@ async function roomTransaction<T>(
     const rows = new events.EventReads(conn, edges);
     const tx = bind(conn, roomId, edges, groups, rows);
     try {
+      if (admit) conn.admit(admit);
       const result = await fn(tx);
       return { result, resolutions: tx.diagnostics.resolutions, edges };
     } finally {
@@ -281,12 +288,14 @@ async function roomTransaction<T>(
 export async function openRoom(
   store: Store,
   roomId: string,
-  options: { create?: boolean } = {},
+  options: { create?: boolean; admit?: CommitCheck } = {},
 ): Promise<Room> {
+  options.admit?.();
   const db: Database = await store.room(roomId, options);
   return {
     id: roomId,
     store,
-    tx: (fn) => roomTransaction(store, roomId, fn, (body) => db.tx(body)),
+    tx: (fn) =>
+      roomTransaction(store, roomId, fn, (body) => db.tx(body), options.admit),
   };
 }

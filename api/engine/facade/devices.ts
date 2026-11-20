@@ -571,7 +571,7 @@ export class DeviceOperations {
     await server.tx(check);
     const { result, projectionRevision, publicKeysChanged } = await tenant.tx(
       async (conn) => {
-        unchanged();
+        conn.admit(unchanged);
         await this.tenantSelected(conn, view);
         const keyCut = await keyChangesCut(conn);
         if (view.kind === 'key-bootstrap') {
@@ -624,10 +624,7 @@ export class DeviceOperations {
           publicKeysChanged,
         });
         const projectionRevision = await pendingTenantProjection(conn);
-        // This synchronous fence is the admission cut. A retirement begun before
-        // it rolls back fact + receipt. Once it passes, a successful owner commit
-        // is admitted immutable work, even if revocation overlaps native COMMIT.
-        unchanged();
+        // Storage validates and retains the authority through native COMMIT.
         return { result, projectionRevision, publicKeysChanged };
       },
     );
