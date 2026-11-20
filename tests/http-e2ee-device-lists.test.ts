@@ -1,6 +1,7 @@
-import { assert, assertEquals } from '@std/assert';
+import { assertEquals } from '@std/assert';
 import { httpSuite } from '#tests/http-app.ts';
 import { config, setConfigForTests } from '#engine/config.ts';
+import { observeSyncWait } from '#tests/support/sync-turn.ts';
 
 type Reply = {
   next_batch: string;
@@ -18,10 +19,12 @@ async function call(
   body?: unknown,
   method = 'POST',
   status = 200,
+  signal?: AbortSignal,
 ): Promise<Reply> {
   const r = await suite.matrix(
     new Request('http://x/_matrix/client/v3/' + path, {
       method: body === undefined ? 'GET' : method,
+      signal,
       headers: { Authorization: 'Bearer ' + token },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     }),
@@ -29,7 +32,12 @@ async function call(
   assertEquals(r.status, status, await r.clone().text());
   return await r.json();
 }
-const sync = (token: string, since?: string, timeout = 0) =>
+const sync = (
+  token: string,
+  since?: string,
+  timeout = 0,
+  signal?: AbortSignal,
+) =>
   call(
     token,
     'sync?timeout=' + timeout + '&filter=' +
@@ -40,6 +48,10 @@ const sync = (token: string, since?: string, timeout = 0) =>
           },
         }),
       ) + (since ? '&since=' + since : ''),
+    undefined,
+    'GET',
+    200,
+    signal,
   );
 const changes = (token: string, from: string, to: string) =>
   call(token, 'keys/changes?from=' + from + '&to=' + to);
@@ -54,37 +66,43 @@ const encrypt = (token: string, room: string) =>
 suite.test('self changes wake an empty account and keys/changes validates cuts', async () => {
   const a = await suite.registerTestUser('list-self', 'pw');
   const before = await sync(a.access_token!);
-  const start = Date.now();
-  const waiting = sync(a.access_token!, before.next_batch, 3000);
-  await call(a.access_token!, 'devices/' + a.device_id, {
-    display_name: 'renamed',
-  }, 'PUT');
-  const after = await waiting;
-  assert(Date.now() - start < 2500);
-  assertEquals(after.device_lists, { changed: [a.user_id], left: [] });
-  const result = await changes(
-    a.access_token!,
-    before.next_batch,
-    after.next_batch,
-  );
-  assertEquals(
-    { changed: result.changed, left: result.left },
-    after.device_lists,
-  );
-  await call(
-    a.access_token!,
-    'keys/changes?from=bad&to=' + after.next_batch,
-    undefined,
-    'GET',
-    400,
-  );
-  await call(
-    a.access_token!,
-    'keys/changes?from=' + after.next_batch + '&to=' + before.next_batch,
-    undefined,
-    'GET',
-    400,
-  );
+  const turns = observeSyncWait();
+  try {
+    const waiting = turns.start((signal) =>
+      sync(a.access_token!, before.next_batch, 3000, signal)
+    );
+    await waiting.capture();
+    await call(a.access_token!, 'devices/' + a.device_id, {
+      display_name: 'renamed',
+    }, 'PUT');
+    const after = await waiting.finish();
+    assertEquals(after.device_lists, { changed: [a.user_id], left: [] });
+    const result = await changes(
+      a.access_token!,
+      before.next_batch,
+      after.next_batch,
+    );
+    assertEquals(
+      { changed: result.changed, left: result.left },
+      after.device_lists,
+    );
+    await call(
+      a.access_token!,
+      'keys/changes?from=bad&to=' + after.next_batch,
+      undefined,
+      'GET',
+      400,
+    );
+    await call(
+      a.access_token!,
+      'keys/changes?from=' + after.next_batch + '&to=' + before.next_batch,
+      undefined,
+      'GET',
+      400,
+    );
+  } finally {
+    await turns.close();
+  }
 });
 
 suite.test('all-room sync and keys changes retain bounded old audiences through leave and rejoin', async () => {

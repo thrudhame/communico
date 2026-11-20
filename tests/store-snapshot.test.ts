@@ -3,6 +3,7 @@ import { openStore, type Store } from '#engine/store/index.ts';
 import { type Database, Db } from '#engine/store/db.ts';
 import { Turso } from '#engine/store/ffi.ts';
 import { integrityCheck } from '#engine/store/create.ts';
+import { keyFor } from '#engine/store/layout.ts';
 
 type SnapshotStore = Store & {
   snapshot(path: string): Promise<{
@@ -135,35 +136,91 @@ Deno.test('store snapshot: lifecycle, held lease and ordinary transactions canno
       },
     };
   };
-  const actions: Promise<unknown>[] = [];
+  type Verdict =
+    & { name: string }
+    & (
+      { status: 'fulfilled' } | { status: 'rejected'; reason: unknown }
+    );
+  const actions: Promise<Verdict>[] = [];
+  const { waiters } = (store as unknown as {
+    admission: { waiters: (() => void)[] };
+  }).admission;
+  const push = waiters.push;
+  const enrolled = latch();
+  waiters.push = function (...wakes) {
+    const length = push.apply(this, wakes);
+    if (length === 3) enrolled.release();
+    return length;
+  };
+  let timer: ReturnType<typeof setTimeout> | undefined;
   let snapshot: ReturnType<SnapshotStore['snapshot']> | undefined;
   try {
     snapshot = store.snapshot(root + '/snapshot');
     await paused.wait;
     const completed: string[] = [];
     const launch = (name: string, fn: () => Promise<unknown>) => {
-      const action = fn().then(() => completed.push(name));
+      // Own rejection immediately, before any independent snapshot IO can yield.
+      const action = fn().then((): Verdict => {
+        completed.push(name);
+        return { name, status: 'fulfilled' };
+      }, (reason): Verdict => ({ name, status: 'rejected', reason }));
       actions.push(action);
+      return action;
     };
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(() =>
+        reject(
+          new Error(
+            'ordering watchdog: lifecycle actions reach the held cut',
+          ),
+        ), 30000);
+    });
     launch('lease', () => lease.db.execute('INSERT INTO source VALUES(1,1)'));
-    launch('logical', () => room.execute('INSERT INTO source VALUES(2,1)'));
     launch('tenant', () => store.tenant('new.test', { create: true }));
     launch('room', () => store.room('!new:test', { create: true }));
-    launch('retire', () => store.retireRoom('!existing:test'));
-    await Promise.resolve();
-    assertEquals(completed, []);
+    const retirement = await Promise.race([
+      launch('retire', () => store.retireRoom('!existing:test')),
+      deadline,
+    ]);
+    assertEquals(retirement.status, 'fulfilled');
+    const logical = await Promise.race([
+      launch('logical', () => room.execute('INSERT INTO source VALUES(2,1)')),
+      deadline,
+    ]);
+    assertEquals(logical.status, 'rejected');
+    assert(
+      logical.status === 'rejected' &&
+        logical.reason instanceof Deno.errors.NotFound,
+    );
+    await Promise.race([enrolled.wait, deadline]);
+    assertEquals(
+      waiters.length,
+      3,
+      'commit and both final publications enroll',
+    );
+    // A published file's later identity/schema read also queues a native
+    // commit. Enrollment alone therefore cannot identify publication admission.
+    // Observe the actual publication destinations while the cut is still held.
+    for (
+      const [kind, id] of [['tenants', 'new.test'], ['rooms', '!new:test']]
+    ) {
+      const key = await keyFor(id);
+      await assertRejects(
+        () => Deno.lstat(root + '/live/' + kind + '/' + key),
+        Deno.errors.NotFound,
+      );
+    }
+    assertEquals(completed, ['retire']);
     resume.release();
     const cut = await snapshot;
     assertEquals(
       cut.files.map((file) => file.id).sort(),
       [null, '!existing:test'].sort(),
     );
-    // Retirement may fence the waiting logical capability, but must not let
-    // any queued operation execute inside the captured common cut.
-    const results = await Promise.allSettled(actions);
+    const results = await Promise.all(actions);
     assertEquals(
-      results.filter((result) => result.status === 'fulfilled').length >= 4,
-      true,
+      results.filter((result) => result.status === 'fulfilled').length,
+      4,
     );
     const ffi = new Turso('./.native/libturso_ffi.so');
     const roomFile = cut.files.find((file) => file.kind === 'rooms')!;
@@ -180,9 +237,11 @@ Deno.test('store snapshot: lifecycle, held lease and ordinary transactions canno
       ffi.close();
     }
   } finally {
+    clearTimeout(timer);
     resume.release();
     await snapshot;
     await Promise.allSettled(actions);
+    waiters.push = push;
     Db.prototype.prepareReadSnapshot = prepare;
     await lease.release();
     await store.close();

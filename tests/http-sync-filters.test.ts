@@ -4,6 +4,7 @@ import { theApp } from '#engine/app.ts';
 import { openRoom } from '#engine/room/index.ts';
 import { sendLocal } from '#engine/room/ingest.ts';
 import { httpSuite } from '#tests/http-app.ts';
+import { observeSyncWait } from '#tests/support/sync-turn.ts';
 
 type Json = Record<string, unknown>;
 const suite = httpSuite('HTTP sync filters and streams');
@@ -12,12 +13,14 @@ async function call(
   token: string,
   method = 'GET',
   body?: unknown,
+  signal?: AbortSignal,
 ) {
   const response = await suite.matrix(
     new Request('http://x' + path, {
       method,
       headers: { Authorization: 'Bearer ' + token },
       body: body === undefined ? undefined : JSON.stringify(body),
+      signal,
     }),
   );
   return { status: response.status, body: await response.json() as Json };
@@ -169,23 +172,29 @@ suite.test('push rule changes and deletes synthesize account data and wake the o
     default: false,
     enabled: false,
   }]);
-  const waiting = call(
-    '/_matrix/client/v3/sync?timeout=5000&since=' + initial.next_batch,
-    token,
+  const turns = observeSyncWait();
+  const waiting = turns.start((signal) =>
+    call(
+      '/_matrix/client/v3/sync?timeout=5000&since=' + initial.next_batch,
+      token,
+      'GET',
+      undefined,
+      signal,
+    )
   );
-  await new Promise((r) => setTimeout(r, 100));
-  const start = performance.now();
-  assertEquals(
-    (await call(rule + '/actions', token, 'PUT', { actions: ['notify'] }))
-      .status,
-    200,
-  );
-  const woken = await waiting;
+  let woken: Awaited<ReturnType<typeof call>>;
+  try {
+    await waiting.capture();
+    assertEquals(
+      (await call(rule + '/actions', token, 'PUT', { actions: ['notify'] }))
+        .status,
+      200,
+    );
+    woken = await waiting.finish();
+  } finally {
+    await turns.close();
+  }
   assertEquals(woken.status, 200);
-  assert(
-    performance.now() - start < 450,
-    'push-rule notification beats polling',
-  );
   assertEquals(rules(woken.body)[0].actions, ['notify']);
   assertEquals((await call(rule, token, 'DELETE')).status, 200);
   const deleted = await sync(token, '&since=' + woken.body.next_batch);
