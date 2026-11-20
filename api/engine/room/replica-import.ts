@@ -34,6 +34,7 @@ export async function importReplicaRoom(
     keys: KeyResolver;
     signal?: AbortSignal;
     signatureUnion?: boolean;
+    home?: boolean;
   },
 ): Promise<void> {
   if (manifest.version !== 1) {
@@ -137,11 +138,11 @@ export async function importReplicaRoom(
       authChain: [...pack.values()],
     });
   // Verification using a declared version is not proof that it is the room's
-  // version. Authenticate the signed create before any v2 overlay can commit.
+  // version. Authenticate the signed create before any v2 evidence can commit.
   const packEvidence = input.signatureUnion ? await verifyPack() : undefined;
   const initialized = new Set<string>();
   // Known auth/genesis events and signature-only packs need the same immutable
-  // comparison/union as live steps. Validate them before any bootstrap writes.
+  // material comparison as live steps. Validate them before bootstrap writes.
   if (packEvidence && (await store.rooms()).includes(manifest.roomId)) {
     const room = await openRoom(store, manifest.roomId);
     await withRoomLock(room.id, () =>
@@ -156,7 +157,7 @@ export async function importReplicaRoom(
         }
         await tx.events.list([...signatures.keys()]);
         for (const evidence of signatures.values()) {
-          await tx.events.mergeSignatures(evidence);
+          await tx.events.mergeSignatures(evidence, input.home);
         }
       }));
   }
@@ -289,7 +290,10 @@ export async function importReplicaRoom(
     await withRoomLock(room.id, () =>
       room.tx(async (tx) => {
         if (input.signatureUnion) {
-          await tx.events.mergeSignatures(signatures.get(step.eventId)!);
+          await tx.events.mergeSignatures(
+            signatures.get(step.eventId)!,
+            input.home,
+          );
         } else {
           const existing = await tx.events.get(step.eventId);
           if (

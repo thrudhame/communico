@@ -337,6 +337,7 @@ export class RoomReplicas {
           self: this.self,
           keys: this.keys,
           signatureUnion: record.version === 2,
+          home: !connection,
         });
         return { roomId: manifest.roomId, cut: manifest.cut };
       },

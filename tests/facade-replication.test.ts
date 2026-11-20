@@ -694,7 +694,7 @@ Deno.test('replica v2 verified join bootstrap preserves evidence-only rooms with
   }
 });
 
-Deno.test('replica signature-only packs union verified signatures without changing base bytes or live news', async () => {
+Deno.test('replica signature-only packs retain verified evidence without changing wire bytes or live news', async () => {
   const f = await fixture();
   try {
     const initial = await f.exports();
@@ -753,9 +753,7 @@ Deno.test('replica signature-only packs union verified signatures without changi
     assertEquals(
       JSON.parse((await replica.tx((tx) => tx.events.get(id)))!.pdu)
         .signatures[witness.name],
-      {
-        [witness.keyId]: signature,
-      },
+      undefined,
     );
     assertEquals(
       await db.query('SELECT pdu FROM events WHERE id=?', [id]),
@@ -767,23 +765,19 @@ Deno.test('replica signature-only packs union verified signatures without changi
     );
     const suffix = await exportReplicaRoom(replica, f.tenant.serverName, head);
     assertEquals(suffix.steps, []);
-    assertEquals(suffix.cut, head + 1);
+    assertEquals(suffix.cut, head);
     assertEquals(
       suffix.events.find((pdu) => pdu.event_id === id)!
         .signatures![witness.name],
-      {
-        [witness.keyId]: signature,
-      },
+      undefined,
     );
     await apply();
-    assertEquals(await replica.tx((tx) => tx.changes.head()), head + 1);
+    assertEquals(await replica.tx((tx) => tx.changes.head()), head);
     await f.reopen();
     assertEquals(
       JSON.parse((await (await f.replica()).tx((tx) => tx.events.get(id)))!.pdu)
         .signatures[witness.name],
-      {
-        [witness.keyId]: signature,
-      },
+      undefined,
     );
     // Invalid optional evidence is omitted, never a reason to reject the pack
     // or replace the verified witness. Full material remains immutable.
@@ -792,23 +786,97 @@ Deno.test('replica signature-only packs union verified signatures without changi
     assertEquals(
       JSON.parse((await (await f.replica()).tx((tx) => tx.events.get(id)))!.pdu)
         .signatures[witness.name],
-      { [witness.keyId]: signature },
+      undefined,
     );
+    const [held] = await (await f.edgeStore().room(replica.id)).query(
+      'SELECT signatures FROM event_signatures WHERE event=?',
+      [id],
+    );
+    assertEquals(JSON.parse(String(held.signatures))[witness.name], {
+      [witness.keyId]: signature,
+    });
     assertEquals(
       await (await f.replica()).tx((tx) => tx.changes.head()),
-      head + 1,
+      head,
     );
     target.signatures![witness.name][witness.keyId] = signature;
     target.content = { ...target.content, injected: true };
     await assertRejects(apply);
     assertEquals(
       await (await f.replica()).tx((tx) => tx.changes.head()),
-      head + 1,
+      head,
     );
   } finally {
     await f.close();
   }
 });
+Deno.test('replica wire: authenticated home copy supersedes the facade first copy without synthesizing a PDU', async () => {
+  const f = await fixture();
+  try {
+    const original = await exportReplicaRoom(f.room, f.tenant.serverName);
+    const own = structuredClone(original);
+    const target = own.events.find((pdu) => pdu.type === 'm.room.create')!;
+    const id = String(target.event_id);
+    const witness = await makeRemoteServer('facade-witness.test');
+    const body = redact(
+      target as unknown as Record<string, unknown>,
+      own.roomVersion,
+    );
+    delete body.event_id;
+    delete body.signatures;
+    target.signatures[witness.name] = {
+      [witness.keyId]: b64encodeStd(
+        new Uint8Array(
+          await crypto.subtle.sign(
+            { name: 'Ed25519' },
+            witness.kp.privateKey,
+            new TextEncoder().encode(canonicalJson(body)),
+          ),
+        ),
+      ),
+    };
+    await importReplicaRoom(f.edgeStore(), own, {
+      self: f.tenant.serverName,
+      keys: fakeKeyResolver(f.signing, witness),
+      signatureUnion: true,
+    });
+    const replica = await f.replica();
+    assertEquals(
+      JSON.parse((await replica.tx((tx) => tx.events.get(id)))!.pdu),
+      target,
+    );
+    const record = await exportRoomReplica(
+      f.home,
+      f.room,
+      f.tenant.serverName,
+      f.node.node,
+      f.bundle.id,
+      2,
+    );
+    assert(record);
+    const journal = new Journal(await f.edgeServer(), LINK_SUPPORTED);
+    await journal.receive('home', [record]);
+    await (await f.replicas()).apply(journal, record);
+    const home = original.events.find((pdu) => pdu.event_id === id)!;
+    assertEquals(
+      JSON.parse((await replica.tx((tx) => tx.events.get(id)))!.pdu),
+      home,
+    );
+    assertEquals(
+      JSON.parse((await replica.tx((tx) => tx.events.stored(id)))!),
+      target,
+    );
+    await f.reopen();
+    const wire = await exportReplicaRoom(
+      await f.replica(),
+      f.tenant.serverName,
+    );
+    assertEquals(wire.events.find((pdu) => pdu.event_id === id), home);
+  } finally {
+    await f.close();
+  }
+});
+
 // Register HTTP compositions after the low-level/historical-schema cases. App
 // recovery installs process-wide projection hooks, which require current schemas.
 function appliedReadTests() {

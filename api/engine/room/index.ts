@@ -84,8 +84,9 @@ function bind(
       list: (ids: readonly string[]) => rows.list(ids),
       mergeSignatures: async (
         evidence: import('./signatures.ts').SignatureEvidence,
+        home = false,
       ) => {
-        if (!await events.mergeEventSignatures(conn, rows, evidence)) {
+        if (!await events.mergeEventSignatures(conn, rows, evidence, home)) {
           return false;
         }
         await changes.appendChange(conn, 'signature', evidence.eventId, {});

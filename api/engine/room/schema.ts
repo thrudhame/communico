@@ -158,19 +158,22 @@ UPDATE waits SET state='ready' WHERE
 `;
 
 const HASH_REDACTION_SQL =
-  'ALTER TABLE events ADD COLUMN hash_redacted INTEGER NOT NULL DEFAULT 0';
+  'ALTER TABLE events ADD COLUMN hash_redacted INTEGER NOT NULL DEFAULT 0;';
+
+const HOME_PDU_SQL = 'ALTER TABLE event_signatures ADD COLUMN home_pdu TEXT';
 
 export const roomSchema: SchemaProvider = {
-  version: 10,
+  version: 11,
   apply: async (db) => {
     await db.exec(
       ROOM_SCHEMA_SQL + TOPOLOGY_SQL + CHANGE_INDEX_SQL + PUBLICATION_KEYS_SQL +
         ANNOTATION_INDEX_SQL + REMOTE_BATCHES_SQL + WAIT_READY_SQL +
-        EVENT_SIGNATURES_SQL + HASH_REDACTION_SQL,
+        EVENT_SIGNATURES_SQL + HASH_REDACTION_SQL + HOME_PDU_SQL,
     );
     await db.tx(initializeCompletion, { mode: 'deferred' });
   },
   migrations: {
+    10: (conn) => conn.exec(HOME_PDU_SQL),
     9: (conn) => conn.exec(HASH_REDACTION_SQL),
     8: (conn) => conn.exec(EVENT_SIGNATURES_SQL),
     7: initializeCompletion,

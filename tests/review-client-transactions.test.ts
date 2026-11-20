@@ -191,12 +191,7 @@ for (const kind of ['send', 'redact'] as const) {
           );
           assertEquals(
             JSON.parse(stored!.pdu),
-            cut === 'after'
-              ? {
-                ...expected,
-                signatures: { ...expected.signatures, ...learned },
-              }
-              : expected,
+            expected,
           );
           assertEquals(
             JSON.parse(
