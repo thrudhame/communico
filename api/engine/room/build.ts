@@ -355,6 +355,7 @@ export async function buildInTx(
   partial: BuildPartial,
   signer: Signer,
 ): Promise<Pdu> {
+  if (signer.admit) tx.admit(signer.admit);
   const isCreate = partial.type === 'm.room.create' &&
     (partial.prev_events ?? []).length === 0;
   const stay = await stayForEvent(tx, partial);

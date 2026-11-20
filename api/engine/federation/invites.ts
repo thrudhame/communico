@@ -138,7 +138,7 @@ export async function inviteRemote(
   deps: InviteDeps,
 ): Promise<{ eventId: string }> {
   const remote = domainOf(target);
-  const room = await openRoom(deps.store, roomId);
+  const room = await openRoom(deps.store, roomId, { admit: deps.signer.admit });
   await room.tx(async (tx) => {
     await assertAcl(tx, remote);
     await assertAcl(tx, deps.self);
@@ -483,6 +483,7 @@ export async function receiveInvite(
         );
         // Redelivery is not a new invitation, including after local rejection.
         if (previous[0]?.event_id === eventId) return;
+        if (deps.signer.admit) tx.admit(deps.signer.admit);
         if (previous.length) {
           await withdrawInvitePush(
             tx,
@@ -566,6 +567,7 @@ export async function rejectInviteRemote(
         ? candidatesOf(invite, deps.self)
         : [];
     }
+    if (deps.signer.admit) tx.admit(deps.signer.admit);
     await withdrawInvitePush(tx, userId, roomId, invite.eventId);
     const localLeave = await buildLocalPrejoinLeave(
       invite,
@@ -648,6 +650,7 @@ export async function prejoinDeparture(
       if (rows[0]?.local_leave_json != null) {
         return JSON.parse(String(rows[0].local_leave_json)) as Pdu;
       }
+      if (deps.signer.admit) tx.admit(deps.signer.admit);
       const signed = await buildLocalPrejoinLeave(invite, deps.signer);
       await tx.execute(
         'UPDATE prejoin_memberships SET local_leave_json=? WHERE room_id=? AND user_id=? AND revision=? AND seq=?',
@@ -787,6 +790,9 @@ async function performRejectInvite(
         [invite.roomId, invite.userId, invite.revision],
       );
       if (!rows.length) return false;
+      if (invite.leaveJson === null && deps.signer.admit) {
+        tx.admit(deps.signer.admit);
+      }
       await tx.execute(
         'UPDATE prejoin_memberships SET leave_json=? WHERE room_id=? AND user_id=? AND revision=?',
         [JSON.stringify(signed), invite.roomId, invite.userId, invite.revision],

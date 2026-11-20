@@ -213,7 +213,7 @@ export class ToDeviceOperations {
     });
     const { result, pending, changed } =
       await (await this.store.tenant(context.server)).tx(async (conn) => {
-        unchanged();
+        conn.admit(unchanged);
         for (const view of bindings) await this.tenantSelected(conn, view);
         requireSelectionReady(
           !!await tenantAuthority(conn),
@@ -270,7 +270,6 @@ export class ToDeviceOperations {
         );
         const changed = inboxChanged ||
           beforeOperation?.operation_id !== afterOperation?.operation_id;
-        unchanged();
         return { result, pending, changed };
       });
     await tenantChangesCommitted(
@@ -327,7 +326,7 @@ export class ToDeviceOperations {
     const after = exported ? Number(exported.source_cut) : 0;
     const { operations, pending, inboxChanged } =
       await (await this.store.tenant(binding.server)).tx(async (conn) => {
-        unchanged();
+        conn.admit(unchanged);
         await this.tenantSelected(conn, binding);
         const before = await syncStreamHeads(conn);
         const operations = await captureToDeviceOperations(
@@ -338,7 +337,6 @@ export class ToDeviceOperations {
         const pending = await pendingTenantProjection(conn);
         const inboxChanged =
           (await syncStreamHeads(conn)).inbox !== before.inbox;
-        unchanged();
         return { operations, pending, inboxChanged };
       });
     // Capture can discharge an already-admitted selector as its scope arrives.
@@ -464,7 +462,7 @@ export class ToDeviceOperations {
     });
     const { result, projectionRevision, inboxChanged } = await tenant.tx(
       async (conn) => {
-        unchanged();
+        conn.admit(unchanged);
         await this.tenantSelected(conn, view);
         const before = await syncStreamHeads(conn);
         await importToDeviceOperation(conn, view.operation, view, view.server);
@@ -476,9 +474,7 @@ export class ToDeviceOperations {
           inboxChanged,
         });
         const projectionRevision = await pendingTenantProjection(conn);
-        // Revocation before this admission cut rolls back fact, inbox and receipt.
-        // A successful commit is immutable admitted work even across retirement.
-        unchanged();
+        // Storage validates and retains the authority through native COMMIT.
         return { result, projectionRevision, inboxChanged };
       },
     );

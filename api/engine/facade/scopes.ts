@@ -7,6 +7,7 @@ import { canonicalJson } from '#engine/canonical.ts';
 import type { Pairings } from './pairing.ts';
 import { LinkError, type LinkRecord, type Stream } from './protocol.ts';
 import { verificationFence } from './signing-authority.ts';
+import type { CommitCheck } from '#engine/store/commit.ts';
 
 export async function applyReplicaScope(options: {
   db: Database;
@@ -25,7 +26,7 @@ export async function applyReplicaScope(options: {
   // A snapshot owner may prove these predecessors subsumed by record. They
   // still receive individual durable results in the same contiguous commit.
   superseded?: readonly { record: LinkRecord; result: unknown }[];
-  apply(admit: () => void): Promise<unknown>;
+  apply(admit: CommitCheck): Promise<unknown>;
   // A control revision may supersede an authenticated snapshot while its
   // independent stream drains. Consume that source cut without enabling it.
   ready?(conn: Conn): Promise<boolean>;
@@ -80,7 +81,7 @@ export async function applyReplicaScope(options: {
   };
   const admit = verificationFence(db);
   await db.tx(async (conn) => {
-    admit();
+    conn.admit(admit);
     await checkGrant(conn);
     const [prior] = await conn.query(
       'SELECT source_cut,pending_hash FROM facade_scopes WHERE incarnation=? AND scope=?',
@@ -100,7 +101,6 @@ export async function applyReplicaScope(options: {
         changedColumns('facade_scopes', 'ready', 'pending_hash'),
       [context.id, scope, after, record.hash],
     );
-    admit();
   });
   const result = await options.apply(admit);
   return await journal.apply(

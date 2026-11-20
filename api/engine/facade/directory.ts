@@ -28,6 +28,7 @@ import type { Tenant } from '#engine/tenant/index.ts';
 import { appendRecord, type Journal, receivedFence } from './journal.ts';
 import type { Pairings } from './pairing.ts';
 import { signingFence } from './signing-authority.ts';
+import { type CommitCheck, commitCheck } from '#engine/store/commit.ts';
 import {
   integer,
   LinkError,
@@ -223,7 +224,7 @@ export function startDirectoryExports(
 
 export type ReplicaRoomAdmission = {
   check(conn: Conn): Promise<void>;
-  checkCurrent(): void;
+  checkCurrent: CommitCheck;
 };
 
 type ScopeAccess = 'current' | 'applied';
@@ -345,7 +346,7 @@ export class DirectoryReplicas {
     if (!view) unavailable();
     const scope = 'room:' + roomId;
     const localAuth = new Set<string>();
-    const checkCurrent = () => {
+    const checkCurrent = commitCheck(() => {
       authority();
       const streams = access === 'applied'
         ? [...localAuth]
@@ -355,9 +356,9 @@ export class DirectoryReplicas {
           !received('home', { source: 'home', incarnation: pairing, stream })
         ) unavailable();
       }
-    };
+    }, authority);
     const check = async (conn: Conn) => {
-      checkCurrent();
+      conn.admit(checkCurrent);
       const [binding] = await conn.query(
         "SELECT state,grant_json FROM facade_pairings WHERE id=? AND side='facade'",
         [pairing],
@@ -378,7 +379,6 @@ export class DirectoryReplicas {
       if (state === 'absent' && !allowAbsent) {
         throw new MatrixError(404, 'M_NOT_FOUND', 'scope not found');
       }
-      checkCurrent();
     };
     await this.db.tx(check);
     return { check, checkCurrent };

@@ -9,6 +9,7 @@ import {
   type Value,
 } from '#engine/store/ffi.ts';
 import { Gate } from '#engine/store/gate.ts';
+import { commitAdmitted, type CommitCheck } from '#engine/store/commit.ts';
 import type { Admission } from '#engine/store/admission.ts';
 import { databaseFiles } from '#engine/store/layout.ts';
 import { publish } from '#engine/store/files.ts';
@@ -47,7 +48,18 @@ export class Conn {
   private active = true;
   private writeVersion = 0;
 
-  constructor(private readonly ffi: Turso, private readonly handle: number) {}
+  constructor(
+    private readonly ffi: Turso,
+    private readonly handle: number,
+    private readonly checks = new Set<CommitCheck>(),
+  ) {}
+
+  /** Retain a dependency for this attempt's actual native commit. */
+  admit(check: CommitCheck): void {
+    this.check();
+    check();
+    this.checks.add(check);
+  }
 
   private check(): void {
     if (!this.active) {
@@ -91,7 +103,7 @@ export interface Database {
   readonly path: string;
   tx<T>(
     fn: (connection: Conn) => Promise<T>,
-    options?: { mode?: BeginMode },
+    options?: { mode?: BeginMode; admit?: CommitCheck },
   ): Promise<T>;
   query(sql: string, values?: readonly Value[]): Promise<Row[]>;
   execute(sql: string, values?: readonly Value[]): Promise<number>;
@@ -241,7 +253,7 @@ export class Db {
   // Only native write-write/busy conflicts retry, after a successful rollback.
   async tx<T>(
     fn: (connection: Conn) => Promise<T>,
-    options: { mode?: BeginMode } = {},
+    options: { mode?: BeginMode; admit?: CommitCheck } = {},
   ): Promise<T> {
     if (this.closing || this.closed) {
       throw new Error('database is closing or closed');
@@ -249,7 +261,7 @@ export class Db {
     this.users++;
     try {
       for (let attempt = 1;; attempt++) {
-        const result = await this.attempt(fn, options.mode ?? 'concurrent');
+        const result = await this.attempt(fn, options);
         if (result.committed) return result.value;
         this.conflictCounters.conflicts++;
         if (attempt === TRANSACTION_ATTEMPTS) {
@@ -273,7 +285,7 @@ export class Db {
 
   private async attempt<T>(
     fn: (connection: Conn) => Promise<T>,
-    mode: BeginMode,
+    options: { mode?: BeginMode; admit?: CommitCheck },
   ): Promise<
     { committed: true; value: T } | { committed: false; error: StoreError }
   > {
@@ -284,14 +296,18 @@ export class Db {
     let committed = false;
     try {
       handle = await this.acquire();
-      connection = new Conn(this.ffi, handle);
+      const checks = new Set<CommitCheck>();
+      connection = new Conn(this.ffi, handle, checks);
       try {
-        await this.ffi.begin(handle, mode);
+        await this.ffi.begin(handle, options.mode ?? 'concurrent');
+        if (options.admit) connection.admit(options.admit);
         const result = await fn(connection);
+        const commit = () =>
+          commitAdmitted(checks, () => this.ffi.commit(handle!));
         if (this.admission) {
-          await this.admission.run(() => this.ffi.commit(handle!));
+          await this.admission.run(commit);
         } else {
-          await this.ffi.commit(handle);
+          await commit();
         }
         committed = true;
         return { committed: true, value: result };
