@@ -9,6 +9,7 @@ import {
   publishKeyDocument,
 } from '#engine/facade/control.ts';
 import { homeKeyDocument } from '#engine/federation/keydoc.ts';
+import { startHomeLinks } from '#engine/facade/home.ts';
 import { signWithSigner } from '#engine/federation/keys.ts';
 import { initializeNode } from '#engine/facade/identity.ts';
 import { Journal } from '#engine/facade/journal.ts';
@@ -27,6 +28,7 @@ import type { Database } from '#engine/store/db.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { startHttp } from './http-app.ts';
+import { facadeTls } from './support/facade-tls.ts';
 import {
   importPublicKeyFromRaw,
   matrixBase64,
@@ -179,6 +181,65 @@ async function fixture(seedServer = serverSchema) {
     },
   };
 }
+
+Deno.test('home link recovery publishes last-facade retirement before any public key request', async () => {
+  const tls = await facadeTls();
+  const f = await fixture();
+  let app: Awaited<ReturnType<typeof openApp>> | undefined;
+  let links: Awaited<ReturnType<typeof startHomeLinks>> | undefined;
+  try {
+    await f.receive();
+    const retiredAt = Date.now();
+    const revoked = await f.hp.revoke(f.bundle.id, retiredAt);
+    setConfigForTests({
+      server: { name: 'logical.test', role: 'home' },
+      facade: {
+        // The retired peer need not remain in the configured worker set.
+        nodes: ['not_enrolled'],
+        linkcert: tls.dir + '/home.crt',
+        linkkey: tls.dir + '/home.key',
+        linkcacerts: [tls.dir + '/ca.crt'],
+      },
+    });
+    app = await f.openHomeApp();
+    links = await startHomeLinks(app);
+    // No key-document request or explicit control publisher repairs this cut.
+    assertEquals(
+      (await app.federationKeys.getVerifyKey(
+        'logical.test',
+        app.tenant.keyId,
+        Date.now(),
+        'event',
+      )).algorithm.name,
+      'Ed25519',
+    );
+    const [held] = await app.server.query(
+      'SELECT revision,document_json FROM facade_key_roster WHERE singleton=1',
+    );
+    assertEquals(Number(held.revision), revoked.body.revision);
+    const doc = JSON.parse(String(held.document_json));
+    assertEquals(Object.keys(doc.verify_keys), [app.tenant.keyId]);
+    assertEquals(doc.old_verify_keys[f.node.keyId], {
+      key: f.node.publicKey,
+      expired_ts: retiredAt,
+    });
+    assertEquals(
+      await verifyJson(
+        doc,
+        'logical.test',
+        app.tenant.keyId,
+        await importPublicKeyFromRaw(matrixBase64(app.tenant.publicB64, 32)),
+      ),
+      true,
+    );
+  } finally {
+    await links?.close();
+    if (app) await closeApp();
+    await f.close();
+    await tls.close();
+    setConfigForTests({});
+  }
+});
 
 Deno.test('home-only App resolves its own key without logical-self acquisition', async () => {
   setConfigForTests({ server: { name: 'logical.test', role: 'home' } });

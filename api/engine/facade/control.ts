@@ -313,6 +313,25 @@ export async function publishKeyDocument(
   }
 }
 
+function onlyHomeSigns(roster: Roster, signer: Signer): boolean {
+  return roster.keys.every((key) =>
+    key.keyId === signer.keyId || key.retiredAt !== null
+  );
+}
+
+/** Retirement no longer needs a peer signature. The existing home lifecycle
+ * repairs this complete publication even when no retired link can reconnect. */
+export async function refreshRetiredKeyDocument(
+  db: Database,
+  signer: Signer,
+  publicKey: string,
+): Promise<void> {
+  const roster = await homeRoster(db, signer, publicKey);
+  if (roster.keys.length > 1 && onlyHomeSigns(roster, signer)) {
+    await publishedKeyDocument(db, signer, publicKey);
+  }
+}
+
 /** A public read never starts network collection or publishes a partial roster. */
 export async function publishedKeyDocument(
   db: Database,
@@ -322,11 +341,7 @@ export async function publishedKeyDocument(
 ): Promise<KeyDoc | null> {
   const roster = await homeRoster(db, signer, publicKey);
   if (roster.keys.length === 1) return null;
-  if (
-    roster.keys.every((key) =>
-      key.keyId === signer.keyId || key.retiredAt !== null
-    )
-  ) {
+  if (onlyHomeSigns(roster, signer)) {
     return await publishKeyDocument(db, signer, publicKey, () => {
       throw new LinkError('LINK_UNAVAILABLE', 'unexpected active facade');
     });
