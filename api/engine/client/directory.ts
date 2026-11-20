@@ -87,7 +87,7 @@ export async function resolveAlias(
     throw new MatrixError(404, 'M_NOT_FOUND', 'Room alias not found');
   }
   await requireDirectoryScope('room:' + roomId, access);
-  const servers = await serversInRoom(roomId);
+  const servers = await serversInRoom(roomId, access);
   if (servers.length === 0) {
     throw new MatrixError(404, 'M_NOT_FOUND', 'Room alias not found');
   }
@@ -99,7 +99,7 @@ export async function powerFor(roomId: string, user: string, type: string) {
   const rows = await stateAtSeq(roomId, null, [
     ['m.room.power_levels', ''],
     ['m.room.create', ''],
-  ]);
+  ], 'admission');
   const pdu = async (type: string) => {
     const id = rows.find((r) => r.type === type && r.stateKey === '')?.eventId;
     const row = id === undefined
@@ -128,10 +128,14 @@ export async function deleteAlias(alias: string, user: string) {
       'not the alias creator and insufficient power level',
     );
   }
-  const canon =
-    (await stateAtSeq(row.roomId, null, [['m.room.canonical_alias', '']])).find(
-      (r) => r.type === 'm.room.canonical_alias' && r.stateKey === '',
-    );
+  const canon = (await stateAtSeq(
+    row.roomId,
+    null,
+    [['m.room.canonical_alias', '']],
+    'admission',
+  )).find(
+    (r) => r.type === 'm.room.canonical_alias' && r.stateKey === '',
+  );
   await removeAlias(db, alias);
   if (canon !== undefined) {
     const content = { ...canon.content };
@@ -286,7 +290,7 @@ export async function listLocalPublishedRooms(
     if (access === 'admission') {
       await theApp().replica?.requireScope('room:' + id);
     }
-    const chunk = await publicRoomSummary(id);
+    const chunk = await publicRoomSummary(id, access);
     if (
       roomTypes !== undefined &&
       !roomTypes.includes(

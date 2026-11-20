@@ -28,14 +28,18 @@ import { getProfile } from '#engine/tenant/users.ts';
 import {
   lookupRoomForAdmission,
   requireRoomForAdmission,
+  type RoomAccess,
   stateAtSeq,
 } from './room.ts';
 import { inviteDeps } from './write.ts';
 
-export async function serversInRoom(roomId: string): Promise<string[]> {
-  const members = (await stateAtSeq(roomId, null)).filter((r) =>
-    r.type === 'm.room.member' && r.content.membership === 'join'
-  );
+export async function serversInRoom(
+  roomId: string,
+  access: RoomAccess = 'read',
+): Promise<string[]> {
+  const members = (await stateAtSeq(roomId, null, undefined, access)).filter((
+    r,
+  ) => r.type === 'm.room.member' && r.content.membership === 'join');
   return [...new Set(members.map((r) => domainOf(r.stateKey)))].sort();
 }
 
@@ -88,7 +92,7 @@ export async function join(
   if (result === undefined) {
     const deps = inviteDeps();
     const invitation = await inviteFor(roomId, userId, deps);
-    const held = room === null ? [] : await serversInRoom(roomId);
+    const held = room === null ? [] : await serversInRoom(roomId, 'admission');
     const qualified = room === null
       ? []
       : await restrictedResidents(room, userId);

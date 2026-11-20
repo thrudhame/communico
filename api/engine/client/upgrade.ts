@@ -36,7 +36,7 @@ export async function upgradeRoom(
   if (power.level < power.need) {
     throw new MatrixError(403, 'M_FORBIDDEN', 'You cannot upgrade this room');
   }
-  const state = await stateAtSeq(oldRoomId, null),
+  const state = await stateAtSeq(oldRoomId, null, undefined, 'admission'),
     oldCreate =
       state.find((r) => r.type === 'm.room.create' && r.stateKey === '')
         ?.content ?? {},

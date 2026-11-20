@@ -9,6 +9,8 @@ import { membershipOf } from '#engine/server/read.ts';
 import { parseStreamToken } from './tokens.ts';
 import { admitState } from './state-admission.ts';
 
+export type RoomAccess = 'read' | 'admission';
+
 export async function lookupRoom(roomId: string): Promise<Room | null> {
   return await lookup(roomId, 'read');
 }
@@ -21,7 +23,7 @@ export async function lookupRoomForAdmission(
 
 async function lookup(
   roomId: string,
-  access: 'read' | 'admission',
+  access: RoomAccess,
 ): Promise<Room | null> {
   try {
     const replica = theApp().replica;
@@ -132,8 +134,11 @@ export async function stateAtSeq(
   roomId: string,
   seq: number | null,
   keys?: readonly (readonly [type: string, stateKey: string])[],
+  access: RoomAccess = 'read',
 ): Promise<StateRow[]> {
-  const room = await requireRoom(roomId);
+  const room = access === 'read'
+    ? await requireRoom(roomId)
+    : await requireRoomForAdmission(roomId);
   const feed = seq === null ? [] : await theApp().server.query(
     'SELECT stay, pos FROM feed WHERE room = ? AND seq <= ? ORDER BY seq DESC LIMIT 1',
     [roomId, seq],

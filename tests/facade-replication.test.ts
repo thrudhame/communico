@@ -101,7 +101,10 @@ import { registerUser } from '#engine/tenant/users.ts';
 import { writeStateKey } from '#engine/client/write.ts';
 import { getPresence } from '#engine/client/presence.ts';
 import { setPresence } from '#engine/server/ephemeral.ts';
-import { resolveAlias } from '#engine/client/directory.ts';
+import {
+  listLocalPublishedRooms,
+  resolveAlias,
+} from '#engine/client/directory.ts';
 
 async function fixture(seedServer = serverSchema, facadePin = 'b'.repeat(64)) {
   const dir = await Deno.makeTempDir({ prefix: 'facade-replication-' });
@@ -259,10 +262,12 @@ function appliedReadTests() {
       'received room',
       'applying room',
       'partially applying room',
+      'unrelated room',
     ] as const
   ) {
     Deno.test(
-      'applied read stays available during a newer ' + pending + ' suffix',
+      'applied handler read stays available during a newer ' + pending +
+        ' suffix',
       async () => {
         const f = await fixture();
         let http: Deno.HttpServer<Deno.NetAddr> | undefined;
@@ -320,6 +325,8 @@ function appliedReadTests() {
             keyDocument: () => Promise.reject(new Error('unused key document')),
             publicRooms: async () => (await directory.snapshot())!.publicRooms,
           });
+          // Handler-level HTTP proof: main's capability manifest does not mount
+          // B6 client room routes yet. This prerequisite does not enable routes.
           http = Deno.serve({
             hostname: '127.0.0.1',
             port: 0,
@@ -377,11 +384,29 @@ function appliedReadTests() {
             })
             : null;
           if (tail) await f.ingest([tail]);
+          let unrelated: Awaited<ReturnType<typeof f.exports>> = null;
+          if (pending === 'unrelated room') {
+            const created = await createRoom(f.home, {
+              creator: '@other:logical.test',
+            }, f.tenant.signer());
+            unrelated = await exportRoomReplica(
+              f.home,
+              await openRoom(f.home, created.roomId),
+              f.tenant.serverName,
+              f.node.node,
+              f.bundle.id,
+            );
+            assert(unrelated);
+          }
           const suffix = await f.exports(),
             nextInventory = await f.directoryExport();
           assert(suffix && nextInventory);
           if (pending === 'directory') {
             await journal.receive('home', [nextInventory]);
+          } else if (unrelated) {
+            await journal.receive('home', [unrelated]);
+            await journal.receive('home', [nextInventory]);
+            assert(await directory.apply(journal, nextInventory));
           } else {
             await journal.receive('home', [suffix]);
             if (
@@ -488,6 +513,7 @@ function appliedReadTests() {
             await journal.receive('home', [suffix]);
           }
           release.resolve();
+          if (unrelated) await journal.receive('home', [suffix]);
           if (application) assert(await application);
           else assert(await (await f.replicas()).apply(journal, suffix));
           assertEquals(await get('state/m.room.topic'), {
@@ -496,7 +522,7 @@ function appliedReadTests() {
           });
         } finally {
           release.resolve();
-          if (application) await application;
+          if (application) await Promise.allSettled([application]);
           await http?.shutdown();
           await closeApp();
           await f.close();
@@ -561,6 +587,101 @@ function appliedReadTests() {
       await f.close();
     }
   });
+
+  for (
+    const caller of [
+      'state write',
+      'federation alias',
+      'federation directory',
+    ] as const
+  ) {
+    Deno.test(
+      'applied read split preserves nested admission for ' + caller,
+      async () => {
+        const f = await fixture();
+        try {
+          const topic = await f.source.addEvent({
+            type: 'm.room.topic',
+            state_key: '',
+            content: { topic: 'same content' },
+          });
+          await f.ingest([topic]);
+          await registerAlias(
+            await f.home.server(),
+            '#nested:logical.test',
+            f.source.roomId,
+            f.source.creator,
+          );
+          await setVisibility(await f.home.server(), f.source.roomId, 'public');
+          const room = await f.exports(), inventory = await f.directoryExport();
+          assert(room && inventory);
+          const journal = await f.journal(),
+            directory = await f.directoryOwner();
+          await journal.receive('home', [room]);
+          assert(await (await f.replicas()).apply(journal, room));
+          await journal.receive('home', [inventory]);
+          assert(await directory.apply(journal, inventory));
+          const next = await f.source.addEvent({
+            type: 'm.room.topic',
+            state_key: '',
+            content: { topic: 'newer authority' },
+          });
+          await f.ingest([next]);
+          const suffix = await f.exports();
+          assert(suffix);
+          let received = false;
+          setConfigForTests({
+            server: { name: 'logical.test', role: 'facade' },
+          });
+          await openReplicaApp(f.edgeStore(), await f.edgeTenant(), {
+            requireReadScope: (scope, absent) =>
+              directory.requireReadScope(scope, absent),
+            prepareReadRoomScope: (id, absent) =>
+              directory.prepareReadRoomScope(id, absent),
+            async requireScope(scope, absent) {
+              await directory.requireScope(scope, absent);
+              if (scope === room.stream && !received) {
+                received = true;
+                await journal.receive('home', [suffix]);
+              }
+            },
+            prepareRoomScope: (id, absent) =>
+              directory.prepareRoomScope(id, absent),
+            keys: keyStore(await f.edgeServer(), { signer: f.node.signer() }),
+            signer: f.node.signer(),
+            keyDocument: () => Promise.reject(new Error('unused')),
+            publicRooms: async () => (await directory.snapshot())!.publicRooms,
+          });
+          const action = () =>
+            caller === 'state write'
+              ? writeStateKey(
+                f.source.roomId,
+                f.source.creator,
+                'm.room.topic',
+                '',
+                { topic: 'same content' },
+              )
+              : caller === 'federation alias'
+              ? resolveAlias('#nested:logical.test', 'admission')
+              : listLocalPublishedRooms(
+                { network: { kind: 'native' } },
+                'admission',
+              );
+          const denied = await assertRejects(
+            action,
+            MatrixError,
+            'replica unavailable',
+          );
+          assertEquals(denied.status, 503);
+          assert(received, 'suffix arrives after the outer admission');
+        } finally {
+          await closeApp();
+          await f.close();
+          setConfigForTests({});
+        }
+      },
+    );
+  }
 }
 
 Deno.test('ordinary v12 room directory inventory applies without an upgrade journal', async () => {

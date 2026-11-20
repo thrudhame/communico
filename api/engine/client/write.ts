@@ -138,9 +138,9 @@ export async function writeStateKey(
     throw new MatrixError(403, 'M_FORBIDDEN', 'not joined to ' + roomId);
   }
   assertCanonicalNumbers(content);
-  const cur = (await stateAtSeq(roomId, null)).find((r) =>
-    r.type === type && r.stateKey === stateKey
-  );
+  const cur = (await stateAtSeq(roomId, null, undefined, 'admission')).find((
+    r,
+  ) => r.type === type && r.stateKey === stateKey);
   if (cur) {
     const row = await room.tx((tx) => tx.events.get(cur.eventId));
     const pdu = row === null ? null : JSON.parse(row.pdu) as Pdu;

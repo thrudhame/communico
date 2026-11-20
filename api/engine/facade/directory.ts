@@ -280,6 +280,9 @@ export class DirectoryReplicas {
     if (!view) unavailable();
     if (scope === 'directory') return 'ready';
     if (scope === 'rooms') {
+      // An ordinary inventory read does not depend on every received room.
+      // Its selected audience prepares each actual room dependency separately.
+      if (access === 'applied') return 'ready';
       const grant = await this.pairings.active();
       const incoming = await this.db.query(
         "SELECT DISTINCT stream FROM facade_streams WHERE peer='home' AND direction='in' AND source='home' AND incarnation=? AND stream LIKE 'room:%'",
@@ -290,10 +293,7 @@ export class DirectoryReplicas {
           ...view!.rooms.map((id) => 'room:' + id),
           ...incoming.map((row) => String(row.stream)),
         ])
-      ) {
-        if (access === 'current') await this.requireScope(room);
-        else await this.requireReadScope(room);
-      }
+      ) await this.requireScope(room);
       return 'ready';
     }
     const grant = await this.pairings.active();
