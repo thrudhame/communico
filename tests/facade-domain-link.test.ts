@@ -13,6 +13,7 @@ import {
 import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
 import { AuthLinkHealth, FacadeAuth } from '#engine/facade/auth.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { drainResources } from '#engine/lifetime.ts';
 import { closeApp, openReplicaApp } from '#engine/app.ts';
 import { setConfigForTests } from '#engine/config.ts';
 import { keyStore } from '#engine/federation/keys.ts';
@@ -506,15 +507,13 @@ Deno.test('domain applied reads: every register owner serves HTTP during suffix 
         const before = await f.ej.heads('home', 'in', suffix[0]);
         const news = await f.et.tx((tx) => tx.streams.heads());
         assertEquals(await request(path), baseline);
+        const refusedBody = owner === 'account-data'
+          ? {}
+          : owner === 'profile'
+          ? { displayname: 'denied' }
+          : { enabled: false };
         assertEquals(
-          (await request(
-            path,
-            owner === 'account-data'
-              ? {}
-              : owner === 'profile'
-              ? { displayname: 'denied' }
-              : { enabled: false },
-          )).status,
+          (await request(path, refusedBody)).status,
           503,
         );
         assertEquals(await f.et.tx((tx) => tx.streams.heads()), news);
@@ -526,7 +525,13 @@ Deno.test('domain applied reads: every register owner serves HTTP during suffix 
           return await apply(...args);
         };
         application = f.es.apply(f.ej, suffix[0]);
-        void application.catch(entered.reject);
+        void application.then(
+          () =>
+            entered.reject(
+              new Error('application completed before journal entry'),
+            ),
+          entered.reject,
+        );
         await entered.promise;
         const applied = owner === 'account-data'
           ? { newer: true }
@@ -535,6 +540,7 @@ Deno.test('domain applied reads: every register owner serves HTTP during suffix 
           : { enabled: true };
         const semanticNews = await f.et.tx((tx) => tx.streams.heads());
         assertEquals(await request(path), { status: 200, body: applied });
+        assertEquals((await request(path, refusedBody)).status, 503);
         // Every ordinary accessor, including visibility's ignored-user policy,
         // shares this intent. None may stamp news or advance the held ACK.
         assertEquals(
@@ -582,10 +588,12 @@ Deno.test('domain applied reads: every register owner serves HTTP during suffix 
       } finally {
         release.resolve();
         if (application) await Promise.allSettled([application]);
-        await http?.shutdown();
-        await closeApp();
-        await f.close();
-        setConfigForTests({});
+        await drainResources([
+          () => http?.shutdown(),
+          closeApp,
+          () => f.close(),
+          () => setConfigForTests({}),
+        ]);
       }
     });
   }
