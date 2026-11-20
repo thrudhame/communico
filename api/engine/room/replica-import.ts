@@ -81,10 +81,26 @@ export async function importReplicaRoom(
   }
   const event = (id: string): Pdu =>
     pack.get(id) ?? unavailable('replica event is unavailable');
-  // Decode at the semantic owner. Old complete-list boundaries remain valid;
-  // deltas name an earlier boundary in this pack, so cycles and unknown bases
-  // cannot manufacture a before-state or create unbounded recursion.
+  // Keep the compact wire descriptions, not a complete state/auth copy per
+  // join. Validate all references and removals before any room effects, then
+  // materialize only the boundary requested by a snapshot consumer.
   const boundaries = new Map<string, ReplicaRoom['boundaries'][number]>();
+  const contains = (
+    boundary: ReplicaRoom['boundaries'][number],
+    field: 'state' | 'authChain',
+    id: string,
+  ): boolean => {
+    for (;;) {
+      if (boundary[field].includes(id)) return true;
+      if (boundary.base === undefined) return false;
+      const removed = field === 'state'
+        ? boundary.removedState
+        : boundary.removedAuth;
+      if (removed?.includes(id)) return false;
+      boundary = boundaries.get(boundary.base) ??
+        unavailable('replica boundary base is unavailable');
+    }
+  };
   for (const boundary of manifest.boundaries) {
     if (boundaries.has(boundary.eventId)) {
       throw new MatrixError(400, 'M_BAD_JSON', 'duplicate replica boundary');
@@ -95,32 +111,56 @@ export async function importReplicaRoom(
     }
     const base = boundaries.get(boundary.base);
     if (!base) unavailable('replica boundary base is unavailable');
-    const expand = (prior: string[], removed: string[], added: string[]) => {
-      const ids = new Set(prior);
+    for (
+      const [field, removed] of [
+        ['state', boundary.removedState ?? []],
+        ['authChain', boundary.removedAuth ?? []],
+      ] as const
+    ) {
+      const seen = new Set<string>();
       for (const id of removed) {
-        if (!ids.delete(id)) {
+        if (seen.has(id) || !contains(base, field, id)) {
           throw new MatrixError(
             400,
             'M_BAD_JSON',
             'replica removes unknown boundary event',
           );
         }
+        seen.add(id);
       }
-      for (const id of added) ids.add(id);
-      return [...ids].sort();
-    };
-    boundaries.set(boundary.eventId, {
-      ...boundary,
-      state: expand(base.state, boundary.removedState ?? [], boundary.state),
-      authChain: expand(
-        base.authChain,
-        boundary.removedAuth ?? [],
-        boundary.authChain,
-      ),
-    });
+    }
+    boundaries.set(boundary.eventId, boundary);
   }
+  const expandedBoundary = (id: string) => {
+    let boundary = boundaries.get(id);
+    if (!boundary) return undefined;
+    // Preserve complete-list ordering/duplicates for the existing snapshot
+    // verifier. Only a delta has set semantics in the original wire contract.
+    if (boundary.base === undefined) return boundary;
+    const chain = [boundary];
+    while (boundary.base !== undefined) {
+      boundary = boundaries.get(boundary.base) ??
+        unavailable('replica boundary base is unavailable');
+      chain.push(boundary);
+    }
+    const state = new Set<string>(), auth = new Set<string>();
+    for (let i = chain.length - 1; i >= 0; i--) {
+      const part = chain[i];
+      if (part.base !== undefined) {
+        for (const event of part.removedState ?? []) state.delete(event);
+        for (const event of part.removedAuth ?? []) auth.delete(event);
+      }
+      for (const event of part.state) state.add(event);
+      for (const event of part.authChain) auth.add(event);
+    }
+    return {
+      ...chain[0],
+      state: [...state].sort(),
+      authChain: [...auth].sort(),
+    };
+  };
   const snapshot = (id: string) => {
-    const boundary = boundaries.get(id);
+    const boundary = expandedBoundary(id);
     if (!boundary) unavailable('replica before-state is unavailable');
     return {
       resident: boundary.resident,
@@ -137,7 +177,7 @@ export async function importReplicaRoom(
     timestampToEvent: () => Promise.resolve(null),
     missingEvents: () => Promise.resolve([]),
     stateIds: (_room, id) => {
-      const boundary = boundaries.get(id);
+      const boundary = expandedBoundary(id);
       return Promise.resolve(
         boundary
           ? { pduIds: boundary.state, authChainIds: boundary.authChain }
