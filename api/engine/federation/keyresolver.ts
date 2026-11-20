@@ -26,7 +26,7 @@ export function productionKeyResolver(
           args.keyId,
           args.minValidUntilMs,
           'event',
-          { signal: args.signal },
+          { signal: args.signal, discovery: args.discovery },
         );
       } catch (error) {
         args.signal?.throwIfAborted();

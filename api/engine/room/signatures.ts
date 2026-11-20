@@ -60,6 +60,7 @@ export async function prepareEventSignatures(
           minValidUntilMs: getRulebook(roomVersion).spec.enforceKeyValidity
             ? Number(verified.pdu.origin_server_ts)
             : 0,
+          discovery: 'cached',
           signal: options.signal,
         });
         options.signal?.throwIfAborted();

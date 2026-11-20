@@ -26,6 +26,8 @@ export interface KeyResolver {
     pdu: Pdu;
     roomVersion: string;
     minValidUntilMs: number;
+    // Optional evidence may use known keys, but cannot initiate discovery.
+    discovery?: 'cached';
     signal?: AbortSignal;
   }): Promise<boolean>;
 }

@@ -113,7 +113,7 @@ export type KeyStore = {
     keyId: string,
     minimumValidUntilTs: number,
     purpose: 'request' | 'event',
-    ctx?: { roomId?: string; signal?: AbortSignal },
+    ctx?: { roomId?: string; signal?: AbortSignal; discovery?: 'cached' },
   ) => Promise<CryptoKey>;
   listServerKeys: (
     name: string | null,
@@ -739,7 +739,7 @@ export function keyStore(
     keyId: string,
     minimumValidUntilTs: number,
     purpose: 'request' | 'event',
-    ctx?: { roomId?: string; signal?: AbortSignal },
+    ctx?: { roomId?: string; signal?: AbortSignal; discovery?: 'cached' },
   ): Promise<CryptoKey> {
     ctx?.signal?.throwIfAborted();
     if (!/^ed25519:[a-zA-Z0-9_]+$/.test(keyId)) {
@@ -767,6 +767,15 @@ export function keyStore(
       ctx?.signal?.throwIfAborted();
       requireCurrent(epoch);
       if (hit !== null) return hit;
+      // Evidence-only lookups cannot create network demand or negative memory.
+      // Required admission already owns discovery; intrinsic key names above
+      // and cached keys retain the same validity, retirement and epoch checks.
+      if (ctx?.discovery === 'cached') {
+        throw new UpstreamError('validation', {
+          phase: 'key-lookup',
+          reason: 'key unavailable without discovery',
+        });
+      }
       await acquireKeyDoc(name, minimumValidUntilTs, ctx, keyId);
       ctx?.signal?.throwIfAborted();
       const again = await cachedVerifyKey(
