@@ -92,7 +92,12 @@ export async function exportRoomReplica(
       [peer, pairing, scope],
     );
     const after = prior ? Number(prior.source_cut) : 0;
-    const manifest = await exportReplicaRoom(room, self, after);
+    const manifest = await exportReplicaRoom(
+      room,
+      self,
+      after,
+      wireVersion === 2,
+    );
     if (prior && manifest.cut === after) return null;
     const result = await db.tx(async (conn) => {
       const [currentBinding] = await conn.query(

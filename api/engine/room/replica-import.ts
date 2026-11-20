@@ -81,9 +81,44 @@ export async function importReplicaRoom(
   }
   const event = (id: string): Pdu =>
     pack.get(id) ?? unavailable('replica event is unavailable');
-  const boundaries = new Map(
-    manifest.boundaries.map((boundary) => [boundary.eventId, boundary]),
-  );
+  // Decode at the semantic owner. Old complete-list boundaries remain valid;
+  // deltas name an earlier boundary in this pack, so cycles and unknown bases
+  // cannot manufacture a before-state or create unbounded recursion.
+  const boundaries = new Map<string, ReplicaRoom['boundaries'][number]>();
+  for (const boundary of manifest.boundaries) {
+    if (boundaries.has(boundary.eventId)) {
+      throw new MatrixError(400, 'M_BAD_JSON', 'duplicate replica boundary');
+    }
+    if (boundary.base === undefined) {
+      boundaries.set(boundary.eventId, boundary);
+      continue;
+    }
+    const base = boundaries.get(boundary.base);
+    if (!base) unavailable('replica boundary base is unavailable');
+    const expand = (prior: string[], removed: string[], added: string[]) => {
+      const ids = new Set(prior);
+      for (const id of removed) {
+        if (!ids.delete(id)) {
+          throw new MatrixError(
+            400,
+            'M_BAD_JSON',
+            'replica removes unknown boundary event',
+          );
+        }
+      }
+      for (const id of added) ids.add(id);
+      return [...ids].sort();
+    };
+    boundaries.set(boundary.eventId, {
+      ...boundary,
+      state: expand(base.state, boundary.removedState ?? [], boundary.state),
+      authChain: expand(
+        base.authChain,
+        boundary.removedAuth ?? [],
+        boundary.authChain,
+      ),
+    });
+  }
   const snapshot = (id: string) => {
     const boundary = boundaries.get(id);
     if (!boundary) unavailable('replica before-state is unavailable');

@@ -663,12 +663,11 @@ Deno.test('replica v2 verified join bootstrap preserves evidence-only rooms with
     // not as an unpublished-file genesis. Its create belongs to before-state.
     const opening = manifest.stays[0].opening;
     opening.kind = 'join';
-    manifest.boundaries.push({
-      eventId: opening.eventId,
-      resident: f.tenant.serverName,
-      state: [opening.createId],
-      authChain: [],
-    });
+    const boundary = manifest.boundaries.find((entry) =>
+      entry.eventId === opening.eventId
+    )!;
+    boundary.state = [opening.createId];
+    boundary.authChain = [];
     manifest.steps = manifest.steps.filter((step) =>
       step.eventId !== opening.createId
     );
