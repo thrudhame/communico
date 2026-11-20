@@ -23,7 +23,7 @@ import { lookupAlias, registerAlias } from '#engine/server/aliases.ts';
 import { deviceIdentity, transactionSubmission } from '#engine/tenant/txns.ts';
 import { localpartOf } from '#engine/ids.ts';
 import { getProfile } from '#engine/tenant/users.ts';
-import { requireRoom, stateAtSeq, versionOf } from './room.ts';
+import { requireRoomForAdmission, stateAtSeq, versionOf } from './room.ts';
 
 export type { CreateRoomOptions };
 
@@ -85,7 +85,7 @@ export async function sendEvent(
   deviceGeneration?: number,
 ) {
   const app = theApp();
-  const room = await requireRoom(roomId);
+  const room = await requireRoomForAdmission(roomId);
   const submission = transactionSubmission(
     app.tenant,
     deviceId === null ? null : await deviceIdentity(
@@ -124,7 +124,7 @@ export async function writeStateKey(
   stateKey: string,
   content: Record<string, unknown>,
 ) {
-  const room = await requireRoom(roomId);
+  const room = await requireRoomForAdmission(roomId);
   if (type === 'm.room.create') {
     throw new MatrixError(
       400,
@@ -182,7 +182,7 @@ export async function redactEvent(
   deviceGeneration?: number,
 ) {
   const app = theApp();
-  const room = await requireRoom(roomId);
+  const room = await requireRoomForAdmission(roomId);
   const res = await redact(
     room,
     userId,

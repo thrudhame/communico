@@ -25,7 +25,11 @@ import {
   forget as markForgotten,
 } from '#engine/server/membership.ts';
 import { getProfile } from '#engine/tenant/users.ts';
-import { lookupRoom, requireRoom, stateAtSeq } from './room.ts';
+import {
+  lookupRoomForAdmission,
+  requireRoomForAdmission,
+  stateAtSeq,
+} from './room.ts';
 import { inviteDeps } from './write.ts';
 
 export async function serversInRoom(roomId: string): Promise<string[]> {
@@ -67,7 +71,7 @@ export async function join(
     localpartOf(userId),
   );
   const content = { ...profile, ...extra, membership: 'join' };
-  const room = await lookupRoom(roomId);
+  const room = await lookupRoomForAdmission(roomId);
   let result;
   if (room !== null) {
     try {
@@ -181,7 +185,7 @@ export async function knock(
     membership: 'knock',
   };
   await assertKnownJoinEncryption(app.store, roomId);
-  const room = await lookupRoom(roomId);
+  const room = await lookupRoomForAdmission(roomId);
   if (room !== null && await room.tx((tx) => tx.segments.openStay()) !== null) {
     const result = await local.knock(
       room,
@@ -200,7 +204,7 @@ export async function leave(roomId: string, userId: string, reason?: string) {
   const app = theApp();
   const deps = inviteDeps();
   const invitation = await inviteFor(roomId, userId, deps);
-  const room = await lookupRoom(roomId);
+  const room = await lookupRoomForAdmission(roomId);
   const current = await membershipOf(app.server, roomId, userId);
   if (
     (current === null || current.seq < (invitation?.seq ?? 0)) &&
@@ -222,7 +226,7 @@ export async function memberOperation(
   target: string,
   reason?: string,
 ) {
-  const room = await requireRoom(roomId);
+  const room = await requireRoomForAdmission(roomId);
   const app = theApp();
   let result;
   if (op === 'invite' && domainOf(target) !== serverName()) {

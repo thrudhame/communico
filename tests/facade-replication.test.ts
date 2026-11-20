@@ -97,6 +97,11 @@ import {
 } from './helpers/facade-process.ts';
 import { facadeTls } from './support/facade-tls.ts';
 import { object, recordHash } from '#engine/facade/protocol.ts';
+import { registerUser } from '#engine/tenant/users.ts';
+import { writeStateKey } from '#engine/client/write.ts';
+import { getPresence } from '#engine/client/presence.ts';
+import { setPresence } from '#engine/server/ephemeral.ts';
+import { resolveAlias } from '#engine/client/directory.ts';
 
 async function fixture(seedServer = serverSchema, facadePin = 'b'.repeat(64)) {
   const dir = await Deno.makeTempDir({ prefix: 'facade-replication-' });
@@ -243,6 +248,319 @@ async function fixture(seedServer = serverSchema, facadePin = 'b'.repeat(64)) {
       await Deno.remove(dir, { recursive: true });
     },
   };
+}
+
+// Register HTTP compositions after the low-level/historical-schema cases. App
+// recovery installs process-wide projection hooks, which require current schemas.
+function appliedReadTests() {
+  for (
+    const pending of [
+      'directory',
+      'received room',
+      'applying room',
+      'partially applying room',
+    ] as const
+  ) {
+    Deno.test(
+      'applied read stays available during a newer ' + pending + ' suffix',
+      async () => {
+        const f = await fixture();
+        let http: Deno.HttpServer<Deno.NetAddr> | undefined;
+        let application: Promise<boolean> | undefined;
+        const entered = Promise.withResolvers<void>();
+        const release = Promise.withResolvers<void>();
+        try {
+          const topic = await f.source.addEvent({
+            type: 'm.room.topic',
+            state_key: '',
+            content: { topic: 'applied topic' },
+          });
+          await f.ingest([topic]);
+          const joined = await f.source.addEvent({
+            type: 'm.room.member',
+            state_key: '@bob:logical.test',
+            sender: '@bob:logical.test',
+            content: { membership: 'join' },
+          });
+          await f.ingest([joined]);
+          await registerAlias(
+            await f.home.server(),
+            '#applied:logical.test',
+            f.source.roomId,
+            f.source.creator,
+          );
+          await setVisibility(await f.home.server(), f.source.roomId, 'public');
+          const room = await f.exports(), inventory = await f.directoryExport();
+          assert(room && inventory);
+          const journal = await f.journal(),
+            directory = await f.directoryOwner();
+          await journal.receive('home', [room]);
+          assert(await (await f.replicas()).apply(journal, room));
+          await journal.receive('home', [inventory]);
+          assert(await directory.apply(journal, inventory));
+          setConfigForTests({
+            server: { name: 'logical.test', role: 'facade' },
+          });
+          const tenant = await f.edgeTenant();
+          const session = await registerUser(tenant, {
+            localpart: 'zoe',
+            password: 'applied-read-test',
+          });
+          await openReplicaApp(f.edgeStore(), tenant, {
+            requireReadScope: (scope, absent) =>
+              directory.requireReadScope(scope, absent),
+            prepareReadRoomScope: (id, absent) =>
+              directory.prepareReadRoomScope(id, absent),
+            requireScope: (scope, absent) =>
+              directory.requireScope(scope, absent),
+            prepareRoomScope: (id, absent) =>
+              directory.prepareRoomScope(id, absent),
+            keys: keyStore(await f.edgeServer(), { signer: f.node.signer() }),
+            signer: f.node.signer(),
+            keyDocument: () => Promise.reject(new Error('unused key document')),
+            publicRooms: async () => (await directory.snapshot())!.publicRooms,
+          });
+          http = Deno.serve({
+            hostname: '127.0.0.1',
+            port: 0,
+            onListen: () => {},
+          }, await pathfinder({ roots: ['api/endpoints/matrix/'] }));
+          const get = async (suffix: string) => {
+            const response = await fetch(
+              `http://127.0.0.1:${http!.addr.port}/_matrix/client/v3/rooms/${
+                encodeURIComponent(f.source.roomId)
+              }/${suffix}`,
+              {
+                headers: { authorization: 'Bearer ' + session.access_token },
+              },
+            );
+            return { status: response.status, body: await response.json() };
+          };
+          const path = 'event/' + encodeURIComponent(String(topic.event_id));
+          const initial = await get(path);
+          assertEquals(initial.status, 200, JSON.stringify(initial.body));
+          await setPresence(
+            await f.edgeServer(),
+            '@bob:logical.test',
+            'online',
+            'applied presence',
+          );
+          assertEquals(
+            (await getPresence(f.source.creator, '@bob:logical.test'))
+              .statusMsg,
+            'applied presence',
+          );
+          const readAdmission = await directory.prepareReadRoomScope(
+            f.source.roomId,
+          );
+          const routes = [
+            'messages?dir=b&limit=20',
+            'members',
+            'joined_members',
+            'state',
+            'aliases',
+          ];
+          for (const route of routes) {
+            assertEquals((await get(route)).status, 200, route);
+          }
+          const alias = await resolveAlias('#applied:logical.test');
+          const next = await f.source.addEvent({
+            type: 'm.room.topic',
+            state_key: '',
+            content: { topic: 'new topic' },
+          });
+          await f.ingest([next]);
+          const tail = pending === 'partially applying room'
+            ? await f.source.addEvent({
+              type: 'm.room.message',
+              content: { body: 'unapplied tail' },
+            })
+            : null;
+          if (tail) await f.ingest([tail]);
+          const suffix = await f.exports(),
+            nextInventory = await f.directoryExport();
+          assert(suffix && nextInventory);
+          if (pending === 'directory') {
+            await journal.receive('home', [nextInventory]);
+          } else {
+            await journal.receive('home', [suffix]);
+            if (
+              pending === 'applying room' ||
+              pending === 'partially applying room'
+            ) {
+              const keys = fakeKeyResolver(f.signing);
+              let tailVerifications = 0;
+              application = new RoomReplicas(
+                f.edgeStore(),
+                await f.edgePairings(),
+                f.tenant.serverName,
+                {
+                  async verifyEventSignature(...args) {
+                    if (
+                      !tail ||
+                      (args[0].pdu.event_id === tail.event_id &&
+                        ++tailVerifications === 2)
+                    ) {
+                      entered.resolve();
+                      await release.promise;
+                    }
+                    return await keys.verifyEventSignature(...args);
+                  },
+                },
+              ).apply(journal, suffix);
+              await bounded(entered.promise, 3000);
+              assertEquals(
+                (await (await f.replicas()).status(f.source.roomId))!.ready,
+                false,
+              );
+            }
+          }
+          // Admission still requires the newest received cut. Reading an already
+          // applied publication is not that admission or a new receipt/ACK.
+          const denied = await assertRejects(
+            () => directory.scopeState('room:' + f.source.roomId),
+            MatrixError,
+          );
+          assertEquals(denied.status, 503);
+          const mutation = await assertRejects(
+            () =>
+              writeStateKey(
+                f.source.roomId,
+                f.source.creator,
+                'm.room.topic',
+                '',
+                { topic: 'must not author' },
+              ),
+            MatrixError,
+          );
+          assertEquals(mutation.status, 503);
+          await assertRejects(
+            () =>
+              serveEvent(String(topic.event_id), 'logical.test', serveDeps()),
+            MatrixError,
+            'replica unavailable',
+          );
+          await assertRejects(
+            () => resolveAlias('#applied:logical.test', 'admission'),
+            MatrixError,
+            'replica unavailable',
+          );
+          await (await f.edgeServer()).tx((conn) => readAdmission.check(conn));
+          const before = await journal.heads('home', 'in', room);
+          const read = await get(path);
+          assertEquals(read.status, 200, JSON.stringify(read.body));
+          // Age is response-time metadata; every retained event field stays equal.
+          assert(read.body.unsigned.age >= initial.body.unsigned.age);
+          assertEquals({
+            ...read.body,
+            unsigned: { ...read.body.unsigned, age: 0 },
+          }, {
+            ...initial.body,
+            unsigned: { ...initial.body.unsigned, age: 0 },
+          });
+          assertEquals(await get('state/m.room.topic'), {
+            status: 200,
+            body: { topic: tail ? 'new topic' : 'applied topic' },
+          });
+          for (const route of routes) {
+            assertEquals((await get(route)).status, 200, route);
+          }
+          assertEquals(await resolveAlias('#applied:logical.test'), alias);
+          assertEquals(
+            (await getPresence(f.source.creator, '@bob:logical.test'))
+              .statusMsg,
+            'applied presence',
+          );
+          assertEquals(
+            (await journal.heads('home', 'in', room)).applied,
+            before.applied,
+          );
+          if (pending === 'directory') {
+            assert(await directory.apply(journal, nextInventory));
+            // An inventory's successor cut constrains admission, not this ordinary
+            // reader's already applied publication or its own causal obligations.
+            await assertRejects(
+              () => directory.prepareRoomScope(f.source.roomId),
+              MatrixError,
+              'replica unavailable',
+            );
+            assertEquals((await get(path)).status, 200);
+            await journal.receive('home', [suffix]);
+          }
+          release.resolve();
+          if (application) assert(await application);
+          else assert(await (await f.replicas()).apply(journal, suffix));
+          assertEquals(await get('state/m.room.topic'), {
+            status: 200,
+            body: { topic: 'new topic' },
+          });
+        } finally {
+          release.resolve();
+          if (application) await application;
+          await http?.shutdown();
+          await closeApp();
+          await f.close();
+          setConfigForTests({});
+        }
+      },
+    );
+  }
+
+  Deno.test('applied read requires an initial completed scope and live enrollment across restart', async () => {
+    const f = await fixture();
+    try {
+      const room = await f.exports(), inventory = await f.directoryExport();
+      assert(room && inventory);
+      let journal = await f.journal(), owner = await f.directoryOwner();
+      await assertRejects(
+        () => owner.requireReadScope('directory'),
+        MatrixError,
+        'replica unavailable',
+      );
+      await journal.receive('home', [inventory]);
+      assert(await owner.apply(journal, inventory));
+      await assertRejects(
+        () => owner.requireReadScope(room.stream),
+        MatrixError,
+        'replica unavailable',
+      );
+      await journal.receive('home', [room]);
+      await assertRejects(
+        () => owner.requireReadScope(room.stream),
+        MatrixError,
+        'replica unavailable',
+      );
+      assert(await (await f.replicas()).apply(journal, room));
+      await owner.requireReadScope(room.stream);
+      const next = await f.source.addEvent({
+        type: 'm.room.topic',
+        state_key: '',
+        content: { topic: 'restart suffix' },
+      });
+      await f.ingest([next]);
+      const suffix = await f.exports();
+      assert(suffix);
+      await journal.receive('home', [suffix]);
+      await f.reopen();
+      owner = await f.directoryOwner();
+      journal = await f.journal();
+      await owner.requireReadScope(room.stream);
+      await assertRejects(
+        () => owner.requireScope(room.stream),
+        MatrixError,
+        'replica unavailable',
+      );
+      assertEquals(
+        (await journal.heads('home', 'in', room)).applied.sequence,
+        room.sequence,
+      );
+      await f.retire();
+      await assertRejects(() => owner.requireReadScope(room.stream));
+      await assertRejects(() => owner.prepareReadRoomScope(f.source.roomId));
+    } finally {
+      await f.close();
+    }
+  });
 }
 
 Deno.test('ordinary v12 room directory inventory applies without an upgrade journal', async () => {
@@ -1567,6 +1885,10 @@ Deno.test('replica device composition borrows the node service and binds its dis
     });
     const directory = await f.directoryOwner();
     const app = await openReplicaApp(f.edgeStore(), tenant, {
+      requireReadScope: (scope, absent) =>
+        directory.requireReadScope(scope, absent),
+      prepareReadRoomScope: (id, absent) =>
+        directory.prepareReadRoomScope(id, absent),
       requireScope: (scope, absent) => directory.requireScope(scope, absent),
       prepareRoomScope: (room, absent) =>
         directory.prepareRoomScope(room, absent),
@@ -1665,6 +1987,12 @@ Deno.test('replica service acquisition releases a failed composition before retr
       stop: () => Promise.resolve(),
     };
     const access = {
+      requireReadScope: () => Promise.resolve(),
+      prepareReadRoomScope: () =>
+        Promise.resolve({
+          check: () => Promise.resolve(),
+          checkCurrent: () => {},
+        }),
       requireScope: () => Promise.resolve(),
       prepareRoomScope: () => Promise.reject(new Error('unused')),
       keys: keyStore(await f.edgeServer(), { signer: f.node.signer() }),
@@ -1738,6 +2066,10 @@ Deno.test('enrolled replica app composes ordinary reads and recovery without cre
     });
     const directory = await f.directoryOwner();
     const app = await openReplicaApp(f.edgeStore(), tenant, {
+      requireReadScope: (scope, absent) =>
+        directory.requireReadScope(scope, absent),
+      prepareReadRoomScope: (id, absent) =>
+        directory.prepareReadRoomScope(id, absent),
       requireScope: (scope, allowAbsent) =>
         directory.requireScope(scope, allowAbsent),
       prepareRoomScope: (roomId, allowAbsent) =>
@@ -1877,6 +2209,10 @@ Deno.test('receipt scope: a suffix after preparation refuses all client receipt 
         });
         const directory = await f.directoryOwner();
         const app = await openReplicaApp(f.edgeStore(), tenant, {
+          requireReadScope: (scope, absent) =>
+            directory.requireReadScope(scope, absent),
+          prepareReadRoomScope: (id, absent) =>
+            directory.prepareReadRoomScope(id, absent),
           requireScope: (scope, allowAbsent) =>
             directory.requireScope(scope, allowAbsent),
           prepareRoomScope: async (roomId, allowAbsent) => {
@@ -2032,6 +2368,10 @@ Deno.test('real replica HTTP reads distinguish required cuts from absence and bi
       federation: { enabled: true, mode: 'closed', publicrooms: true },
     });
     await openReplicaApp(f.edgeStore(), await f.edgeTenant(), {
+      requireReadScope: (scope, absent) =>
+        directory.requireReadScope(scope, absent),
+      prepareReadRoomScope: (id, absent) =>
+        directory.prepareReadRoomScope(id, absent),
       requireScope: (scope, allowAbsent) =>
         directory.requireScope(scope, allowAbsent),
       prepareRoomScope: (roomId, allowAbsent) =>
@@ -2128,3 +2468,5 @@ Deno.test('real replica HTTP reads distinguish required cuts from absence and bi
     await f.close();
   }
 });
+
+appliedReadTests();

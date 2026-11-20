@@ -5,7 +5,7 @@ import { config } from '#engine/config.ts';
 import { assertCanonicalNumbers } from '#engine/canonical.ts';
 import { localpartOf } from '#engine/ids.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
-import { requireRoom } from '#engine/client/room.ts';
+import { requireRoomForAdmission } from '#engine/client/room.ts';
 import { openRoom, type RoomTx } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
 import { sendLocal } from '#engine/room/ingest.ts';
@@ -131,7 +131,7 @@ export class DelayedEvents {
       const old = await tenant.tx((tx) => tx.delayedEvents.receipt(receipt));
       if (old !== null) return { delay_id: old };
     }
-    const room = await requireRoom(input.roomId);
+    const room = await requireRoomForAdmission(input.roomId);
     const id = await withRoomLock(input.roomId, async () => {
       const cut = await room.tx(async (tx) => {
         await requireJoined(tx, input.userId);

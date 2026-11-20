@@ -10,5 +10,5 @@ export default async function (request: PathfinderRequest) {
   if (alias === null || !aliasIsLocal(alias)) {
     throw new MatrixError(400, 'M_INVALID_PARAM', 'invalid alias');
   }
-  return await resolveAlias(alias);
+  return await resolveAlias(alias, 'admission');
 }
