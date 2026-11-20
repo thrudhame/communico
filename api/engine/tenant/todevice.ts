@@ -80,6 +80,17 @@ export async function insertMessage(
   limits: KeyLimits,
 ): Promise<void> {
   bounded([event], limits.maxrequestbytes);
+  await insertRetainedMessage(conn, d, source, event);
+}
+
+/** Retained selectors have already passed admission. Mutable request limits
+ * must not revoke their delivery or make unrelated auth bootstrap roll back. */
+export async function insertRetainedMessage(
+  conn: Conn,
+  d: DeviceIdentity,
+  source: string,
+  event: Json,
+): Promise<void> {
   const owner = args(d);
   if (
     (await conn.query(

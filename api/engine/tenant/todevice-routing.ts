@@ -21,7 +21,11 @@ import {
   registryDevice,
   tenantAuthority,
 } from './session-authority.ts';
-import { insertMessage, type Message, targetSelectors } from './todevice.ts';
+import {
+  insertRetainedMessage,
+  type Message,
+  targetSelectors,
+} from './todevice.ts';
 
 export const TO_DEVICE_ROUTING_SQL = `
 CREATE TABLE to_device_admissions(kind TEXT NOT NULL,origin TEXT NOT NULL,message_id TEXT NOT NULL,payload_hash TEXT NOT NULL,PRIMARY KEY(kind,origin,message_id));
@@ -35,6 +39,12 @@ CREATE INDEX to_device_targets_device ON to_device_targets(localpart,device_id,g
 
 export const TO_DEVICE_ADMISSION_POLICY_SQL = `
 ALTER TABLE to_device_admissions ADD COLUMN policy TEXT NOT NULL DEFAULT 'routed' CHECK(policy IN ('legacy','routed'));
+`;
+
+export const TO_DEVICE_ROUTE_LOOKUPS_SQL = `
+CREATE INDEX to_device_routes_origin ON to_device_routes(json_extract(payload_json,'$.origin.kind'),json_extract(payload_json,'$.origin.origin'),json_extract(payload_json,'$.origin.id'));
+CREATE INDEX to_device_routes_pending_owner ON to_device_routes(expanded,localpart,json_extract(payload_json,'$.owner'),json_extract(payload_json,'$.ownerIncarnation'));
+CREATE INDEX to_device_routes_pending_recipient ON to_device_routes(expanded,json_extract(payload_json,'$.recipient'),json_extract(payload_json,'$.owner'),json_extract(payload_json,'$.ownerIncarnation'));
 `;
 
 type Origin = { kind: 'client' | 'federation'; origin: string; id: string };
@@ -403,7 +413,6 @@ async function expandRoute(
   conn: Conn,
   identity: AuthorityIdentity,
   route: ToDeviceRoute,
-  limits: KeyLimits,
 ) {
   if (
     route.owner !== identity.node ||
@@ -478,7 +487,7 @@ async function expandRoute(
             content: selector.content,
           },
         };
-        await insertMessage(
+        await insertRetainedMessage(
           conn,
           {
             localpart,
@@ -487,7 +496,6 @@ async function expandRoute(
           },
           target.targetId,
           target.event,
-          limits,
         );
         await conn.execute(
           'INSERT INTO to_device_targets VALUES(?,?,?,?,?,?,?,?)',
@@ -570,6 +578,12 @@ export async function routeToDeviceMessages(
   const users = new Map<string, Message[]>();
   for (const message of messages) {
     if (domainOf(message.user) !== server) continue;
+    // Enforce new-request admission once, before retaining the route. Deferred
+    // destination expansion must not recheck a later receiver configuration.
+    bounded(
+      [{ sender, type, content: message.content }],
+      limits.maxrequestbytes,
+    );
     let selected = users.get(message.user);
     if (!selected) users.set(message.user, selected = []);
     selected.push(message);
@@ -613,7 +627,7 @@ export async function routeToDeviceMessages(
           value: route,
         });
       }
-      await expandRoute(conn, identity, route, limits);
+      await expandRoute(conn, identity, route);
     }
   }
   return true;
@@ -631,15 +645,14 @@ export async function captureToDeviceOperations(
   if (!identity) return [];
   for (
     const row of await conn.query(
-      'SELECT payload_json FROM to_device_routes WHERE expanded=0 AND localpart=?',
-      [localpart],
+      "SELECT payload_json FROM to_device_routes WHERE expanded=0 AND localpart=? AND json_extract(payload_json,'$.owner')=? AND json_extract(payload_json,'$.ownerIncarnation')=?",
+      [localpart, identity.node, identity.incarnation],
     )
   ) {
     await expandRoute(
       conn,
       identity,
       JSON.parse(String(row.payload_json)),
-      config().e2ee,
     );
   }
   return (await conn.query(
@@ -655,19 +668,27 @@ export async function resumePendingToDeviceRoutes(
   conn: Conn,
   recipient: string,
 ): Promise<void> {
-  const pending = await conn.query(
-    "SELECT payload_json FROM to_device_routes WHERE expanded=0 AND json_extract(payload_json,'$.recipient')=?",
-    [recipient],
-  );
-  if (!pending.length) return;
+  // A freshness-only auth renewal must not revisit semantic authority when
+  // there is no pending recipient work. This probe is an indexed existence
+  // check, not a scan/parse of foreign retained payloads.
+  if (
+    !(await conn.query(
+      "SELECT 1 FROM to_device_routes WHERE expanded=0 AND json_extract(payload_json,'$.recipient')=? LIMIT 1",
+      [recipient],
+    )).length
+  ) return;
   const identity = await tenantAuthority(conn);
   if (!identity) return;
+  const pending = await conn.query(
+    "SELECT payload_json FROM to_device_routes WHERE expanded=0 AND json_extract(payload_json,'$.recipient')=? AND json_extract(payload_json,'$.owner')=? AND json_extract(payload_json,'$.ownerIncarnation')=?",
+    [recipient, identity.node, identity.incarnation],
+  );
+  if (!pending.length) return;
   for (const row of pending) {
     await expandRoute(
       conn,
       identity,
       JSON.parse(String(row.payload_json)),
-      config().e2ee,
     );
   }
 }
@@ -829,7 +850,8 @@ function operationOf(raw: unknown, server: string): ToDeviceOperation {
     const targets = input.targets.map((raw) => {
       const target = object(raw, 'to-device target');
       const event = object(target.event, 'to-device event');
-      bounded([event], config().e2ee.maxrequestbytes);
+      // This is evidence of an already-admitted selector, checked against its
+      // retained route below, not a new request under the receiver's limits.
       return {
         targetId: requiredText(target.targetId),
         deviceId: requiredText(target.deviceId),
@@ -1051,6 +1073,6 @@ export async function importToDeviceOperation(
     ],
   );
   if (fact.kind === 'route') {
-    await expandRoute(conn, identity, fact.value, config().e2ee);
+    await expandRoute(conn, identity, fact.value);
   }
 }

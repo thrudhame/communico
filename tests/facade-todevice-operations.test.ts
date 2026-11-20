@@ -141,6 +141,169 @@ async function fixture() {
   };
 }
 
+Deno.test('to-device admission limits: a fresh route still checks its request before retaining an obligation', async () => {
+  const f = await fixture();
+  const previous = { ...config().e2ee };
+  try {
+    setConfigForTests({ e2ee: { maxrequestbytes: 1 } });
+    await assertRejects(() => f.send('new-limit'), Error, 'M_TOO_LARGE');
+    for (
+      const table of [
+        'to_device_routes',
+        'to_device_operations',
+        'to_device_inbox',
+        'to_device_admissions',
+      ]
+    ) {
+      assertEquals(await f.ed.query('SELECT * FROM ' + table), []);
+    }
+  } finally {
+    setConfigForTests({ e2ee: previous });
+    await f.close();
+  }
+});
+
+Deno.test('to-device retained limits: accepted routes and dispositions survive a lower receiver request cap', async () => {
+  const f = await fixture();
+  const previous = { ...config().e2ee };
+  try {
+    await f.send('retained-limit');
+    const source = await f.ed.tx((conn) =>
+      routing.captureToDeviceOperations(conn, 'alice')
+    );
+    setConfigForTests({ e2ee: { maxrequestbytes: 1 } });
+    for (const op of source) await f.hd.tx((conn) => apply(conn, op, 'edge'));
+    const reverse = await f.hd.tx((conn) =>
+      routing.captureToDeviceOperations(conn, 'alice')
+    );
+    for (const op of reverse) await f.ed.tx((conn) => apply(conn, op, 'home'));
+    setConfigForTests({ e2ee: previous });
+    const lan = await deviceIdentity(f.home, 'alice', 'LAN');
+    const delivered = await f.home.tx((tx) =>
+      tx.toDevice.deliverSliding(lan, 'lan', 100, config().e2ee)
+    );
+    assertEquals(delivered.events.map((event) => event.content), [{
+      key: 'retained-limit',
+    }]);
+  } finally {
+    setConfigForTests({ e2ee: previous });
+    await f.close();
+  }
+});
+
+Deno.test('to-device origin lookup: fresh admissions search the indexed origin tuple', async () => {
+  const f = await fixture();
+  try {
+    let observed = false;
+    await f.ed.tx(async (conn) => {
+      const query = conn.query.bind(conn);
+      conn.query = async (sql, values) => {
+        if (
+          sql.startsWith(
+            'SELECT payload_json FROM to_device_routes WHERE json_extract',
+          )
+        ) {
+          observed = true;
+          const plan = await query('EXPLAIN QUERY PLAN ' + sql, values);
+          assert(
+            plan.some((row) =>
+              String(row.detail).includes('to_device_routes_origin')
+            ),
+            JSON.stringify(plan),
+          );
+        }
+        return await query(sql, values);
+      };
+      try {
+        await routing.routeToDeviceMessages(
+          conn,
+          { kind: 'client', origin: 'logical.test', id: 'indexed-origin' },
+          '@alice:logical.test',
+          'm.room_key',
+          'logical.test',
+          [{
+            user: '@alice:logical.test',
+            id: '*',
+            content: { key: 'indexed' },
+          }],
+          config().e2ee,
+          'alice',
+        );
+      } finally {
+        conn.query = query;
+      }
+    });
+    assert(observed, 'exercise the actual fresh-admission lookup');
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('to-device pending lookup: indexed current-owner work excludes foreign history but retains auth dependencies', async () => {
+  const f = await fixture();
+  try {
+    await f.ed.execute('DELETE FROM account_auth_snapshots');
+    await f.send('pending-owner');
+    const [held] = await f.ed.query(
+      "SELECT payload_json FROM to_device_routes WHERE json_extract(payload_json,'$.owner')='edge'",
+    );
+    const obsolete = JSON.parse(
+      String(held.payload_json),
+    ) as routing.ToDeviceRoute;
+    obsolete.ownerIncarnation = 'old-edge-store';
+    obsolete.routeId = createHash('sha256').update(canonicalJson([
+      obsolete.origin,
+      obsolete.recipient,
+      { node: obsolete.owner, incarnation: obsolete.ownerIncarnation },
+    ])).digest('hex');
+    await f.ed.execute('INSERT INTO to_device_routes VALUES(?,?,?,0)', [
+      obsolete.routeId,
+      obsolete.localpart,
+      canonicalJson(obsolete),
+    ]);
+    assertEquals(
+      (await f.ed.query('SELECT * FROM to_device_routes WHERE expanded=0'))
+        .length,
+      3,
+    );
+    let observed = false;
+    await f.ed.tx(async (conn) => {
+      const query = conn.query.bind(conn);
+      conn.query = async (sql, values) => {
+        const rows = await query(sql, values);
+        if (
+          sql.startsWith(
+            'SELECT payload_json FROM to_device_routes WHERE expanded=0',
+          )
+        ) {
+          observed = true;
+          assertEquals(
+            rows.map((row) => JSON.parse(String(row.payload_json)).owner),
+            ['edge'],
+          );
+          const plan = await query('EXPLAIN QUERY PLAN ' + sql, values);
+          assert(
+            plan.some((row) =>
+              String(row.detail).includes('to_device_routes_pending_owner')
+            ),
+            JSON.stringify(plan),
+          );
+        }
+        return rows;
+      };
+      try {
+        await routing.captureToDeviceOperations(conn, 'alice');
+      } finally {
+        conn.query = query;
+      }
+    });
+    assert(observed, 'exercise the actual pending expansion lookup');
+    assertEquals(await f.ed.query('SELECT * FROM to_device_inbox'), []);
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('to-device semantic import: destination alone expands; exact ACK facts cannot delete the other inbox', async () => {
   const f = await fixture();
   try {
@@ -846,6 +1009,8 @@ Deno.test('to-device semantic import: recipient auth alone resumes a cold cross-
       )
     );
     const { ed } = await f.reopen();
+    // Auth readiness must not re-admit retained selectors under a new cap.
+    setConfigForTests({ e2ee: { maxrequestbytes: 1 } });
     await assertRejects(
       () =>
         ed.tx(async (conn) => {
@@ -863,6 +1028,7 @@ Deno.test('to-device semantic import: recipient auth alone resumes a cold cross-
       [],
     );
     await ed.tx((conn) => installAccountAuth(conn, snapshot));
+    setConfigForTests({ e2ee: previous });
     const delivered = await ed.tx((conn) =>
       deliverSliding(conn, recipient, 'bob', 100, config().e2ee)
     );
