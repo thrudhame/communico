@@ -5,6 +5,11 @@ import { Buffer } from 'node:buffer';
 import { canonicalJson } from '#engine/canonical.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { eduEnvelope } from '#engine/federation/peer-json.ts';
+import { decodeToDevice } from '#engine/federation/todevice.ts';
+import { PermanentEduRefusal } from '#engine/federation/edus.ts';
+import { openTenant } from '#engine/tenant/index.ts';
+import { config } from '#engine/config.ts';
+import type { ToDeviceIngressReceipt } from '#engine/tenant/todevice-routing.ts';
 import {
   absentTransactionRoom,
   dispatchTransactionEdu,
@@ -32,6 +37,11 @@ export class HomeIngress {
       pairing: string;
       pairings: Pairings;
       transaction: TransactionDeps;
+      toDevice?(
+        origin: string,
+        raw: unknown,
+        receipt: ToDeviceIngressReceipt,
+      ): Promise<unknown>;
     },
   ) {}
 
@@ -39,7 +49,7 @@ export class HomeIngress {
     const { peer, pairing, pairings, transaction } = this.options;
     const record = await journal.next(peer, stream);
     if (!record) return false;
-    if (record.type !== 'ingress' || record.version !== 1) {
+    if (record.type !== 'ingress' || ![1, 2, 3].includes(record.version)) {
       throw new LinkError(
         'LINK_CAPABILITY_MISMATCH',
         'not an ingress obligation',
@@ -61,6 +71,18 @@ export class HomeIngress {
     if (payload.kind !== 'ingress' || !Array.isArray(payload.rooms)) {
       throw new LinkError('LINK_BAD_RECORD', 'invalid ingress obligation', 400);
     }
+    if (
+      record.version === 1
+        ? payload.phase !== undefined
+        : payload.phase !== 'f2'
+    ) {
+      throw new LinkError(
+        'LINK_BAD_RECORD',
+        'ingress phase differs from reader version',
+        400,
+      );
+    }
+    const phase = record.version >= 2 ? 'f2' : 'f1';
     const txnId = text(payload.txnId);
     const verified = await verifyIngressRequest(
       txnId,
@@ -75,6 +97,34 @@ export class HomeIngress {
       throw new LinkError('LINK_DIVERGED', 'ingress identity diverged');
     }
     const rooms = transactionRooms(verified.transaction.pdus);
+    const eduManifest = new Map<number, Record<string, unknown>>();
+    if (record.version === 3) {
+      if (
+        !Array.isArray(payload.edus) ||
+        payload.edus.length !== verified.transaction.edus.length
+      ) {
+        throw new LinkError(
+          'LINK_BAD_RECORD',
+          'ingress EDU manifest mismatch',
+          400,
+        );
+      }
+      for (const raw of payload.edus) {
+        const entry = object(raw);
+        if (
+          !Number.isSafeInteger(entry.index) || Number(entry.index) < 0 ||
+          Number(entry.index) >= payload.edus.length ||
+          eduManifest.has(Number(entry.index))
+        ) {
+          throw new LinkError(
+            'LINK_BAD_RECORD',
+            'ingress EDU index mismatch',
+            400,
+          );
+        }
+        eduManifest.set(Number(entry.index), object(entry.disposition));
+      }
+    }
     const recovery = new Map(payload.rooms.map((raw) => {
       const room = object(raw);
       return [text(room.roomId), room] as const;
@@ -102,16 +152,16 @@ export class HomeIngress {
     await this.db.tx(async (conn) => {
       await checkBinding(conn);
       const [held] = await conn.query(
-        'SELECT input_hash,evidence_json FROM facade_ingress WHERE origin=? AND txn_id=?',
+        'SELECT input_hash,evidence_json,ingress_phase FROM facade_ingress WHERE origin=? AND txn_id=?',
         [origin, txnId],
       );
       if (
-        held && !await sameIngressRequest(
+        held && (held.ingress_phase !== phase || !await sameIngressRequest(
           txnId,
           transaction.self,
           held,
           verified,
-        )
+        ))
       ) {
         throw new LinkError(
           'LINK_DIVERGED',
@@ -121,7 +171,7 @@ export class HomeIngress {
       if (!held) {
         const encoded = canonicalJson(verified.evidence);
         await conn.execute(
-          'INSERT INTO facade_ingress(origin,txn_id,input_hash,evidence_json,bytes,pairing,revision,source,incarnation) VALUES(?,?,?,?,?,?,?,?,?)',
+          'INSERT INTO facade_ingress(origin,txn_id,input_hash,evidence_json,bytes,pairing,revision,source,incarnation,ingress_phase) VALUES(?,?,?,?,?,?,?,?,?,?)',
           [
             origin,
             txnId,
@@ -132,6 +182,7 @@ export class HomeIngress {
             revision,
             peer,
             record.incarnation,
+            phase,
           ],
         );
       }
@@ -225,11 +276,71 @@ export class HomeIngress {
         try {
           eduResults.push(
             await child('edu', String(index), async () => {
-              const { type } = eduEnvelope(raw);
+              const { type, content } = eduEnvelope(raw);
               if (type === 'm.typing' || type === 'm.presence') {
                 return { index, kind: 'expired', type };
               }
-              await dispatchTransactionEdu(origin, raw, transaction.edus);
+              if (type === 'm.direct_to_device') {
+                let input;
+                try {
+                  input = decodeToDevice(origin, transaction.self, content);
+                } catch (error) {
+                  if (!(error instanceof PermanentEduRefusal)) throw error;
+                }
+                if (input) {
+                  const disposition = eduManifest.get(index);
+                  if (record.version === 3 && disposition?.kind === 'routed') {
+                    if (!this.options.toDevice) {
+                      throw new MatrixError(
+                        503,
+                        'M_UNAVAILABLE',
+                        'to-device home owner unavailable',
+                      );
+                    }
+                    await this.options.toDevice(
+                      origin,
+                      content,
+                      object(disposition.receipt) as ToDeviceIngressReceipt,
+                    );
+                  } else {
+                    if (
+                      record.version === 3 && disposition?.policy !== 'legacy'
+                    ) {
+                      throw new LinkError(
+                        'LINK_BAD_RECORD',
+                        'missing frozen to-device disposition',
+                        400,
+                      );
+                    }
+                    const tenant = await openTenant(
+                      transaction.store,
+                      transaction.self,
+                    );
+                    await tenant.tx((tx) =>
+                      tx.toDevice.receive(
+                        origin,
+                        input.id,
+                        input.sender,
+                        input.type,
+                        transaction.self,
+                        input.messages,
+                        config().e2ee,
+                        'legacy',
+                      )
+                    );
+                  }
+                  return { index, kind: 'processed', type };
+                }
+              }
+              await dispatchTransactionEdu(
+                origin,
+                raw,
+                transaction.edus,
+                phase === 'f2' &&
+                  ['m.device_list_update', 'm.signing_key_update'].includes(
+                    type,
+                  ),
+              );
               return { index, kind: 'processed', type };
             }),
           );

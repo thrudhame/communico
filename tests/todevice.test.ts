@@ -210,3 +210,100 @@ Deno.test('E2 inbox survives reopen and concurrent/out-of-order issued cuts cann
     await Deno.remove(dir, { recursive: true });
   }
 });
+
+Deno.test('E2 inbox grows beyond the remote intent budget, survives reopen, and only issued page ACKs delete it', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'inbox-retention-' });
+  const options = {
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  };
+  let store = await openStore(options, { schemas: { tenant: tenantSchema } });
+  const bounds = { ...limits, maxinboxmessages: 1 };
+  try {
+    let tenant = await openTenant(store, 'growth.test', { create: true });
+    await tenant.tx(async (tx) => {
+      await tx.users.insert('alice', 'Alice');
+      await tx.devices.upsert('PHONE', 'alice', null);
+    });
+    const device = await deviceIdentity(tenant, 'alice', 'PHONE');
+    const send = (
+      tx: Parameters<Parameters<typeof tenant.tx>[0]>[0],
+      n: number,
+    ) =>
+      tx.toDevice.send(
+        device,
+        tenant.serverName,
+        'm.room_key',
+        String(n),
+        String(n),
+        [{
+          user: '@alice:growth.test',
+          id: '*',
+          content: { n },
+        }],
+        bounds,
+        { enabled: true, maxBytes: 1048576 },
+      );
+    await tenant.tx(async (tx) => {
+      for (let n = 0; n < 105; n++) await send(tx, n);
+    });
+    await store.close();
+    store = await openStore(options, { schemas: { tenant: tenantSchema } });
+    tenant = await openTenant(store, 'growth.test');
+    const raw = await store.tenant('growth.test');
+    const contents = (events: { content?: unknown }[]) =>
+      events.map((e) => e.content);
+    const all = Array.from({ length: 105 }, (_, n) => ({ n }));
+    const first = await tenant.tx((tx) =>
+      tx.toDevice.deliver(device, token, bounds)
+    );
+    assertEquals(contents(first.events), all.slice(0, 100));
+    assertEquals(
+      (await raw.query('SELECT * FROM to_device_inbox')).length,
+      105,
+    );
+    await tenant.tx((tx) =>
+      tx.toDevice.acknowledge(device, { ...token, mSeq: first.token.mSeq + 1 })
+    );
+    assertEquals(
+      (await raw.query('SELECT * FROM to_device_inbox')).length,
+      105,
+      'an unissued position cannot delete retained rows',
+    );
+    const sliding = await tenant.tx((tx) =>
+      tx.toDevice.deliverSliding(device, 'one', 100, bounds)
+    );
+    assertEquals(contents(sliding.events), all.slice(0, 100));
+    await tenant.tx((tx) =>
+      tx.toDevice.acknowledgeSliding(device, 'two', sliding.nextBatch)
+    );
+    assertEquals(
+      (await raw.query('SELECT * FROM to_device_inbox')).length,
+      105,
+    );
+    await tenant.tx((tx) => tx.toDevice.acknowledge(device, first.token));
+    const rest = await tenant.tx((tx) =>
+      tx.toDevice.deliverSliding(device, 'one', 100, bounds)
+    );
+    assertEquals(contents(rest.events), all.slice(100));
+    await tenant.tx((tx) =>
+      tx.toDevice.acknowledgeSliding(device, 'one', rest.nextBatch)
+    );
+    assertEquals(await raw.query('SELECT * FROM to_device_inbox'), []);
+    await tenant.tx((tx) => send(tx, 105));
+    await tenant.tx((tx) => tx.toDevice.acknowledge(device, first.token));
+    assertEquals(
+      contents(
+        (await tenant.tx((tx) => tx.toDevice.deliver(device, token, bounds)))
+          .events,
+      ),
+      [{ n: 105 }],
+    );
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});

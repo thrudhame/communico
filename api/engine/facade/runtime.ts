@@ -51,6 +51,7 @@ import { startDeactivationWork } from '#engine/deactivation.ts';
 import { startProfileFanout } from '#engine/profile-fanout.ts';
 import { DomainOperations } from './domain.ts';
 import { DeviceOperations, isKeyStream } from './devices.ts';
+import { isToDeviceStream, ToDeviceOperations } from './todevice.ts';
 import type { EduState } from '#engine/federation/edus.ts';
 import {
   type DeviceListService,
@@ -93,6 +94,7 @@ export async function openFacadeRuntime(
   let mailbox: Mailbox | undefined;
   let authExports: ReturnType<typeof startAccountExports> | undefined;
   let keyExports: ReturnType<typeof startAccountExports> | undefined;
+  let toDeviceExports: ReturnType<typeof startAccountExports> | undefined;
   let deactivation: ReturnType<typeof startDeactivationWork> | undefined;
   let profileFanout: ReturnType<typeof startProfileFanout> | undefined;
   let deviceLists: DeviceListService | undefined;
@@ -251,6 +253,26 @@ export async function openFacadeRuntime(
           ),
       });
     }
+    if (settings.phase === 'f2' && !toDeviceExports) {
+      toDeviceExports = startAccountExports({
+        store,
+        tenant,
+        pollseconds: settings.pollseconds,
+        users: async () =>
+          (await (await store.tenant(identity.server)).query(
+            'SELECT localpart FROM account_auth_snapshots ORDER BY localpart',
+          )).map((row) => String(row.localpart)),
+        emit: async (localpart) =>
+          await new ToDeviceOperations(store, tenant!, await pairings(), node!)
+            .export(localpart),
+        changed: () => notices.changed(),
+        failed: (error) =>
+          console.error(
+            'facade to-device export:',
+            error instanceof LinkError ? error.code : 'LINK_UNAVAILABLE',
+          ),
+      });
+    }
   };
   const acceptConfigured = async () => {
     // A file bootstraps a binding, not a second live registry. Restart never
@@ -296,6 +318,14 @@ export async function openFacadeRuntime(
             .apply(journal, stream)
           : settings.phase === 'f2' && isKeyStream(stream)
           ? await new DeviceOperations(store, tenant!, await pairings(), node!)
+            .apply(journal, stream)
+          : settings.phase === 'f2' && isToDeviceStream(stream)
+          ? await new ToDeviceOperations(
+            store,
+            tenant!,
+            await pairings(),
+            node!,
+          )
             .apply(journal, stream)
           : stream.stream === 'directory'
           ? await new DirectoryReplicas(
@@ -435,14 +465,26 @@ export async function openFacadeRuntime(
         node: node!,
         pairings: owner,
         transaction,
+        phase: settings.phase as 'f1' | 'f2',
         scopeState: (scope) => directory.scopeState(scope),
-        acceptEdu: (origin, raw) =>
+        acceptEdu: (origin, raw, phase) =>
           acceptIngressEdu(
             origin,
             identity.server,
             raw,
             transaction.edus,
-            settings.phase,
+            phase,
+            async (origin, raw) => {
+              if (!tenant) {
+                throw new LinkError(
+                  'LINK_UNAVAILABLE',
+                  'to-device owner unavailable',
+                  503,
+                );
+              }
+              return await new ToDeviceOperations(store, tenant, owner, node!)
+                .ingress(origin, raw);
+            },
           ),
         changed: () => notices.changed(),
       });
@@ -581,6 +623,7 @@ export async function openFacadeRuntime(
       closed ??= (async () => {
         await authExports?.close();
         await keyExports?.close();
+        await toDeviceExports?.close();
         await inbox?.close();
         await deactivation?.close();
         await profileFanout?.close();

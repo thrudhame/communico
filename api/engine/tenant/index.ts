@@ -353,6 +353,7 @@ function bind(
         server: string,
         messages: todevice.Message[],
         limits: e2ee.KeyLimits,
+        policy?: 'legacy',
       ) =>
         mutation(
           () =>
@@ -365,15 +366,23 @@ function bind(
               server,
               messages,
               limits,
+              policy,
             ),
         ),
       acknowledge: (d: devices.DeviceIdentity, since: StreamToken | null) =>
-        todevice.acknowledge(conn, d, since),
+        todevice.acknowledge(conn, d, since, projectionChanged),
       acknowledgeSliding: (
         d: devices.DeviceIdentity,
         connection: string,
         since: string | null,
-      ) => todevice.acknowledgeSliding(conn, d, connection, since),
+      ) =>
+        todevice.acknowledgeSliding(
+          conn,
+          d,
+          connection,
+          since,
+          projectionChanged,
+        ),
       deliverSliding: (
         d: devices.DeviceIdentity,
         connection: string,

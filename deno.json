@@ -21,6 +21,7 @@
     "debug-proxy": "deno run --allow-env --allow-net --allow-write jsr:@thrudhame/http-debug-proxy"
   },
   "imports": {
+    "@matrix-org/olm": "npm:@matrix-org/olm@3.2.15",
     "ws": "npm:ws@8.23.0",
     "imagescript": "npm:imagescript@3.20.2",
     "parse5": "npm:parse5@8.0.0",

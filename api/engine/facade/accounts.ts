@@ -45,7 +45,7 @@ import {
   text,
 } from './protocol.ts';
 import { applyReplicaScope } from './scopes.ts';
-import { onTenantStream } from '#engine/tenant/streams.ts';
+import { onTenantStream, syncStreamHeads } from '#engine/tenant/streams.ts';
 import {
   requireAccountExport,
   requireAccountSelection,
@@ -638,23 +638,26 @@ export class AccountSnapshots {
           )
           ? await captureErasureCuts(this.store)
           : undefined;
-        const { projectionRevision, publicKeysChanged } =
+        const { projectionRevision, publicKeysChanged, inboxChanged } =
           await (await this.store.tenant(view.server))
             .tx(async (conn) => {
               const keyCut = await keyChangesCut(conn);
+              const before = await syncStreamHeads(conn);
               if (await current(conn)) {
                 await publishAccountAuth(conn, view, record, cuts);
               }
               return {
                 projectionRevision: await pendingTenantProjection(conn),
                 publicKeysChanged: await publicKeysChangedAfter(conn, keyCut),
+                inboxChanged:
+                  (await syncStreamHeads(conn)).inbox !== before.inbox,
               };
             });
         await tenantChangesCommitted(
           this.store,
           view.server,
           projectionRevision,
-          false,
+          inboxChanged,
           'replica',
           publicKeysChanged,
         );

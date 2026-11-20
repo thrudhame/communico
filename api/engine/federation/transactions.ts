@@ -38,7 +38,9 @@ export type TransactionDeps = {
   fetcher: Fetcher;
   // our own server name (the delivering server's events never fan back)
   self: string;
-  edus: { dispatch(origin: string, raw: unknown): Promise<void> };
+  edus: {
+    dispatch(origin: string, raw: unknown, required?: boolean): Promise<void>;
+  };
   // a leave/ban for a user with an out-of-band invite is a remote
   // rejection (invites.ts, 4c-2 commit 4 — wired when it lands)
   rescind?: (roomId: string, pdu: Pdu) => Promise<boolean>;
@@ -132,9 +134,10 @@ export async function dispatchTransactionEdu(
   origin: string,
   raw: unknown,
   edus: TransactionDeps['edus'],
+  required = false,
 ): Promise<void> {
   try {
-    await edus.dispatch(origin, raw);
+    await edus.dispatch(origin, raw, required);
   } catch (error) {
     if (error instanceof ReliableEduError) throw error;
     if (

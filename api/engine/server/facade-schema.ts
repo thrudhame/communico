@@ -37,3 +37,13 @@ CREATE TABLE facade_ingress(origin TEXT NOT NULL,txn_id TEXT NOT NULL,input_hash
 CREATE TABLE facade_ingress_children(origin TEXT NOT NULL,txn_id TEXT NOT NULL,kind TEXT NOT NULL,child_key TEXT NOT NULL,result_json TEXT NOT NULL,PRIMARY KEY(origin,txn_id,kind,child_key));
 CREATE TABLE facade_ingress_collisions(origin TEXT NOT NULL,txn_id TEXT NOT NULL,input_hash TEXT NOT NULL,evidence_json TEXT NOT NULL,PRIMARY KEY(origin,txn_id,input_hash));
 `;
+
+// Old pending admissions always retain their original F1-home expansion policy.
+export const FACADE_INGRESS_PHASE_SQL = `
+ALTER TABLE facade_ingress ADD COLUMN ingress_phase TEXT NOT NULL DEFAULT 'f1' CHECK(ingress_phase IN ('f1','f2'));
+`;
+
+export const FACADE_INGRESS_POLICY_SQL = `
+ALTER TABLE facade_ingress ADD COLUMN policies_indexed INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE facade_ingress_edu_policy(origin TEXT NOT NULL,message_id TEXT NOT NULL,payload_hash TEXT NOT NULL,phase TEXT NOT NULL CHECK(phase IN ('f1','f2')),PRIMARY KEY(origin,message_id));
+`;

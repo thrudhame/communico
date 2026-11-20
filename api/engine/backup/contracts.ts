@@ -110,6 +110,12 @@ export const tableContracts = {
       'device_stream_frontier',
       'device_stream_baselines',
       'device_stream_checkpoints',
+      // Accepted routed sends, frozen incarnations and their ACK/cancellation
+      // dispositions remain durable across backup and owner-local recovery.
+      'to_device_admissions',
+      'to_device_operations',
+      'to_device_routes',
+      'to_device_targets',
       'profile_fanout',
       'profile_fanout_rooms',
       ...causal,
@@ -212,6 +218,7 @@ export const tableContracts = {
       'facade_ingress',
       'facade_ingress_children',
       'facade_ingress_collisions',
+      'facade_ingress_edu_policy',
       'facade_egress',
       'facade_egress_routes',
       'publication_domain',

@@ -27,6 +27,11 @@ import type { Conn, Database } from '#engine/store/db.ts';
 import { appendRecord } from './journal.ts';
 import type { NodeIdentity } from './identity.ts';
 import type { Pairings } from './pairing.ts';
+import { PermanentEduRefusal } from '#engine/federation/edus.ts';
+import { eduEnvelope } from '#engine/federation/peer-json.ts';
+import { decodeToDevice } from '#engine/federation/todevice.ts';
+import { toDeviceMessageHash } from '#engine/tenant/todevice-routing.ts';
+import { UpstreamError } from '#engine/net/upstream-error.ts';
 
 export type IngressRoom = {
   roomId: string;
@@ -36,6 +41,7 @@ export type IngressRoom = {
 export type IngressEdu = { index: number; disposition: unknown };
 export type IngressObligation = {
   kind: 'ingress';
+  phase?: 'f2';
   txnId: string;
   evidence: RequestEvidence;
   rooms: IngressRoom[];
@@ -49,6 +55,7 @@ type Binding = {
   incarnation: string;
 };
 type Admission = Binding & {
+  phase: 'f1' | 'f2';
   origin: string;
   txnId: string;
   evidence: RequestEvidence;
@@ -141,6 +148,56 @@ async function checkBinding(conn: Conn, binding: Binding) {
   }
 }
 
+function logicalMessage(origin: string, self: string, raw: unknown) {
+  try {
+    const { type, content } = eduEnvelope(raw);
+    if (type !== 'm.direct_to_device') return null;
+    const input = decodeToDevice(origin, self, content);
+    return {
+      id: input.id,
+      hash: toDeviceMessageHash(input.sender, input.type, self, input.messages),
+    };
+  } catch (error) {
+    // Invalid EDUs retain the normal saved refusal, never a logical policy.
+    if (error instanceof PermanentEduRefusal) return null;
+    if (
+      error instanceof UpstreamError &&
+      ['protocol', 'validation'].includes(error.category)
+    ) return null;
+    throw error;
+  }
+}
+
+/** Recover the first authenticated admission cut, including old pending F1
+ * envelopes whose child has never run. Indexing shares the admission tx and
+ * never rewrites original evidence, child results or exported records. */
+async function indexLogicalPolicies(conn: Conn, self: string) {
+  for (
+    const row of await conn.query(
+      'SELECT * FROM facade_ingress WHERE policies_indexed=0 ORDER BY rowid',
+    )
+  ) {
+    const verified = await verifyIngressRequest(
+      String(row.txn_id),
+      JSON.parse(String(row.evidence_json)),
+      self,
+    );
+    if (verified.inputHash !== row.input_hash) throw unavailable();
+    for (const raw of verified.transaction.edus) {
+      const input = logicalMessage(verified.evidence.origin, self, raw);
+      if (!input) continue;
+      await conn.execute(
+        'INSERT INTO facade_ingress_edu_policy(origin,message_id,payload_hash,phase) VALUES(?,?,?,?) ON CONFLICT(origin,message_id) DO NOTHING',
+        [verified.evidence.origin, input.id, input.hash, row.ingress_phase],
+      );
+    }
+    await conn.execute(
+      'UPDATE facade_ingress SET policies_indexed=1 WHERE origin=? AND txn_id=?',
+      [row.origin, row.txn_id],
+    );
+  }
+}
+
 export class Mailbox {
   private readonly locks = new Map<string, Promise<void>>();
   constructor(
@@ -150,8 +207,13 @@ export class Mailbox {
       node: NodeIdentity;
       pairings: Pairings;
       transaction: TransactionDeps;
+      phase?: 'f1' | 'f2';
       scopeState(scope: string): Promise<'ready' | 'absent'>;
-      acceptEdu(origin: string, raw: unknown): Promise<unknown>;
+      acceptEdu(
+        origin: string,
+        raw: unknown,
+        phase: 'f1' | 'f2',
+      ): Promise<unknown>;
       changed(): void;
     },
   ) {}
@@ -192,12 +254,30 @@ export class Mailbox {
     const bytes = Buffer.byteLength(encoded);
     const changed = await this.db.tx(async (conn) => {
       await checkBinding(conn, binding);
+      await indexLogicalPolicies(conn, this.options.self);
+      let logicalCollision = false;
+      const incoming = new Map<string, string>();
+      for (const raw of verified.transaction.edus) {
+        const input = logicalMessage(evidence.origin, this.options.self, raw);
+        if (!input) continue;
+        if (incoming.has(input.id) && incoming.get(input.id) !== input.hash) {
+          logicalCollision = true;
+        }
+        incoming.set(input.id, input.hash);
+        const [policy] = await conn.query(
+          'SELECT payload_hash FROM facade_ingress_edu_policy WHERE origin=? AND message_id=?',
+          [evidence.origin, input.id],
+        );
+        if (policy && policy.payload_hash !== input.hash) {
+          logicalCollision = true;
+        }
+      }
       const [held] = await conn.query(
         'SELECT input_hash,evidence_json FROM facade_ingress WHERE origin=? AND txn_id=?',
         [evidence.origin, txnId],
       );
       if (
-        held && await sameIngressRequest(
+        !logicalCollision && held && await sameIngressRequest(
           txnId,
           this.options.self,
           held,
@@ -205,7 +285,7 @@ export class Mailbox {
         )
       ) return false;
       if (
-        held && (await conn.query(
+        (held || logicalCollision) && (await conn.query(
           'SELECT 1 FROM facade_ingress_collisions WHERE origin=? AND txn_id=? AND input_hash=?',
           [evidence.origin, txnId, inputHash],
         )).length
@@ -225,7 +305,7 @@ export class Mailbox {
           );
         }
       }
-      if (held) {
+      if (held || logicalCollision) {
         await conn.execute(
           'INSERT INTO facade_ingress_collisions(origin,txn_id,input_hash,evidence_json) VALUES(?,?,?,?)',
           [evidence.origin, txnId, inputHash, encoded],
@@ -233,7 +313,7 @@ export class Mailbox {
         return true;
       }
       await conn.execute(
-        'INSERT INTO facade_ingress(origin,txn_id,input_hash,evidence_json,bytes,pairing,revision,source,incarnation) VALUES(?,?,?,?,?,?,?,?,?)',
+        'INSERT INTO facade_ingress(origin,txn_id,input_hash,evidence_json,bytes,pairing,revision,source,incarnation,ingress_phase) VALUES(?,?,?,?,?,?,?,?,?,?)',
         [
           evidence.origin,
           txnId,
@@ -244,8 +324,10 @@ export class Mailbox {
           binding.revision,
           binding.source,
           binding.incarnation,
+          this.options.phase ?? 'f1',
         ],
       );
+      await indexLogicalPolicies(conn, this.options.self);
       return false;
     });
     if (changed) collision();
@@ -283,6 +365,7 @@ export class Mailbox {
     return {
       origin,
       txnId,
+      phase: row.ingress_phase as Admission['phase'],
       pairing: String(row.pairing),
       revision: Number(row.revision),
       source: String(row.source),
@@ -322,6 +405,7 @@ export class Mailbox {
     const entry = await this.admission(origin, txnId);
     if (entry.response) return entry.response;
     await this.db.tx((conn) => checkBinding(conn, entry));
+    await this.db.tx((conn) => indexLogicalPolicies(conn, this.options.self));
     const body = JSON.parse(
       Buffer.from(entry.evidence.request.body, 'base64').toString('utf8'),
     );
@@ -365,10 +449,33 @@ export class Mailbox {
       for (const [index, raw] of edus.entries()) {
         try {
           tail.push(
-            await this.child(entry, 'edu', String(index), async () => ({
-              index,
-              disposition: await this.options.acceptEdu(origin, raw),
-            })),
+            await this.child(entry, 'edu', String(index), async () => {
+              const input = logicalMessage(origin, this.options.self, raw);
+              let phase = entry.phase;
+              if (input) {
+                const [held] = await this.db.query(
+                  'SELECT payload_hash,phase FROM facade_ingress_edu_policy WHERE origin=? AND message_id=?',
+                  [origin, input.id],
+                );
+                if (!held) throw unavailable();
+                if (held.payload_hash !== input.hash) {
+                  return {
+                    index,
+                    disposition: {
+                      kind: 'refused',
+                      type: 'm.direct_to_device',
+                      errcode: 'M_BAD_JSON',
+                      error: 'to-device operation identity changed',
+                    },
+                  };
+                }
+                phase = held.phase as Admission['phase'];
+              }
+              return {
+                index,
+                disposition: await this.options.acceptEdu(origin, raw, phase),
+              };
+            }),
           );
         } catch (error) {
           failures.push(error);
@@ -384,8 +491,19 @@ export class Mailbox {
     const results: PduResults = {};
     for (const room of rooms) Object.assign(results, room.result);
     const response: TxnResult = { status: 200, body: { pdus: results } };
+    // A later F1 transaction can retry an earlier F2 logical message. The
+    // immutable child contract, not that later transaction's phase, owns drain.
+    const phase =
+      tail.some(({ disposition }) =>
+          typeof disposition === 'object' &&
+          disposition !== null && 'kind' in disposition &&
+          disposition.kind === 'routed'
+        )
+        ? 'f2'
+        : entry.phase;
     const payload: IngressObligation = {
       kind: 'ingress',
+      ...(phase === 'f2' ? { phase: 'f2' as const } : {}),
       txnId,
       evidence: entry.evidence,
       rooms,
@@ -399,7 +517,11 @@ export class Mailbox {
         incarnation: entry.incarnation,
         stream: 'ingress:' + origin,
         type: 'ingress',
-        version: 1,
+        version: phase === 'f2'
+          ? edus.some((raw) => logicalMessage(origin, this.options.self, raw))
+            ? 3
+            : 2
+          : 1,
         operationId: ingressOperation(origin, txnId),
         payload,
       });

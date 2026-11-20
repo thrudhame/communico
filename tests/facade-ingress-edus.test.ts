@@ -2,9 +2,12 @@ import { assertEquals, assertRejects, assertThrows } from '@std/assert';
 import { acceptIngressEdu } from '#engine/facade/ingress-edus.ts';
 import { decodeToDevice } from '#engine/federation/todevice.ts';
 import {
+  eduState,
   PermanentEduRefusal,
   ReliableEduError,
 } from '#engine/federation/edus.ts';
+import { openStore } from '#engine/store/index.ts';
+import { serverSchema } from '#engine/server/schema.ts';
 
 const origin = 'remote.test', self = 'home.test';
 const direct = {
@@ -19,6 +22,57 @@ const unused = {
   dispatch: () => Promise.reject(new Error('must not deliver at facade')),
 };
 
+Deno.test('retained F2 ingress requires its handler instead of checkpointing F1 unknown-type ignore', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'retained-f2-edu-' });
+  const store = await openStore({
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  }, { schemas: { server: serverSchema } });
+  try {
+    const edus = eduState(await store.server(), self, store);
+    const raw = {
+      edu_type: 'm.device_list_update',
+      content: {
+        user_id: '@alice:remote.test',
+        device_id: 'A',
+        stream_id: 1,
+        prev_id: [],
+        deleted: true,
+      },
+    };
+    await assertRejects(
+      () => acceptIngressEdu(origin, self, raw, edus, 'f2'),
+      ReliableEduError,
+    );
+    // Ordinary unknown EDUs and F1 mailbox-only retention stay unchanged.
+    await edus.dispatch(origin, raw);
+    assertEquals(
+      (await acceptIngressEdu(origin, self, raw, edus, 'f1')).kind,
+      'retained',
+    );
+    const applied: unknown[] = [];
+    edus.register('m.device_list_update', (from, content) => {
+      applied.push([from, content]);
+      return Promise.resolve();
+    }, true);
+    assertEquals(
+      (await acceptIngressEdu(origin, self, raw, edus, 'f2')).kind,
+      'retained',
+    );
+    assertEquals(
+      applied,
+      [[origin, raw.content]],
+      'retry completes only after the consumer actually applies the update',
+    );
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test('F1 to-device admission shares home validation but never expands facade targets', async () => {
   assertEquals(decodeToDevice(origin, self, direct).id, 'one');
   assertEquals(
@@ -26,7 +80,7 @@ Deno.test('F1 to-device admission shares home validation but never expands facad
       edu_type: 'm.direct_to_device',
       content: direct,
     }, unused),
-    { kind: 'retained', type: 'm.direct_to_device' },
+    { kind: 'retained', type: 'm.direct_to_device', policy: 'legacy' },
   );
   for (
     const patch of [{ sender: '@fake:other.test' }, { message_id: '' }, {
@@ -126,7 +180,7 @@ Deno.test('F1 explicitly expires volatile activity and delegates receipt marks w
   );
 });
 
-Deno.test('F2 device ingress delivers validated evidence locally but preserves F1 and later to-device boundaries', async () => {
+Deno.test('F2 device ingress delivers validated evidence locally but preserves F1 and separate to-device ownership', async () => {
   const device = {
     user_id: '@alice:remote.test',
     device_id: 'A',
@@ -206,17 +260,19 @@ Deno.test('F2 device ingress delivers validated evidence locally but preserves F
     )).kind,
     'refused',
   );
-  assertEquals(
-    (await acceptIngressEdu(
-      origin,
-      self,
-      {
-        edu_type: 'm.direct_to_device',
-        content: direct,
-      },
-      unused,
-      'f2',
-    )).kind,
-    'retained',
+  await assertRejects(
+    () =>
+      acceptIngressEdu(
+        origin,
+        self,
+        {
+          edu_type: 'm.direct_to_device',
+          content: direct,
+        },
+        unused,
+        'f2',
+      ),
+    Error,
+    'to-device owner unavailable',
   );
 });

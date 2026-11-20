@@ -15,6 +15,11 @@ import {
   ACCOUNT_AUTH_SQL,
 } from '#engine/tenant/account-auth.ts';
 import { SESSION_AUTHORITY_SQL } from '#engine/tenant/session-authority.ts';
+import {
+  TO_DEVICE_ADMISSION_POLICY_SQL,
+  TO_DEVICE_ROUTE_LOOKUPS_SQL,
+  TO_DEVICE_ROUTING_SQL,
+} from '#engine/tenant/todevice-routing.ts';
 import { UIA_BINDING_SQL } from '#engine/tenant/uia.ts';
 import { CLIENT_COMPLETION_SQL } from '#engine/tenant/completion.ts';
 import { PROFILE_FANOUT_SQL } from '#engine/tenant/profile-fanout.ts';
@@ -291,7 +296,7 @@ INSERT INTO deactivation_work SELECT localpart,EXISTS(SELECT 1 FROM erased_users
 `;
 
 export const tenantSchema: SchemaProvider = {
-  version: 38,
+  version: 41,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
     await db.exec(E2EE_SQL);
@@ -328,8 +333,14 @@ export const tenantSchema: SchemaProvider = {
     await db.exec(DEVICE_CREATION_HISTORY_SQL);
     await db.exec(DEVICE_STREAM_SQL);
     await db.exec(DEVICE_CHECKPOINT_SQL);
+    await db.exec(TO_DEVICE_ROUTING_SQL);
+    await db.exec(TO_DEVICE_ADMISSION_POLICY_SQL);
+    await db.exec(TO_DEVICE_ROUTE_LOOKUPS_SQL);
   },
   migrations: {
+    40: (conn) => conn.exec(TO_DEVICE_ROUTE_LOOKUPS_SQL),
+    39: (conn) => conn.exec(TO_DEVICE_ADMISSION_POLICY_SQL),
+    38: (conn) => conn.exec(TO_DEVICE_ROUTING_SQL),
     37: (conn) => conn.exec(DEVICE_CHECKPOINT_SQL),
     36: (conn) => conn.exec(DEVICE_STREAM_SQL),
     35: (conn) => conn.exec(DEVICE_CREATION_HISTORY_SQL),

@@ -21,6 +21,7 @@ import {
   type SessionFact,
 } from '#engine/tenant/session-authority.ts';
 import type { ErasureCut } from '#engine/room/state.ts';
+import { resumePendingToDeviceRoutes } from '#engine/tenant/todevice-routing.ts';
 import {
   captureDeviceStreamFloor,
   installDeviceStreamFloor,
@@ -155,6 +156,10 @@ export async function installAccountAuth(
         Number(old.grant_revision) !== view.grantRevision ||
         Number(old.owner_revision) !== view.ownerRevision
       ) authUnavailable();
+      await resumePendingToDeviceRoutes(
+        conn,
+        '@' + view.localpart + ':' + view.server,
+      );
       return;
     }
     installed = view.revision === Number(old.revision) &&
@@ -216,6 +221,10 @@ export async function installAccountAuth(
       Math.max(Number(old?.checked_ms ?? 0), view.capturedMs),
       view.credentials ? 1 : 0,
     ],
+  );
+  await resumePendingToDeviceRoutes(
+    conn,
+    '@' + view.localpart + ':' + view.server,
   );
 }
 

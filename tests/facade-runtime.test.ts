@@ -7,6 +7,7 @@ import type { AccountAuth } from '#engine/tenant/account-auth.ts';
 import type { DeviceOperation } from '#engine/tenant/device-source.ts';
 import type { SigningOperation } from '#engine/tenant/signing-operations.ts';
 import type { SignatureOperation } from '#engine/tenant/signature-operations.ts';
+import type { ToDeviceOperation } from '#engine/tenant/todevice-routing.ts';
 import type { ReplicaRoom } from '#engine/room/replica-export.ts';
 import { ColdAuthTimings } from './helpers/cold-auth-timings.ts';
 import { facadeTls } from './support/facade-tls.ts';
@@ -920,6 +921,18 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       );
       const device = await deviceIdentity(tenant, 'outside', 'outside-device');
       await tenant.tx((tx) =>
+        tx.toDevice.send(
+          device,
+          'logical.test',
+          'm.room_key_request',
+          'cold-runtime-request',
+          'cold-runtime-request-source',
+          [{ user, id: '*', content: { request_id: 'cold-runtime-key' } }],
+          config().e2ee,
+          { enabled: false, maxBytes: 1048576 },
+        )
+      );
+      await tenant.tx((tx) =>
         tx.e2ee.upload(
           device,
           validateUpload(
@@ -1234,6 +1247,75 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
         ?.['ed25519:outside-device'],
       edgeSignature,
     );
+    // Match the actual home-owned route before consuming cold-authored work.
+    await home.observations.fact({
+      ...edgeIdentity,
+      stream: 'to-device:' + user,
+    }, (record) => {
+      const operation = toDeviceView(record);
+      return operation.kind === 'route' && operation.value.owner === 'home' &&
+        operation.value.selectors.some((selector) =>
+          selector.content.request_id === 'cold-runtime-key'
+        );
+    });
+    const keySync = await api(
+      'sync?timeout=0',
+      undefined,
+      registered.body.access_token,
+    );
+    assertEquals(keySync.status, 200, JSON.stringify(keySync));
+    assert(keySync.body.to_device.events.some(
+      (event: { type: string; content: { request_id?: string } }) =>
+        event.type === 'm.room_key_request' &&
+        event.content.request_id === 'cold-runtime-key',
+    ));
+    assertEquals(
+      (await api(
+        'sendToDevice/m.room_key_request/runtime-reply',
+        {
+          messages: {
+            [user]: { 'outside-device': { request_id: 'home-runtime-key' } },
+          },
+        },
+        registered.body.access_token,
+        'PUT',
+      )).status,
+      200,
+    );
+    // The exact reply, not an older wildcard or unrelated larger cut, is proof.
+    await homeFact(edge, pairing, 'to-device:' + user, (record) => {
+      const operation = toDeviceView(record);
+      return operation.kind === 'route' && operation.value.owner === 'edge_a' &&
+        operation.value.selectors.some((selector) =>
+          selector.id === 'outside-device' &&
+          selector.content.request_id === 'home-runtime-key'
+        );
+    });
+    await edge.stop();
+    const delivered = await open('facade');
+    try {
+      const tenant = await openTenant(delivered, 'logical.test');
+      const device = await deviceIdentity(tenant, 'outside', 'outside-device');
+      const page = await tenant.tx((tx) =>
+        tx.toDevice.deliverSliding(
+          device,
+          'runtime-observation',
+          100,
+          config().e2ee,
+        )
+      );
+      assertEquals(
+        page.events.filter((event) =>
+          event.type === 'm.room_key_request' &&
+          (event.content as { request_id?: string }).request_id ===
+            'home-runtime-key'
+        ).length,
+        1,
+      );
+    } finally {
+      await delivered.close();
+    }
+    edge = await process(file('facade'), 'facade: link/local admin ready');
     const before =
       (await adminCall(tls.dir + '/facade-auth.sock', 'facade/status')).body
         .result.scopes.find((scope: { scope: string }) =>
@@ -1507,11 +1589,83 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       (await api('facade', 'account/whoami', undefined, 'unknown')).status,
       401,
     );
+    const toDevicePath = 'sendToDevice/m.room_key_request/public-owner-send';
+    const originalRequest = {
+      messages: {
+        '@outside:logical.test': { '*': { request_id: 'public-owner-send' } },
+      },
+    };
+    assertEquals(
+      (await api(
+        'facade',
+        toDevicePath,
+        originalRequest,
+        session.body.access_token,
+        'PUT',
+      )).status,
+      200,
+    );
+    assertEquals(
+      (await api(
+        'facade',
+        toDevicePath,
+        {
+          messages: {
+            '@outside:logical.test': {
+              '*': { request_id: 'must-not-replace' },
+            },
+          },
+        },
+        session.body.access_token,
+        'PUT',
+      )).status,
+      200,
+    );
+    assertEquals(
+      (await api(
+        'facade',
+        toDevicePath + '-wrong',
+        originalRequest,
+        registered.body.access_token,
+        'PUT',
+      )).status,
+      503,
+    );
     const rotated = await api('facade', 'refresh', {
       refresh_token: session.body.refresh_token,
     });
     assertEquals(rotated.status, 200);
     await edge.stop();
+    const sentStore = await openStore({
+      dir: tls.dir + '/facade-public-auth-store',
+      library: './.native/libturso_ffi.so',
+      checkpointlogbytes: 65536,
+      maxopenfiles: 8,
+      idleseconds: 300,
+    }, {
+      schemas: { room: roomSchema, server: serverSchema, tenant: tenantSchema },
+    });
+    try {
+      const db = await sentStore.tenant('logical.test');
+      assertEquals(
+        (await db.query(
+          'SELECT * FROM to_device_transactions WHERE txn_id LIKE ?',
+          ['public-owner-send%'],
+        )).length,
+        1,
+      );
+      const received = await db.query(
+        'SELECT event_json FROM to_device_inbox WHERE localpart=? AND device_id=?',
+        ['outside', 'public-device'],
+      );
+      assertEquals(
+        received.map((row) => JSON.parse(String(row.event_json)).content),
+        [{ request_id: 'public-owner-send' }],
+      );
+      assertEquals(await db.query('SELECT * FROM to_device_intents'), []);
+    } finally {
+      await sentStore.close();
+    }
     await configure('facade', 'allowstaleauth=false\n');
     edge = await process(file('facade'), 'facade: link/local admin ready');
     const unavailable = {
@@ -2036,6 +2190,10 @@ function authorityView(
   record: LinkRecord,
 ): { authority: AccountAuth['authority'] } {
   return object(record.payload).body as { authority: AccountAuth['authority'] };
+}
+
+function toDeviceView(record: LinkRecord): ToDeviceOperation {
+  return object(object(record.payload).body).operation as ToDeviceOperation;
 }
 
 function roomView(record: LinkRecord): ReplicaRoom {

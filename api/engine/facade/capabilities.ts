@@ -148,6 +148,12 @@ const F2_DEVICES: readonly Rule[] = [
   route('POST', literal(f + 'user/keys/claim'), 'public'),
 ];
 
+// B5 sends retain local targets and remote/other-owner obligations before 200.
+// Inbox publication remains gated independently by the sync capability slice.
+const F2_TODEVICE: readonly Rule[] = [
+  route('PUT', /^\/_matrix\/client\/v3\/sendToDevice\/[^/]+\/[^/]+$/, 'auth'),
+];
+
 const HOME_SERVICES = new Set([
   'recovery',
   'link-client',
@@ -185,11 +191,16 @@ export function capabilities(role: string, phase = 'f1') {
     gate(request: Request, ready: (scope: Scope) => boolean): Response | null {
       if (role === 'home') return null;
       const path = new URL(request.url).pathname;
-      const matching =
-        (phase === 'f2'
-          ? [...F1_PUBLIC, ...F2_AUTH, ...F2_REGISTERS, ...F2_DEVICES]
-          : F1_PUBLIC)
-          .filter((rule) => rule.path.test(path));
+      const matching = (phase === 'f2'
+        ? [
+          ...F1_PUBLIC,
+          ...F2_AUTH,
+          ...F2_REGISTERS,
+          ...F2_DEVICES,
+          ...F2_TODEVICE,
+        ]
+        : F1_PUBLIC)
+        .filter((rule) => rule.path.test(path));
       const rule = matching.find((rule) => rule.method === request.method);
       if (!rule) {
         return Response.json({

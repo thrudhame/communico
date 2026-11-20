@@ -15,8 +15,14 @@ import { nextCounter } from '#engine/tenant/accountdata.ts';
 import { domainOf, localpartOf } from '#engine/ids.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { hashToken } from '#engine/tenant/auth.ts';
+import { registryDevice, tenantAuthority } from './session-authority.ts';
 import { encodeStreamToken, type StreamToken } from '#engine/client/tokens.ts';
 import { encodeEnvelope } from '#engine/federation-envelope.ts';
+import {
+  acknowledgeToDeviceTargets,
+  checkToDeviceReplay,
+  routeToDeviceMessages,
+} from './todevice-routing.ts';
 
 const args = (d: DeviceIdentity) => [d.localpart, d.deviceId, d.generation];
 
@@ -26,11 +32,17 @@ export function forgetRestoredDeliveries(conn: Conn): Promise<number> {
   return conn.execute('DELETE FROM sync_deliveries');
 }
 export type Message = { user: string; id: string; content: Json };
-/** Queue pressure is temporary, unlike a permanently oversized wire object. */
-export class InboxFullError extends MatrixError {
-  constructor() {
-    super(413, 'M_TOO_LARGE', 'device inbox is full');
+/** Like Synapse, only a sole '*' selector expands the owning registry. Mixed
+ * maps use literal device IDs, never entry-order-dependent overlapping fanout. */
+export function targetSelectors(messages: Message[]) {
+  const counts = new Map<string, number>();
+  for (const message of messages) {
+    counts.set(message.user, (counts.get(message.user) ?? 0) + 1);
   }
+  return messages.map((message) => ({
+    ...message,
+    wildcard: message.id === '*' && counts.get(message.user) === 1,
+  }));
 }
 export type DeliveryPolicy = { enabled: boolean; maxBytes: number };
 export function validateMessages(body: unknown, limits: KeyLimits): Message[] {
@@ -68,6 +80,17 @@ export async function insertMessage(
   limits: KeyLimits,
 ): Promise<void> {
   bounded([event], limits.maxrequestbytes);
+  await insertRetainedMessage(conn, d, source, event);
+}
+
+/** Retained selectors have already passed admission. Mutable request limits
+ * must not revoke their delivery or make unrelated auth bootstrap roll back. */
+export async function insertRetainedMessage(
+  conn: Conn,
+  d: DeviceIdentity,
+  source: string,
+  event: Json,
+): Promise<void> {
   const owner = args(d);
   if (
     (await conn.query(
@@ -75,11 +98,10 @@ export async function insertMessage(
       [...owner, source],
     )).length
   ) return;
-  const count = await conn.query(
-    'SELECT COUNT(*) AS n FROM to_device_inbox WHERE localpart=? AND device_id=? AND generation=?',
-    owner,
-  );
-  if (Number(count[0].n) >= limits.maxinboxmessages) throw new InboxFullError();
+  // Like Synapse, retain inbox rows until their issued receipt is acknowledged
+  // or this device incarnation is deleted. Remote-intent admission budgets do
+  // not bound a receiving device's durable inbox. Actual I/O errors still abort
+  // the caller's whole transaction, including its route expansion and receipt.
   const pos = await nextCounter(conn, 'to_device');
   await conn.execute('INSERT INTO to_device_inbox VALUES(?,?,?,?,?,?)', [
     ...owner,
@@ -108,9 +130,19 @@ export async function sendMessages(
       receipt,
     )).length
   ) return;
+  const routed = await routeToDeviceMessages(
+    conn,
+    { kind: 'client', origin: server, id: source },
+    '@' + d.localpart + ':' + server,
+    type,
+    server,
+    messages,
+    limits,
+    d.localpart,
+  );
   let fanout = 0;
   const remote = new Map<string, Record<string, Record<string, Json>>>();
-  for (const m of messages) {
+  for (const m of targetSelectors(messages)) {
     const destination = domainOf(m.user);
     if (destination !== server) {
       let users = remote.get(destination);
@@ -122,8 +154,9 @@ export async function sendMessages(
       users![m.user][m.id] = m.content;
       continue;
     }
+    if (routed) continue;
     const lp = localpartOf(m.user);
-    const targets = m.id === '*'
+    const targets = m.wildcard
       ? await devicesOfUser(conn, lp)
       : [await deviceById(conn, m.id, lp)];
     for (const target of targets) {
@@ -207,21 +240,58 @@ export async function receiveMessages(
   server: string,
   messages: Message[],
   limits: KeyLimits,
+  policy?: 'legacy',
 ): Promise<void> {
   if (
     (await conn.query(
       'SELECT 1 FROM inbound_to_device WHERE origin=? AND message_id=?',
       [origin, id],
     )).length
-  ) return;
-  for (const m of messages) {
+  ) {
+    await checkToDeviceReplay(conn, origin, id, sender, type, server, messages);
+    return;
+  }
+  const routed = await routeToDeviceMessages(
+    conn,
+    { kind: 'federation', origin, id },
+    sender,
+    type,
+    server,
+    messages,
+    limits,
+    undefined,
+    policy,
+  );
+  if (routed) {
+    await conn.execute('INSERT INTO inbound_to_device VALUES(?,?)', [
+      origin,
+      id,
+    ]);
+    return;
+  }
+  const identity = await tenantAuthority(conn);
+  if (identity && identity.node !== 'home') {
+    throw new MatrixError(
+      503,
+      'M_UNAVAILABLE',
+      'legacy to-device delivery requires home owner',
+    );
+  }
+  for (const m of targetSelectors(messages)) {
     if (domainOf(m.user) !== server) continue;
     const lp = localpartOf(m.user);
-    const targets = m.id === '*'
+    const targets = m.wildcard
       ? await devicesOfUser(conn, lp)
       : [await deviceById(conn, m.id, lp)];
     for (const target of targets) {
       if (target === null) continue;
+      if (identity) {
+        const creation = await registryDevice(conn, lp, target.device_id);
+        if (
+          !creation || creation.node !== 'home' ||
+          creation.incarnation !== identity.incarnation
+        ) continue;
+      }
       // Wire entries are sender-bounded before this transaction. Wildcard
       // expansion belongs to the local device owner, not that wire budget.
       await insertMessage(
@@ -245,6 +315,7 @@ export async function acknowledge(
   conn: Conn,
   d: DeviceIdentity,
   since: StreamToken | null,
+  sourceChanged?: () => void,
 ): Promise<number> {
   await current(conn, d);
   if (since !== null) {
@@ -262,6 +333,7 @@ export async function acknowledge(
     conn,
     d,
     since === null ? null : await hashToken(encodeStreamToken(since)),
+    sourceChanged,
   );
 }
 
@@ -275,12 +347,14 @@ export async function acknowledgeSliding(
   d: DeviceIdentity,
   connection: string,
   since: string | null,
+  sourceChanged?: () => void,
 ): Promise<number> {
   await current(conn, d);
   return await acknowledgeIssued(
     conn,
     d,
     since === null ? null : await hashToken(slidingReceipt(connection, since)),
+    sourceChanged,
   );
 }
 
@@ -288,9 +362,11 @@ async function acknowledgeIssued(
   conn: Conn,
   d: DeviceIdentity,
   tokenHash: string | null,
+  sourceChanged?: () => void,
 ): Promise<number> {
   const owner = args(d);
   const ack = await issuedAck(conn, d, tokenHash);
+  if (await acknowledgeToDeviceTargets(conn, d, ack)) sourceChanged?.();
   await conn.execute(
     `INSERT INTO device_ack VALUES(?,?,?,?) ON CONFLICT(localpart,device_id,generation) DO UPDATE SET msg_pos=excluded.msg_pos WHERE ${
       changedColumns('device_ack', 'msg_pos')

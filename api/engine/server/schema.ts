@@ -22,6 +22,8 @@ import {
   RECEIPT_GRAPH_SQL,
 } from '#engine/server/receipt-frontier.ts';
 import {
+  FACADE_INGRESS_PHASE_SQL,
+  FACADE_INGRESS_POLICY_SQL,
   FACADE_INGRESS_SQL,
   FACADE_JOURNAL_SQL,
   FACADE_KEY_RETIREMENT_SQL,
@@ -434,7 +436,7 @@ CREATE INDEX notification_horizons_room ON notification_horizons(room);
 `;
 
 export const serverSchema: SchemaProvider = {
-  version: 44,
+  version: 46,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -481,6 +483,8 @@ export const serverSchema: SchemaProvider = {
     await db.exec(RECEIPT_ADMISSION_SQL);
     await db.exec(DEVICE_PUBLICATIONS_SQL);
     await db.exec(PUBLICATION_CAPTURE_SQL);
+    await db.exec(FACADE_INGRESS_PHASE_SQL);
+    await db.exec(FACADE_INGRESS_POLICY_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -547,5 +551,7 @@ INSERT INTO device_publications SELECT json_extract(payload,'$.user_id'),destina
 INSERT INTO device_publication_predecessors SELECT DISTINCT p.subject,p.destination,p.epoch,p.stream_id,j.value FROM device_publications p,json_each(p.content,'$.prev_id') j;
 `);
     },
+    44: (conn) => conn.exec(FACADE_INGRESS_PHASE_SQL),
+    45: (conn) => conn.exec(FACADE_INGRESS_POLICY_SQL),
   },
 };

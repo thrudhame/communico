@@ -33,6 +33,7 @@ import {
 import { exportOwnerControl } from './ownership.ts';
 import { DomainOperations } from './domain.ts';
 import { DeviceOperations, isKeyStream } from './devices.ts';
+import { isToDeviceStream, ToDeviceOperations } from './todevice.ts';
 
 export async function startHomeLinks(
   app: App,
@@ -78,9 +79,14 @@ export async function startHomeLinks(
   const jobs = new Map<string, Promise<void>>();
   const authExports = new Map<string, ReturnType<typeof startAccountExports>>();
   const keyExports = new Map<string, ReturnType<typeof startAccountExports>>();
+  const toDeviceExports = new Map<
+    string,
+    ReturnType<typeof startAccountExports>
+  >();
   const accounts = new AccountSnapshots(app.store, app.tenant, pairings);
   const domains = new DomainOperations(app.store, app.tenant, pairings);
   const devices = new DeviceOperations(app.store, app.tenant, pairings);
+  const toDevice = new ToDeviceOperations(app.store, app.tenant, pairings);
   const collectKeySignature = async (
     keyId: string,
     document: import('#engine/federation/keys.ts').KeyDoc,
@@ -139,6 +145,7 @@ export async function startHomeLinks(
       directoryExports.get(id)?.wake();
       authExports.get(id)?.wake();
       keyExports.get(id)?.wake();
+      toDeviceExports.get(id)?.wake();
       return;
     }
     await exports.get(id)?.close();
@@ -151,6 +158,8 @@ export async function startHomeLinks(
     authExports.delete(id);
     await keyExports.get(id)?.close();
     keyExports.delete(id);
+    await toDeviceExports.get(id)?.close();
+    toDeviceExports.delete(id);
     await workers.get(id)?.close();
     workers.delete(id);
     let secret: string | undefined;
@@ -195,6 +204,8 @@ export async function startHomeLinks(
       pairing: id,
       pairings,
       transaction: transactionDependencies(app),
+      toDevice: (origin, raw, receipt) =>
+        toDevice.ingress(origin, raw, receipt, id),
     });
     workers.set(
       id,
@@ -218,6 +229,8 @@ export async function startHomeLinks(
             ? domains.apply(journal, stream, id)
             : settings.phase === 'f2' && isKeyStream(stream)
             ? devices.apply(journal, stream, id)
+            : settings.phase === 'f2' && isToDeviceStream(stream)
+            ? toDevice.apply(journal, stream, id)
             : apply(node, stream),
         failed: (error) => failed(node, error),
         acknowledged: (stream) => {
@@ -297,6 +310,18 @@ export async function startHomeLinks(
           failed: (error) => failed(node, error),
         }),
       );
+      toDeviceExports.set(
+        id,
+        startAccountExports({
+          store: app.store,
+          tenant: app.tenant,
+          pollseconds: settings.pollseconds,
+          users: () => app.tenant.tx((tx) => tx.publicReplica.users()),
+          emit: (localpart) => toDevice.export(localpart, id),
+          changed: () => workers.get(id)?.wake(),
+          failed: (error) => failed(node, error),
+        }),
+      );
     }
   }
   let scanning: Promise<void> | undefined;
@@ -336,6 +361,9 @@ export async function startHomeLinks(
         );
         await Promise.all(
           [...keyExports.values()].map((keys) => keys.close()),
+        );
+        await Promise.all(
+          [...toDeviceExports.values()].map((deliveries) => deliveries.close()),
         );
         await Promise.all([...exports.values()].map((rooms) => rooms.close()));
         await Promise.all(
