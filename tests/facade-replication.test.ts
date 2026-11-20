@@ -102,6 +102,15 @@ import { writeStateKey } from '#engine/client/write.ts';
 import { getPresence } from '#engine/client/presence.ts';
 import { setPresence } from '#engine/server/ephemeral.ts';
 import {
+  clientHierarchy,
+  federationHierarchy,
+  hierarchyQuery,
+} from '#engine/client/hierarchy.ts';
+import {
+  b64decode,
+  importPublicKeyFromRaw,
+} from '#engine/signing-primitives.js';
+import {
   listLocalPublishedRooms,
   resolveAlias,
 } from '#engine/client/directory.ts';
@@ -470,6 +479,11 @@ function appliedReadTests() {
             MatrixError,
             'replica unavailable',
           );
+          await assertRejects(
+            () => federationHierarchy(f.source.roomId, 'logical.test', false),
+            MatrixError,
+            'replica unavailable',
+          );
           await (await f.edgeServer()).tx((conn) => readAdmission.check(conn));
           const before = await journal.heads('home', 'in', room);
           const read = await get(path);
@@ -585,6 +599,103 @@ function appliedReadTests() {
       await assertRejects(() => owner.prepareReadRoomScope(f.source.roomId));
     } finally {
       await f.close();
+    }
+  });
+
+  Deno.test('applied read split preserves federation hierarchy child admission', async () => {
+    const f = await fixture();
+    try {
+      const root = await createRoom(f.home, {
+        creator: f.source.creator,
+        preset: 'public_chat',
+        creation_content: { type: 'm.space' },
+        initial_state: [{
+          type: 'm.space.child',
+          state_key: f.source.roomId,
+          content: { via: ['logical.test'] },
+        }],
+      }, f.tenant.signer());
+      const rootRecord = await exportRoomReplica(
+        f.home,
+        await openRoom(f.home, root.roomId),
+        f.tenant.serverName,
+        f.node.node,
+        f.bundle.id,
+      );
+      const childRecord = await f.exports(),
+        inventory = await f.directoryExport();
+      assert(rootRecord && childRecord && inventory);
+      const journal = await f.journal(), directory = await f.directoryOwner();
+      await journal.receive('home', [childRecord]);
+      assert(await (await f.replicas()).apply(journal, childRecord));
+      const publicKey = await importPublicKeyFromRaw(
+        b64decode(f.tenant.publicB64),
+      );
+      const keys = productionKeyResolver(
+        await f.edgeServer(),
+        f.node.signer(),
+        {
+          getVerifyKey(name, keyId) {
+            assertEquals(name, f.tenant.serverName);
+            assertEquals(keyId, f.tenant.keyId);
+            return Promise.resolve(publicKey);
+          },
+        },
+      );
+      await journal.receive('home', [rootRecord]);
+      assert(
+        await new RoomReplicas(
+          f.edgeStore(),
+          await f.edgePairings(),
+          f.tenant.serverName,
+          keys,
+        ).apply(journal, rootRecord),
+      );
+      await journal.receive('home', [inventory]);
+      assert(await directory.apply(journal, inventory));
+      setConfigForTests({ server: { name: 'logical.test', role: 'facade' } });
+      await openReplicaApp(f.edgeStore(), await f.edgeTenant(), {
+        requireReadScope: (scope, absent) =>
+          directory.requireReadScope(scope, absent),
+        prepareReadRoomScope: (id, absent) =>
+          directory.prepareReadRoomScope(id, absent),
+        requireScope: (scope, absent) => directory.requireScope(scope, absent),
+        prepareRoomScope: (id, absent) =>
+          directory.prepareRoomScope(id, absent),
+        keys: keyStore(await f.edgeServer(), { signer: f.node.signer() }),
+        signer: f.node.signer(),
+        keyDocument: () => Promise.reject(new Error('unused')),
+        publicRooms: async () => (await directory.snapshot())!.publicRooms,
+      });
+      assertEquals(
+        (await federationHierarchy(root.roomId, 'logical.test', false)).children
+          .length,
+        1,
+      );
+      const next = await f.source.addEvent({
+        type: 'm.room.join_rules',
+        state_key: '',
+        content: { join_rule: 'invite' },
+      });
+      await f.ingest([next]);
+      const suffix = await f.exports();
+      assert(suffix);
+      await journal.receive('home', [suffix]);
+      await assertRejects(
+        () => federationHierarchy(root.roomId, 'logical.test', false),
+        MatrixError,
+        'replica unavailable',
+      );
+      const client = await clientHierarchy(
+        root.roomId,
+        f.source.creator,
+        hierarchyQuery(new URLSearchParams('limit=10')),
+      );
+      assert(client.rooms.some((room) => room.room_id === f.source.roomId));
+    } finally {
+      await closeApp();
+      await f.close();
+      setConfigForTests({});
     }
   });
 
