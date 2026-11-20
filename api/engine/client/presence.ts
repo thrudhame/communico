@@ -14,10 +14,10 @@ export async function getPresence(
   const app = theApp();
   const admissions: ReplicaRoomAdmission[] = [];
   if (observer !== subject) {
-    await app.replica?.requireScope('rooms');
+    await app.replica?.requireReadScope('rooms');
     const rooms = await completionAudience(app, observer);
     for (const room of rooms) {
-      const admission = await app.replica?.prepareRoomScope(room);
+      const admission = await app.replica?.prepareReadRoomScope(room);
       if (admission) admissions.push(admission);
     }
     await roomCompletion(app, rooms, signal);

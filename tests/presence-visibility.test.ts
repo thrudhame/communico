@@ -126,12 +126,12 @@ suite.test('incomplete replica membership returns unavailable before disclosure 
       Object.defineProperty(app, 'replica', {
         configurable: true,
         value: {
-          requireScope(scope: string) {
+          requireReadScope(scope: string) {
             scopes.push(scope);
             if (phase === 'inventory') unavailable();
             return Promise.resolve();
           },
-          prepareRoomScope() {
+          prepareReadRoomScope() {
             return Promise.resolve({
               check() {
                 checks++;

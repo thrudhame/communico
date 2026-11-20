@@ -226,6 +226,8 @@ export type ReplicaRoomAdmission = {
   checkCurrent(): void;
 };
 
+type ScopeAccess = 'current' | 'applied';
+
 export class DirectoryReplicas {
   constructor(
     private readonly db: Database,
@@ -233,10 +235,13 @@ export class DirectoryReplicas {
     private readonly self: string,
   ) {}
 
-  async snapshot(): Promise<DirectoryReplica | null> {
+  async snapshot(
+    access: ScopeAccess = 'current',
+  ): Promise<DirectoryReplica | null> {
     const context = (await this.pairings.active()).body.transcript.body.context;
     const [row] = await this.db.query(
-      "SELECT r.record_json FROM facade_streams s JOIN facade_records r ON r.peer=s.peer AND r.direction=s.direction AND r.source=s.source AND r.incarnation=s.incarnation AND r.stream=s.stream AND r.sequence=s.applied JOIN facade_scopes v ON v.incarnation=s.incarnation AND v.scope=s.stream AND v.ready=1 WHERE s.peer='home' AND s.direction='in' AND s.source='home' AND s.incarnation=? AND s.stream='directory' AND s.received=s.applied",
+      "SELECT r.record_json FROM facade_streams s JOIN facade_records r ON r.peer=s.peer AND r.direction=s.direction AND r.source=s.source AND r.incarnation=s.incarnation AND r.stream=s.stream AND r.sequence=s.applied JOIN facade_scopes v ON v.incarnation=s.incarnation AND v.scope=s.stream AND v.ready=1 WHERE s.peer='home' AND s.direction='in' AND s.source='home' AND s.incarnation=? AND s.stream='directory'" +
+        (access === 'current' ? ' AND s.received=s.applied' : ''),
       [context.id],
     );
     return row
@@ -250,14 +255,34 @@ export class DirectoryReplicas {
     }
   }
 
+  /** Ordinary readers need a completed publication, not the cut advertised by
+   * a successor inventory. Their own causal cuts remain completion obligations. */
+  async requireReadScope(scope: string, allowAbsent = false): Promise<void> {
+    if (
+      await this.scopeStateFor(scope, 'applied') === 'absent' && !allowAbsent
+    ) {
+      throw new MatrixError(404, 'M_NOT_FOUND', 'scope not found');
+    }
+  }
+
   async scopeState(scope: string): Promise<'ready' | 'absent'> {
-    const view = await this.snapshot();
+    return await this.scopeStateFor(scope, 'current');
+  }
+
+  private async scopeStateFor(
+    scope: string,
+    access: ScopeAccess,
+  ): Promise<'ready' | 'absent'> {
+    const view = await this.snapshot(access);
     const unavailable = () => {
       throw new MatrixError(503, 'M_UNAVAILABLE', 'replica unavailable');
     };
     if (!view) unavailable();
     if (scope === 'directory') return 'ready';
     if (scope === 'rooms') {
+      // An ordinary inventory read does not depend on every received room.
+      // Its selected audience prepares each actual room dependency separately.
+      if (access === 'applied') return 'ready';
       const grant = await this.pairings.active();
       const incoming = await this.db.query(
         "SELECT DISTINCT stream FROM facade_streams WHERE peer='home' AND direction='in' AND source='home' AND incarnation=? AND stream LIKE 'room:%'",
@@ -278,6 +303,7 @@ export class DirectoryReplicas {
         scope,
         grant.body.transcript.body.context.id,
         view!.cuts[scope],
+        access,
       )
     );
   }
@@ -289,10 +315,25 @@ export class DirectoryReplicas {
     roomId: string,
     allowAbsent = false,
   ): Promise<ReplicaRoomAdmission> {
+    return await this.prepareScope(roomId, allowAbsent, 'current');
+  }
+
+  async prepareReadRoomScope(
+    roomId: string,
+    allowAbsent = false,
+  ): Promise<ReplicaRoomAdmission> {
+    return await this.prepareScope(roomId, allowAbsent, 'applied');
+  }
+
+  private async prepareScope(
+    roomId: string,
+    allowAbsent: boolean,
+    access: ScopeAccess,
+  ): Promise<ReplicaRoomAdmission> {
     const received = receivedFence(this.db), authority = signingFence(this.db);
     const grant = await this.pairings.active();
     const pairing = grant.body.transcript.body.context.id;
-    const view = await this.snapshot();
+    const view = await this.snapshot(access);
     const unavailable = (): never => {
       throw new MatrixError(503, 'M_UNAVAILABLE', 'replica unavailable');
     };
@@ -300,6 +341,7 @@ export class DirectoryReplicas {
     const scope = 'room:' + roomId;
     const checkCurrent = () => {
       authority();
+      if (access === 'applied') return;
       for (const stream of ['directory', scope]) {
         if (
           !received('home', { source: 'home', incarnation: pairing, stream })
@@ -321,6 +363,7 @@ export class DirectoryReplicas {
         scope,
         pairing,
         view!.cuts[scope],
+        access,
       );
       if (state === 'absent' && !allowAbsent) {
         throw new MatrixError(404, 'M_NOT_FOUND', 'scope not found');
@@ -336,12 +379,21 @@ export class DirectoryReplicas {
     scope: string,
     pairing: string,
     required?: number,
+    access: ScopeAccess = 'current',
   ): Promise<'ready' | 'absent'> {
     const [held] = await conn.query(
-      "SELECT s.received,s.applied,v.source_cut,v.ready FROM facade_streams s LEFT JOIN facade_scopes v ON v.incarnation=s.incarnation AND v.scope=s.stream WHERE s.peer='home' AND s.direction='in' AND s.source='home' AND s.incarnation=? AND s.stream=?",
+      "SELECT s.received,s.applied,v.source_cut,v.ready,v.pending_hash FROM facade_streams s LEFT JOIN facade_scopes v ON v.incarnation=s.incarnation AND v.scope=s.stream WHERE s.peer='home' AND s.direction='in' AND s.source='home' AND s.incarnation=? AND s.stream=?",
       [pairing, scope],
     );
     // A newer stream may precede the next inventory. Do not hide that held scope.
+    // Pending application does not erase the prior completed source cut. Room
+    // transactions publish semantic steps through the ordinary completion owner;
+    // this does not mark the suffix complete or advance the journal's ACK.
+    if (
+      access === 'applied' && held && Number(held.applied) > 0 &&
+      Number(held.source_cut) > 0 &&
+      (Number(held.ready) === 1 || held.pending_hash !== null)
+    ) return 'ready';
     if (
       held && Number(held.ready) === 1 &&
       Number(held.received) === Number(held.applied) &&

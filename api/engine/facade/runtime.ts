@@ -512,6 +512,20 @@ export async function openFacadeRuntime(
       );
       return rows.length !== 0;
     },
+    async requireReadScope(scope: string, allowAbsent?: boolean) {
+      return await new DirectoryReplicas(
+        server,
+        await pairings(),
+        identity.server,
+      ).requireReadScope(scope, allowAbsent);
+    },
+    async prepareReadRoomScope(roomId: string, allowAbsent?: boolean) {
+      return await new DirectoryReplicas(
+        server,
+        await pairings(),
+        identity.server,
+      ).prepareReadRoomScope(roomId, allowAbsent);
+    },
     async requireScope(scope: string, allowAbsent?: boolean) {
       return await new DirectoryReplicas(
         server,

@@ -12,5 +12,6 @@ export default async function (request: PathfinderRequest) {
   await assertFederationDirectoryAllowed();
   return await listLocalPublishedRooms(
     decodeDirectoryRequest(request.query, undefined, 'federation'),
+    'admission',
   );
 }
