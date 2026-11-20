@@ -218,7 +218,8 @@ async function submissionReceipt(
   }
   if (
     prepared !== null &&
-    event.pdu !== canonicalJson(prepared as unknown as Record<string, unknown>)
+    await tx.events.stored(eventId) !==
+      canonicalJson(prepared as unknown as Record<string, unknown>)
   ) {
     throw new Error('E_SUBMISSION_PDU_MISMATCH: ' + eventId);
   }

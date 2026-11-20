@@ -80,6 +80,7 @@ function bind(
         await waits.readyFor(conn, id);
       },
       get: (id: string) => rows.get(id),
+      stored: (id: string) => rows.stored(id),
       list: (ids: readonly string[]) => rows.list(ids),
       mergeSignatures: async (
         evidence: import('./signatures.ts').SignatureEvidence,

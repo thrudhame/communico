@@ -289,6 +289,16 @@ export class EventReads {
     return row === null ? null : { ...row };
   }
 
+  /** Exact accepted bytes for prepared receipts, without learned signatures. */
+  async stored(id: string): Promise<string | null> {
+    this.check();
+    const [row] = await this.conn.query('SELECT pdu FROM events WHERE id = ?', [
+      id,
+    ]);
+    this.check();
+    return row === undefined ? null : String(row.pdu);
+  }
+
   replace(row: EventRow): void {
     this.check();
     this.rows.set(row.id, Promise.resolve({ ...row }));

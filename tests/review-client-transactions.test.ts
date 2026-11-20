@@ -159,6 +159,15 @@ for (const kind of ['send', 'redact'] as const) {
             ])).length,
             cut === 'before' ? 0 : 1,
           );
+          const learned = { 'peer.test': { 'ed25519:peer': 'learned' } };
+          if (cut === 'after') {
+            // The verified overlay owner may learn another signature while
+            // the tenant still holds the exact original prepared submission.
+            await before.execute(
+              'INSERT INTO event_signatures(event,signatures) VALUES(?,?)',
+              [expected.event_id!, JSON.stringify(learned)],
+            );
+          }
           const config = {
             dir: dirname(dirname(app.server.path)),
             library: './.native/libturso_ffi.so',
@@ -180,7 +189,26 @@ for (const kind of ['send', 'redact'] as const) {
           const stored = await room.tx((tx) =>
             tx.events.get(expected.event_id!)
           );
-          assertEquals(JSON.parse(stored!.pdu), expected);
+          assertEquals(
+            JSON.parse(stored!.pdu),
+            cut === 'after'
+              ? {
+                ...expected,
+                signatures: { ...expected.signatures, ...learned },
+              }
+              : expected,
+          );
+          assertEquals(
+            JSON.parse(
+              String(
+                (await (await theApp().store.room(f.roomId)).query(
+                  'SELECT pdu FROM events WHERE id=?',
+                  [expected.event_id!],
+                ))[0].pdu,
+              ),
+            ),
+            expected,
+          );
           const rendered = await renderEvent(room, expected.event_id!, {
             userId: f.user.user_id,
             deviceId: f.user.device_id,
