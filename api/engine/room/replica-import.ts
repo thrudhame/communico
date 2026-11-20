@@ -35,12 +35,15 @@ export async function importReplicaRoom(
     signal?: AbortSignal;
     signatureUnion?: boolean;
     home?: boolean;
+    admit?: () => void;
   },
 ): Promise<void> {
   if (manifest.version !== 1) {
     throw new MatrixError(400, 'M_BAD_JSON', 'replica manifest version');
   }
-  if (manifest.after > 0) await openRoom(store, manifest.roomId);
+  const roomHandle = () =>
+    openRoom(store, manifest.roomId, { admit: input.admit });
+  if (manifest.after > 0) await roomHandle();
   const residents = new Map(Object.entries(manifest.residents));
   const pack = new Map<string, Pdu>();
   const signatures = new Map<string, SignatureEvidence>();
@@ -144,7 +147,7 @@ export async function importReplicaRoom(
   // Known auth/genesis events and signature-only packs need the same immutable
   // material comparison as live steps. Validate them before bootstrap writes.
   if (packEvidence && (await store.rooms()).includes(manifest.roomId)) {
-    const room = await openRoom(store, manifest.roomId);
+    const room = await roomHandle();
     await withRoomLock(room.id, () =>
       room.tx(async (tx) => {
         const stay = await tx.segments.latestStay();
@@ -190,7 +193,7 @@ export async function importReplicaRoom(
     input.signal?.throwIfAborted();
     const step = manifest.steps[i];
     await ensure(step.stay);
-    const room = await openRoom(store, manifest.roomId);
+    const room = await roomHandle();
     if (step.kind === 'history') {
       const chunk = [];
       do {
@@ -346,7 +349,7 @@ export async function importReplicaRoom(
     if (!initialized.has(id)) {
       await ensure(id);
     }
-    const room = await openRoom(store, manifest.roomId);
+    const room = await roomHandle();
     const closed = await room.tx(async (tx) => {
       const stay = (await tx.segments.list()).find((held) =>
         held.kind === 'stay' &&
@@ -364,7 +367,7 @@ export async function importReplicaRoom(
   // copied source status or live publication. Later source transitions can
   // ground them normally. This also works after the final stay has closed.
   const evidence = packEvidence ?? await verifyPack();
-  const room = await openRoom(store, manifest.roomId);
+  const room = await roomHandle();
   await withRoomLock(room.id, () =>
     room.tx(async (tx) => {
       const stay = await tx.segments.latestStay();

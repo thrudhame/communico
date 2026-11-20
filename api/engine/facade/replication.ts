@@ -332,12 +332,13 @@ export class RoomReplicas {
           );
         }
         : undefined,
-      apply: async () => {
+      apply: async (admit) => {
         await importReplicaRoom(this.store, manifest, {
           self: this.self,
           keys: this.keys,
           signatureUnion: record.version === 2,
           home: !connection,
+          admit,
         });
         return { roomId: manifest.roomId, cut: manifest.cut };
       },

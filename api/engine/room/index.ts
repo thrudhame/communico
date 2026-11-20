@@ -267,12 +267,15 @@ export function initializeRoom<T>(
   store: Store,
   roomId: string,
   fn: (tx: RoomTx) => Promise<T>,
+  admit?: () => void,
 ): Promise<T> {
+  admit?.();
   return roomTransaction(
     store,
     roomId,
     fn,
     (body) => store.initializeRoom(roomId, (db) => db.tx(body)),
+    admit,
   );
 }
 
@@ -283,6 +286,7 @@ async function roomTransaction<T>(
   roomId: string,
   fn: (tx: RoomTx) => Promise<T>,
   run: <R>(body: (conn: Conn) => Promise<R>) => Promise<R>,
+  admit?: () => void,
 ): Promise<T> {
   const cutoff = roomEdges.cutoff();
   const { result, resolutions, edges } = await run(async (conn) => {
@@ -291,7 +295,11 @@ async function roomTransaction<T>(
     const rows = new events.EventReads(conn, edges);
     const tx = bind(conn, roomId, edges, groups, rows);
     try {
+      admit?.();
       const result = await fn(tx);
+      // The authority owner supplies a synchronous fence: no cross-file
+      // transaction or awaited authority read while this room lock is held.
+      admit?.();
       return { result, resolutions: tx.diagnostics.resolutions, edges };
     } finally {
       // Cache hits must not let an escaped RoomTx outlive its Conn.
@@ -308,12 +316,14 @@ async function roomTransaction<T>(
 export async function openRoom(
   store: Store,
   roomId: string,
-  options: { create?: boolean } = {},
+  options: { create?: boolean; admit?: () => void } = {},
 ): Promise<Room> {
+  options.admit?.();
   const db: Database = await store.room(roomId, options);
   return {
     id: roomId,
     store,
-    tx: (fn) => roomTransaction(store, roomId, fn, (body) => db.tx(body)),
+    tx: (fn) =>
+      roomTransaction(store, roomId, fn, (body) => db.tx(body), options.admit),
   };
 }

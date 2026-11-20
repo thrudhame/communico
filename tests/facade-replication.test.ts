@@ -1764,8 +1764,8 @@ Deno.test('room replication exports an enrolled facade suffix under its own sour
     await incoming.receive(f.node.node, [next]);
     const manifest =
       (next.payload as { manifest: { after: number; cut: number } }).manifest;
-    // The room commit may finish across a concurrent grant change, but its
-    // journal result/readiness must not cross that authority fence.
+    // Completion independently rechecks the grant even when its caller
+    // supplied no room effect and changed the database directly.
     await assertRejects(
       async () =>
         await applyReplicaScope({
@@ -1793,6 +1793,74 @@ Deno.test('room replication exports an enrolled facade suffix under its own sour
     assertEquals(
       (await incoming.heads(f.node.node, 'in', next)).applied.sequence,
       edgeSuffix.sequence,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('reverse room admission: revocation during verification cannot commit room effects', async () => {
+  const f = await fixture();
+  try {
+    const initial = await f.exports();
+    assert(initial);
+    const journal = await f.journal();
+    await journal.receive('home', [initial]);
+    await (await f.replicas()).apply(journal, initial);
+    const replica = await f.replica();
+    const message = await f.source.addEvent({
+      type: 'm.room.message',
+      content: { msgtype: 'm.text', body: 'not admitted after revocation' },
+    });
+    await ingestRemote(replica, [message], f.signing.name, {
+      keys: fakeKeyResolver(f.signing),
+      self: f.signing.name,
+      fetcher: fakeFetcher({}).fetcher,
+      limits: { waitMs: 0, limit: 100, budgetMs: 1000 },
+      ungroundedMs: 3600000,
+    });
+    const reverse = await exportRoomReplica(
+      f.edgeStore(),
+      replica,
+      f.tenant.serverName,
+      'home',
+      f.bundle.id,
+    );
+    assert(reverse);
+    const incoming = new Journal(await f.home.server(), LINK_SUPPORTED);
+    await incoming.receive(f.node.node, [reverse]);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const keys = fakeKeyResolver(f.signing);
+    const owner = new RoomReplicas(
+      f.home,
+      f.homePairings,
+      f.tenant.serverName,
+      {
+        verifyEventSignature: async (args) => {
+          entered.resolve();
+          await release.promise;
+          return await keys.verifyEventSignature(args);
+        },
+      },
+    );
+    const before = await f.room.tx((tx) => tx.changes.head());
+    const applying = owner.apply(incoming, reverse, f.bundle.id).then(
+      () => null,
+      (error) => error,
+    );
+    await entered.promise;
+    await f.homePairings.revoke(f.bundle.id);
+    release.resolve();
+    assert(await applying instanceof Error);
+    assertEquals(
+      await f.room.tx((tx) => tx.events.get(String(message.event_id))),
+      null,
+    );
+    assertEquals(await f.room.tx((tx) => tx.changes.head()), before);
+    assertEquals(
+      (await incoming.heads(f.node.node, 'in', reverse)).applied.sequence,
+      0,
     );
   } finally {
     await f.close();
