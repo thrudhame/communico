@@ -690,9 +690,10 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     token?: string,
     method = body === undefined ? 'GET' : 'POST',
     port = homePort,
+    version = 'v3',
   ) => {
     const response = await fetch(
-      `http://127.0.0.1:${port}/_matrix/client/v3/${path}`,
+      `http://127.0.0.1:${port}/_matrix/client/${version}/${path}`,
       {
         method,
         headers: token ? { authorization: 'Bearer ' + token } : {},
@@ -1278,6 +1279,63 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     const freshEvent = await edgeApi(freshSendPath, freshContent, 'PUT');
     assertEquals(freshEvent.status, 200, JSON.stringify(freshEvent.body));
     assertEquals(await edgeApi(freshSendPath, freshContent, 'PUT'), freshEvent);
+    const readAdapter = (path: string, version = 'v1', bearer = token) =>
+      api(path, undefined, bearer, 'GET', facadePort, version);
+    const freshId = encodeURIComponent(fresh.body.room_id);
+    for (
+      const [version, path] of [
+        ['v1', 'room_summary/' + freshId],
+        ['unstable', 'im.nheko.summary/summary/' + freshId],
+        ['unstable', 'im.nheko.summary/rooms/' + freshId + '/summary'],
+      ]
+    ) {
+      const summary = await readAdapter(path, version);
+      assertEquals(summary.status, 200, JSON.stringify(summary));
+      assertEquals(summary.body.room_id, fresh.body.room_id);
+      assertEquals(summary.body.name, 'facade-domain-context');
+      assertEquals(summary.body.join_rule, 'invite');
+      assertEquals(
+        (await readAdapter(path, version, registered.body.access_token)).status,
+        503,
+      );
+    }
+    const hierarchy = await readAdapter(freshRoomPath + '/hierarchy');
+    assertEquals(hierarchy.status, 200, JSON.stringify(hierarchy));
+    assertEquals(
+      hierarchy.body.rooms.map((room: { room_id: string }) => room.room_id),
+      [fresh.body.room_id],
+    );
+    for (const suffix of ['', '/m.annotation', '/m.annotation/m.reaction']) {
+      const relations = await readAdapter(
+        freshRoomPath + '/relations/' +
+          encodeURIComponent(freshEvent.body.event_id) + suffix,
+      );
+      assertEquals(relations.status, 200, JSON.stringify(relations));
+      assertEquals(relations.body.chunk, []);
+    }
+    const threads = await readAdapter(freshRoomPath + '/threads');
+    assertEquals(threads.status, 200, JSON.stringify(threads));
+    assertEquals(threads.body.chunk, []);
+    const timestamp = await readAdapter(
+      freshRoomPath + '/timestamp_to_event?ts=0&dir=f',
+    );
+    assertEquals(timestamp.status, 200, JSON.stringify(timestamp));
+    assertEquals(typeof timestamp.body.event_id, 'string');
+    const legacyMembers = await readAdapter(
+      freshRoomPath + '/joined_members',
+      'r0',
+    );
+    assertEquals(legacyMembers.status, 200, JSON.stringify(legacyMembers));
+    assertEquals(legacyMembers.body.joined[user] !== undefined, true);
+    const legacyMessages = await readAdapter(
+      freshRoomPath + '/messages?dir=b&limit=1',
+      'r0',
+    );
+    assertEquals(legacyMessages.status, 200, JSON.stringify(legacyMessages));
+    assertEquals(
+      legacyMessages.body.chunk[0].event_id,
+      freshEvent.body.event_id,
+    );
     const preview = await edgeApi(freshRoomPath + '/initialSync');
     const searchContext = await edgeApi('search', {
       search_categories: {
