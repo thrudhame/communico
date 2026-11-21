@@ -1160,24 +1160,23 @@ export function inviteIntentProvider(
             if (
               await deps.store.roomRetired(attempt.roomId) ||
               invitePerformers(deps.store).has(attempt.eventId)
-            ) return false;
-            if (
-              !(await server.query(
-                "SELECT 1 FROM federation_invite_attempts WHERE event_id=? AND status='pending'",
-                [attempt.eventId],
-              )).length
-            ) return false;
+            ) return null;
+            const [current] = await server.query(
+              "SELECT * FROM federation_invite_attempts WHERE event_id=? AND status='pending'",
+              [attempt.eventId],
+            );
+            if (!current) return null;
             invitePerformers(deps.store).add(attempt.eventId);
-            return true;
+            return outboundInvite(current);
           });
           if (!claimed) return;
           try {
             await admit(server, destination, {
               kind: 'outbound',
-              user: attempt.sender,
+              user: claimed.sender,
               what: 'intent:invite',
             });
-            await performOutboundInvite(attempt, deps);
+            await performOutboundInvite(claimed, deps);
           } finally {
             invitePerformers(deps.store).delete(attempt.eventId);
           }

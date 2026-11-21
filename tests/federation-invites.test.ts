@@ -486,6 +486,101 @@ Deno.test('inviter: signed attempt survives uncertain response and cold sender r
   }
 });
 
+Deno.test('inviter: discovered intent reloads a response committed by the live performer', async () => {
+  await withStore(async (store) => {
+    await withInviteHost(async (h) => {
+      const g = await genesis(store, { roomId: '!invite-discovery:test' });
+      const server = await store.server();
+      const fault = new Error('response committed before local ingest');
+      const faultServer = new Proxy(server, {
+        get(target, property) {
+          if (property === 'execute') {
+            return async (...args: Parameters<typeof server.execute>) => {
+              const value = await target.execute(...args);
+              if (args[0].includes('SET response_json=')) throw fault;
+              return value;
+            };
+          }
+          const value = Reflect.get(target, property);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+      const deps: InviteDeps = {
+        store,
+        server,
+        signer: g.signer,
+        keys: productionKeyResolver(keyStore(server, { signer: g.signer })),
+        self: 'test',
+        wake: () => {},
+      };
+      const replyReached = Promise.withResolvers<void>();
+      const releaseReply = Promise.withResolvers<void>();
+      h.beforeReply = () => {
+        replyReached.resolve();
+        return releaseReply.promise;
+      };
+      const first = assertRejects(() =>
+        inviteRemote(
+          g.roomId,
+          '@dev:test',
+          `@zoe:${h.fake.name}`,
+          'retained',
+          undefined,
+          { ...deps, server: faultServer },
+        )
+      );
+      const provider = inviteIntentProvider(deps);
+      try {
+        await replyReached.promise;
+        // Discovery normally skips live claims. Capture precisely the durable
+        // query result here, then let the live performer finish before the
+        // provider examines it. No claim or response is modified by the test.
+        const query = server.query.bind(server);
+        const staleServer = new Proxy(server, {
+          get(target, property) {
+            if (property === 'query') {
+              return async (...args: Parameters<typeof server.query>) => {
+                const rows = await query(...args);
+                if (
+                  args[0].startsWith('SELECT * FROM federation_invite_attempts')
+                ) {
+                  releaseReply.resolve();
+                  assertEquals(await first, fault);
+                }
+                return rows;
+              };
+            }
+            const value = Reflect.get(target, property);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+        const job = await provider(staleServer, h.fake.name);
+        assert(job);
+        const [retained] = await query(
+          'SELECT * FROM federation_invite_attempts',
+        );
+        assert(retained.response_json !== null);
+        await job.run();
+        assertEquals(
+          h.inviteRequests.length,
+          1,
+          'saved response must prevent a second PUT',
+        );
+        assert(
+          await g.room.tx((tx) => tx.events.get(String(retained.event_id))),
+        );
+        assertEquals(
+          await query('SELECT * FROM federation_invite_attempts'),
+          [],
+        );
+      } finally {
+        releaseReply.resolve();
+        await first;
+      }
+    });
+  });
+});
+
 Deno.test('inviter: same reference ID cannot hide changed immutable content', async () => {
   await withStore(async (store) => {
     await withInviteHost(async (h) => {
