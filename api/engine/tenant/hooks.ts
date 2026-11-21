@@ -37,6 +37,15 @@ export async function pendingTenantProjection(
   return rows.length ? Number(rows[0].value) : 0;
 }
 
+export async function completedTenantProjection(
+  db: Pick<Database, 'query'>,
+): Promise<number> {
+  const rows = await db.query(
+    "SELECT value FROM counters WHERE name='projection_completed'",
+  );
+  return rows.length ? Number(rows[0].value) : 0;
+}
+
 /** Publish only committed revisions, before the optional post-commit hook. */
 export function rememberTenantProjection(
   store: Store,
@@ -61,24 +70,41 @@ export async function completeTenantProjection(
   captured: number,
 ): Promise<void> {
   if (!captured) return;
-  await db.execute(
-    "DELETE FROM counters WHERE name='projection_pending' AND value=?",
-    [captured],
-  );
+  await db.tx(async (conn) => {
+    await conn.execute(
+      "INSERT INTO counters(name,value) VALUES('projection_completed',?) ON CONFLICT(name) DO UPDATE SET value=MAX(value,excluded.value)",
+      [captured],
+    );
+    await conn.execute(
+      "DELETE FROM counters WHERE name='projection_pending' AND value=?",
+      [captured],
+    );
+  });
   const value = revision(store, tenant);
   value.completed = Math.max(value.completed, captured);
 }
 
-let project: ((store: Store, tenant: string) => Promise<void>) | undefined;
+let project:
+  | ((store: Store, tenant: string, through?: number) => Promise<void>)
+  | undefined;
 export function setTenantProjector(fn: typeof project): void {
   project = fn;
 }
 export async function tenantCommitted(
   store: Store,
   tenant: string,
+  through?: number,
 ): Promise<void> {
   try {
-    await project?.(store, tenant);
+    if (through !== undefined) {
+      const completed = await completedTenantProjection(
+        await store.tenant(tenant),
+      );
+      const value = revision(store, tenant);
+      value.completed = Math.max(value.completed, completed);
+      if (completed >= through) return;
+    }
+    await project?.(store, tenant, through);
   } catch (error) {
     console.error('tenant projection pending for ' + tenant + ':', error);
   }
@@ -96,7 +122,7 @@ export async function tenantChangesCommitted(
 ): Promise<void> {
   if (projectionRevision) {
     rememberTenantProjection(store, tenant, projectionRevision);
-    await tenantCommitted(store, tenant);
+    await tenantCommitted(store, tenant, projectionRevision);
   }
   if (changed || projectionRevision || publicKeysChanged) {
     tenantStreamCommitted(store, tenant, source, publicKeysChanged);
