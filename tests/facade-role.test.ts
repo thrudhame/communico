@@ -12,6 +12,7 @@ Deno.test('F2 ingress discovery mounts existing authenticated reads without enab
   const f1 = capabilities('facade', 'f1');
   const paths = [
     'v3/account/3pid',
+    'v3/admin/whois/%40outside%3Alogical.test',
     'v3/capabilities',
     'v3/thirdparty/protocols',
     'v3/thirdparty/protocol/unknown',

@@ -24,6 +24,9 @@ import * as operations from '#engine/tenant/device-operations.ts';
 import { config } from '#engine/config.ts';
 import { validateUpload } from '#engine/tenant/e2ee.ts';
 import { deviceIdentity } from '#engine/tenant/txns.ts';
+import { whois } from '#engine/tenant/whois.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
+import type { IngressAuthority } from '#engine/tenant/ingress.ts';
 
 const expected = {
   source: 'edge',
@@ -58,6 +61,8 @@ async function fixture(node: 'home' | 'edge') {
   return {
     db,
     tenant,
+    withIngress: (ingress: IngressAuthority) =>
+      openTenant(store, 'logical.test', { ingress }),
     async close() {
       await store.close();
       await Deno.remove(dir, { recursive: true });
@@ -213,10 +218,32 @@ Deno.test('F2 device metadata reads include foreign devices without execution au
       assertEquals(await getDevice(f.home.tenant, 'alice', 'missing'), null);
     });
     await t.step(
+      'whois includes foreign metadata without foreign sessions',
+      async () => {
+        assertEquals(
+          await whois(
+            f.home.tenant,
+            '@alice:logical.test',
+            '@alice:logical.test',
+          ),
+          {
+            user_id: '@alice:logical.test',
+            devices: { LAN: { sessions: [] }, PHONE: { sessions: [] } },
+          },
+        );
+      },
+    );
+    await t.step(
       'partial foreign bootstrap is unavailable, not a complete list',
       async () => {
         await assertRejects(
           () => listDevices(f.edge.tenant, 'alice'),
+          Error,
+          'key bootstrap unavailable',
+        );
+        await assertRejects(
+          () =>
+            whois(f.edge.tenant, '@alice:logical.test', '@alice:logical.test'),
           Error,
           'key bootstrap unavailable',
         );
@@ -252,6 +279,45 @@ Deno.test('F2 device metadata reads include foreign devices without execution au
     ) {
       assertEquals(await f.home.db.query('SELECT * FROM ' + table), []);
     }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('F2 whois authorizes before local target account admission', async () => {
+  const f = await fixture('home');
+  const admitted: string[] = [];
+  try {
+    const tenant = await f.withIngress({
+      check(_conn, intent) {
+        if (intent.kind === 'account') {
+          admitted.push(intent.localpart);
+          throw new MatrixError(
+            503,
+            'M_UNAVAILABLE',
+            'target account unavailable',
+          );
+        }
+        return Promise.resolve();
+      },
+    });
+    await assertRejects(
+      () => whois(tenant, '@alice:logical.test', '@other:elsewhere'),
+      MatrixError,
+      'not permitted to inspect this user',
+    );
+    await assertRejects(
+      () => whois(tenant, '@remote:elsewhere', '@remote:elsewhere'),
+      MatrixError,
+      'can only inspect a local user',
+    );
+    assertEquals(admitted, []);
+    await assertRejects(
+      () => whois(tenant, '@alice:logical.test', '@alice:logical.test'),
+      MatrixError,
+      'target account unavailable',
+    );
+    assertEquals(admitted, ['alice']);
   } finally {
     await f.close();
   }

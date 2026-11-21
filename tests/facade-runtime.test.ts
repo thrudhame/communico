@@ -2558,6 +2558,35 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       session.body.access_token,
     );
     assertEquals(deviceList.status, 200);
+    const whoisPath = 'admin/whois/%40outside%3Alogical.test';
+    assertEquals(
+      await api('facade', whoisPath, undefined, session.body.access_token),
+      {
+        status: 200,
+        body: {
+          user_id: '@outside:logical.test',
+          devices: {
+            'home-device': { sessions: [] },
+            'public-device': { sessions: [{ connections: [] }] },
+          },
+        },
+      },
+    );
+    assertEquals((await api('facade', whoisPath)).status, 401);
+    assertEquals(
+      (await api('facade', whoisPath, undefined, registered.body.access_token))
+        .status,
+      503,
+    );
+    assertEquals(
+      (await api(
+        'facade',
+        'admin/whois/%40unknown%3Alogical.test',
+        undefined,
+        session.body.access_token,
+      )).status,
+      403,
+    );
     assertEquals(
       deviceList.body.devices.map((device: { device_id: string }) =>
         device.device_id

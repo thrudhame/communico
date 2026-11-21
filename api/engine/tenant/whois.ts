@@ -23,7 +23,7 @@ export async function whois(tenant: Tenant, requester: string, user: string) {
   return await tenant.tx(async (tx) => {
     const devices: Record<string, { sessions: { connections: never[] }[] }> =
       Object.create(null);
-    for (const device of await tx.devices.ofUser(target.localpart)) {
+    for (const device of await tx.devices.metadata(target.localpart)) {
       devices[device.device_id] = { sessions: [] };
     }
     for (const token of await tx.tokens.ofUser(target.localpart)) {
