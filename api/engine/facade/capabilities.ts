@@ -70,6 +70,20 @@ const F2_AUTH: readonly Rule[] = [
       route('POST', literal('/_matrix/client/v3/' + name), 'auth')
     ),
   route('GET', literal('/_matrix/client/v3/account/whoami'), 'auth'),
+  // Ingress discovery has no home-owned domain read. The ordinary folder auth
+  // still checks the supplied session's owner/freshness before its adapter runs.
+  ...['account/3pid', 'capabilities', 'voip/turnServer', 'thirdparty/protocols']
+    .map((name) => route('GET', literal('/_matrix/client/v3/' + name), 'auth')),
+  route(
+    'GET',
+    /^\/_matrix\/client\/v3\/thirdparty\/(?:protocol\/[^/]+|(?:user|location)(?:\/[^/]+)?)$/,
+    'auth',
+  ),
+  route(
+    'GET',
+    literal('/_matrix/client/unstable/org.matrix.msc4143/rtc/transports'),
+    'auth',
+  ),
   ...['PUT', 'DELETE'].map((method) =>
     route(method, /^\/_matrix\/client\/v3\/devices\/[^/]+$/, 'auth')
   ),

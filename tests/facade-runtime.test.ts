@@ -2241,7 +2241,12 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
   const [homePort, facadePort, linkPort] = ports;
   const bundlefile = tls.dir + '/public-auth-bundle.json';
   const file = (side: string) => tls.dir + '/' + side + '-public-auth.toml';
-  const configure = async (side: string, extra = '', maxDelay = 60000) => {
+  const configure = async (
+    side: string,
+    extra = '',
+    maxDelay = 60000,
+    discovery = false,
+  ) => {
     await Deno.writeTextFile(
       file(side),
       `[server]\nname="logical.test"\nrole="${side}"\nport=${
@@ -2254,7 +2259,10 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
           : '') +
         extra +
         `\n[delayedevents]\nmaxdelayms=${maxDelay}\n` +
-        '\n[push]\ncacerts=["tests/fixtures/tls/ca.crt"]\nallowlist=["127.0.0.1/32"]\n',
+        '\n[push]\ncacerts=["tests/fixtures/tls/ca.crt"]\nallowlist=["127.0.0.1/32"]\n' +
+        (discovery
+          ? '\n[turn]\nuris=["turn:ingress.test:3478"]\nusername="ingress-user"\npassword="ingress-test-password"\nttl=600\n[matrixrtc]\nlivekitserviceurl="https://rtc.ingress.test/"\n'
+          : ''),
     );
   };
   await configure('home');
@@ -2445,6 +2453,87 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
     const session = await api('facade', 'login', login());
     assertEquals(session.status, 200, JSON.stringify(session));
     assertEquals(session.body.device_id, 'public-device');
+    // These reads use the ingress's existing authenticated adapters. Home is
+    // stopped, and a supplied home-owned token must not bypass owner admission.
+    const rtc = async (token?: string) => {
+      const response = await fetch(
+        `http://127.0.0.1:${facadePort}/_matrix/client/unstable/org.matrix.msc4143/rtc/transports`,
+        { headers: token ? { authorization: 'Bearer ' + token } : {} },
+      );
+      return { status: response.status, body: await response.json() };
+    };
+    for (
+      const [path, body] of [
+        ['account/3pid', { threepids: [] }],
+        ['thirdparty/protocols', {}],
+        ['thirdparty/user?userid=%40outside%3Alogical.test', []],
+        ['thirdparty/user/unknown', []],
+        ['thirdparty/location?alias=%23unknown%3Alogical.test', []],
+        ['thirdparty/location/unknown', []],
+        ['voip/turnServer', {}],
+      ] as const
+    ) {
+      assertEquals(
+        await api('facade', path, undefined, session.body.access_token),
+        {
+          status: 200,
+          body,
+        },
+        path,
+      );
+      assertEquals((await api('facade', path)).status, 401, path);
+      assertEquals(
+        (await api('facade', path, undefined, registered.body.access_token))
+          .status,
+        503,
+        path,
+      );
+    }
+    const discovery = await api(
+      'facade',
+      'capabilities',
+      undefined,
+      session.body.access_token,
+    );
+    assertEquals(discovery.status, 200);
+    assertEquals(discovery.body.capabilities['m.change_password'], {
+      enabled: false,
+    });
+    assertEquals(discovery.body.capabilities['m.profile_fields'], {
+      enabled: true,
+    });
+    assertEquals((await api('facade', 'capabilities')).status, 401);
+    assertEquals(
+      (await api(
+        'facade',
+        'capabilities',
+        undefined,
+        registered.body.access_token,
+      )).status,
+      503,
+    );
+    assertEquals(await rtc(session.body.access_token), {
+      status: 200,
+      body: {},
+    });
+    assertEquals((await rtc()).status, 401);
+    assertEquals((await rtc(registered.body.access_token)).status, 503);
+    assertEquals(
+      (await api(
+        'facade',
+        'thirdparty/protocol/unknown',
+        undefined,
+        session.body.access_token,
+      )).body.errcode,
+      'M_NOT_FOUND',
+    );
+    for (const path of ['thirdparty/user', 'thirdparty/location']) {
+      assertEquals(
+        (await api('facade', path, undefined, session.body.access_token))
+          .status,
+        400,
+      );
+    }
     assertEquals(
       (await api(
         'facade',
@@ -2712,8 +2801,34 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
     assertEquals(dueWhileStopped.status, 200);
     await edge.stop();
     await new Promise((resolve) => setTimeout(resolve, 2100));
-    await configure('facade', '', 0);
+    await configure('facade', '', 0, true);
     edge = await process(file('facade'), 'facade: link/local admin ready');
+    assertEquals(
+      await api(
+        'facade',
+        'voip/turnServer',
+        undefined,
+        session.body.access_token,
+      ),
+      {
+        status: 200,
+        body: {
+          uris: ['turn:ingress.test:3478'],
+          username: 'ingress-user',
+          password: 'ingress-test-password',
+          ttl: 600,
+        },
+      },
+    );
+    assertEquals(await rtc(session.body.access_token), {
+      status: 200,
+      body: {
+        rtc_transports: [{
+          type: 'livekit',
+          livekit_service_url: 'https://rtc.ingress.test/',
+        }],
+      },
+    });
     await waitDelayedState('cold', 'cold-with-new-scheduling-disabled');
     assertEquals(
       (await api(

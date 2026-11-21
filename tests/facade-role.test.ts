@@ -7,6 +7,60 @@ import { serverSchema } from '#engine/server/schema.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 
+Deno.test('F2 ingress discovery mounts existing authenticated reads without enabling producers', () => {
+  const f2 = capabilities('facade', 'f2');
+  const f1 = capabilities('facade', 'f1');
+  const paths = [
+    'v3/account/3pid',
+    'v3/capabilities',
+    'v3/thirdparty/protocols',
+    'v3/thirdparty/protocol/unknown',
+    'v3/thirdparty/user',
+    'v3/thirdparty/user/unknown',
+    'v3/thirdparty/location',
+    'v3/thirdparty/location/unknown',
+    'v3/voip/turnServer',
+    'unstable/org.matrix.msc4143/rtc/transports',
+  ];
+  for (const path of paths) {
+    const url = 'https://facade.test/_matrix/client/' + path;
+    let required: string | undefined;
+    assertEquals(
+      f2.gate(new Request(url), (scope) => {
+        required = scope;
+        return true;
+      }),
+      null,
+      path,
+    );
+    assertEquals(required, 'auth', path);
+    assertEquals(f2.gate(new Request(url), () => false)?.status, 503, path);
+    assertEquals(f1.gate(new Request(url), () => true)?.status, 404, path);
+    assertEquals(
+      f2.gate(new Request(url, { method: 'POST' }), () => true)?.status,
+      405,
+      path,
+    );
+  }
+  for (
+    const path of [
+      'account/3pid/add',
+      'account/3pid/bind',
+      'account/3pid/unbind',
+    ]
+  ) {
+    assertEquals(
+      f2.gate(
+        new Request('https://facade.test/_matrix/client/v3/' + path, {
+          method: 'POST',
+        }),
+        () => true,
+      )?.status,
+      404,
+    );
+  }
+});
+
 Deno.test('B8 push surfaces mount only at F2 and share the domain gate without federation', () => {
   for (
     const [method, path] of [
