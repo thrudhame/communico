@@ -102,10 +102,7 @@ suite.test('an older delivery epoch resets every sync baseline, survives numeric
   );
   assertEquals(page.status, 200, await page.clone().text());
   assertEquals(((await page.json()) as { chunk: unknown[] }).chunk, []);
-  const alias = String(reset.next_batch).replace(
-    '_z' + state.epoch,
-    '_z' + 'f'.repeat(32),
-  );
+  const alias = encodeStreamToken({ ...token, epoch: 'f'.repeat(32) });
   const again = await sync(alias);
   assert(again.rooms.join[room.roomId].state.events.length > 0);
   assertEquals(again.to_device.events.length, 1);

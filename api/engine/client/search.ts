@@ -22,6 +22,7 @@ import { clientEventsForRows, clientStateFor } from './state.ts';
 import { canSeeEvent } from './visibility.ts';
 import { erasurePrunes } from '#engine/erasure.ts';
 import { roomCompletion } from './completion.ts';
+import { parseLocalStreamToken } from './positions.ts';
 export interface SearchRoomEvents {
   search_term: string;
   keys?: unknown;
@@ -67,6 +68,9 @@ export async function search(
   nextBatch: string | null,
   signal?: AbortSignal,
 ) {
+  if (nextBatch !== null && !nextBatch.startsWith('search_')) {
+    await parseLocalStreamToken(theApp().server, nextBatch);
+  }
   const request = searchRequest(req), { filter, keys } = request;
   const tokens = request.term.toLowerCase().split(/\s+/).filter(Boolean);
   const rooms = await roomScope(userId, filter);
@@ -143,13 +147,13 @@ export async function search(
       const b = await messages({
           ...common,
           dir: 'b',
-          fromToken: 's' + (hit.seq - 1),
+          fromSeq: hit.seq - 1,
           limit: ctx.before,
         }),
         a = await messages({
           ...common,
           dir: 'f',
-          fromToken: 's' + hit.seq,
+          fromSeq: hit.seq,
           limit: ctx.after,
         });
       context = { events_before: b.chunk, events_after: a.chunk };

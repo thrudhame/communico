@@ -26,7 +26,7 @@ import { admitState } from './state-admission.ts';
 import { canSeeEvent } from './visibility.ts';
 import { integerParameter } from '#engine/operation.ts';
 
-import { parseStreamToken } from './tokens.ts';
+import { parseLocalStreamToken } from './positions.ts';
 export { parseStreamToken } from './tokens.ts';
 
 export async function cursorForToken(
@@ -36,7 +36,7 @@ export async function cursorForToken(
 ): Promise<WalkCursor | null> {
   const cursor = parseCursor(token);
   if (cursor !== null) return cursor;
-  const stream = parseStreamToken(token);
+  const stream = await parseLocalStreamToken(theApp().server, token);
   if (stream === null) {
     throw new MatrixError(
       400,
@@ -44,9 +44,18 @@ export async function cursorForToken(
       'unknown pagination token: ' + token,
     );
   }
+  return await cursorForSeq(room, stream.eSeq, dir);
+}
+
+// Internal publication cuts are already local facts, not public wire tokens.
+async function cursorForSeq(
+  room: Room,
+  seq: number,
+  dir: 'b' | 'f',
+): Promise<WalkCursor | null> {
   const rows = await theApp().server.query(
     'SELECT event FROM feed WHERE room = ? AND seq <= ? ORDER BY seq DESC LIMIT 1',
-    [room.id, stream.eSeq],
+    [room.id, seq],
   );
   if (rows.length === 0) return null;
   const position = await room.tx((tx) =>
@@ -100,21 +109,25 @@ export async function stateAtEvent(
   });
 }
 
-export type MessagesWindow = {
-  roomId: string;
-  userId: string;
-  deviceId: string | null;
-  leaveAt: number | null;
-  dir: 'b' | 'f';
-  fromToken: string | null;
-  toToken: string | null;
-  limit: number;
-  lazyLoadMembers: boolean;
-  containsUrl?: boolean;
-  filter?: RoomEventFilter;
-  // Room previews never start a history fetch or change participation.
-  localOnly?: boolean;
-};
+export type MessagesWindow =
+  & {
+    roomId: string;
+    userId: string;
+    deviceId: string | null;
+    leaveAt: number | null;
+    dir: 'b' | 'f';
+    toToken: string | null;
+    limit: number;
+    lazyLoadMembers: boolean;
+    containsUrl?: boolean;
+    filter?: RoomEventFilter;
+    // Room previews never start a history fetch or change participation.
+    localOnly?: boolean;
+  }
+  & (
+    | { fromToken: string | null; fromSeq?: never }
+    | { fromSeq: number; fromToken?: never }
+  );
 export async function messages(
   w: MessagesWindow,
 ): Promise<
@@ -134,8 +147,10 @@ export async function messages(
   const limit = Math.min(requested, filter.limit ?? requested);
   const leave = w.leaveAt === null
     ? null
-    : await cursorForToken(room, 's' + w.leaveAt, 'f');
-  let cursor = w.fromToken === null
+    : await cursorForSeq(room, w.leaveAt, 'f');
+  let cursor = w.fromSeq !== undefined
+    ? await cursorForSeq(room, w.fromSeq, w.dir)
+    : w.fromToken == null
     ? null
     : await cursorForToken(room, w.fromToken, w.dir);
   if (cursor === null) {

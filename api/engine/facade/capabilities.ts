@@ -229,6 +229,7 @@ const F2_CLIENT_DATA: readonly Rule[] = [
     'domain',
   ),
   route('GET', literal('/_matrix/client/v3/notifications'), 'domain'),
+  route('POST', literal('/_matrix/client/v3/search'), 'domain'),
   route('GET', literal('/_matrix/client/v3/pushers'), 'domain'),
   route('POST', literal('/_matrix/client/v3/pushers/set'), 'domain'),
   route('POST', /^\/_matrix\/client\/v3\/rooms\/[^/]+\/forget$/, 'clientrooms'),

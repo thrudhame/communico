@@ -107,14 +107,21 @@ export function formatStreamToken(
   kSeq = 0,
   nSeq?: number,
   epoch?: string,
+  domain?: string,
 ): string {
-  return `s${eSeq}_p${pSeq}_t${tSeq}_r${rSeq}_a${aSeq}_d${dSeq}_m${mSeq}_k${kSeq}` +
+  const cuts =
+    `s${eSeq}_p${pSeq}_t${tSeq}_r${rSeq}_a${aSeq}_d${dSeq}_m${mSeq}_k${kSeq}` +
     (nSeq === undefined ? '' : `_n${nSeq}`) +
     (epoch === undefined ? '' : `_z${epoch}`);
+  if (domain === undefined) return cuts;
+  if (!validDomain(domain)) throw new TypeError('invalid publication domain');
+  return 'v1.' + Buffer.from(JSON.stringify([domain, cuts])).toString(
+    'base64url',
+  );
 }
 
 export function encodeStreamToken(t: StreamToken): string {
-  const cuts = formatStreamToken(
+  return formatStreamToken(
     t.eSeq,
     t.pSeq,
     t.tSeq,
@@ -125,10 +132,6 @@ export function encodeStreamToken(t: StreamToken): string {
     t.kSeq,
     t.nSeq,
     t.epoch,
-  );
-  if (t.domain === undefined) return cuts;
-  if (!validDomain(t.domain)) throw new TypeError('invalid publication domain');
-  return 'v1.' + Buffer.from(JSON.stringify([t.domain, cuts])).toString(
-    'base64url',
+    t.domain,
   );
 }

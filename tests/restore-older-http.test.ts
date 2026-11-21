@@ -258,7 +258,10 @@ Deno.test('older archive over HTTP: consumed keys never reappear and newer ordin
       'retained B ordinary token resets all state and cannot acknowledge A inbox',
       async () => {
         const reset = await sync(String(ordinaryB.next_batch));
-        assert(String(reset.next_batch).includes('_z' + result.report.epoch));
+        assertEquals(
+          parseStreamToken(String(reset.next_batch))?.epoch,
+          result.report.epoch,
+        );
         assertEquals(
           object(reset.to_device).events,
           object(ordinaryA.to_device).events,

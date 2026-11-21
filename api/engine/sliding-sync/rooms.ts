@@ -133,6 +133,7 @@ export async function roomPayloads(
     direct: unknown;
     previous: Record<string, SentRoom>;
     notifications?: ReadonlyMap<string, Counts>;
+    domain?: string;
   },
 ) {
   const sent = structuredClone(input.previous);
@@ -247,7 +248,19 @@ export async function roomPayloads(
         entry.timeline = window.events;
         entry.limited = limited;
         entry.prev_batch = cursor === null
-          ? formatStreamToken(end, 0, 0, 0, 0)
+          ? formatStreamToken(
+            end,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            undefined,
+            undefined,
+            input.domain,
+          )
           : formatCursor(cursor);
         entry.num_live = input.requestSince === null
           ? 0

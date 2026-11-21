@@ -1,5 +1,5 @@
 import { theApp } from '#engine/app.ts';
-import { parseStreamToken } from '#engine/client/tokens.ts';
+import { parseLocalStreamToken } from './positions.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import {
   deviceListsBetween,
@@ -13,9 +13,9 @@ export async function keyChanges(
   from: string | null,
   to: string | null,
 ) {
-  const start = from === null ? null : parseStreamToken(from);
-  const end = to === null ? null : parseStreamToken(to);
   const server = theApp().server;
+  const start = await parseLocalStreamToken(server, from);
+  const end = await parseLocalStreamToken(server, to);
   const epoch = (await recoveryState(server))?.epoch;
   if (
     start !== null && end !== null &&

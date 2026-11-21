@@ -18,9 +18,9 @@ import { inviteOf, prejoinDeparture } from '#engine/federation/invites.ts';
 import {
   boundFutureToken,
   encodeStreamToken,
-  formatStreamToken,
   type StreamToken,
 } from '#engine/client/tokens.ts';
+import { requireStreamDomain } from '#engine/client/positions.ts';
 import { config } from '#engine/config.ts';
 import {
   prejoinDisplay,
@@ -174,18 +174,7 @@ async function roomTimeline(
       events,
       limited,
       prev_batch: paginationCursor === null
-        ? formatStreamToken(
-          prevE,
-          now.pSeq,
-          now.tSeq,
-          now.rSeq,
-          now.aSeq,
-          now.dSeq,
-          now.mSeq,
-          now.kSeq,
-          now.nSeq,
-          now.epoch,
-        )
+        ? encodeStreamToken({ ...now, eSeq: prevE })
         : formatCursor(paginationCursor),
     },
     ephemeral: { events: [] },
@@ -318,6 +307,7 @@ async function waitForRelevant(
 }
 
 export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
+  const domain = await requireStreamDomain(theApp().server, i.since);
   const device = i.deviceId === null || i.deviceGeneration === undefined
     ? null
     : {
@@ -334,12 +324,15 @@ export async function syncFor(i: SyncInputs): Promise<Record<string, unknown>> {
       !i.filter.notRooms?.includes(roomId)
     ),
   );
-  const response = await assembleSync(i);
+  const response = await assembleSync(i, domain);
   await completion.retire();
   return response;
 }
 
-async function assembleSync(i: SyncInputs): Promise<Record<string, unknown>> {
+async function assembleSync(
+  i: SyncInputs,
+  domain: string,
+): Promise<Record<string, unknown>> {
   const app = theApp();
   const epoch = (await recoveryState(app.server))?.epoch;
   const recoveryReset = i.since !== null && i.since.epoch !== epoch;
@@ -351,7 +344,10 @@ async function assembleSync(i: SyncInputs): Promise<Record<string, unknown>> {
     i.deviceId === null || i.deviceGeneration === undefined
       ? null
       : { localpart: lp, deviceId: i.deviceId, generation: i.deviceGeneration };
-  const issuedSince = i.since;
+  // Legacy cuts remain original-home read baselines, not a reconstruction of
+  // pre-domain deletion authority. Republish their retained inbox once under an
+  // exact domain-bound receipt before accepting an acknowledgment.
+  const issuedSince = i.since?.domain === domain ? i.since : null;
   if (i.since !== null) {
     const serverHeads = await syncStreamHeads(app.server);
     const tenantHeads = await app.tenant.tx((tx) => tx.streams.heads());
@@ -439,6 +435,7 @@ async function assembleSync(i: SyncInputs): Promise<Record<string, unknown>> {
     snapshot.memberships.map((m) => m.roomId),
   );
   const now: StreamToken = {
+    domain,
     eSeq: snapshot.counters.get('events') ?? 0,
     pSeq: snapshot.counters.get('presence') ?? 0,
     tSeq: typingSnapshot.seq,

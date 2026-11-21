@@ -6,7 +6,7 @@ import type { Pdu } from '#engine/pdu.ts';
 import { roomVersionOf } from '#engine/room/build.ts';
 import { openRoom, parseCursor, type Room } from '#engine/room/index.ts';
 import { membershipOf } from '#engine/server/read.ts';
-import { parseStreamToken } from './tokens.ts';
+import { parseLocalStreamToken } from './positions.ts';
 import { admitState } from './state-admission.ts';
 
 export async function lookupRoom(roomId: string): Promise<Room | null> {
@@ -73,7 +73,7 @@ export async function stateSeqAtToken(
 ): Promise<number | null> {
   let seq = leaveAt;
   if (raw !== null) {
-    const stream = parseStreamToken(raw);
+    const stream = await parseLocalStreamToken(theApp().server, raw);
     let requested = stream?.eSeq;
     if (requested === undefined) {
       const cursor = parseCursor(raw);

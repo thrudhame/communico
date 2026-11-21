@@ -1239,6 +1239,7 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     // This room has never existed at home or in its exported inventory.
     const fresh = await edgeApi('createRoom', {
       room_version: '11',
+      name: 'facade-domain-context',
       // The corpus deliberately enables permissive encryption policy for its
       // legacy fixtures; this client explicitly requests an encrypted room.
       initial_state: [{
@@ -1272,6 +1273,25 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     const freshEvent = await edgeApi(freshSendPath, freshContent, 'PUT');
     assertEquals(freshEvent.status, 200, JSON.stringify(freshEvent.body));
     assertEquals(await edgeApi(freshSendPath, freshContent, 'PUT'), freshEvent);
+    const preview = await edgeApi(freshRoomPath + '/initialSync');
+    const searchContext = await edgeApi('search', {
+      search_categories: {
+        room_events: {
+          search_term: 'facade-domain-context',
+          keys: ['content.name'],
+          event_context: { before_limit: 1, after_limit: 1 },
+        },
+      },
+    }, 'POST');
+    assertEquals(
+      [preview.status, searchContext.status],
+      [200, 200],
+      JSON.stringify({ preview, searchContext }),
+    );
+    assertEquals(
+      searchContext.body.search_categories.room_events.results.length,
+      1,
+    );
     const edit = await edgeApi(
       freshRoomPath + '/send/m.room.encrypted/public-edit',
       {
