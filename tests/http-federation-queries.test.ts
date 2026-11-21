@@ -1,5 +1,6 @@
 // doltgres federation-endpoints and room-route method inventory, real HTTP.
 import { assertEquals } from '@std/assert';
+import { parsePosition } from '#engine/client/tokens.ts';
 import { theApp } from '#engine/app.ts';
 import { setConfigForTests } from '#engine/config.ts';
 import { setAvatarUrl, setDisplayName } from '#engine/tenant/users.ts';
@@ -169,10 +170,13 @@ test('publicRooms: signed GET/POST, search, pagination and truthful network sele
   assertEquals(get.status, 200);
   assertEquals((get.body.chunk as Json[]).length, 1);
   assertEquals(get.body.total_room_count_estimate, 2);
-  assertEquals(get.body.next_batch, '1');
-  const next = await call('GET', target + '?limit=1&since=1');
+  assertEquals(parsePosition(String(get.body.next_batch))?.payload, '1');
+  const next = await call(
+    'GET',
+    target + '?limit=1&since=' + get.body.next_batch,
+  );
   assertEquals((next.body.chunk as Json[]).length, 1);
-  assertEquals(next.body.prev_batch, '0');
+  assertEquals(parsePosition(String(next.body.prev_batch))?.payload, '0');
   const post = await call('POST', target, {
     filter: { generic_search_term: 'Alpha' },
     include_all_networks: true,

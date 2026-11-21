@@ -1,5 +1,10 @@
 import { assertEquals } from '@std/assert';
-import { encodeStreamToken, parseStreamToken } from '#engine/client/tokens.ts';
+import {
+  encodeStreamToken,
+  formatPosition,
+  parsePosition,
+  parseStreamToken,
+} from '#engine/client/tokens.ts';
 import { bounded, serverProcess } from './helpers/server-process.ts';
 
 Deno.test('cold ordinary sync retains its domain and session, acknowledges only the old issued prefix and delivers the unseen inbox tail', async () => {
@@ -18,6 +23,24 @@ Deno.test('cold ordinary sync retains its domain and session, acknowledges only 
     });
     assertEquals(registered.status, 200);
     const user = registered.body;
+    const room = await server.api('v3/createRoom', {}, user.access_token);
+    assertEquals(room.status, 200);
+    const roomPath = 'v3/rooms/' + encodeURIComponent(room.body.room_id);
+    const page = await server.api(
+      roomPath + '/messages?dir=b&limit=1',
+      undefined,
+      user.access_token,
+    );
+    assertEquals(page.status, 200);
+    const bookmark = parsePosition(page.body.end)!;
+    assertEquals(typeof bookmark.domain, 'string');
+    const pagePath = roomPath + '/messages?dir=b&limit=1&from=';
+    const tail = await server.api(
+      pagePath + page.body.end,
+      undefined,
+      user.access_token,
+    );
+    assertEquals(tail.status, 200);
     const send = async (marker: string) => {
       const response = await fetch(
         'http://127.0.0.1:' + server.port +
@@ -49,6 +72,28 @@ Deno.test('cold ordinary sync retains its domain and session, acknowledges only 
     assertEquals((await bounded(server.output)).code, 0);
     await server.dispose();
     server = await serverProcess({ dir });
+    const reopenedPage = await server.api(
+      pagePath + page.body.end,
+      undefined,
+      user.access_token,
+    );
+    assertEquals(reopenedPage.status, 200);
+    assertEquals(
+      reopenedPage.body.chunk.map((event: { event_id: string }) =>
+        event.event_id
+      ),
+      tail.body.chunk.map((event: { event_id: string }) => event.event_id),
+    );
+    assertEquals(reopenedPage.body.end, tail.body.end);
+    const foreignPage = await server.api(
+      pagePath + formatPosition(crypto.randomUUID(), bookmark.payload),
+      undefined,
+      user.access_token,
+    );
+    assertEquals([foreignPage.status, foreignPage.body.errcode], [
+      400,
+      'M_INVALID_PARAM',
+    ]);
     const resumed = await server.api(
       'v3/sync?since=' + first.body.next_batch,
       undefined,

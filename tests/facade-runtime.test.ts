@@ -23,6 +23,7 @@ import { setConfigForTests } from '#engine/config.ts';
 import { loginUser, verifyUserPassword } from '#engine/tenant/users.ts';
 import { hashToken, lookupToken } from '#engine/tenant/auth.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { formatPosition, parsePosition } from '#engine/client/tokens.ts';
 import { getAccountData, putAccountData } from '#engine/tenant/accountdata.ts';
 import { membershipOf } from '#engine/room/membership.ts';
 import { loadNode } from '#engine/facade/identity.ts';
@@ -1292,6 +1293,41 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       searchContext.body.search_categories.room_events.results.length,
       1,
     );
+    const page = await edgeApi(freshRoomPath + '/messages?dir=b&limit=1');
+    assertEquals(page.status, 200, JSON.stringify(page.body));
+    const bookmark = parsePosition(page.body.end);
+    assert(bookmark !== null);
+    assertEquals(
+      (await edgeApi(freshRoomPath + '/messages?dir=b&from=' + page.body.end))
+        .status,
+      200,
+    );
+    assertEquals(
+      (await edgeApi(
+        freshRoomPath + '/messages?dir=b&from=' + bookmark.payload,
+      )).status,
+      400,
+    );
+    const foreignPage = await edgeApi(
+      freshRoomPath + '/messages?dir=b&from=' +
+        formatPosition(crypto.randomUUID(), bookmark.payload),
+    );
+    assertEquals([foreignPage.status, foreignPage.body.errcode], [
+      400,
+      'M_INVALID_PARAM',
+    ]);
+    const searchBookmark =
+      searchContext.body.search_categories.room_events.next_batch;
+    assert(parsePosition(searchBookmark) !== null);
+    const searchNext = await edgeApi('search?next_batch=' + searchBookmark, {
+      search_categories: {
+        room_events: {
+          search_term: 'facade-domain-context',
+          keys: ['content.name'],
+        },
+      },
+    }, 'POST');
+    assertEquals(searchNext.status, 200, JSON.stringify(searchNext.body));
     const edit = await edgeApi(
       freshRoomPath + '/send/m.room.encrypted/public-edit',
       {

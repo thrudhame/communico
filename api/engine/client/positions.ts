@@ -3,12 +3,14 @@
 import { readPublicationIdentity } from '#engine/facade/ownership.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Database } from '#engine/store/db.ts';
-import { parseStreamToken, type StreamToken } from './tokens.ts';
+import {
+  formatPosition,
+  parsePosition,
+  parseStreamToken,
+  type StreamToken,
+} from './tokens.ts';
 
-export async function requireStreamDomain(
-  server: Pick<Database, 'query'>,
-  token: StreamToken | null,
-): Promise<string> {
+async function publicationIdentity(server: Pick<Database, 'query'>) {
   const local = await readPublicationIdentity(server);
   if (local === null) {
     throw new MatrixError(
@@ -17,6 +19,48 @@ export async function requireStreamDomain(
       'publication domain unavailable',
     );
   }
+  return local;
+}
+
+export async function bindPaginationToken(
+  server: Pick<Database, 'query'>,
+  payload: string,
+): Promise<string> {
+  return formatPosition((await publicationIdentity(server)).domain, payload);
+}
+
+/** Pagination never clamps a cut or requests sync's full-state reset. Legacy
+ * payloads belong only to the original home; facades must issue their own. */
+export async function localPaginationToken(
+  server: Pick<Database, 'query'>,
+  raw: string,
+): Promise<string> {
+  const local = await publicationIdentity(server);
+  const position = parsePosition(raw);
+  if (raw.startsWith('v1.') && position === null) {
+    throw new MatrixError(
+      400,
+      'M_INVALID_PARAM',
+      'invalid pagination position',
+    );
+  }
+  if (
+    position === null ? local.node !== 'home' : position.domain !== local.domain
+  ) {
+    throw new MatrixError(
+      400,
+      'M_INVALID_PARAM',
+      'foreign pagination position',
+    );
+  }
+  return position?.payload ?? raw;
+}
+
+export async function requireStreamDomain(
+  server: Pick<Database, 'query'>,
+  token: StreamToken | null,
+): Promise<string> {
+  const local = await publicationIdentity(server);
   // The original home store alone retains its pre-domain grammar. An enrolled
   // facade cannot reinterpret a home legacy token as a locally issued position.
   if (

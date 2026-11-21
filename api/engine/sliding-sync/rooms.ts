@@ -1,4 +1,6 @@
 // Protocol room payloads compose existing publication, display and live-window owners.
+import { theApp } from '#engine/app.ts';
+import { requireStreamDomain } from '#engine/client/positions.ts';
 import { heldRoom, stateAtSeq, type StateRow } from '#engine/client/read.ts';
 import {
   admitState,
@@ -11,7 +13,7 @@ import {
 } from '#engine/client/render.ts';
 import { syncWindow } from '#engine/client/sync-window.ts';
 import { StateDelivery } from '#engine/client/state-delivery.ts';
-import { formatStreamToken } from '#engine/client/tokens.ts';
+import { formatPosition, formatStreamToken } from '#engine/client/tokens.ts';
 import type { Room } from '#engine/room/index.ts';
 import {
   prejoinDisplay,
@@ -136,6 +138,8 @@ export async function roomPayloads(
     domain?: string;
   },
 ) {
+  const domain = input.domain ??
+    await requireStreamDomain(theApp().server, null);
   const sent = structuredClone(input.previous);
   const rooms: Record<string, Json> = {};
   const dm = new Set(
@@ -259,9 +263,9 @@ export async function roomPayloads(
             0,
             undefined,
             undefined,
-            input.domain,
+            domain,
           )
-          : formatCursor(cursor);
+          : formatPosition(domain, formatCursor(cursor));
         entry.num_live = input.requestSince === null
           ? 0
           : window.rows.filter((r) => r.seq > input.requestSince!).length;

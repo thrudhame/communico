@@ -1,5 +1,6 @@
 // Remaining doltgres sync consumer assertions, using the landed room routes.
 import { assert, assertEquals } from '@std/assert';
+import { parsePosition } from '#engine/client/tokens.ts';
 import { theApp } from '#engine/app.ts';
 import { config, setConfigForTests } from '#engine/config.ts';
 import { resetCaCertsForTests } from '#engine/federation/client.ts';
@@ -93,7 +94,7 @@ suite.test('sync tokens bound messages in both directions and preserve room curs
   assertEquals(garbage.body.errcode, 'M_INVALID_PARAM');
   const page = await call(base + '/messages?dir=b&limit=2', token);
   assertEquals(page.status, 200);
-  assert(/^c\d+_\d+$/.test(String(page.body.end)));
+  assert(/^c\d+_\d+$/.test(parsePosition(String(page.body.end))!.payload));
   const next = await call(
     base + '/messages?dir=b&limit=2&from=' + page.body.end,
     token,

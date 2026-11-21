@@ -8,6 +8,8 @@ import { cursorForToken } from './timeline.ts';
 import { renderEvents } from './render.ts';
 import { canSeeEvent } from './visibility.ts';
 import { relationView } from './relation-view.ts';
+import { bindPaginationToken, localPaginationToken } from './positions.ts';
+import { parseStreamToken } from './tokens.ts';
 
 function invalid(message: string): never {
   throw new MatrixError(400, 'M_INVALID_PARAM', message);
@@ -19,13 +21,14 @@ export function relationLimit(raw: string | null): number {
   }
   return Math.min(100, Number(raw));
 }
-function tokenFor(room: Room, event: string): string {
-  return 'rel_' +
+async function tokenFor(room: Room, event: string): Promise<string> {
+  const payload = 'rel_' +
     btoa(
       String.fromCharCode(
         ...new TextEncoder().encode(JSON.stringify([room.id, event])),
       ),
     ).replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
+  return await bindPaginationToken(theApp().server, payload);
 }
 type Bound = { event: string; inclusive: boolean } | 'before' | 'after' | null;
 async function boundary(
@@ -34,13 +37,16 @@ async function boundary(
   dir: 'b' | 'f',
 ): Promise<Bound> {
   if (raw === null || raw === '') return null;
-  if (raw.startsWith('rel_')) {
+  const payload = parseStreamToken(raw) === null
+    ? await localPaginationToken(theApp().server, raw)
+    : raw;
+  if (payload.startsWith('rel_')) {
     let value;
     try {
       value = JSON.parse(
         new TextDecoder('utf-8', { fatal: true }).decode(
           Uint8Array.from(
-            atob(raw.slice(4).replaceAll('-', '+').replaceAll('_', '/')),
+            atob(payload.slice(4).replaceAll('-', '+').replaceAll('_', '/')),
             (c) => c.charCodeAt(0),
           ),
         ),
@@ -170,7 +176,7 @@ export async function relationsPage(
     out.recursion_depth = query.recurse === 'true' ? 3 : 0;
   }
   if (window.length > slice.length && slice.length > 0) {
-    out.next_batch = tokenFor(room, slice.at(-1)!.event);
+    out.next_batch = await tokenFor(room, slice.at(-1)!.event);
   }
   return out;
 }
@@ -208,7 +214,7 @@ export async function threads(
     chunk: slice.map((r) => r.ev),
   };
   if (window.length > slice.length && slice.length > 0) {
-    out.next_batch = tokenFor(room, slice.at(-1)!.event);
+    out.next_batch = await tokenFor(room, slice.at(-1)!.event);
   }
   return out;
 }

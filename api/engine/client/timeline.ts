@@ -26,7 +26,12 @@ import { admitState } from './state-admission.ts';
 import { canSeeEvent } from './visibility.ts';
 import { integerParameter } from '#engine/operation.ts';
 
-import { parseLocalStreamToken } from './positions.ts';
+import {
+  bindPaginationToken,
+  localPaginationToken,
+  parseLocalStreamToken,
+} from './positions.ts';
+import { parseStreamToken } from './tokens.ts';
 export { parseStreamToken } from './tokens.ts';
 
 export async function cursorForToken(
@@ -34,17 +39,20 @@ export async function cursorForToken(
   token: string,
   dir: 'b' | 'f',
 ): Promise<WalkCursor | null> {
-  const cursor = parseCursor(token);
+  const stream = parseStreamToken(token);
+  const cursor = stream === null
+    ? parseCursor(await localPaginationToken(theApp().server, token))
+    : null;
   if (cursor !== null) return cursor;
-  const stream = await parseLocalStreamToken(theApp().server, token);
-  if (stream === null) {
+  const local = await parseLocalStreamToken(theApp().server, token);
+  if (local === null) {
     throw new MatrixError(
       400,
       'M_INVALID_PARAM',
       'unknown pagination token: ' + token,
     );
   }
-  return await cursorForSeq(room, stream.eSeq, dir);
+  return await cursorForSeq(room, local.eSeq, dir);
 }
 
 // Internal publication cuts are already local facts, not public wire tokens.
@@ -369,9 +377,16 @@ export async function messages(
     state?: Record<string, unknown>[];
   } = { chunk, start: w.fromToken ?? '' };
   if (!((ended || last?.type === 'm.room.create') && !filtered)) {
-    if (frontier !== null) result.end = formatCursor(frontier);
-    else if (lastScanned !== undefined || limit === 0) {
-      result.end = formatCursor(cursor);
+    if (frontier !== null) {
+      result.end = await bindPaginationToken(
+        theApp().server,
+        formatCursor(frontier),
+      );
+    } else if (lastScanned !== undefined || limit === 0) {
+      result.end = await bindPaginationToken(
+        theApp().server,
+        formatCursor(cursor),
+      );
     }
   }
   if (w.lazyLoadMembers) {
@@ -438,7 +453,7 @@ export async function eventContext(
     leaveAt: member === null || member.membership === 'join'
       ? null
       : member.seq,
-    fromToken: formatCursor(pivot),
+    fromToken: await bindPaginationToken(theApp().server, formatCursor(pivot)),
     toToken: null,
     lazyLoadMembers: false,
   };

@@ -1,4 +1,5 @@
 import { theApp } from '#engine/app.ts';
+import { bindPaginationToken, localPaginationToken } from './positions.ts';
 import { config, serverName } from '#engine/config.ts';
 import { localpartOf, splitId } from '#engine/ids.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
@@ -266,7 +267,11 @@ export async function listLocalPublishedRooms(
   const limit = opts.limit != null && opts.limit > 0
       ? Math.min(opts.limit, 100)
       : 100,
-    offset = localDirectoryOffset(opts.since);
+    offset = localDirectoryOffset(
+      opts.since === undefined
+        ? undefined
+        : await localPaginationToken(theApp().server, opts.since),
+    );
   if (opts.network.kind === 'instance') {
     return { chunk: [], total_room_count_estimate: 0 };
   }
@@ -303,8 +308,18 @@ export async function listLocalPublishedRooms(
     chunk: all.slice(offset, offset + limit),
     total_room_count_estimate: all.length,
   };
-  if (offset + limit < all.length) out.next_batch = String(offset + limit);
-  if (offset > 0) out.prev_batch = String(Math.max(0, offset - limit));
+  if (offset + limit < all.length) {
+    out.next_batch = await bindPaginationToken(
+      theApp().server,
+      String(offset + limit),
+    );
+  }
+  if (offset > 0) {
+    out.prev_batch = await bindPaginationToken(
+      theApp().server,
+      String(Math.max(0, offset - limit)),
+    );
+  }
   return out;
 }
 export async function searchUsers(searcher: string, term: string, limit = 10) {

@@ -37,6 +37,7 @@ import { syncStreamHeads } from '#engine/server/stream.ts';
 import type { DeviceIdentity } from '#engine/tenant/devices.ts';
 import type { Room } from '#engine/room/index.ts';
 import { formatCursor } from '#engine/room/segments.ts';
+import { formatPosition } from '#engine/client/tokens.ts';
 import { feedAfter, feedBefore, roomsFor } from '#engine/server/read.ts';
 import {
   notificationChanged,
@@ -175,7 +176,7 @@ async function roomTimeline(
       limited,
       prev_batch: paginationCursor === null
         ? encodeStreamToken({ ...now, eSeq: prevE })
-        : formatCursor(paginationCursor),
+        : formatPosition(now.domain!, formatCursor(paginationCursor)),
     },
     ephemeral: { events: [] },
     account_data: { events: [] },

@@ -1,5 +1,6 @@
 // doltgres aliases/directory/relations/search/upgrade/user-directory contracts.
 import { assert, assertEquals } from '@std/assert';
+import { parsePosition } from '#engine/client/tokens.ts';
 import { httpSuite } from '#tests/http-app.ts';
 import { setConfigForTests } from '#engine/config.ts';
 const { matrix, registerTestUser, test } = httpSuite(
@@ -224,8 +225,12 @@ test('directory: public GET/protected POST, chunk shapes, search, visibility tog
   const page = await call('publicRooms?limit=1');
   assert(typeof page.body.next_batch === 'string');
   assertEquals(
-    (await call('publicRooms?limit=1&since=' + page.body.next_batch)).body
-      .prev_batch,
+    parsePosition(
+      String(
+        (await call('publicRooms?limit=1&since=' + page.body.next_batch)).body
+          .prev_batch,
+      ),
+    )?.payload,
     '0',
   );
 });

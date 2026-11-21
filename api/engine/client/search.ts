@@ -22,7 +22,12 @@ import { clientEventsForRows, clientStateFor } from './state.ts';
 import { canSeeEvent } from './visibility.ts';
 import { erasurePrunes } from '#engine/erasure.ts';
 import { roomCompletion } from './completion.ts';
-import { parseLocalStreamToken } from './positions.ts';
+import {
+  bindPaginationToken,
+  localPaginationToken,
+  parseLocalStreamToken,
+} from './positions.ts';
+import { parseStreamToken } from './tokens.ts';
 export interface SearchRoomEvents {
   search_term: string;
   keys?: unknown;
@@ -68,8 +73,14 @@ export async function search(
   nextBatch: string | null,
   signal?: AbortSignal,
 ) {
-  if (nextBatch !== null && !nextBatch.startsWith('search_')) {
-    await parseLocalStreamToken(theApp().server, nextBatch);
+  if (nextBatch !== null) {
+    if (parseStreamToken(nextBatch) !== null) {
+      const local = await parseLocalStreamToken(theApp().server, nextBatch);
+      // searchPage's legacy compatibility path consumes an already-local cut.
+      nextBatch = 's' + local!.eSeq;
+    } else {
+      nextBatch = await localPaginationToken(theApp().server, nextBatch);
+    }
   }
   const request = searchRequest(req), { filter, keys } = request;
   const tokens = request.term.toLowerCase().split(/\s+/).filter(Boolean);
@@ -112,6 +123,16 @@ export async function search(
     request,
     nextBatch,
   );
+  for (const group of Object.values(groups)) {
+    for (const entry of Object.values(group)) {
+      if (entry.next_batch !== undefined) {
+        entry.next_batch = await bindPaginationToken(
+          theApp().server,
+          entry.next_batch,
+        );
+      }
+    }
+  }
   const results: Record<string, unknown>[] = [];
   const selected = new Map<string, string[]>();
   for (const hit of page) {
@@ -205,7 +226,9 @@ export async function search(
     results.push({ rank: hit.rank, result: ev, context });
   }
   const out: Record<string, unknown> = { count, highlights: tokens, results };
-  if (continuation !== undefined) out.next_batch = continuation;
+  if (continuation !== undefined) {
+    out.next_batch = await bindPaginationToken(theApp().server, continuation);
+  }
   if (request.state) {
     const state: Record<string, unknown> = {};
     for (const roomId of new Set(page.map((h) => h.roomId))) {

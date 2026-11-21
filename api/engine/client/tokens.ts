@@ -43,24 +43,16 @@ export function boundFutureToken(
 export function parseStreamToken(raw: string | null): StreamToken | null {
   if (raw === null) return null;
   if (raw.startsWith('v1.')) {
-    if (!/^v1\.[A-Za-z0-9_-]+$/.test(raw)) return null;
-    let envelope: unknown;
-    try {
-      envelope = JSON.parse(Buffer.from(raw.slice(3), 'base64url').toString());
-    } catch {
-      return null;
-    }
-    if (
-      !Array.isArray(envelope) || envelope.length !== 2 ||
-      typeof envelope[0] !== 'string' || !validDomain(envelope[0]) ||
-      typeof envelope[1] !== 'string'
-    ) return null;
+    const envelope = parsePosition(raw);
+    if (envelope === null) return null;
     // Only the existing numeric grammar can inhabit an envelope. Requiring the
     // issued spelling prevents padding, JSON and shorthand aliases from hashing
     // into another token's inbox receipt. Domain validation is the consumer's job.
-    const cuts = parseLegacyToken(envelope[1]);
-    if (cuts === null || encodeStreamToken(cuts) !== envelope[1]) return null;
-    const token = { ...cuts, domain: envelope[0] };
+    const cuts = parseLegacyToken(envelope.payload);
+    if (cuts === null || encodeStreamToken(cuts) !== envelope.payload) {
+      return null;
+    }
+    const token = { ...cuts, domain: envelope.domain };
     return encodeStreamToken(token) === raw ? token : null;
   }
   return parseLegacyToken(raw);
@@ -68,6 +60,33 @@ export function parseStreamToken(raw: string | null): StreamToken | null {
 
 function validDomain(domain: string): boolean {
   return /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(domain);
+}
+
+/** One canonical envelope for node-local positions. Each consumer still owns
+ * its payload grammar, ordering and admission; this grants no ACK authority. */
+export function formatPosition(domain: string, payload: string): string {
+  if (!validDomain(domain)) throw new TypeError('invalid publication domain');
+  return 'v1.' +
+    Buffer.from(JSON.stringify([domain, payload])).toString('base64url');
+}
+
+export function parsePosition(
+  raw: string,
+): { domain: string; payload: string } | null {
+  if (!/^v1\.[A-Za-z0-9_-]+$/.test(raw)) return null;
+  let envelope: unknown;
+  try {
+    envelope = JSON.parse(Buffer.from(raw.slice(3), 'base64url').toString());
+  } catch {
+    return null;
+  }
+  if (
+    !Array.isArray(envelope) || envelope.length !== 2 ||
+    typeof envelope[0] !== 'string' || !validDomain(envelope[0]) ||
+    typeof envelope[1] !== 'string' ||
+    formatPosition(envelope[0], envelope[1]) !== raw
+  ) return null;
+  return { domain: envelope[0], payload: envelope[1] };
 }
 
 function parseLegacyToken(raw: string): StreamToken | null {
@@ -114,10 +133,7 @@ export function formatStreamToken(
     (nSeq === undefined ? '' : `_n${nSeq}`) +
     (epoch === undefined ? '' : `_z${epoch}`);
   if (domain === undefined) return cuts;
-  if (!validDomain(domain)) throw new TypeError('invalid publication domain');
-  return 'v1.' + Buffer.from(JSON.stringify([domain, cuts])).toString(
-    'base64url',
-  );
+  return formatPosition(domain, cuts);
 }
 
 export function encodeStreamToken(t: StreamToken): string {
