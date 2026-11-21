@@ -16,6 +16,12 @@ export default async function (
     userId,
     body.presence,
     body.status,
+    typeof context.state.device === 'string'
+      ? {
+        deviceId: context.state.device,
+        generation: Number(context.state.deviceGeneration ?? 0),
+      }
+      : undefined,
   );
   return {};
 }

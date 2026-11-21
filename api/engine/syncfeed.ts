@@ -64,8 +64,8 @@ import {
   publishPresence,
   receiptRoomsSince,
   receiptSnapshot,
-  setPresenceValue,
   sharedUsers,
+  withPresenceSync,
 } from '#engine/server/ephemeral.ts';
 import {
   captureTyping,
@@ -374,16 +374,31 @@ async function assembleSync(
       )
     );
   }
-  if (i.setPresence !== undefined) {
-    await setPresenceValue(app.server, i.userId, i.setPresence);
-  }
+  return await withPresenceSync(
+    app.server,
+    i.userId,
+    i.setPresence,
+    device ?? undefined,
+    () => assembleSyncView(i, domain, epoch, recoveryReset, device),
+  );
+}
+
+async function assembleSyncView(
+  i: SyncInputs,
+  domain: string,
+  epoch: string | undefined,
+  recoveryReset: boolean,
+  device: DeviceIdentity | null,
+): Promise<Record<string, unknown>> {
+  const app = theApp();
+  const lp = localpartOf(i.userId);
   sweepTyping();
   await waitForRelevant(i, device);
   sweepTyping();
   // One server transaction selects events, receipts, memberships and counts.
   // Rendering afterward may be slow, but cannot mix a later count/receipt cut.
   const snapshot = await app.server.tx(async (tx) => {
-    const presence = await capturePresence(tx, i.userId);
+    const presence = await capturePresence(tx, i.userId, app.server);
     const counters = new Map(
       (await tx.query('SELECT name,value FROM counters')).map((
         r,

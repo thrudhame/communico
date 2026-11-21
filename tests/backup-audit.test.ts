@@ -131,6 +131,17 @@ Deno.test('backup audit: presence receipt evidence is retained and invalid times
       "UPDATE presence SET remote_received_ms=0.5 WHERE user_id='@remote:test'",
     );
     await assertRejects(f.audit, Error, 'remote presence receipt');
+    await f.app.server.execute(
+      "UPDATE presence SET remote_received_ms=1 WHERE user_id='@remote:test'",
+    );
+    await f.app.server.execute(
+      "INSERT INTO presence_observations VALUES('@local:test','','','PHONE',0,'online',1,1)",
+    );
+    await f.audit();
+    await f.app.server.execute(
+      'UPDATE presence_observations SET generation=0.5',
+    );
+    await assertRejects(f.audit, Error, 'presence observation generation');
   } finally {
     await f.close();
   }

@@ -174,6 +174,8 @@ export const tableContracts = {
     // Retain local authoritative facts, frozen obligations and their results;
     // no replica may replace these with another node's allocator positions.
     retained: [
+      // Original per-device/node activity timestamps, never renewed by restore.
+      'presence_observations',
       'aliases',
       'directory',
       'visibility',

@@ -90,7 +90,9 @@ Deno.test('presence wire: producer storage to EDU to remote persistence preserve
       (await getPresence(consumer, local)).seq,
       beforeExpiry.seq + 1,
     );
-    assertEquals((await getPresence(producer, local)).presence, 'online');
+    // The sender's local device also expires, under its own shorter sync grace,
+    // rather than acquiring the receiver's remote-observation lifetime.
+    assertEquals((await getPresence(producer, local)).presence, 'offline');
   } finally {
     Date.now = clock;
     await stop?.();

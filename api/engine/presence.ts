@@ -8,4 +8,5 @@ export const setPresence = (
   userId: string,
   presence: string,
   statusMsg?: string,
-) => rows.setPresence(theApp().server, userId, presence, statusMsg);
+  device?: rows.PresenceDevice,
+) => rows.setPresence(theApp().server, userId, presence, statusMsg, { device });

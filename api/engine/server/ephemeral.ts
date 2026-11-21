@@ -3,6 +3,7 @@
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Conn, Database as Db } from '#engine/store/db.ts';
 import type { Row } from '#engine/store/ffi.ts';
+import { readPublicationIdentity } from '#engine/facade/ownership.ts';
 import { eventStreamTx } from '#engine/server/stream.ts';
 import { isJoined, receiptTargetInThread } from '#engine/server/read.ts';
 import { advanceNotificationRead } from '#engine/server/notifications.ts';
@@ -22,6 +23,18 @@ const MAX_UNKNOWN_THREADS = 100;
 // Synapse's FEDERATION_TIMEOUT: remote liveness expires from authenticated
 // receipt, never from the independently reported age of the user's activity.
 const REMOTE_PRESENCE_FRESHNESS_MS = 30 * 60 * 1000;
+const LOCAL_SYNC_GRACE_MS = 30_000;
+const LOCAL_IDLE_MS = 5 * 60 * 1000;
+const LOCAL_ACTIVITY_GRANULARITY_MS = 60_000;
+export type PresenceDevice = { deviceId: string; generation: number };
+const syncingDevices = new WeakMap<Db, Map<string, number>>();
+function syncDeviceKey(userId: string, device?: PresenceDevice) {
+  return JSON.stringify([
+    userId,
+    device?.deviceId ?? '',
+    device?.generation ?? 0,
+  ]);
+}
 /** Protocol identifiers, not arbitrary durable keys. Adapters must not coerce
  * malformed metadata into the distinct unthreaded identity. */
 export function receiptThreadId(value: unknown): string | null {
@@ -105,19 +118,170 @@ export async function setPresence(
     lastActiveAgo?: number;
     currentlyActive?: boolean;
     remote?: boolean;
+    device?: PresenceDevice;
   } = {},
 ): Promise<void> {
   await writePresence(server, userId, presence, statusMsg ?? null, opts, false);
 }
 
-// A presence-only intent preserves the separately owned status message and
-// does nothing when the value already matches, including concurrent callers.
+// Refresh private device activity even when the aggregate remains identical;
+// the public stream/status must not be rewritten or wake peers for that refresh.
 export async function setPresenceValue(
   server: Db,
   userId: string,
   presence: string,
+  observation?: PresenceDevice,
 ): Promise<void> {
-  await writePresence(server, userId, presence, undefined, {}, true);
+  await writePresence(server, userId, presence, undefined, {
+    device: observation,
+  }, true);
+}
+
+async function localPresenceIdentity(tx: Pick<Conn, 'query'>) {
+  const source = await readPublicationIdentity(tx);
+  // The empty identity is file-local ordinary/unpaired activity, not authority
+  // to export an observation. Enrolled exchange requires publication identity.
+  return { node: source?.node ?? '', incarnation: source?.incarnation ?? '' };
+}
+
+async function observeLocalPresence(
+  tx: Conn,
+  userId: string,
+  presence: string,
+  receivedMs: number,
+  lastActiveMs: number,
+  device?: PresenceDevice,
+) {
+  const source = await localPresenceIdentity(tx);
+  const id = device?.deviceId ?? '', generation = device?.generation ?? 0;
+  if (!Number.isSafeInteger(generation) || generation < 0) {
+    throw new MatrixError(
+      400,
+      'M_INVALID_PARAM',
+      'bad presence device generation',
+    );
+  }
+  const [held] = await tx.query(
+    'SELECT generation,last_active_ms FROM presence_observations WHERE user_id=? AND node=? AND incarnation=? AND device_id=?',
+    [userId, source.node, source.incarnation, id],
+  );
+  if (held && Number(held.generation) > generation) return false;
+  const active =
+    presence === 'online' || !held || Number(held.generation) !== generation
+      ? lastActiveMs
+      : Number(held.last_active_ms);
+  await tx.execute(
+    `INSERT INTO presence_observations(user_id,node,incarnation,device_id,generation,presence,last_active_ms,last_sync_ms) VALUES(?,?,?,?,?,?,?,?)
+    ON CONFLICT(user_id,node,incarnation,device_id) DO UPDATE SET generation=excluded.generation,presence=excluded.presence,last_active_ms=excluded.last_active_ms,last_sync_ms=excluded.last_sync_ms`,
+    [
+      userId,
+      source.node,
+      source.incarnation,
+      id,
+      generation,
+      presence,
+      active,
+      receivedMs,
+    ],
+  );
+  return true;
+}
+
+async function projectedPresence(
+  tx: Pick<Conn, 'query'>,
+  userId: string,
+  current: Row | undefined,
+  server?: Db,
+) {
+  if (current !== undefined && current.remote_received_ms !== null) {
+    return {
+      presence: presenceExpired(current) ? 'offline' : String(current.presence),
+      lastActiveMs: Number(current.last_active_ms),
+    };
+  }
+  const source = await localPresenceIdentity(tx);
+  const rows = await tx.query(
+    'SELECT * FROM presence_observations WHERE user_id=? AND node=? AND incarnation=?',
+    [userId, source.node, source.incarnation],
+  );
+  let presence = 'offline', lastActiveMs = Number(current?.last_active_ms ?? 0);
+  const now = Date.now();
+  for (const row of rows) {
+    const active = Number(row.last_active_ms),
+      lastSync = Number(row.last_sync_ms);
+    lastActiveMs = Math.max(lastActiveMs, active);
+    const syncing = server &&
+      (syncingDevices.get(server)?.get(
+          syncDeviceKey(userId, {
+            deviceId: String(row.device_id),
+            generation: Number(row.generation),
+          }),
+        ) ?? 0) > 0;
+    let state = String(row.presence);
+    if (!syncing && now - Math.max(lastSync, active) > LOCAL_SYNC_GRACE_MS) {
+      state = 'offline';
+    }
+    if (state === 'online' && now - active > LOCAL_IDLE_MS) {
+      state = 'unavailable';
+    }
+    if (
+      state === 'online' || (state === 'unavailable' && presence === 'offline')
+    ) presence = state;
+  }
+  const previousActivity = Number(current?.last_active_ms ?? 0);
+  return {
+    presence,
+    lastActiveMs: presence !== current?.presence ||
+        lastActiveMs - previousActivity >= LOCAL_ACTIVITY_GRANULARITY_MS
+      ? lastActiveMs
+      : previousActivity,
+  };
+}
+
+/** Synapse's user_syncing contract: active requests hold their own device,
+ * and the final completed request starts that device's ordinary offline grace.
+ * No timer, reliable backlog or independently running presence worker. */
+export async function withPresenceSync<T>(
+  server: Db,
+  userId: string,
+  presence: string | undefined,
+  device: PresenceDevice | undefined,
+  run: () => Promise<T>,
+): Promise<T> {
+  if (presence === undefined) return await run();
+  if (!['online', 'offline', 'unavailable'].includes(presence)) {
+    throw new MatrixError(400, 'M_INVALID_PARAM', 'bad presence: ' + presence);
+  }
+  const key = syncDeviceKey(userId, device);
+  const syncing = syncingDevices.get(server) ?? new Map<string, number>();
+  syncingDevices.set(server, syncing);
+  syncing.set(key, (syncing.get(key) ?? 0) + 1);
+  try {
+    await setPresenceValue(server, userId, presence, device);
+    return await run();
+  } finally {
+    try {
+      await eventStreamTx(server, async (tx) => {
+        const source = await localPresenceIdentity(tx);
+        await tx.execute(
+          'UPDATE presence_observations SET last_sync_ms=MAX(last_sync_ms,?) WHERE user_id=? AND node=? AND incarnation=? AND device_id=? AND generation=?',
+          [
+            Date.now(),
+            userId,
+            source.node,
+            source.incarnation,
+            device?.deviceId ?? '',
+            device?.generation ?? 0,
+          ],
+        );
+      });
+    } finally {
+      const count = (syncing.get(key) ?? 1) - 1;
+      if (count) syncing.set(key, count);
+      else syncing.delete(key);
+      if (!syncing.size) syncingDevices.delete(server);
+    }
+  }
 }
 
 async function writePresence(
@@ -125,7 +289,12 @@ async function writePresence(
   userId: string,
   presence: string,
   statusMsg: string | null | undefined,
-  opts: { lastActiveAgo?: number; currentlyActive?: boolean; remote?: boolean },
+  opts: {
+    lastActiveAgo?: number;
+    currentlyActive?: boolean;
+    remote?: boolean;
+    device?: PresenceDevice;
+  },
   skipUnchanged: boolean,
 ): Promise<void> {
   if (!['online', 'offline', 'unavailable'].includes(presence)) {
@@ -134,29 +303,49 @@ async function writePresence(
   const receivedMs = Date.now();
   const lastActiveMs = receivedMs - (opts.lastActiveAgo ?? 0);
   const row = await eventStreamTx(server, async (tx) => {
-    let status = statusMsg;
-    if (skipUnchanged) {
-      const current = (await tx.query(
-        'SELECT presence,status_msg FROM presence WHERE user_id=?',
-        [userId],
-      ))[0];
-      if (current?.presence === presence) return null;
-      status = current?.status_msg == null ? null : String(current.status_msg);
-    }
+    const [current] = await tx.query('SELECT * FROM presence WHERE user_id=?', [
+      userId,
+    ]);
+    if (
+      !opts.remote &&
+      !await observeLocalPresence(
+        tx,
+        userId,
+        presence,
+        receivedMs,
+        lastActiveMs,
+        opts.device,
+      )
+    ) return null;
+    const projected = opts.remote
+      ? { presence, lastActiveMs }
+      : await projectedPresence(
+        tx,
+        userId,
+        current ? { ...current, remote_received_ms: null } : undefined,
+        server,
+      );
+    const status = skipUnchanged
+      ? current?.status_msg == null ? null : String(current.status_msg)
+      : statusMsg;
+    if (
+      skipUnchanged && current?.presence === projected.presence &&
+      Number(current.last_active_ms) === projected.lastActiveMs
+    ) return null;
     const seq = await next(tx, 'presence');
     await tx.execute(
       `INSERT INTO presence(user_id,presence,status_msg,last_active_ms,seq,remote_received_ms) VALUES(?,?,?,?,?,?)
       ON CONFLICT(user_id) DO UPDATE SET presence=excluded.presence,status_msg=excluded.status_msg,last_active_ms=excluded.last_active_ms,seq=excluded.seq,remote_received_ms=excluded.remote_received_ms`,
       [
         userId,
-        presence,
+        projected.presence,
         status ?? null,
-        lastActiveMs,
+        projected.lastActiveMs,
         seq,
         opts.remote ? receivedMs : null,
       ],
     );
-    return { presence, statusMsg: status ?? null, lastActiveMs, seq };
+    return { ...projected, statusMsg: status ?? null, seq };
   });
   if (row === null) return;
   notify(server, { kind: 'presence', userId, row });
@@ -196,20 +385,30 @@ function presenceRow(r: Row | undefined): PresenceRow {
     };
 }
 
-async function normalizePresence(tx: Conn, userId: string) {
+async function normalizePresence(tx: Conn, userId: string, server?: Db) {
   const [current] = await tx.query('SELECT * FROM presence WHERE user_id=?', [
     userId,
   ]);
-  if (!presenceExpired(current)) {
+  const projected = await projectedPresence(tx, userId, current, server);
+  if (
+    !current ||
+    (projected.presence === current.presence &&
+      projected.lastActiveMs === Number(current.last_active_ms))
+  ) {
     return { row: presenceRow(current), changed: false };
   }
   const seq = await next(tx, 'presence');
   await tx.execute(
-    "UPDATE presence SET presence='offline',seq=? WHERE user_id=?",
-    [seq, userId],
+    'UPDATE presence SET presence=?,last_active_ms=?,seq=? WHERE user_id=?',
+    [projected.presence, projected.lastActiveMs, seq, userId],
   );
   return {
-    row: presenceRow({ ...current, presence: 'offline', seq }),
+    row: presenceRow({
+      ...current,
+      presence: projected.presence,
+      last_active_ms: projected.lastActiveMs,
+      seq,
+    }),
     changed: true,
   };
 }
@@ -222,11 +421,16 @@ export async function getPresence(
     'SELECT * FROM presence WHERE user_id=?',
     [userId],
   );
-  if (!presenceExpired(current)) return presenceRow(current);
+  if (!current) return presenceRow(current);
+  const projected = await projectedPresence(server, userId, current, server);
+  if (
+    projected.presence === current.presence &&
+    projected.lastActiveMs === Number(current.last_active_ms)
+  ) return presenceRow(current);
   // A concurrent authenticated observation wins over a stale reader's expiry.
   const value = await eventStreamTx(
     server,
-    (tx) => normalizePresence(tx, userId),
+    (tx) => normalizePresence(tx, userId, server),
   );
   if (value.changed) {
     notify(server, { kind: 'presence', userId, row: value.row });
@@ -237,11 +441,11 @@ export async function getPresence(
 /** Capture the exact presence view in the sync owner's existing server
  * transaction, BEFORE it captures counters. Rendering cannot publish a lazy
  * expiry after next_batch or mix a newer presence row into an older cut. */
-export async function capturePresence(tx: Conn, userId: string) {
+export async function capturePresence(tx: Conn, userId: string, server?: Db) {
   const rows = new Map<string, PresenceRow>();
   const changes: { userId: string; row: PresenceRow }[] = [];
   for (const user of await sharedUsers(tx, userId)) {
-    const value = await normalizePresence(tx, user);
+    const value = await normalizePresence(tx, user, server);
     rows.set(user, value.row);
     if (value.changed) changes.push({ userId: user, row: value.row });
   }

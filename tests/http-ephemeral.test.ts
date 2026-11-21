@@ -481,6 +481,52 @@ suite.test('presence joins fan out both ways; status/set_presence validation and
   assert(presence(result.body).some((e) => e.sender === b.user_id));
 });
 
+suite.test('presence PUT, ordinary sync and sliding sync aggregate the authenticated device observations', async () => {
+  const user = await suite.registerTestUser('ep-presence-devices', 'pw');
+  const login = await call('/_matrix/client/v3/login', undefined, 'POST', {
+    type: 'm.login.password',
+    identifier: { type: 'm.id.user', user: user.user_id },
+    password: 'pw',
+    device_id: 'SECOND',
+  });
+  assertEquals(login.status, 200);
+  assert(login.body.device_id !== user.device_id);
+  const second = String(login.body.access_token);
+  const path = '/_matrix/client/v3/presence/' +
+    encodeURIComponent(user.user_id) + '/status';
+  assertEquals(
+    (await call(path, user.access_token!, 'PUT', {
+      presence: 'online',
+      status_msg: 'per-device status',
+    })).status,
+    200,
+  );
+  await sync(second, '&set_presence=unavailable');
+  assertEquals((await call(path, user.access_token!)).body.presence, 'online');
+  await sync(user.access_token!, '&set_presence=offline');
+  assertEquals(
+    (await call(path, user.access_token!)).body.presence,
+    'unavailable',
+  );
+  const sliding = '/_matrix/client/unstable/org.matrix.simplified_msc3575/sync';
+  const start = await call(sliding + '?set_presence=online', second, 'POST', {
+    conn_id: 'presence-devices',
+  });
+  assertEquals(start.status, 200);
+  assertEquals((await call(path, user.access_token!)).body.presence, 'online');
+  const end = await call(
+    sliding + '?set_presence=offline&pos=' +
+      encodeURIComponent(String(start.body.pos)),
+    second,
+    'POST',
+    { conn_id: 'presence-devices' },
+  );
+  assertEquals(end.status, 200);
+  const offline = await call(path, user.access_token!);
+  assertEquals(offline.body.presence, 'offline');
+  assertEquals(offline.body.status_msg, 'per-device status');
+});
+
 suite.test('sync presence changes preserve status and identical concurrent syncs do not rewrite or wake peers', async () => {
   const a = await suite.registerTestUser('ep-presence-stable-a', 'pw');
   const b = await suite.registerTestUser('ep-presence-stable-b', 'pw');

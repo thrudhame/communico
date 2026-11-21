@@ -473,8 +473,12 @@ const PRESENCE_FRESHNESS_SQL = `
 ALTER TABLE presence ADD COLUMN remote_received_ms INTEGER DEFAULT 0 CHECK(remote_received_ms IS NULL OR remote_received_ms>=0);
 `;
 
+const PRESENCE_OBSERVATIONS_SQL = `
+CREATE TABLE presence_observations(user_id TEXT NOT NULL,node TEXT NOT NULL,incarnation TEXT NOT NULL,device_id TEXT NOT NULL,generation INTEGER NOT NULL CHECK(generation>=0),presence TEXT NOT NULL CHECK(presence IN ('online','unavailable','offline')),last_active_ms INTEGER NOT NULL,last_sync_ms INTEGER NOT NULL,PRIMARY KEY(user_id,node,incarnation,device_id));
+`;
+
 export const serverSchema: SchemaProvider = {
-  version: 56,
+  version: 57,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -537,6 +541,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(NOTIFICATION_CONTEXT_SQL);
     await db.exec(ROOM_UPGRADES_SQL);
     await db.exec(PRESENCE_FRESHNESS_SQL);
+    await db.exec(PRESENCE_OBSERVATIONS_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -624,5 +629,6 @@ INSERT INTO device_publication_predecessors SELECT DISTINCT p.subject,p.destinat
     53: (conn) => conn.exec(NOTIFICATION_CONTEXT_SQL),
     54: (conn) => conn.exec(ROOM_UPGRADES_SQL),
     55: (conn) => conn.exec(PRESENCE_FRESHNESS_SQL),
+    56: (conn) => conn.exec(PRESENCE_OBSERVATIONS_SQL),
   },
 };
