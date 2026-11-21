@@ -3,6 +3,7 @@
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Conn, Database as Db } from '#engine/store/db.ts';
 import type { Row } from '#engine/store/ffi.ts';
+import { integerParameter, invalidParameter } from '#engine/operation.ts';
 import { readPublicationIdentity } from '#engine/facade/ownership.ts';
 import { eventStreamTx } from '#engine/server/stream.ts';
 import { isJoined, receiptTargetInThread } from '#engine/server/read.ts';
@@ -34,6 +35,123 @@ const LOCAL_SYNC_GRACE_MS = 30_000;
 const LOCAL_IDLE_MS = 5 * 60 * 1000;
 const LOCAL_ACTIVITY_GRANULARITY_MS = 60_000;
 export type PresenceDevice = { deviceId: string; generation: number };
+export type PresenceSource = { node: string; incarnation: string };
+export type LivePresenceObservation = PresenceDevice & {
+  userId: string;
+  presence: string;
+  remainingMs: number;
+  lastActiveAgo: number;
+};
+
+/** Export only this database's activity, never a projection imported from a
+ * different node. An active sync has a bounded fresh observation, not a lease
+ * that can outlive the source after disconnection. Explicit status is separate. */
+export async function captureLocalPresence(
+  server: Db,
+): Promise<LivePresenceObservation[]> {
+  return await server.tx(async (tx) => {
+    const source = await localPresenceIdentity(tx);
+    const rows = await tx.query(
+      'SELECT * FROM presence_observations WHERE node=? AND incarnation=? ORDER BY user_id,device_id',
+      [source.node, source.incarnation],
+    );
+    const values: LivePresenceObservation[] = [];
+    for (const row of rows) {
+      const observed = observedPresence(row, server, true);
+      if (observed.presence === 'offline') continue;
+      values.push({
+        userId: String(row.user_id),
+        deviceId: String(row.device_id),
+        generation: Number(row.generation),
+        presence: observed.presence,
+        remainingMs: Math.max(0, observed.expiresAt - Date.now()),
+        lastActiveAgo: Math.max(0, Date.now() - Number(row.last_active_ms)),
+      });
+    }
+    return values;
+  });
+}
+
+/** Replace an authenticated source's live view in the existing observation
+ * owner. Receiver elapsed time includes admission and writer-queue waits. The
+ * callback composes pairing/account/device authority before any row mutation. */
+export async function replacePresenceSource(
+  server: Db,
+  source: PresenceSource,
+  values: readonly LivePresenceObservation[],
+  elapsed: () => number,
+  check: (tx: Conn) => Promise<void>,
+): Promise<void> {
+  if (!source.node || !source.incarnation) invalidParameter('presence source');
+  const seen = new Set<string>();
+  for (const value of values) {
+    if (
+      !value.userId || !value.deviceId ||
+      !['online', 'unavailable'].includes(value.presence)
+    ) {
+      invalidParameter('presence observation');
+    }
+    for (
+      const n of [value.generation, value.remainingMs, value.lastActiveAgo]
+    ) {
+      if (
+        integerParameter(n, 'presence observation', 0) === undefined
+      ) invalidParameter('presence observation');
+    }
+    const key = JSON.stringify([value.userId, value.deviceId]);
+    if (seen.has(key)) invalidParameter('duplicate presence observation');
+    seen.add(key);
+  }
+  const changes = await eventStreamTx(server, async (tx) => {
+    await check(tx);
+    const local = await localPresenceIdentity(tx);
+    if (source.node === local.node) invalidParameter('local presence source');
+    const held = await tx.query(
+      'SELECT DISTINCT user_id FROM presence_observations WHERE node=?',
+      [source.node],
+    );
+    const affected = new Set([
+      ...held.map((row) => String(row.user_id)),
+      ...values.map((v) => v.userId),
+    ]);
+    // A currently admitted new incarnation supersedes its own node only. It
+    // cannot clear another node or acquire that node's process-local sync lease.
+    await tx.execute('DELETE FROM presence_observations WHERE node=?', [
+      source.node,
+    ]);
+    // Monotonic round-trip clocks have fractional milliseconds. Persist integer
+    // timestamp evidence, rounding age upward so quantization cannot renew TTL.
+    const age = Math.max(0, Math.ceil(elapsed())), now = Date.now();
+    for (const value of values) {
+      const remaining = value.remainingMs - age;
+      if (remaining <= 0) continue;
+      await tx.execute(
+        'INSERT INTO presence_observations(user_id,node,incarnation,device_id,generation,presence,last_active_ms,last_sync_ms) VALUES(?,?,?,?,?,?,?,?)',
+        [
+          value.userId,
+          source.node,
+          source.incarnation,
+          value.deviceId,
+          value.generation,
+          value.presence,
+          now - value.lastActiveAgo - age,
+          now + remaining - LOCAL_SYNC_GRACE_MS,
+        ],
+      );
+      await tx.execute(
+        "INSERT INTO presence(user_id,presence,status_msg,last_active_ms,seq,remote_received_ms) VALUES(?,'offline',NULL,0,0,NULL) ON CONFLICT(user_id) DO UPDATE SET remote_received_ms=NULL",
+        [value.userId],
+      );
+    }
+    const changes: { userId: string; row: PresenceRow }[] = [];
+    for (const userId of affected) {
+      const value = await normalizePresence(tx, userId, server);
+      if (value.changed) changes.push({ userId, row: value.row });
+    }
+    return changes;
+  });
+  for (const change of changes) notify(server, { kind: 'presence', ...change });
+}
 const syncingDevices = new WeakMap<Db, Map<string, number>>();
 function syncDeviceKey(userId: string, device?: PresenceDevice) {
   return JSON.stringify([
@@ -208,29 +326,18 @@ async function projectedPresence(
   }
   const source = await localPresenceIdentity(tx);
   const rows = await tx.query(
-    'SELECT * FROM presence_observations WHERE user_id=? AND node=? AND incarnation=?',
-    [userId, source.node, source.incarnation],
+    "SELECT * FROM presence_observations WHERE user_id=? AND ((node=? AND incarnation=?) OR (node<>? AND node<>''))",
+    [userId, source.node, source.incarnation, source.node],
   );
   let presence = 'offline', lastActiveMs = Number(current?.last_active_ms ?? 0);
-  const now = Date.now();
   for (const row of rows) {
-    const active = Number(row.last_active_ms),
-      lastSync = Number(row.last_sync_ms);
+    const active = Number(row.last_active_ms);
     lastActiveMs = Math.max(lastActiveMs, active);
-    const syncing = server &&
-      (syncingDevices.get(server)?.get(
-          syncDeviceKey(userId, {
-            deviceId: String(row.device_id),
-            generation: Number(row.generation),
-          }),
-        ) ?? 0) > 0;
-    let state = String(row.presence);
-    if (!syncing && now - Math.max(lastSync, active) > LOCAL_SYNC_GRACE_MS) {
-      state = 'offline';
-    }
-    if (state === 'online' && now - active > LOCAL_IDLE_MS) {
-      state = 'unavailable';
-    }
+    const state = observedPresence(
+      row,
+      server,
+      row.node === source.node && row.incarnation === source.incarnation,
+    ).presence;
     if (
       state === 'online' || (state === 'unavailable' && presence === 'offline')
     ) presence = state;
@@ -243,6 +350,27 @@ async function projectedPresence(
       ? lastActiveMs
       : previousActivity,
   };
+}
+
+function observedPresence(row: Row, server: Db | undefined, local: boolean) {
+  const now = Date.now(), active = Number(row.last_active_ms);
+  const syncing = local && server && (syncingDevices.get(server)?.get(
+        syncDeviceKey(String(row.user_id), {
+          deviceId: String(row.device_id),
+          generation: Number(row.generation),
+        }),
+      ) ?? 0) > 0;
+  const expiresAt = syncing
+    ? now + LOCAL_SYNC_GRACE_MS
+    : (local
+      ? Math.max(Number(row.last_sync_ms), active)
+      : Number(row.last_sync_ms)) + LOCAL_SYNC_GRACE_MS;
+  let presence = String(row.presence);
+  if (now > expiresAt) presence = 'offline';
+  if (presence === 'online' && now - active > LOCAL_IDLE_MS) {
+    presence = 'unavailable';
+  }
+  return { presence, expiresAt };
 }
 
 /** Synapse's user_syncing contract: active requests hold their own device,
@@ -371,7 +499,7 @@ export async function ensurePresenceRow(
     ) return;
     const seq = await next(tx, 'presence');
     await tx.execute(
-      "INSERT INTO presence(user_id,presence,status_msg,last_active_ms,seq) VALUES(?,'offline',NULL,?,?)",
+      "INSERT INTO presence(user_id,presence,status_msg,last_active_ms,seq,remote_received_ms) VALUES(?,'offline',NULL,?,?,NULL)",
       [userId, Date.now(), seq],
     );
   });
@@ -465,8 +593,8 @@ export async function importPresenceStatus(
     if (current && current.status_msg === value.status) return null;
     const seq = await next(tx, 'presence');
     await tx.execute(
-      `INSERT INTO presence(user_id,presence,status_msg,last_active_ms,seq) VALUES(?,'offline',?,0,?)
-      ON CONFLICT(user_id) DO UPDATE SET status_msg=excluded.status_msg,seq=excluded.seq`,
+      `INSERT INTO presence(user_id,presence,status_msg,last_active_ms,seq,remote_received_ms) VALUES(?,'offline',?,0,?,NULL)
+      ON CONFLICT(user_id) DO UPDATE SET status_msg=excluded.status_msg,seq=excluded.seq,remote_received_ms=NULL`,
       [value.user, value.status, seq],
     );
     return {
