@@ -2,6 +2,7 @@
 import { createHash } from 'node:crypto';
 import { canonicalJson } from '#engine/canonical.ts';
 import type { Conn, Database } from '#engine/store/db.ts';
+import type { CommitCheck } from '#engine/store/commit.ts';
 import type { Store } from '#engine/store/index.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import type { KeyResolver } from '#engine/room/deps.ts';
@@ -39,7 +40,12 @@ import {
   type MembershipState,
   recordMembershipOperation,
 } from '#engine/server/membership-operations.ts';
-import { type DomainBinding, requireDomainControl } from './domain-control.ts';
+import {
+  type DomainBinding,
+  requireAccountExport,
+  requireDomainControl,
+  requireSelectionReady,
+} from './domain-control.ts';
 import type { NodeIdentity } from './identity.ts';
 import { appendRecord, type Journal } from './journal.ts';
 import type { OwnerControl } from './ownership.ts';
@@ -339,17 +345,23 @@ export class MembershipOperations {
     if (row?.state !== 'paired' || row.grant_json !== canonicalJson(grant)) {
       mismatch('membership exchange grant changed');
     }
-    const scope = 'auth:@' + localpart + ':' + context.server;
-    const selected = this.node
-      ? await conn.query(
-        'SELECT 1 FROM facade_scopes WHERE incarnation=? AND scope=? AND ready=1',
-        [context.id, scope],
-      )
-      : await conn.query(
-        'SELECT 1 FROM facade_exports WHERE peer=? AND incarnation=? AND scope=?',
-        [context.node, context.id, scope],
-      );
-    if (!selected.length) mismatch('membership account not selected');
+    if (!this.node) {
+      await requireAccountExport(conn, {
+        peer: context.node,
+        pairing: context.id,
+        server: context.server,
+        localpart,
+      });
+      return;
+    }
+    const [selected] = await conn.query(
+      'SELECT 1 FROM facade_scopes WHERE incarnation=? AND scope=? AND ready=1',
+      [context.id, 'auth:@' + localpart + ':' + context.server],
+    );
+    requireSelectionReady(
+      !!selected,
+      'membership account not selected: awaiting applied auth snapshot',
+    );
   }
 
   /** Retention alone never completes a journal record or changes a display.
@@ -404,17 +416,16 @@ export class MembershipOperations {
       mismatch('only home may attest membership history');
     }
     await server.tx(async (conn) => {
-      unchanged();
+      conn.admit(unchanged);
       await this.selected(conn, grant, view.localpart);
       await requireDomainControl(conn, view);
     });
     const prepared = await preparedState(view.operation, keys);
     await server.tx(async (conn) => {
-      unchanged();
+      conn.admit(unchanged);
       await this.selected(conn, grant, view.localpart);
       await requireDomainControl(conn, view);
       await retainMembershipOperation(conn, view.operation);
-      unchanged();
     });
     return prepared.state;
   }
@@ -562,13 +573,13 @@ export class MembershipOperations {
             );
           }
           return await eventStreamTx(server, async (conn) => {
-            unchanged();
             const retained = await prejoinResult(
               conn,
               application,
               record.hash,
             );
             if (retained !== null) return retained;
+            conn.admit(unchanged);
             await this.selected(conn, grant, view.localpart);
             await requireDomainControl(conn, view);
             const [published] = await conn.query(
@@ -604,7 +615,6 @@ export class MembershipOperations {
               record.hash,
               { operationId: view.operation.operationId },
             );
-            unchanged();
             return result;
           });
         }),
@@ -659,7 +669,7 @@ export class MembershipOperations {
     );
     const server = await this.store.server(), unchanged = signingFence(server);
     const operations = await server.tx(async (conn) => {
-      unchanged();
+      conn.admit(unchanged);
       await this.selected(conn, grant, localpart);
       await requireDomainControl(conn, binding);
       await conn.execute(
@@ -702,7 +712,7 @@ export class MembershipOperations {
     // A partial append, missing history or changed authority leaves no new
     // declaration. This also commits the otherwise indistinguishable zero case.
     await server.tx(async (conn) => {
-      unchanged();
+      conn.admit(unchanged);
       await this.selected(conn, grant, localpart);
       await requireDomainControl(conn, binding);
       const [head] = await conn.query(
@@ -722,7 +732,6 @@ export class MembershipOperations {
           Number(head?.received ?? 0),
         ],
       );
-      unchanged();
     });
     return records;
   }
@@ -730,7 +739,7 @@ export class MembershipOperations {
   private async append(
     view: MembershipView,
     grant: Grant,
-    unchanged: () => void,
+    unchanged: CommitCheck,
     replay = false,
   ) {
     const server = await this.store.server();
@@ -743,7 +752,7 @@ export class MembershipOperations {
       ),
     };
     return await server.tx(async (conn) => {
-      unchanged();
+      conn.admit(unchanged);
       await this.selected(conn, grant, view.localpart);
       await requireDomainControl(conn, view);
       const { kind: _kind, operation: _operation, ...binding } = view;
@@ -815,7 +824,6 @@ export class MembershipOperations {
           [peer, context.id, scope, view.operation.sequence],
         );
       }
-      unchanged();
       return record;
     });
   }
@@ -832,7 +840,7 @@ export class MembershipOperations {
     const peer = this.node ? 'home' : context.node;
     const scope = 'membership-export:' + canonicalJson(binding);
     const operations = await server.tx(async (conn) => {
-      unchanged();
+      conn.admit(unchanged);
       await this.selected(conn, grant, localpart);
       await requireDomainControl(conn, binding);
       const [exported] = await conn.query(

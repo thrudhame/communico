@@ -123,7 +123,7 @@ export async function beginJoinAttempt(
       }
       const server = await store.server();
       await server.tx((tx) =>
-        withMembershipFence(admission, async () => {
+        withMembershipFence(admission, tx, async () => {
           await admission?.check?.(tx);
           if (
             (await tx.query(

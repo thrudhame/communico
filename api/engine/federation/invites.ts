@@ -212,7 +212,7 @@ export async function inviteRemote(
   deps: InviteDeps,
 ): Promise<{ eventId: string }> {
   const remote = domainOf(target);
-  const room = await openRoom(deps.store, roomId);
+  const room = await openRoom(deps.store, roomId, { admit: deps.signer.admit });
   await room.tx(async (tx) => {
     await assertAcl(tx, remote);
     await assertAcl(tx, deps.self);
@@ -265,7 +265,7 @@ export async function inviteRemote(
         );
       }
       const { version, pdu } = await room.tx((tx) =>
-        withMembershipFence(admission, async () => {
+        withMembershipFence(admission, tx, async () => {
           await assertAcl(tx, remote);
           await assertAcl(tx, deps.self);
           const stay = await tx.segments.openStay();
@@ -322,7 +322,7 @@ export async function inviteRemote(
       };
       await deps.server.tx(async (tx) => {
         await admission?.check(tx);
-        await withMembershipFence(admission, () =>
+        await withMembershipFence(admission, tx, () =>
           tx.execute(
             "INSERT INTO federation_invite_attempts(room_id,sender,target,event_id,destination,request_json,status,added_ms) VALUES(?,?,?,?,?,?,'pending',?)",
             [
@@ -688,7 +688,8 @@ export async function receiveInvite(
     },
   );
   const signed = prepared.pdu;
-  await countersign(signed, roomVersion, await prepareSigner(deps.signer));
+  const permit = await prepareSigner(deps.signer);
+  await countersign(signed, roomVersion, permit);
   admission?.checkCurrent();
   const response = { event: toWire(signed, roomVersion) };
   // store: a room we HOLD does nothing else (the event arrives by /send
@@ -747,6 +748,7 @@ export async function receiveInvite(
         );
         // Redelivery is not a new invitation, including after local rejection.
         if (previous[0]?.event_id === eventId) return await finish();
+        if (permit.admit) tx.admit(permit.admit);
         await recordMembershipOperation(tx, roomId, target);
         if (previous.length) {
           await withdrawInvitePush(
@@ -862,8 +864,9 @@ export async function rejectInviteRemote(
           'membership changed during rejection',
         );
       }
+      if (prepared.admit) tx.admit(prepared.admit);
       await admission?.check(tx);
-      return await withMembershipFence(admission, async () => {
+      return await withMembershipFence(admission, tx, async () => {
         await recordMembershipOperation(tx, roomId, userId);
         await withdrawInvitePush(tx, userId, roomId, invite.eventId);
         const localLeave = await buildLocalPrejoinLeave(
@@ -965,6 +968,7 @@ export async function prejoinDeparture(
         return JSON.parse(String(rows[0].local_leave_json)) as Pdu;
       }
       await recordMembershipOperation(tx, invite.roomId, invite.userId);
+      if (prepared.admit) tx.admit(prepared.admit);
       const signed = await buildLocalPrejoinLeave(invite, prepared);
       await tx.execute(
         'UPDATE prejoin_memberships SET local_leave_json=? WHERE room_id=? AND user_id=? AND revision=? AND seq=?',
@@ -1097,10 +1101,17 @@ async function performRejectInvite(
   if (releaseJob === null) return;
   const release = beginPrejoinLeave(deps.store, invite.roomId, invite.userId);
   try {
+    const prepared = invite.leaveJson === null
+      ? await prepareSigner(deps.signer)
+      : null;
     const signed = invite.leaveJson === null
-      ? await prepareRemoteLeave(destination, invite, deps)
+      ? await prepareRemoteLeave(destination, invite, {
+        ...deps,
+        signer: prepared!,
+      })
       : JSON.parse(invite.leaveJson) as Pdu;
     const active = await inviteTransition(deps.server, async (tx) => {
+      if (prepared?.admit) tx.admit(prepared.admit);
       return await updatePrejoinJob(tx, job, {
         ...invite,
         leaveJson: JSON.stringify(signed),

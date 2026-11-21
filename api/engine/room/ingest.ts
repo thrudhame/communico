@@ -211,7 +211,10 @@ export type LocalSubmission = {
   // room-write transaction. Grounded receipts reconcile without re-admission.
   admit?(tx: RoomTx): Promise<void>;
   lookup(): Promise<PreparedSubmission | null>;
-  prepare(pdu: Pdu): Promise<PreparedSubmission>;
+  prepare(
+    pdu: Pdu,
+    admit?: import('#engine/store/commit.ts').CommitCheck,
+  ): Promise<PreparedSubmission>;
   finish(
     eventId: string,
     accepted: boolean,
@@ -232,7 +235,8 @@ async function submissionReceipt(
   }
   if (
     prepared !== null &&
-    event.pdu !== canonicalJson(prepared as unknown as Record<string, unknown>)
+    await tx.events.stored(eventId) !==
+      canonicalJson(prepared as unknown as Record<string, unknown>)
   ) {
     throw new Error('E_SUBMISSION_PDU_MISMATCH: ' + eventId);
   }
@@ -300,7 +304,7 @@ async function submitLocal(
         if (submission === undefined) {
           const permit = await prepareSigner(signer);
           committed = await room.tx((tx) =>
-            withMembershipFence(admission, async () => {
+            withMembershipFence(admission, tx, async () => {
               const pdu = await build(tx, permit);
               await assertLocalAnnotation(tx, pdu);
               return await ingestInTx(tx, room.id, pdu, {
@@ -310,12 +314,19 @@ async function submitLocal(
           );
           return committed;
         }
+        const receipt = prepared === null
+          ? null
+          : await room.tx((tx) =>
+            submissionReceipt(tx, prepared!.eventId, prepared!.pdu)
+          );
+        const permit = receipt === null
+          ? await prepareSigner(signer)
+          : undefined;
         if (prepared === null) {
-          const permit = await prepareSigner(signer);
           const built = await room.tx((tx) =>
-            withMembershipFence(admission, async () => {
+            withMembershipFence(admission, tx, async () => {
               await submission.admit?.(tx);
-              const pdu = await build(tx, permit);
+              const pdu = await build(tx, permit!);
               await assertLocalAnnotation(tx, pdu);
               const stay = await tx.segments.openStay();
               const group = stay === null
@@ -330,7 +341,7 @@ async function submitLocal(
               return pdu;
             })
           );
-          prepared = await submission.prepare(built);
+          prepared = await submission.prepare(built, permit!.admit);
         }
         const result = await room.tx(async (tx) => {
           const receipt = await submissionReceipt(
@@ -339,7 +350,8 @@ async function submitLocal(
             prepared.pdu,
           );
           if (receipt !== null) return receipt;
-          return await withMembershipFence(admission, async () => {
+          if (permit?.admit) tx.admit(permit.admit);
+          return await withMembershipFence(admission, tx, async () => {
             await submission.admit?.(tx);
             if (prepared.pdu === null) {
               throw new Error(
@@ -409,7 +421,7 @@ export async function ingestLocal(
         )
         : undefined;
       return await room.tx((tx) =>
-        withMembershipFence(scope, async () => {
+        withMembershipFence(scope, tx, async () => {
           await admission?.(tx);
           return await ingestInTx(tx, room.id, pdu, { self });
         })

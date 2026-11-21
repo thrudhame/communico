@@ -6,6 +6,7 @@ import { deviceIdentity } from '#engine/tenant/txns.ts';
 import { startHttp } from '#tests/http-app.ts';
 import { dropOperatorRoom } from '#engine/room/operator.ts';
 import { clientCompletion } from '#engine/client/completion.ts';
+import { completionCounterName } from '#engine/tenant/completion.ts';
 
 Deno.test('client completion: tenant finish is atomic, exact, client-scoped and revision-fenced', async () => {
   const http = await startHttp();
@@ -29,6 +30,11 @@ Deno.test('client completion: tenant finish is atomic, exact, client-scoped and 
     }, app.tenant.signer());
     const room = await openRoom(app.store, created.roomId);
     const db = await app.store.tenant(app.tenant.serverName);
+    // Supported existing stores retain this read-only legacy ceiling. New
+    // scoped allocators must seed above it, not recycle an old sync's revision.
+    await db.execute(
+      "INSERT INTO counters(name,value) VALUES('client_completion',500)",
+    );
     const endpoint = {
       kind: 'send' as const,
       roomId: room.id,
@@ -81,6 +87,7 @@ Deno.test('client completion: tenant finish is atomic, exact, client-scoped and 
     assertEquals(captured.roomId, target.roomId);
     assertEquals(captured.generation, target.generation);
     assertEquals(captured.through, target.through);
+    assertEquals(captured.revision, 501);
     assertEquals(await app.tenant.tx((tx) => tx.completion.pending(other)), []);
     // Exact repeat is a no-op, including its pending-cut allocator/revision.
     await app.tenant.tx((tx) =>
@@ -136,10 +143,44 @@ Deno.test('client completion: tenant finish is atomic, exact, client-scoped and 
       )).map((r) => r.event_id),
       [first.eventId, second.eventId],
     );
+    // Recreating the exact same cut after retirement still gets a fresh
+    // revision. Neither an old capture nor a legacy revision may delete it.
+    await app.tenant.tx((tx) =>
+      tx.txns.finish(device, endpoint, 'first', first.eventId, true, target)
+    );
+    const [recreated] = await app.tenant.tx((tx) =>
+      tx.completion.pending(device)
+    );
+    assert(recreated.revision > higher.revision);
+    await app.tenant.tx((tx) => tx.completion.retire(device, captured));
+    await app.tenant.tx((tx) =>
+      tx.completion.retire(device, { ...recreated, revision: 500 })
+    );
+    assertEquals(await app.tenant.tx((tx) => tx.completion.pending(device)), [
+      recreated,
+    ]);
+    assertEquals(
+      await db.query(
+        "SELECT value FROM counters WHERE name='client_completion'",
+      ),
+      [{ value: 500 }],
+    );
+    assertEquals(
+      await db.query('SELECT value FROM counters WHERE name=?', [
+        completionCounterName(device, target),
+      ]),
+      [{ value: recreated.revision }],
+    );
     await app.tenant.tx((tx) =>
       tx.devices.delete(device.deviceId, device.localpart)
     );
     assertEquals(await db.query('SELECT * FROM transaction_completions'), []);
+    assertEquals(
+      await db.query('SELECT value FROM counters WHERE name=?', [
+        completionCounterName(device, target),
+      ]),
+      [],
+    );
     await assertRejects(
       () => app.tenant.tx((tx) => tx.completion.pending(device)),
       Error,

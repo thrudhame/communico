@@ -868,7 +868,7 @@ export async function ingestRemote(
         );
       }
       return await room.tx((tx) =>
-        withMembershipFence(admission, async () => {
+        withMembershipFence(admission, tx, async () => {
           deps.signal?.throwIfAborted();
           if (operationId !== undefined) {
             const prior = await tx.remoteBatches.get(operationId, inputHash);

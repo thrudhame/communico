@@ -87,6 +87,7 @@ Deno.test('request cancellation: listener cancellation reaches the body owner wi
       completed.resolve();
       await run;
     }
+    await lifetime.settled();
     assertEquals(lifetime.count, 0);
   }
 });

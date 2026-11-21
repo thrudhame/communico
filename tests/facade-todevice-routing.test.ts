@@ -353,6 +353,60 @@ Deno.test('routed to-device: tenant38 upgrade preserves legacy inbox and never m
   }
 });
 
+Deno.test('routed to-device: tenant40 lookup upgrade indexes retained routes without rewriting obligations', async () => {
+  const dir = await Deno.makeTempDir();
+  const storage = {
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  };
+  let store = await openStore(storage, {
+    schemas: { tenant: historicalTenantSchema(40) },
+  });
+  try {
+    const db = await store.tenant('lookup-upgrade.test', { create: true });
+    const payload = JSON.stringify({
+      origin: { kind: 'client', origin: 'logical.test', id: 'retained' },
+      owner: 'edge',
+      ownerIncarnation: 'edge-store',
+      recipient: '@bob:logical.test',
+      selectors: [{ id: '*', content: { key: 'retained' } }],
+    });
+    await db.execute('INSERT INTO to_device_routes VALUES(?,?,?,0)', [
+      'route',
+      'alice',
+      payload,
+    ]);
+    const before = await db.query('SELECT * FROM to_device_routes');
+    await store.close();
+    store = await openStore(storage, { schemas: { tenant: tenantSchema } });
+    const upgraded = await store.tenant('lookup-upgrade.test');
+    const fresh = await store.tenant('lookup-fresh.test', { create: true });
+    assertEquals(
+      await upgraded.query('SELECT * FROM to_device_routes'),
+      before,
+    );
+    const shape =
+      "SELECT name,sql FROM sqlite_master WHERE tbl_name='to_device_routes' ORDER BY name";
+    assertEquals(await upgraded.query(shape), await fresh.query(shape));
+    const plan = await upgraded.query(
+      "EXPLAIN QUERY PLAN SELECT payload_json FROM to_device_routes WHERE json_extract(payload_json,'$.origin.kind')=? AND json_extract(payload_json,'$.origin.origin')=? AND json_extract(payload_json,'$.origin.id')=?",
+      ['client', 'logical.test', 'retained'],
+    );
+    assert(
+      plan.some((row) =>
+        String(row.detail).includes('to_device_routes_origin')
+      ),
+      JSON.stringify(plan),
+    );
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test('routed to-device: tenant39 admission upgrade preserves original routed hashes and fresh shape', async () => {
   const dir = await Deno.makeTempDir();
   const storage = {

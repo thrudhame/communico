@@ -23,14 +23,23 @@ import type { Conn } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
 import { roomSource } from '#engine/store/projection-sources.ts';
 import { queueBadge } from '#engine/server/push-queue.ts';
-import { advance, get } from '#engine/store/watermark.ts';
+import { advance, advanceAll, get } from '#engine/store/watermark.ts';
 import { changedColumns } from '#engine/store/changed.ts';
-import { eventStreamTx, nextEventSeq } from '#engine/server/stream.ts';
+import {
+  eventStreamTx,
+  nextEventSeq,
+  reserveEventSeqs,
+} from '#engine/server/stream.ts';
+import {
+  hasPublicationEvents,
+  insertPublicationRows,
+} from './publication-rows.ts';
 import { finishRoomRemoval, type Removal } from '#engine/server/removal.ts';
 import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
 import { reconcileTyping } from '#engine/typing.ts';
 import {
   projectReceiptGraph,
+  projectReceiptGraphs,
   type ReceiptMembership,
   receiptMembership,
 } from '#engine/server/receipt-frontier.ts';
@@ -38,11 +47,13 @@ import { reconcileReceiptMarks } from '#engine/server/ephemeral.ts';
 import {
   capturePushesAt,
   prepareCapturedPush,
+  prepareCapturedPushes,
   type PushCapture,
   type PushPublication,
 } from '#engine/server/push-project.ts';
 import {
   applyPushPublication,
+  captureIndependentPushes,
   reconcileNotificationEvent,
   reconcileNotificationReads,
 } from '#engine/server/notifications.ts';
@@ -96,7 +107,24 @@ async function captureChanges(room: Room, mark: number, head: number) {
 // One publication/lifecycle mutation at a time. Immutable room preparation
 // belongs to each room's capture owner, never this shared writer turn. Failed
 // work releases both owners for the next write or startup roll-forward.
-let queue: Promise<void> = Promise.resolve();
+type PublicationTurn = {
+  store: Store;
+  roomId: string;
+  prepare: (contended: boolean) => Promise<Prepared[] | null>;
+  finish: (ready: Prepared[] | null) => Promise<TurnOutcome>;
+  resolve: (value: TurnOutcome) => void;
+  reject: (error: unknown) => void;
+  localServers: string[];
+};
+type TurnOutcome =
+  | { kind: 'retry' }
+  | { kind: 'more'; end: number; pos: number }
+  | { kind: 'complete'; listeners: typeof projectedListeners };
+type WriterTurn =
+  | { kind: 'lifecycle'; run: () => Promise<void> }
+  | { kind: 'publication'; work: PublicationTurn };
+const writerQueue: WriterTurn[] = [];
+let writing = false;
 let waitingWriters = 0;
 const roomQueues = new WeakMap<Store, Map<string, Promise<void>>>();
 
@@ -330,7 +358,7 @@ async function projectRoom(
     // similarly one atomic lifecycle turn, never mixed into ordinary work.
     let index = 0;
     do {
-      const outcome = await withProjectionLock(async () => {
+      const lifecycle = async (): Promise<TurnOutcome> => {
         if (!await current()) return { kind: 'retry' } as const;
         if (
           device !== null && !(await server.query(
@@ -356,57 +384,69 @@ async function projectRoom(
             JSON.parse(batch[0].data) as Removal,
             batch[0].pos,
           );
-        } else if (index < prepared.length) {
-          // Tenant reads cannot run inside a retryable server transaction.
-          // Stop preparing at a complete accepted unit when demand appears.
-          // Unused policy decisions never escape this writer turn.
-          const ready: Prepared[] = [];
-          for (let at = index; at < prepared.length; at++) {
-            const item = prepared[at];
-            ready.push(
-              'pushCapture' in item && item.pushCapture !== null
-                ? {
-                  ...item,
-                  push: await prepareCapturedPush(store, item.pushCapture),
-                }
-                : item,
-            );
-            if (
-              waitingWriters > 0 &&
-              !samePublicationUnit(item.change, prepared[at + 1]?.change)
-            ) break;
-          }
-          const addedMs = Date.now();
-          const end = await eventStreamTx(server, async (tx) => {
-            let count = 0;
-            for (const item of ready) {
-              await apply(tx, roomId, item, addedMs, localServers);
-              count++;
-              // This prefix owns this turn's captured policy. New demand
-              // queues behind the complete prefix, never truncating its inputs.
-            }
-            // Relations, feed positions and graph evidence must all exist at
-            // this committed cut before pending threaded marks are projected.
-            // One sweep per prefix also avoids a whole-room scan per event.
-            await reconcileReceiptMarks(tx, roomId);
-            await reconcileNotificationReads(tx, roomId, addedMs);
-            const pos = ready[count - 1].change.pos;
-            await advance(tx, sourceOf(roomId), pos);
-            await advance(tx, roomSource('push-context', roomId), pos);
-            await advance(tx, roomSource('receipt-graph', roomId), pos);
-            return index + count;
-          });
-          const pos = prepared[end - 1].change.pos;
-          if (end < prepared.length || pos < head) {
-            return { kind: 'more', end, pos } as const;
-          }
+        }
+        if (drop !== 0 && index < prepared.length) {
+          // Upgrade seeding is a boundary. Recapture its now-current baseline
+          // before offering the ordinary unit to the publication queue.
+          return { kind: 'retry' };
         }
         await reconcileTyping(server, roomId);
         return {
           kind: 'complete',
           listeners: [...projectedListeners],
         } as const;
-      });
+      };
+      // Empty/upgrade/removal work is opaque lifecycle work. Only immutable,
+      // ordinary prepared units enter the coalescible queue surface.
+      const outcome = seed === null && device === null && drop !== 0 &&
+          index < prepared.length
+        ? await new Promise<TurnOutcome>((resolve, reject) => {
+          enqueueWriter({
+            kind: 'publication',
+            work: {
+              store,
+              roomId,
+              localServers,
+              resolve,
+              reject,
+              prepare: async (contended) => {
+                if (!await current()) return null;
+                const ready: Prepared[] = [];
+                for (let at = index; at < prepared.length; at++) {
+                  const item = prepared[at];
+                  ready.push(
+                    !contended && 'pushCapture' in item &&
+                      item.pushCapture !== null
+                      ? {
+                        ...item,
+                        push: await prepareCapturedPush(
+                          store,
+                          item.pushCapture,
+                        ),
+                      }
+                      : item,
+                  );
+                  if (
+                    (contended || waitingWriters > 0) &&
+                    !samePublicationUnit(item.change, prepared[at + 1]?.change)
+                  ) break;
+                }
+                return ready;
+              },
+              finish: async (ready) => {
+                if (ready === null) return { kind: 'retry' };
+                const end = index + ready.length;
+                const pos = ready.at(-1)!.change.pos;
+                if (end < prepared.length || pos < head) {
+                  return { kind: 'more', end, pos };
+                }
+                await reconcileTyping(server, roomId);
+                return { kind: 'complete', listeners: [...projectedListeners] };
+              },
+            },
+          });
+        })
+        : await withProjectionLock(lifecycle);
       if (outcome.kind === 'retry') continue capture;
       await progress?.();
       if (outcome.kind === 'complete') {
@@ -483,16 +523,277 @@ async function projectRoom(
 
 /** Room lifecycle operations use the same serialization as projection. */
 export function withProjectionLock<T>(fn: () => Promise<T>): Promise<T> {
-  waitingWriters++;
-  const run = queue.then(() => {
-    waitingWriters--;
-    return fn();
+  return new Promise<T>((resolve, reject) => {
+    enqueueWriter({
+      kind: 'lifecycle',
+      run: async () => {
+        try {
+          resolve(await fn());
+        } catch (error) {
+          reject(error);
+        }
+      },
+    });
   });
-  queue = run.then(
-    () => undefined,
-    () => undefined,
+}
+
+function enqueueWriter(turn: WriterTurn): void {
+  writerQueue.push(turn);
+  waitingWriters++;
+  if (writing) return;
+  writing = true;
+  void Promise.resolve().then(drainWriter);
+}
+
+async function drainWriter(): Promise<void> {
+  try {
+    while (writerQueue.length) {
+      const first = writerQueue.shift()!;
+      waitingWriters--;
+      if (first.kind === 'lifecycle') {
+        await first.run();
+        continue;
+      }
+      // Snapshot ONLY the already-ready same-Store FIFO prefix. Enqueues during
+      // validation, policy reads or commit cannot enlarge this admitted group.
+      const group = [first.work];
+      while (
+        writerQueue[0]?.kind === 'publication' &&
+        writerQueue[0].work.store === first.work.store
+      ) {
+        group.push(
+          (writerQueue.shift()! as Extract<WriterTurn, {
+            kind: 'publication';
+          }>).work,
+        );
+        waitingWriters--;
+      }
+      try {
+        await publishGroup(group);
+      } catch (error) {
+        if (group.length === 1) {
+          first.work.reject(error);
+          continue;
+        }
+        // The group rolled back: no waiter, sequence or watermark was
+        // acknowledged. Isolate through the same individual application path,
+        // in original FIFO order, with fresh attempt/policy input for each unit.
+        for (const work of group) {
+          try {
+            await publishGroup([work]);
+          } catch (error) {
+            work.reject(error);
+          }
+        }
+      }
+    }
+  } finally {
+    writing = false;
+  }
+}
+
+async function publishGroup(group: PublicationTurn[]): Promise<void> {
+  const captured: { work: PublicationTurn; ready: Prepared[] | null }[] = [];
+  for (const work of group) {
+    captured.push({ work, ready: await work.prepare(group.length > 1) });
+  }
+  const active = captured.filter((entry): entry is {
+    work: PublicationTurn;
+    ready: Prepared[];
+  } => entry.ready !== null);
+  const policies = active.flatMap(({ ready }) =>
+    ready.filter((item): item is Extract<Prepared, { payload: EventPayload }> =>
+      'pushCapture' in item && item.pushCapture !== null && item.push === null
+    )
   );
-  return run;
+  if (policies.length) {
+    const publications = await prepareCapturedPushes(
+      group[0].store,
+      policies.map((p) => p.pushCapture!),
+    );
+    for (let at = 0; at < policies.length; at++) {
+      policies[at].push = publications[at];
+    }
+  }
+  if (active.length) {
+    const server = await group[0].store.server();
+    const now = Date.now();
+    await eventStreamTx(server, async (tx) => {
+      if (
+        active.length > 1 && await applyIndependentPublications(tx, active, now)
+      ) return;
+      for (const { work, ready } of active) {
+        for (const item of ready) {
+          await apply(tx, work.roomId, item, now, work.localServers);
+        }
+        await reconcileReceiptMarks(tx, work.roomId);
+        await reconcileNotificationReads(tx, work.roomId, now);
+        const pos = ready.at(-1)!.change.pos;
+        await advance(tx, sourceOf(work.roomId), pos);
+        await advance(tx, roomSource('push-context', work.roomId), pos);
+        await advance(tx, roomSource('receipt-graph', work.roomId), pos);
+      }
+    });
+  }
+  // A post-commit typing/listener failure is this unit's failure, not grounds
+  // for replaying the durable group or suppressing another room's completion.
+  for (const { work, ready } of captured) {
+    try {
+      work.resolve(await work.finish(ready));
+    } catch (error) {
+      work.reject(error);
+    }
+  }
+}
+
+/** Plain, independent event/effect units can flush each dependency as a set.
+ * Complex transitions, relation repair, replay and membership/device changes
+ * keep the general ordered owner path, in the same grouped transaction. */
+async function applyIndependentPublications(
+  tx: Conn,
+  active: { work: PublicationTurn; ready: Prepared[] }[],
+  now: number,
+): Promise<boolean> {
+  const units: {
+    work: PublicationTurn;
+    ready: Prepared[];
+    item: Extract<Prepared, { payload: EventPayload }>;
+  }[] = [];
+  for (const { work, ready } of active) {
+    const item = ready[0];
+    if (
+      item.kind !== 'event' || !isLive(item.payload) ||
+      item.payload.grounding !== 'grounded' || item.publication !== null ||
+      item.relation !== null || item.push === null || item.prevs === null ||
+      ready.slice(1).some((i) => i.kind !== 'delivery')
+    ) return false;
+    units.push({ work, ready, item });
+  }
+  if (await hasPublicationEvents(tx, units.map((u) => u.item.change.event!))) {
+    return false;
+  }
+  const applyPushes = await captureIndependentPushes(
+    tx,
+    units.map(({ work, item }) => ({
+      room: work.roomId,
+      event: item.change.event!,
+      pos: item.change.pos,
+      publication: item.push!,
+    })),
+  );
+  if (applyPushes === null) return false;
+  const first = await reserveEventSeqs(tx, units.length);
+  await insertPublicationRows(
+    tx,
+    'event_index',
+    [
+      'event',
+      'room',
+      'pos',
+      'standing',
+      'grounding',
+      'reason',
+      'rule',
+      'origin',
+      'seq',
+    ],
+    units.map((
+      { work, item },
+      at,
+    ) => [
+      item.change.event,
+      work.roomId,
+      item.change.pos,
+      item.payload.standing,
+      item.payload.grounding,
+      item.payload.reason,
+      item.payload.rule,
+      item.payload.origin,
+      first + at,
+    ]),
+  );
+  await projectReceiptGraphs(
+    tx,
+    units.map(({ work, item }) => ({
+      room: work.roomId,
+      event: item.change.event!,
+      prevs: item.prevs!,
+      membership: item.receiptMembership,
+    })),
+  );
+  await insertPublicationRows(
+    tx,
+    'feed',
+    ['seq', 'room', 'pos', 'event', 'stay'],
+    units.map((
+      { work, item },
+      at,
+    ) => [
+      first + at,
+      work.roomId,
+      item.change.pos,
+      item.change.event,
+      item.payload.stay,
+    ]),
+  );
+  await insertPublicationRows(
+    tx,
+    'search',
+    ['event', 'room', 'seq', 'key', 'sender', 'origin_ts', 'body_lower'],
+    units.flatMap(({ work, item }, at) =>
+      item.search === null ? [] : [[
+        item.change.event,
+        work.roomId,
+        first + at,
+        item.search.key,
+        item.payload.sender,
+        item.payload.origin_server_ts,
+        item.search.text,
+      ]]
+    ),
+  );
+  await applyPushes(units.map((_, at) => first + at), now);
+  await insertPublicationRows(
+    tx,
+    'outbox',
+    [
+      'room',
+      'pos',
+      'destination',
+      'event',
+      'state',
+      'attempts',
+      'next_attempt_ms',
+      'added_ms',
+    ],
+    units.flatMap(({ work, ready }) =>
+      ready.flatMap((item) =>
+        item.kind !== 'delivery' ? [] : item.destinations.map((
+          destination,
+        ) => [
+          work.roomId,
+          item.change.pos,
+          destination,
+          item.change.event,
+          'pending',
+          0,
+          0,
+          now,
+        ])
+      )
+    ),
+  );
+  await advanceAll(
+    tx,
+    units.flatMap(({ work, ready }) =>
+      [
+        sourceOf(work.roomId),
+        roomSource('push-context', work.roomId),
+        roomSource('receipt-graph', work.roomId),
+      ].map((source): [string, number] => [source, ready.at(-1)!.change.pos])
+    ),
+  );
+  return true;
 }
 
 async function captureDevicePublication(

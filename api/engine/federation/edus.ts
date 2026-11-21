@@ -21,6 +21,7 @@ import {
   receiptRows,
   setPresence,
   setReceiptMark,
+  sharedUsers,
 } from '#engine/server/ephemeral.ts';
 import type { Database as Db } from '#engine/store/db.ts';
 import { setTyping, typingIn } from '#engine/typing.ts';
@@ -365,15 +366,8 @@ export function eduState(server: Db, self: string, store: Store): EduState {
       }
       if (domainOf(p.userId) !== origin) continue;
       // only for users sharing a room with a local user
-      const shares = await server.query(
-        `SELECT 1 FROM memberships m1
-         JOIN memberships m2 ON m1.room = m2.room
-         WHERE m1.user = ? AND m1.membership = 'join'
-           AND m2.membership = 'join' AND m2.user LIKE '%:' || ?
-         LIMIT 1`,
-        [p.userId, self],
-      );
-      if (shares.length === 0) continue;
+      const shares = await sharedUsers(server, p.userId);
+      if (!shares.some((user) => domainOf(user) === self)) continue;
       await setPresence(
         server,
         p.userId,

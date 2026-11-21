@@ -11,7 +11,7 @@ import { recoverableUpstream } from '#engine/net/upstream-error.ts';
 import { joinedAllowedRoom } from '#engine/room/restricted.ts';
 import { membershipOf } from '#engine/server/read.ts';
 import { resolveAlias } from './directory.ts';
-import { lookupRoom } from './room.ts';
+import { lookupRoom, lookupRoomForAdmission } from './room.ts';
 import { heldRoomSummary } from './summary.ts';
 
 type Json = Record<string, unknown>;
@@ -85,8 +85,12 @@ export async function localDiscoverySummary(
   id: string,
   principal: DiscoveryPrincipal,
 ): Promise<Json | null> {
-  if (await lookupRoom(id) === null) return null;
-  const summary = await heldRoomSummary(id);
+  const access = 'origin' in principal ? 'admission' : 'read';
+  const room = access === 'admission'
+    ? await lookupRoomForAdmission(id)
+    : await lookupRoom(id);
+  if (room === null) return null;
+  const summary = await heldRoomSummary(id, access);
   return await summaryAccessible(summary, principal) ? summary : null;
 }
 

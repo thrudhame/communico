@@ -380,7 +380,7 @@ async function joinVia(
       args.roomId,
       () =>
         room.tx((tx) =>
-          withMembershipFence(commitAdmission, async () => {
+          withMembershipFence(commitAdmission, tx, async () => {
             // revalidation (G8): a live stay means the room is already joined
             if ((await tx.segments.openStay()) !== null) {
               // /send may publish the same join while the dance is in flight.

@@ -77,6 +77,35 @@ Deno.test('presence wire: producer storage to EDU to remote persistence preserve
       assertEquals(received.statusMsg, status ?? null);
       assert(received.seq > 0);
     }
+    // Both federation directions use the same current shared-join audience.
+    // Once the resident user leaves, later local changes are not queued and
+    // inbound updates cannot refresh the old stored remote presence.
+    await stop();
+    stop = undefined;
+    for (const server of [producer, consumer]) {
+      await server.execute(
+        "UPDATE memberships SET membership='leave' WHERE user=?",
+        [remote],
+      );
+    }
+    stop = wireEphemeral(producer, 'origin.test', queues);
+    await setPresence(producer, local, 'online', 'not shared');
+    await stop();
+    stop = undefined;
+    assertEquals(queues.drain('resident.test', 100), []);
+    const before = await getPresence(consumer, local);
+    await receiver.dispatch('origin.test', {
+      edu_type: 'm.presence',
+      content: {
+        push: [{
+          user_id: local,
+          presence: 'online',
+          status_msg: 'not shared',
+          last_active_ago: 0,
+        }],
+      },
+    });
+    assertEquals(await getPresence(consumer, local), before);
   } finally {
     await stop?.();
     await Promise.all(stores.map((s) => s.close()));

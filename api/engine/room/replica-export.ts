@@ -30,6 +30,11 @@ export type ReplicaRoom = {
     resident: string;
     state: string[];
     authChain: string[];
+    // A semantic boundary event, never a source-local state-group ID. With a
+    // base, these lists are additions and the removed lists are subtractions.
+    base?: string;
+    removedState?: string[];
+    removedAuth?: string[];
   }[];
 };
 
@@ -46,6 +51,7 @@ export function exportReplicaRoom(
   room: Room,
   self: string,
   after = 0,
+  compact = true,
 ): Promise<ReplicaRoom> {
   return room.tx(async (tx) => {
     const cut = await tx.changes.head();
@@ -168,6 +174,9 @@ export function exportReplicaRoom(
       });
     }
     const boundaries: ReplicaRoom['boundaries'] = [];
+    let previous:
+      | { eventId: string; state: Set<string>; auth: Set<string> }
+      | undefined;
     const openings = new Set(
       stays.filter((stay) => stay.opening.kind === 'join').map((stay) =>
         stay.opening.eventId
@@ -196,12 +205,28 @@ export function exportReplicaRoom(
         closure.add(auth);
         queue.push(...((await read(auth)).auth_events ?? []));
       }
-      boundaries.push({
+      const stateSet = new Set(state);
+      const boundary: ReplicaRoom['boundaries'][number] = {
         eventId: id,
         resident: residents[id],
         state,
         authChain: [...closure].sort(),
-      });
+      };
+      if (compact && previous) {
+        boundary.base = previous.eventId;
+        boundary.state = state.filter((event) => !previous!.state.has(event));
+        boundary.authChain = boundary.authChain.filter((event) =>
+          !previous!.auth.has(event)
+        );
+        boundary.removedState = [...previous.state].filter((event) =>
+          !stateSet.has(event)
+        );
+        boundary.removedAuth = [...previous.auth].filter((event) =>
+          !closure.has(event)
+        );
+      }
+      boundaries.push(boundary);
+      previous = { eventId: id, state: stateSet, auth: closure };
     }
     // Include complete retained auth closure, even for unpositioned evidence.
     const queue = [...pack.keys()];

@@ -55,10 +55,10 @@ const INDEXES = [
   'completion_receipts_through',
 ];
 
-Deno.test('room schema: v10 membership receipt upgrade preserves events and matches fresh creation', async () => {
+Deno.test('room schema: v11 membership receipt upgrade preserves events and matches fresh creation', async () => {
   const dir = await Deno.makeTempDir();
   let store = await openStore(config(dir), {
-    schemas: { room: historicalRoomSchema(10) },
+    schemas: { room: historicalRoomSchema(11) },
   });
   try {
     const old = await store.room('!membership-upgrade:test', { create: true });
@@ -161,7 +161,43 @@ Deno.test('room schema: v9 receipt provenance upgrade preserves immutable events
     assertEquals(await upgraded.query('SELECT * FROM event_signatures'), [{
       event: '$old',
       signatures: '{}',
+      home_pdu: null,
     }]);
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('room schema: v10 upgrade retains base bytes and internal evidence without inventing a home copy', async () => {
+  const dir = await Deno.makeTempDir();
+  let store = await openStore(config(dir), {
+    schemas: {
+      room: historicalRoomSchema(10),
+    },
+  });
+  try {
+    const old = await store.room('!wire:test', { create: true });
+    await old.execute(
+      "INSERT INTO events(id,pdu,type,sender,depth,origin_ts) VALUES('$old','{}','test','@a:test',1,1)",
+    );
+    await old.execute("INSERT INTO event_signatures VALUES('$old','{}')");
+    await store.close();
+    store = await openStore(config(dir), { schemas: { room: roomSchema } });
+    const upgraded = await store.room('!wire:test');
+    assertEquals(await upgraded.query('SELECT id,pdu FROM events'), [{
+      id: '$old',
+      pdu: '{}',
+    }]);
+    assertEquals(await upgraded.query('SELECT * FROM event_signatures'), [{
+      event: '$old',
+      signatures: '{}',
+      home_pdu: null,
+    }]);
+    const fresh = await store.room('!fresh-wire:test', { create: true });
+    const schema =
+      "SELECT name,sql FROM sqlite_master WHERE type IN ('table','index') AND name NOT LIKE '__turso%' ORDER BY name";
+    assertEquals(await upgraded.query(schema), await fresh.query(schema));
   } finally {
     await store.close();
     await Deno.remove(dir, { recursive: true });

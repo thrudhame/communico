@@ -361,7 +361,7 @@ export function getPublicProfile(
   localpart: string,
 ): Promise<Profile | null> {
   return tenant.tx(async (tx) => {
-    await tx.ingress.check({ kind: 'domain', localpart });
+    await tx.ingress.check({ kind: 'domain-read', localpart });
     return await tx.profiles.get(localpart);
   });
 }

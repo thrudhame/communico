@@ -245,8 +245,11 @@ export function transactionSubmission(
   return {
     lookup: () =>
       tenant.tx((tx) => tx.txns.submission(device, endpoint, txnId)),
-    prepare: (pdu) =>
-      tenant.tx((tx) => tx.txns.prepare(device, endpoint, txnId, pdu)),
+    prepare: (pdu, admit) =>
+      tenant.tx((tx) => {
+        if (admit) tx.admit(admit);
+        return tx.txns.prepare(device, endpoint, txnId, pdu);
+      }),
     finish: (eventId, accepted, target) =>
       tenant.tx((tx) =>
         tx.txns.finish(device, endpoint, txnId, eventId, accepted, target)

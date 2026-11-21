@@ -9,9 +9,27 @@ import { membershipOf } from '#engine/server/read.ts';
 import { parseStreamToken } from './tokens.ts';
 import { admitState } from './state-admission.ts';
 
+export type RoomAccess = 'read' | 'admission';
+
 export async function lookupRoom(roomId: string): Promise<Room | null> {
+  return await lookup(roomId, 'read');
+}
+
+export async function lookupRoomForAdmission(
+  roomId: string,
+): Promise<Room | null> {
+  return await lookup(roomId, 'admission');
+}
+
+async function lookup(
+  roomId: string,
+  access: RoomAccess,
+): Promise<Room | null> {
   try {
-    await theApp().replica?.requireScope('room:' + roomId, true);
+    const replica = theApp().replica;
+    if (access === 'read') {
+      await replica?.requireReadScope('room:' + roomId, true);
+    } else await replica?.requireScope('room:' + roomId, true);
     return await openRoom(theApp().store, roomId);
   } catch (e) {
     if (e instanceof Deno.errors.NotFound) return null;
@@ -20,7 +38,14 @@ export async function lookupRoom(roomId: string): Promise<Room | null> {
 }
 
 export async function requireRoom(roomId: string): Promise<Room> {
-  const room = await lookupRoom(roomId);
+  return requireFound(await lookupRoom(roomId), roomId);
+}
+
+export async function requireRoomForAdmission(roomId: string): Promise<Room> {
+  return requireFound(await lookupRoomForAdmission(roomId), roomId);
+}
+
+function requireFound(room: Room | null, roomId: string): Room {
   if (room === null) {
     throw new MatrixError(404, 'M_NOT_FOUND', 'room not found: ' + roomId);
   }
@@ -109,8 +134,11 @@ export async function stateAtSeq(
   roomId: string,
   seq: number | null,
   keys?: readonly (readonly [type: string, stateKey: string])[],
+  access: RoomAccess = 'read',
 ): Promise<StateRow[]> {
-  const room = await requireRoom(roomId);
+  const room = access === 'read'
+    ? await requireRoom(roomId)
+    : await requireRoomForAdmission(roomId);
   const feed = seq === null ? [] : await theApp().server.query(
     'SELECT stay, pos FROM feed WHERE room = ? AND seq <= ? ORDER BY seq DESC LIMIT 1',
     [roomId, seq],

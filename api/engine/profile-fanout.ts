@@ -176,8 +176,11 @@ export class ProfileFanoutWork {
           },
           lookup: () =>
             tenant.tx((tx) => tx.profiles.fanout.submission(work, roomId)),
-          prepare: (pdu) =>
-            tenant.tx((tx) => tx.profiles.fanout.prepare(work, roomId, pdu)),
+          prepare: (pdu, admit) =>
+            tenant.tx((tx) => {
+              if (admit) tx.admit(admit);
+              return tx.profiles.fanout.prepare(work, roomId, pdu);
+            }),
           finish: (eventId, accepted) =>
             tenant.tx((tx) =>
               tx.profiles.fanout.finish(work, roomId, eventId, accepted)

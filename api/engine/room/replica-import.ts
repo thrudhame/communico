@@ -34,12 +34,16 @@ export async function importReplicaRoom(
     keys: KeyResolver;
     signal?: AbortSignal;
     signatureUnion?: boolean;
+    home?: boolean;
+    admit?: () => void;
   },
 ): Promise<void> {
   if (manifest.version !== 1) {
     throw new MatrixError(400, 'M_BAD_JSON', 'replica manifest version');
   }
-  if (manifest.after > 0) await openRoom(store, manifest.roomId);
+  const roomHandle = () =>
+    openRoom(store, manifest.roomId, { admit: input.admit });
+  if (manifest.after > 0) await roomHandle();
   const residents = new Map(Object.entries(manifest.residents));
   const pack = new Map<string, Pdu>();
   const signatures = new Map<string, SignatureEvidence>();
@@ -82,9 +86,44 @@ export async function importReplicaRoom(
   }
   const event = (id: string): Pdu =>
     pack.get(id) ?? unavailable('replica event is unavailable');
-  const boundaries = new Map(
-    manifest.boundaries.map((boundary) => [boundary.eventId, boundary]),
-  );
+  // Decode at the semantic owner. Old complete-list boundaries remain valid;
+  // deltas name an earlier boundary in this pack, so cycles and unknown bases
+  // cannot manufacture a before-state or create unbounded recursion.
+  const boundaries = new Map<string, ReplicaRoom['boundaries'][number]>();
+  for (const boundary of manifest.boundaries) {
+    if (boundaries.has(boundary.eventId)) {
+      throw new MatrixError(400, 'M_BAD_JSON', 'duplicate replica boundary');
+    }
+    if (boundary.base === undefined) {
+      boundaries.set(boundary.eventId, boundary);
+      continue;
+    }
+    const base = boundaries.get(boundary.base);
+    if (!base) unavailable('replica boundary base is unavailable');
+    const expand = (prior: string[], removed: string[], added: string[]) => {
+      const ids = new Set(prior);
+      for (const id of removed) {
+        if (!ids.delete(id)) {
+          throw new MatrixError(
+            400,
+            'M_BAD_JSON',
+            'replica removes unknown boundary event',
+          );
+        }
+      }
+      for (const id of added) ids.add(id);
+      return [...ids].sort();
+    };
+    boundaries.set(boundary.eventId, {
+      ...boundary,
+      state: expand(base.state, boundary.removedState ?? [], boundary.state),
+      authChain: expand(
+        base.authChain,
+        boundary.removedAuth ?? [],
+        boundary.authChain,
+      ),
+    });
+  }
   const snapshot = (id: string) => {
     const boundary = boundaries.get(id);
     if (!boundary) unavailable('replica before-state is unavailable');
@@ -142,13 +181,13 @@ export async function importReplicaRoom(
       authChain: [...pack.values()],
     });
   // Verification using a declared version is not proof that it is the room's
-  // version. Authenticate the signed create before any v2 overlay can commit.
+  // version. Authenticate the signed create before any v2 evidence can commit.
   const packEvidence = input.signatureUnion ? await verifyPack() : undefined;
   const initialized = new Set<string>();
   // Known auth/genesis events and signature-only packs need the same immutable
-  // comparison/union as live steps. Validate them before any bootstrap writes.
+  // material comparison as live steps. Validate them before bootstrap writes.
   if (packEvidence && (await store.rooms()).includes(manifest.roomId)) {
-    const room = await openRoom(store, manifest.roomId);
+    const room = await roomHandle();
     await withRoomLock(room.id, () =>
       room.tx(async (tx) => {
         const stay = await tx.segments.latestStay();
@@ -161,7 +200,7 @@ export async function importReplicaRoom(
         }
         await tx.events.list([...signatures.keys()]);
         for (const evidence of signatures.values()) {
-          await tx.events.mergeSignatures(evidence);
+          await tx.events.mergeSignatures(evidence, input.home);
         }
       }));
   }
@@ -194,7 +233,7 @@ export async function importReplicaRoom(
     input.signal?.throwIfAborted();
     const step = manifest.steps[i];
     await ensure(step.stay);
-    const room = await openRoom(store, manifest.roomId);
+    const room = await roomHandle();
     if (step.kind === 'history') {
       const chunk = [];
       do {
@@ -294,7 +333,10 @@ export async function importReplicaRoom(
     await withRoomLock(room.id, () =>
       room.tx(async (tx) => {
         if (input.signatureUnion) {
-          await tx.events.mergeSignatures(signatures.get(step.eventId)!);
+          await tx.events.mergeSignatures(
+            signatures.get(step.eventId)!,
+            input.home,
+          );
         } else {
           const existing = await tx.events.get(step.eventId);
           if (
@@ -347,7 +389,7 @@ export async function importReplicaRoom(
     if (!initialized.has(id)) {
       await ensure(id);
     }
-    const room = await openRoom(store, manifest.roomId);
+    const room = await roomHandle();
     const closed = await room.tx(async (tx) => {
       const stay = (await tx.segments.list()).find((held) =>
         held.kind === 'stay' &&
@@ -365,7 +407,7 @@ export async function importReplicaRoom(
   // copied source status or live publication. Later source transitions can
   // ground them normally. This also works after the final stay has closed.
   const evidence = packEvidence ?? await verifyPack();
-  const room = await openRoom(store, manifest.roomId);
+  const room = await roomHandle();
   await withRoomLock(room.id, () =>
     room.tx(async (tx) => {
       const stay = await tx.segments.latestStay();
