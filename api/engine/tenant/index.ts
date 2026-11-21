@@ -343,6 +343,7 @@ function bind(
         lease: slidingSync.PositionLease,
         state: Record<string, unknown>,
         now = Date.now(),
+        domain?: string,
       ) =>
         slidingSync.commitPosition(
           conn,
@@ -351,6 +352,7 @@ function bind(
           state,
           config().slidingsync,
           now,
+          domain,
         ),
       prune: (now = Date.now()) => slidingSync.prunePositions(conn, now),
     },
@@ -422,7 +424,8 @@ function bind(
         connection: string,
         limit: number,
         limits: e2ee.KeyLimits,
-      ) => todevice.deliverSliding(conn, d, connection, limit, limits),
+        domain?: string,
+      ) => todevice.deliverSliding(conn, d, connection, limit, limits, domain),
       deliver: (
         d: devices.DeviceIdentity,
         token: StreamToken,

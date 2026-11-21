@@ -23,7 +23,11 @@ import { setConfigForTests } from '#engine/config.ts';
 import { loginUser, verifyUserPassword } from '#engine/tenant/users.ts';
 import { hashToken, lookupToken } from '#engine/tenant/auth.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
-import { formatPosition, parsePosition } from '#engine/client/tokens.ts';
+import {
+  formatPosition,
+  parsePosition,
+  parseStreamToken,
+} from '#engine/client/tokens.ts';
 import { getAccountData, putAccountData } from '#engine/tenant/accountdata.ts';
 import { membershipOf } from '#engine/room/membership.ts';
 import { loadNode } from '#engine/facade/identity.ts';
@@ -1328,6 +1332,69 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       },
     }, 'POST');
     assertEquals(searchNext.status, 200, JSON.stringify(searchNext.body));
+    const edgeSliding = async (pos?: string) => {
+      const response = await fetch(
+        `http://127.0.0.1:${facadePort}/_matrix/client/unstable/org.matrix.simplified_msc3575/sync` +
+          (pos === undefined ? '' : '?pos=' + pos),
+        {
+          method: 'POST',
+          headers: { authorization: 'Bearer ' + token },
+          body: JSON.stringify({
+            conn_id: 'cold-facade-b9',
+            room_subscriptions: {
+              [fresh.body.room_id]: { timeline_limit: 1, required_state: [] },
+            },
+            extensions: {
+              e2ee: { enabled: true },
+              to_device: { enabled: true, limit: 1 },
+            },
+          }),
+        },
+      );
+      return { status: response.status, body: await response.json() };
+    };
+    const sliding = await edgeSliding();
+    assertEquals(sliding.status, 200, JSON.stringify(sliding.body));
+    const slidingPosition = parsePosition(sliding.body.pos);
+    assert(slidingPosition !== null);
+    assertEquals(slidingPosition.domain, bookmark.domain);
+    assertEquals(
+      parsePosition(sliding.body.extensions.to_device.next_batch)?.domain,
+      bookmark.domain,
+    );
+    assertEquals(
+      sliding.body.rooms[fresh.body.room_id].timeline[0].event_id,
+      freshEvent.body.event_id,
+    );
+    for (
+      const foreign of [
+        slidingPosition.payload,
+        formatPosition(crypto.randomUUID(), slidingPosition.payload),
+      ]
+    ) {
+      const response = await edgeSliding(foreign);
+      assertEquals([response.status, response.body.errcode], [
+        400,
+        'M_UNKNOWN_POS',
+      ]);
+    }
+    assertEquals((await edgeSliding(sliding.body.pos)).status, 200);
+    const ordinary = await edgeApi('sync?timeout=0');
+    assertEquals(ordinary.status, 200, JSON.stringify(ordinary.body));
+    assertEquals(
+      parseStreamToken(ordinary.body.next_batch)?.domain,
+      bookmark.domain,
+    );
+    assert(ordinary.body.rooms.join[fresh.body.room_id].timeline.events.some(
+      (event: { event_id: string }) =>
+        event.event_id === freshEvent.body.event_id,
+    ));
+    const changes = await edgeApi(
+      'keys/changes?from=' + ordinary.body.next_batch + '&to=' +
+        ordinary.body.next_batch,
+    );
+    assertEquals(changes.status, 200, JSON.stringify(changes.body));
+    assertEquals(changes.body, { changed: [], left: [] });
     const edit = await edgeApi(
       freshRoomPath + '/send/m.room.encrypted/public-edit',
       {

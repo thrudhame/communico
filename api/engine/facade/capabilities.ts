@@ -155,6 +155,18 @@ const F2_TODEVICE: readonly Rule[] = [
   route('PUT', /^\/_matrix\/client\/v3\/sendToDevice\/[^/]+\/[^/]+$/, 'auth'),
 ];
 
+// B9 shares the native sync coordinators and their owner-local issued receipts.
+const F2_SYNC: readonly Rule[] = [
+  ...['sync', 'keys/changes'].map((name) =>
+    route('GET', literal('/_matrix/client/v3/' + name), 'domain')
+  ),
+  route(
+    'POST',
+    literal('/_matrix/client/unstable/org.matrix.simplified_msc3575/sync'),
+    'domain',
+  ),
+];
+
 // B6's client room owners enforce their exact room/account cuts. This is not
 // the federation rooms scope: local clients still work with federation off.
 const F2_ROOMS: readonly Rule[] = [
@@ -315,6 +327,7 @@ export function capabilities(role: string, phase = 'f1') {
           ...F2_REGISTERS,
           ...F2_DEVICES,
           ...F2_TODEVICE,
+          ...F2_SYNC,
           ...F2_ROOMS,
           ...F2_MEMBERSHIP,
           ...F2_CLIENT_DATA,

@@ -141,3 +141,109 @@ Deno.test('cold ordinary sync retains its domain and session, acknowledges only 
     await Deno.remove(dir, { recursive: true });
   }
 });
+
+Deno.test('cold sliding sync resumes the exact owner position and inbox receipt without consuming the unseen tail', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'sliding-domain-cold-' });
+  let server = await serverProcess({ dir });
+  try {
+    const registration = { username: 'sliding-cold', password: 'pw' };
+    const challenge = await server.api('v3/register', registration);
+    assertEquals(challenge.status, 401);
+    const registered = await server.api('v3/register', {
+      ...registration,
+      auth: { type: 'm.login.dummy', session: challenge.body.session },
+    });
+    assertEquals(registered.status, 200);
+    const user = registered.body;
+    for (const marker of ['issued', 'unseen']) {
+      const response = await fetch(
+        'http://127.0.0.1:' + server.port +
+          '/_matrix/client/v3/sendToDevice/m.room_key/' + marker,
+        {
+          method: 'PUT',
+          headers: { Authorization: 'Bearer ' + user.access_token },
+          body: JSON.stringify({
+            messages: { [user.user_id]: { [user.device_id]: { marker } } },
+          }),
+        },
+      );
+      assertEquals(response.status, 200, await response.clone().text());
+      await response.body?.cancel();
+    }
+    const sync = (pos?: string, since?: string) =>
+      server.api(
+        'unstable/org.matrix.simplified_msc3575/sync' +
+          (pos === undefined ? '' : '?pos=' + pos),
+        {
+          conn_id: 'encryption',
+          extensions: {
+            e2ee: { enabled: true },
+            to_device: {
+              enabled: true,
+              limit: 1,
+              ...(since === undefined ? {} : { since }),
+            },
+          },
+        },
+        user.access_token,
+      );
+    const markers = (
+      body: {
+        extensions: {
+          to_device: { events: { content: { marker: string } }[] };
+        };
+      },
+    ) => body.extensions.to_device.events.map((event) => event.content.marker);
+    const first = await sync();
+    assertEquals(first.status, 200);
+    const position = parsePosition(first.body.pos)!;
+    const receipt = parsePosition(first.body.extensions.to_device.next_batch)!;
+    assertEquals(typeof position.domain, 'string');
+    assertEquals(receipt.domain, position.domain);
+    assertEquals(markers(first.body), ['issued']);
+    server.child.kill('SIGTERM');
+    assertEquals((await bounded(server.output)).code, 0);
+    await server.dispose();
+    server = await serverProcess({ dir });
+    const foreign = await sync(
+      formatPosition(crypto.randomUUID(), position.payload),
+    );
+    assertEquals([foreign.status, foreign.body.errcode], [
+      400,
+      'M_UNKNOWN_POS',
+    ]);
+    const foreignReceipt = await sync(
+      first.body.pos,
+      formatPosition(crypto.randomUUID(), receipt.payload),
+    );
+    assertEquals([foreignReceipt.status, foreignReceipt.body.errcode], [
+      400,
+      'M_UNKNOWN_POS',
+    ]);
+    const replay = await sync(first.body.pos);
+    assertEquals(replay.status, 200);
+    assertEquals(markers(replay.body), ['issued']);
+    assertEquals(parsePosition(replay.body.pos)?.domain, position.domain);
+    const resumed = await sync(
+      replay.body.pos,
+      first.body.extensions.to_device.next_batch,
+    );
+    assertEquals(resumed.status, 200);
+    assertEquals(markers(resumed.body), ['unseen']);
+    assertEquals(
+      parsePosition(resumed.body.extensions.to_device.next_batch)?.domain,
+      position.domain,
+    );
+    const empty = await sync(
+      resumed.body.pos,
+      resumed.body.extensions.to_device.next_batch,
+    );
+    assertEquals(empty.status, 200);
+    assertEquals(markers(empty.body), []);
+    server.child.kill('SIGTERM');
+    assertEquals((await bounded(server.output)).code, 0);
+  } finally {
+    await server.dispose();
+    await Deno.remove(dir, { recursive: true });
+  }
+});

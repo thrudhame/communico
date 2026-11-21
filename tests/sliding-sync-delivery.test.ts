@@ -54,6 +54,7 @@ async function fixture() {
   ) =>
     publishSlidingResponse({
       tenant,
+      domain: '10000000-0000-0000-0000-000000000001',
       device,
       lease,
       state,
@@ -157,6 +158,7 @@ Deno.test('sliding delivery: rendered response, scoped inbox page and successor 
     const roomList = await f.begin('room-list');
     const roomResponse = await publishSlidingResponse({
       tenant: f.tenant,
+      domain: '10000000-0000-0000-0000-000000000001',
       device: f.device,
       lease: roomList,
       state: { cut: 1 },

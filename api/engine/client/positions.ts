@@ -78,6 +78,30 @@ export async function requireStreamDomain(
   return local.domain;
 }
 
+/** Sliding positions retain exact issued spelling and connection ownership.
+ * Check this boundary before completion admission or any lease mutation. */
+export async function requireSlidingDomain(
+  server: Pick<Database, 'query'>,
+  raw: string | null,
+): Promise<string> {
+  const local = await publicationIdentity(server);
+  if (raw !== null) {
+    const position = parsePosition(raw);
+    if (
+      position === null
+        ? raw.startsWith('v1.') || local.node !== 'home'
+        : position.domain !== local.domain
+    ) {
+      throw new MatrixError(
+        400,
+        'M_UNKNOWN_POS',
+        'unknown sliding sync position',
+      );
+    }
+  }
+  return local.domain;
+}
+
 export async function parseLocalStreamToken(
   server: Pick<Database, 'query'>,
   raw: string | null,

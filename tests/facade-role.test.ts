@@ -293,7 +293,7 @@ Deno.test('F2 manifest enables delivered auth, registers and device keys without
       ['v3/sync', 'GET'],
       ['v3/keys/changes', 'GET'],
     ]
-  ) assertEquals(facade.gate(request(path, method), () => true)?.status, 404);
+  ) assertEquals(facade.gate(request(path, method), () => true), null);
   assertEquals(
     facade.gate(request('v3/profile/%40alice%3Atest', 'PUT'), () => true)
       ?.status,
@@ -445,8 +445,8 @@ Deno.test('F2 room authoring and reads use client scope, not federation availabi
           method,
         }),
         () => true,
-      )?.status,
-      404,
+      ),
+      null,
     );
   }
 });
@@ -519,7 +519,6 @@ Deno.test('F2 membership activates only delivered methods and their independent 
       ['GET', '/_matrix/federation/v1/make_join/room'],
       ['POST', '/_matrix/client/v3/join/room/extra'],
       ['GET', '/_matrix/client/v3/joined_rooms'],
-      ['GET', '/_matrix/client/v3/sync'],
     ]
   ) {
     assertEquals(
@@ -529,6 +528,38 @@ Deno.test('F2 membership activates only delivered methods and their independent 
       )?.status,
       404,
       path,
+    );
+  }
+});
+
+Deno.test('B9 sync routes share their native handlers only at F2 with domain admission', () => {
+  const facade = capabilities('facade', 'f2');
+  const f1 = capabilities('facade', 'f1');
+  for (
+    const [method, path] of [
+      ['GET', '/_matrix/client/v3/sync'],
+      ['GET', '/_matrix/client/v3/keys/changes'],
+      ['POST', '/_matrix/client/unstable/org.matrix.simplified_msc3575/sync'],
+    ]
+  ) {
+    const request = new Request('https://logical.test' + path, { method });
+    const scopes: string[] = [];
+    assertEquals(
+      facade.gate(request, (scope) => {
+        scopes.push(scope);
+        return true;
+      }),
+      null,
+    );
+    assertEquals(scopes, ['domain']);
+    assertEquals(facade.gate(request, () => false)?.status, 503);
+    assertEquals(f1.gate(request, () => true)?.status, 404);
+    assertEquals(
+      facade.gate(
+        new Request(request.url, { method: method === 'GET' ? 'POST' : 'GET' }),
+        () => true,
+      )?.status,
+      405,
     );
   }
 });

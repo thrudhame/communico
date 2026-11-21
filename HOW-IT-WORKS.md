@@ -415,6 +415,11 @@ deletion authority, count/byte limits preserve the tail, and an evicted receipt
 replays rather than consumes data. Ordinary sync remains a direct consumer of
 the same owner. Polling inspects the same issued acknowledgment boundary without
 consuming it, so received pages do not make every encryption poll immediate.
+Top-level sliding positions and enabled to-device receipts carry the existing
+publication domain. Foreign positions are refused before completion, lease,
+presence or inbox effects. The tenant stores and hashes the exact issued wire
+spelling, not a token wrapped after receipt creation. Disabled extensions ignore
+their supplied cursors; a no-pos replacement preserves unacknowledged inbox data.
 (`api/engine/tenant/todevice.ts`)
 
 Account-data delivery captures the global/selected room bodies, push rules and
