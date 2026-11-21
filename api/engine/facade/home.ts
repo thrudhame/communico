@@ -36,6 +36,7 @@ import { DomainOperations } from './domain.ts';
 import { DeviceOperations, isKeyStream } from './devices.ts';
 import { isToDeviceStream, ToDeviceOperations } from './todevice.ts';
 import { MembershipOperations, startMembershipExports } from './membership.ts';
+import { ActivityExchange } from './activity.ts';
 
 export async function startHomeLinks(
   app: App,
@@ -228,6 +229,9 @@ export async function startHomeLinks(
       startHomeLinkWorker({
         client,
         journal,
+        activity: settings.phase === 'f2'
+          ? new ActivityExchange(app.store, app.tenant, pairings)
+          : undefined,
         limits: {
           maxItems: settings.batchmaxitems,
           maxBytes: settings.batchmaxbytes,

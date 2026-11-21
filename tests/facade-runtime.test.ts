@@ -2265,6 +2265,102 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
           selector.content.request_id === 'home-runtime-key'
         );
     });
+    // Real processes exchange live observations over the existing home-initiated
+    // link. Ordinary/sliding consumers, not a durable journal ACK, prove receipt.
+    const livePresence = 'presence/' + encodeURIComponent(user) + '/status';
+    const liveTyping = roomPath + '/typing/' + encodeURIComponent(user);
+    assertEquals(
+      (await api(
+        livePresence,
+        { presence: 'unavailable' },
+        registered.body.access_token,
+        'PUT',
+      )).status,
+      200,
+    );
+    assertEquals(
+      (await api(
+        liveTyping,
+        { typing: true, timeout: 30000 },
+        registered.body.access_token,
+        'PUT',
+      )).status,
+      200,
+    );
+    const observeLive = async (
+      read: () => ReturnType<typeof api>,
+      observed: (body: Awaited<ReturnType<typeof api>>['body']) => boolean,
+    ) => {
+      const deadline = Date.now() + 10000;
+      let value;
+      do {
+        value = await read();
+        if (value.status === 200 && observed(value.body)) return value.body;
+        assert([200, 503].includes(value.status), JSON.stringify(value));
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      } while (Date.now() < deadline);
+      throw new Error('live consumer outcome absent: ' + JSON.stringify(value));
+    };
+    const liveSync = await observeLive(
+      () => edgeApi('sync?timeout=0&set_presence=offline'),
+      (body) =>
+        body.presence?.events.some((
+          e: { sender: string; content: { presence: string } },
+        ) => e.sender === user && e.content.presence === 'unavailable') &&
+        body.rooms?.join?.[roomId]?.ephemeral?.events.some((
+          e: { type: string; content: { user_ids?: string[] } },
+        ) => e.type === 'm.typing' && e.content.user_ids?.includes(user)),
+    );
+    assertEquals(typeof liveSync.next_batch, 'string');
+    const liveSliding = await fetch(
+      `http://127.0.0.1:${facadePort}/_matrix/client/unstable/org.matrix.simplified_msc3575/sync?set_presence=online`,
+      {
+        method: 'POST',
+        headers: { authorization: 'Bearer ' + token },
+        body: JSON.stringify({
+          conn_id: 'cold-live-activity',
+          room_subscriptions: {
+            [roomId]: { timeline_limit: 0, required_state: [] },
+          },
+          extensions: { typing: { enabled: true } },
+        }),
+      },
+    );
+    assertEquals(liveSliding.status, 200);
+    const liveSlidingBody = await liveSliding.json();
+    assertEquals(
+      liveSlidingBody.extensions.typing.rooms[roomId].content.user_ids,
+      [user],
+    );
+    assertEquals(
+      (await api(
+        livePresence,
+        { presence: 'offline' },
+        registered.body.access_token,
+        'PUT',
+      )).status,
+      200,
+    );
+    await observeLive(
+      () => api(livePresence, undefined, registered.body.access_token),
+      (body) => body.presence === 'online',
+    );
+    assertEquals(
+      (await api(
+        liveTyping,
+        { typing: false },
+        registered.body.access_token,
+        'PUT',
+      )).status,
+      200,
+    );
+    await observeLive(
+      () => edgeApi('sync?timeout=0&set_presence=offline'),
+      (body) =>
+        !body.rooms?.join?.[roomId]?.ephemeral?.events.some((
+          e: { type: string; content: { user_ids?: string[] } },
+        ) => e.type === 'm.typing' && e.content.user_ids?.includes(user)),
+    );
     const suffix = await api(
       roomPath + '/send/m.room.encrypted/b6-return-suffix',
       {

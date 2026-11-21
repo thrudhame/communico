@@ -2,6 +2,10 @@ import { assert, assertEquals, assertRejects, assertThrows } from '@std/assert';
 import { createHash } from 'node:crypto';
 import { canonicalJson } from '#engine/canonical.ts';
 import { setConfigForTests } from '#engine/config.ts';
+import { ActivityExchange } from '#engine/facade/activity.ts';
+import { DeviceOperations } from '#engine/facade/devices.ts';
+import { deleteDevices, upsertDevice } from '#engine/tenant/devices.ts';
+import { deviceIdentity } from '#engine/tenant/txns.ts';
 import {
   importReportOperation,
   listReports,
@@ -90,6 +94,7 @@ import {
   LINK_SUPPORTED,
   LinkError,
   type LinkRecord,
+  object,
   recordHash,
 } from '#engine/facade/protocol.ts';
 import { serverSchema } from '#engine/server/schema.ts';
@@ -258,6 +263,330 @@ async function fixture(applyAuth = true) {
     },
   };
 }
+
+async function activityFixture() {
+  const f = await fixture();
+  await upsertDevice(f.ht, 'alice', 'LAN', 'LAN');
+  const device = await deviceIdentity(f.ht, 'alice', 'LAN');
+  const auth = await exportAccountAuth(
+    f.home,
+    f.ht,
+    f.hp,
+    f.bundle.id,
+    'alice',
+    false,
+  );
+  await f.ej.receive('home', [auth]);
+  await new AccountSnapshots(f.edge, f.et, f.fp, f.owners).apply(f.ej, auth);
+  const keys = new DeviceOperations(f.home, f.ht, f.hp);
+  const edgeKeys = new DeviceOperations(f.edge, f.et, f.fp, f.node);
+  for (const record of await keys.bootstrap('alice', f.bundle.id)) {
+    await f.ej.receive('home', [record]);
+    await edgeKeys.apply(f.ej, record);
+  }
+  await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+  const home = new ActivityExchange(f.home, f.ht, f.hp);
+  const edge = new ActivityExchange(f.edge, f.et, f.fp, f.node);
+  return { ...f, device, homeActivity: home, edgeActivity: edge };
+}
+
+Deno.test('live activity wire binds local generation to retained device creation', async () => {
+  const f = await activityFixture();
+  try {
+    await setPresenceValue(
+      await f.home.server(),
+      '@alice:logical.test',
+      'online',
+      f.device,
+    );
+    const snapshot = object(await f.homeActivity.capture(f.bundle.id));
+    const values = snapshot.presence as Record<string, unknown>[];
+    assertEquals(values.length, 1);
+    assertEquals(values[0].userId, '@alice:logical.test');
+    assertEquals(values[0].deviceId, 'LAN');
+    assertEquals(typeof values[0].deviceIncarnation, 'string');
+    assertEquals(values[0].generation, undefined);
+    assert(
+      snapshot.incarnation !== f.bundle.id,
+      'pairing is not publication incarnation',
+    );
+    await f.edgeActivity.apply(f.bundle.id, snapshot, () => 0);
+    assertEquals(
+      (await getPresence(await f.edge.server(), '@alice:logical.test'))
+        .presence,
+      'online',
+    );
+    assertEquals(
+      object(await f.edgeActivity.capture(f.bundle.id)).presence,
+      [],
+      'no imported observation re-export',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('live activity wire admits even empty views through current grant and control', async () => {
+  const f = await activityFixture();
+  try {
+    const snapshot = await f.homeActivity.capture(f.bundle.id);
+    await (await f.edge.server()).execute(
+      'DELETE FROM facade_owner_activation',
+    );
+    await assertRejects(() =>
+      f.edgeActivity.apply(f.bundle.id, snapshot, () => 0)
+    );
+    await assertRejects(() => f.edgeActivity.capture(f.bundle.id));
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('live activity wire rejects unknown and forged device creations before presence effects', async () => {
+  const f = await activityFixture();
+  try {
+    const snapshot = object(await f.homeActivity.capture(f.bundle.id));
+    const forged = {
+      ...snapshot,
+      presence: [{
+        userId: '@alice:logical.test',
+        deviceId: 'LAN',
+        deviceIncarnation: 'not-a-creation',
+        presence: 'online',
+        remainingMs: 30000,
+        lastActiveAgo: 0,
+      }],
+    };
+    await assertRejects(() =>
+      f.edgeActivity.apply(f.bundle.id, forged, () => 0)
+    );
+    assertEquals(
+      (await getPresence(await f.edge.server(), '@alice:logical.test'))
+        .presence,
+      'offline',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('live activity wire preserves source, account, deletion and expiry boundaries', async (t) => {
+  const f = await activityFixture();
+  try {
+    const user = '@alice:logical.test';
+    const server = await f.edge.server();
+    await setPresenceValue(await f.home.server(), user, 'online', f.device);
+    const snapshot = await f.homeActivity.capture(f.bundle.id);
+    assertEquals(snapshot.presence.length, 1);
+    await t.step(
+      'binding substitution cannot name a different source or grant',
+      async () => {
+        for (
+          const key of [
+            'source',
+            'incarnation',
+            'pairing',
+            'server',
+            'grantRevision',
+            'ownerRevision',
+          ] as const
+        ) {
+          await assertRejects(() =>
+            f.edgeActivity.apply(f.bundle.id, {
+              ...snapshot,
+              [key]: typeof snapshot[key] === 'number'
+                ? Number(snapshot[key]) + 1
+                : 'substituted',
+            }, () => 0)
+          );
+        }
+        assertEquals((await getPresence(server, user)).presence, 'offline');
+      },
+    );
+    await t.step(
+      'wire parser refuses numbers, duplicates and undeclared activity fields',
+      async () => {
+        for (
+          const presence of [
+            [{ ...snapshot.presence[0], remainingMs: 0.1 }],
+            [{ ...snapshot.presence[0], lastActiveAgo: -1 }],
+            [{ ...snapshot.presence[0], generation: 1 }],
+            [snapshot.presence[0], snapshot.presence[0]],
+          ]
+        ) {
+          await assertRejects(() =>
+            f.edgeActivity.apply(
+              f.bundle.id,
+              { ...snapshot, presence },
+              () => 0,
+            )
+          );
+        }
+        assertEquals((await getPresence(server, user)).presence, 'offline');
+      },
+    );
+    await t.step(
+      'missing room proof refuses the whole candidate before presence effects',
+      async () => {
+        await assertRejects(() =>
+          f.edgeActivity.apply(f.bundle.id, {
+            ...snapshot,
+            typing: [{
+              userId: user,
+              deviceId: 'LAN',
+              deviceIncarnation: snapshot.presence[0].deviceIncarnation,
+              roomId: '!missing:logical.test',
+              membership: '$missing',
+              remainingMs: 30000,
+            }],
+          }, () => 0)
+        );
+        assertEquals((await getPresence(server, user)).presence, 'offline');
+      },
+    );
+    await t.step(
+      'unapplied selected account is unavailable, unrelated accounts do not block',
+      async () => {
+        const changed = await exportAccountAuth(
+          f.home,
+          f.ht,
+          f.hp,
+          f.bundle.id,
+          'alice',
+          false,
+        );
+        await f.ej.receive('home', [changed]);
+        await assertRejects(() =>
+          f.edgeActivity.apply(f.bundle.id, snapshot, () => 0)
+        );
+        await new AccountSnapshots(f.edge, f.et, f.fp, f.owners).apply(
+          f.ej,
+          changed,
+        );
+        const other = await exportAccountAuth(
+          f.home,
+          f.ht,
+          f.hp,
+          f.bundle.id,
+          'bob',
+          false,
+        );
+        await f.ej.receive('home', [other]);
+        await f.edgeActivity.apply(f.bundle.id, snapshot, () => 0);
+        assertEquals((await getPresence(server, user)).presence, 'online');
+      },
+    );
+    await t.step(
+      'round trip age and empty source replacement expire the existing owner',
+      async () => {
+        await f.edgeActivity.apply(f.bundle.id, snapshot, () => 31000);
+        assertEquals((await getPresence(server, user)).presence, 'offline');
+        await f.edgeActivity.apply(f.bundle.id, snapshot, () => 0);
+        assertEquals((await getPresence(server, user)).presence, 'online');
+        await f.edgeActivity.apply(
+          f.bundle.id,
+          { ...snapshot, presence: [] },
+          () => 0,
+        );
+        assertEquals((await getPresence(server, user)).presence, 'offline');
+      },
+    );
+    await t.step(
+      'missing selection is not an empty admitted account',
+      async () => {
+        const db = await f.edge.tenant('logical.test');
+        await db.execute(
+          "DELETE FROM account_auth_snapshots WHERE localpart='alice'",
+        );
+        await assertRejects(() =>
+          f.edgeActivity.apply(f.bundle.id, snapshot, () => 0)
+        );
+        assertEquals((await getPresence(server, user)).presence, 'offline');
+      },
+    );
+    await t.step(
+      'retired local execution generation is never exported',
+      async () => {
+        await deleteDevices(f.ht, 'alice', ['LAN']);
+        await upsertDevice(f.ht, 'alice', 'LAN', 'recreated');
+        assertEquals((await f.homeActivity.capture(f.bundle.id)).presence, []);
+        const current = await deviceIdentity(f.ht, 'alice', 'LAN');
+        await setPresenceValue(await f.home.server(), user, 'online', current);
+        const recreated = await f.homeActivity.capture(f.bundle.id);
+        assertEquals(recreated.presence.length, 1);
+        assert(
+          recreated.presence[0].deviceIncarnation !==
+            snapshot.presence[0].deviceIncarnation,
+        );
+        await (await f.home.server()).execute(
+          'DELETE FROM facade_exports WHERE scope=?',
+          ['auth:' + user],
+        );
+        assertEquals(
+          (await f.homeActivity.capture(f.bundle.id)).presence,
+          [],
+          'unselected local activity is not exported',
+        );
+      },
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('live activity dependencies distinguish absent creation from conflicting creation', async (t) => {
+  const f = await activityFixture();
+  try {
+    const user = '@alice:logical.test';
+    await setPresenceValue(await f.home.server(), user, 'online', f.device);
+    const snapshot = await f.homeActivity.capture(f.bundle.id);
+    const candidate = { ...snapshot.presence[0], deviceId: 'MISSING' };
+    for (const kind of ['presence', 'typing']) {
+      await t.step(kind, async () => {
+        const values = kind === 'presence' ? [candidate] : [{
+          userId: user,
+          deviceId: 'MISSING',
+          deviceIncarnation: candidate.deviceIncarnation,
+          roomId: '!missing:logical.test',
+          membership: '$missing',
+          remainingMs: 30000,
+        }];
+        const error = await assertRejects(
+          () =>
+            f.edgeActivity.apply(f.bundle.id, {
+              ...snapshot,
+              presence: [],
+              [kind]: values,
+            }, () => 0),
+          LinkError,
+        );
+        assertEquals(
+          error.status,
+          503,
+          'missing creation remains a retryable dependency',
+        );
+      });
+    }
+    const conflict = await assertRejects(
+      () =>
+        f.edgeActivity.apply(f.bundle.id, {
+          ...snapshot,
+          presence: [{
+            ...snapshot.presence[0],
+            deviceIncarnation: 'substituted',
+          }],
+        }, () => 0),
+      LinkError,
+    );
+    assertEquals(conflict.status, 403);
+    assertEquals(
+      (await getPresence(await f.edge.server(), user)).presence,
+      'offline',
+    );
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('domain rolling readers: status requires its reader before receipt or activation', async () => {
   const f = await fixture();
