@@ -4,6 +4,7 @@ import { config, serverName } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { drainResources } from '#engine/lifetime.ts';
 import { ContactObservations } from '#engine/federation/pending-contacts.ts';
+import { inboxFailure } from '#engine/request-diagnostics.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
@@ -451,10 +452,19 @@ export async function openFacadeRuntime(
           ).apply(journal, stream)
           : await apply(journal, stream),
       changed: () => notices.changed(),
-      failed: (error) =>
-        console.error(
-          'facade inbox:',
-          error instanceof LinkError ? error.code : 'LINK_UNAVAILABLE',
+      failed: (error, stream, after) =>
+        inboxFailure(
+          {
+            server: identity.server,
+            node: identity.node,
+            peer: 'home',
+            initialized: !!node,
+            tenantAvailable: !!tenant,
+            phase: settings.phase,
+          },
+          error,
+          stream,
+          after,
         ),
     });
   }
