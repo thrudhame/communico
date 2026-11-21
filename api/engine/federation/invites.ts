@@ -55,6 +55,7 @@ import {
 import {
   FederationHttpError,
   federationRequest,
+  isDefiniteFederationRefusal,
   isEndpointUnknown,
 } from './client.ts';
 import {
@@ -233,10 +234,14 @@ export async function inviteRemote(
     'SELECT * FROM federation_invite_attempts WHERE room_id=? AND sender=? AND target=?',
     [roomId, sender, target],
   );
-  const admission = existing.length
+  const replacing = existing.length > 0 && existing[0].status === 'refused' &&
+    canonicalJson(outboundInvite(existing[0]).request.event.content) !==
+      canonicalJson(content);
+  const continuing = existing.length > 0 && !replacing;
+  const admission = continuing
     ? undefined
     : await deps.prepareRoomScope?.(roomId, false, sender);
-  const permit = existing.length ? null : await prepareSigner(deps.signer);
+  const permit = continuing ? null : await prepareSigner(deps.signer);
   const attempt = await withRoomLock(roomId, async () => {
     if (await deps.store.roomRetired(roomId)) {
       throw new MatrixError(404, 'M_NOT_FOUND', 'room removal is pending');
@@ -246,7 +251,15 @@ export async function inviteRemote(
       [roomId, sender, target],
     );
     let saved: OutboundInvite;
-    if (rows.length) {
+    const replace = rows.length > 0 && rows[0].status === 'refused' &&
+      canonicalJson(outboundInvite(rows[0]).request.event.content) !==
+        canonicalJson(content);
+    if (
+      rows.length && invitePerformers(deps.store).has(String(rows[0].event_id))
+    ) {
+      throw new MatrixError(409, 'M_BAD_STATE', 'Remote invite is active');
+    }
+    if (rows.length && !replace) {
       saved = outboundInvite(rows[0]);
       if (
         canonicalJson(saved.request.event.content) !== canonicalJson(content)
@@ -323,8 +336,21 @@ export async function inviteRemote(
       };
       await deps.server.tx(async (tx) => {
         await admission?.check(tx);
-        await withMembershipFence(admission, tx, () =>
-          tx.execute(
+        await withMembershipFence(admission, tx, async () => {
+          if (replace) {
+            const removed = await tx.execute(
+              "DELETE FROM federation_invite_attempts WHERE event_id=? AND status='refused'",
+              [String(rows[0].event_id)],
+            );
+            if (removed !== 1) {
+              throw new MatrixError(
+                409,
+                'M_BAD_STATE',
+                'Remote invite refusal changed',
+              );
+            }
+          }
+          await tx.execute(
             "INSERT INTO federation_invite_attempts(room_id,sender,target,event_id,destination,request_json,status,added_ms) VALUES(?,?,?,?,?,?,'pending',?)",
             [
               roomId,
@@ -335,14 +361,15 @@ export async function inviteRemote(
               JSON.stringify(request),
               Date.now(),
             ],
-          ));
+          );
+        });
       });
     }
     if (invitePerformers(deps.store).has(saved.eventId)) {
       throw new MatrixError(409, 'M_BAD_STATE', 'Remote invite is active');
     }
     await deps.server.execute(
-      "UPDATE federation_invite_attempts SET status='pending' WHERE event_id=? AND status='failed'",
+      "UPDATE federation_invite_attempts SET status='pending' WHERE event_id=? AND status IN ('failed','refused')",
       [saved.eventId],
     );
     invitePerformers(deps.store).add(saved.eventId);
@@ -375,6 +402,7 @@ async function performOutboundInvite(
     );
     return { eventId };
   }
+  let refused = false;
   try {
     let merged = attempt.response;
     if (merged === null) {
@@ -386,6 +414,11 @@ async function performOutboundInvite(
           encodeURIComponent(eventId)
         }`,
         body: new TextEncoder().encode(JSON.stringify(request)),
+      }).catch((error: unknown) => {
+        // Only a refusal of this submission proves non-acceptance. Key lookup
+        // failures or invalid evidence after a response remain ambiguous.
+        refused = isDefiniteFederationRefusal(error);
+        throw error;
       });
       merged = inviteResponse(res.json);
     }
@@ -471,15 +504,15 @@ async function performOutboundInvite(
     );
     return { eventId };
   } catch (e) {
-    // Definite refusal/bad evidence remains inspectable, but does not make an
-    // autonomous retry loop. Explicit retry continues the same prepared PDU.
+    // Both outcomes remain inspectable without autonomous retry. Only an exact
+    // submission refusal allows a fresh, newly authorized event with new content.
     if (
       (e instanceof FederationHttpError && e.remoteStatus < 500) ||
       (e instanceof UpstreamError && e.category === 'validation')
     ) {
       await deps.server.execute(
-        "UPDATE federation_invite_attempts SET status='failed' WHERE event_id=?",
-        [eventId],
+        'UPDATE federation_invite_attempts SET status=? WHERE event_id=?',
+        [refused ? 'refused' : 'failed', eventId],
       );
     }
     if (
@@ -1417,7 +1450,7 @@ export async function retryPrejoinIntents(
 ): Promise<void> {
   await inviteTransition(server, async (tx) => {
     await tx.execute(
-      "UPDATE federation_invite_attempts SET status='pending' WHERE destination=? AND status='failed'",
+      "UPDATE federation_invite_attempts SET status='pending' WHERE destination=? AND status IN ('failed','refused')",
       [destination],
     );
     const rows = await listRejectIntents(tx, self);

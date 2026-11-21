@@ -28,17 +28,13 @@ import {
   transactionPdus,
 } from './responses.ts';
 import {
-  FederationHttpError,
   federationRequest,
+  isDefiniteFederationRefusal,
   isEndpointUnknown,
 } from './client.ts';
 
 function sendJoinFailure(error: unknown): never {
-  if (
-    error instanceof FederationHttpError && error.matrixBody &&
-    error.remoteStatus >= 400 && error.remoteStatus < 500 &&
-    error.remoteStatus !== 408 && error.remoteStatus !== 429
-  ) {
+  if (isDefiniteFederationRefusal(error)) {
     throw new SendJoinRefused(
       error.status,
       error.errcode,

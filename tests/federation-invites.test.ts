@@ -818,6 +818,113 @@ Deno.test('inviter: unauthorized local membership never becomes remote work', as
   });
 });
 
+Deno.test('inviter: new content replaces only a definitely refused attempt', async (t) => {
+  for (
+    const outcome of [
+      'refusal',
+      'uncertain',
+      'bad-evidence',
+      'timeout',
+      'throttle',
+      'non-matrix',
+    ]
+  ) {
+    await t.step(outcome, () =>
+      withStore(async (store) => {
+        await withInviteHost(async (h) => {
+          const g = await genesis(store, {
+            roomId: '!invite-new-content:test',
+          });
+          const server = await store.server();
+          const deps: InviteDeps = {
+            store,
+            server,
+            signer: g.signer,
+            keys: productionKeyResolver(keyStore(server, { signer: g.signer })),
+            self: 'test',
+            wake: () => {},
+          };
+          h.response = () => {
+            if (outcome === 'bad-evidence') return Response.json({});
+            if (outcome === 'non-matrix') {
+              return new Response('proxy refused', { status: 403 });
+            }
+            return Response.json({ errcode: 'M_FORBIDDEN', error: outcome }, {
+              status: outcome === 'refusal'
+                ? 403
+                : outcome === 'timeout'
+                ? 408
+                : outcome === 'throttle'
+                ? 429
+                : 502,
+            });
+          };
+          const invite = (reason: string) =>
+            inviteRemote(
+              g.roomId,
+              '@dev:test',
+              `@zoe:${h.fake.name}`,
+              reason,
+              undefined,
+              deps,
+            );
+          await assertRejects(() => invite('A'));
+          const [original] = await server.query(
+            'SELECT * FROM federation_invite_attempts',
+          );
+          const request = canonicalJson(h.inviteRequests[0]);
+          h.response = () => null;
+          if (outcome === 'refusal') {
+            deps.prepareRoomScope = () => {
+              throw new MatrixError(
+                503,
+                'M_UNAVAILABLE',
+                'fresh scope unavailable',
+              );
+            };
+            const denied = await assertRejects(() => invite('B'), MatrixError);
+            assertEquals(denied.status, 503);
+            assertEquals(h.inviteRequests.length, 1);
+            assertEquals(
+              (await server.query(
+                'SELECT event_id FROM federation_invite_attempts',
+              ))[0].event_id,
+              original.event_id,
+            );
+            delete deps.prepareRoomScope;
+            const next = await invite('B');
+            assert(next.eventId !== original.event_id);
+            assertEquals(
+              (h.inviteRequests[1].event.content as Record<string, unknown>)
+                .reason,
+              'B',
+            );
+          } else {
+            const conflict = await assertRejects(
+              () => invite('B'),
+              MatrixError,
+            );
+            assertEquals(conflict.status, 409);
+            assertEquals(h.inviteRequests.length, 1);
+            assertEquals(
+              (await server.query(
+                'SELECT request_json FROM federation_invite_attempts',
+              ))[0].request_json,
+              original.request_json,
+            );
+            const retry = await invite('A');
+            assertEquals(retry.eventId, original.event_id);
+            assertEquals(canonicalJson(h.inviteRequests[1]), request);
+          }
+          assertEquals(
+            await server.query('SELECT * FROM federation_invite_attempts'),
+            [],
+          );
+        });
+      }));
+  }
+});
+
 Deno.test('inviter: definite missing-param refusal keeps exact intent for explicit retry', async () => {
   await withStore(async (store) => {
     await withInviteHost(async (h) => {
