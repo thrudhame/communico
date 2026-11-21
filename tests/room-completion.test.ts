@@ -398,6 +398,22 @@ Deno.test('completion: old prepared submission uses its verified fixed upgrade w
       ),
       [{ basis: 'legacy-reconciled' }],
     );
+    // A verified signature learned after the room commit is an overlay; the
+    // retried submission still names the same immutable PDU.
+    await (await store.room(g.roomId)).execute(
+      'INSERT INTO event_signatures(event,signatures) VALUES(?,?)',
+      [
+        g.tipId,
+        JSON.stringify({ 'peer.test': { 'ed25519:peer': 'learned' } }),
+      ],
+    );
+    const overlaid = await sendLocal(
+      room,
+      { type: 'm.room.message', sender: g.creator, content: {} },
+      g.signer,
+      submission,
+    );
+    assertEquals(overlaid.eventId, g.tipId);
     const wrong = {
       ...submission,
       lookup: () =>

@@ -138,10 +138,15 @@ async function materialize(
   await purgeable(conn, room, self);
 }
 
-/** Old manifests do not prove absence of private visibility intent. */
+export type ForgetAccess = 'read' | 'admission';
+
+/** Complete applied visibility is readable during a newer suffix. Producers
+ * still require the current receive cut; missing bootstrap or causal evidence
+ * never proves that a private visibility intent is absent. */
 export async function requireForgetKnowledge(
   conn: Pick<Conn, 'query'>,
   user: string,
+  access: ForgetAccess = 'admission',
 ) {
   const current = 'path' in conn && 'tx' in conn
     ? receivedFence(conn as Database)
@@ -159,14 +164,15 @@ export async function requireForgetKnowledge(
     [localpartOf(user)],
   );
   if (
-    !cut || cut.ready !== 1 || cut.received !== cut.applied ||
-    cut.received_hash !== cut.applied_hash || pending.length ||
-    (current &&
-      !current('home', {
-        source: 'home',
-        incarnation: String(binding.pairing),
-        stream: 'domain:' + user,
-      }))
+    !cut || cut.ready !== 1 || pending.length ||
+    (access === 'admission' &&
+      (cut.received !== cut.applied || cut.received_hash !== cut.applied_hash ||
+        (current &&
+          !current('home', {
+            source: 'home',
+            incarnation: String(binding.pairing),
+            stream: 'domain:' + user,
+          }))))
   ) {
     throw new MatrixError(503, 'M_UNAVAILABLE', 'forget snapshot unavailable');
   }

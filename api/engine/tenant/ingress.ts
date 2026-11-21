@@ -7,7 +7,7 @@ export type AuthIntent =
   | { kind: 'password'; localpart: string }
   | { kind: 'account'; localpart: string }
   | {
-    kind: 'domain';
+    kind: 'domain' | 'domain-read';
     localpart: string;
     feature?:
       | 'filters'

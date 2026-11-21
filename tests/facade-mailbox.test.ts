@@ -566,7 +566,7 @@ Deno.test('mailbox F2 admission survives downgrade and child retry with an addit
   }
 });
 
-Deno.test('mailbox logical policy upgrades actual pending v44 evidence without running its child', async () => {
+Deno.test('mailbox logical policy upgrades actual pending v45 evidence without running its child', async () => {
   const f = await fixture(historicalServerSchema(45));
   try {
     const edus = [{

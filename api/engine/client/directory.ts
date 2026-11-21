@@ -18,7 +18,12 @@ import {
   requiredLevel,
   userPowerLevel,
 } from '#engine/rulebook/power-levels.ts';
-import { requireRoom, stateAtSeq, versionOf } from './room.ts';
+import {
+  requireRoom,
+  requireRoomForAdmission,
+  stateAtSeq,
+  versionOf,
+} from './room.ts';
 import { joinedRooms, serversInRoom } from './membership.ts';
 import { writeStateKey } from './write.ts';
 import { discoveryRequest } from '#engine/federation/discovery.ts';
@@ -44,14 +49,17 @@ export async function createAlias(
   if (
     !aliasIsLocal(alias)
   ) throw new MatrixError(400, 'M_INVALID_PARAM', 'Room alias invalid');
-  await requireRoom(roomId);
+  await requireRoomForAdmission(roomId);
   if (await lookupAlias(theApp().server, alias) !== null) {
     throw new MatrixError(409, 'M_ROOM_IN_USE', 'alias taken: ' + alias);
   }
   await registerAlias(theApp().server, alias, roomId, creator);
 }
-export async function resolveAlias(alias: string) {
-  await theApp().replica?.requireScope('directory');
+export async function resolveAlias(
+  alias: string,
+  access: 'read' | 'admission' = 'read',
+) {
+  await requireDirectoryScope('directory', access);
   const parts = splitId(alias), fed = config().federation;
   if (!aliasIsLocal(alias)) {
     if (!fed.enabled || fed.lookups === 'none') {
@@ -78,20 +86,20 @@ export async function resolveAlias(alias: string) {
   if (roomId === null || await directory.purgeable(theApp().server, roomId)) {
     throw new MatrixError(404, 'M_NOT_FOUND', 'Room alias not found');
   }
-  await theApp().replica?.requireScope('room:' + roomId);
-  const servers = await serversInRoom(roomId);
+  await requireDirectoryScope('room:' + roomId, access);
+  const servers = await serversInRoom(roomId, access);
   if (servers.length === 0) {
     throw new MatrixError(404, 'M_NOT_FOUND', 'Room alias not found');
   }
   return { room_id: roomId, servers };
 }
 export async function powerFor(roomId: string, user: string, type: string) {
-  const room = await requireRoom(roomId),
+  const room = await requireRoomForAdmission(roomId),
     spec = getRulebook(await versionOf(room)).spec;
   const rows = await stateAtSeq(roomId, null, [
     ['m.room.power_levels', ''],
     ['m.room.create', ''],
-  ]);
+  ], 'admission');
   const pdu = async (type: string) => {
     const id = rows.find((r) => r.type === type && r.stateKey === '')?.eventId;
     const row = id === undefined
@@ -120,10 +128,14 @@ export async function deleteAlias(alias: string, user: string) {
       'not the alias creator and insufficient power level',
     );
   }
-  const canon =
-    (await stateAtSeq(row.roomId, null, [['m.room.canonical_alias', '']])).find(
-      (r) => r.type === 'm.room.canonical_alias' && r.stateKey === '',
-    );
+  const canon = (await stateAtSeq(
+    row.roomId,
+    null,
+    [['m.room.canonical_alias', '']],
+    'admission',
+  )).find(
+    (r) => r.type === 'm.room.canonical_alias' && r.stateKey === '',
+  );
   await removeAlias(db, alias);
   if (canon !== undefined) {
     const content = { ...canon.content };
@@ -185,7 +197,7 @@ export async function setVisibility(
   user: string,
   value: string,
 ) {
-  await requireRoom(roomId);
+  await requireRoomForAdmission(roomId);
   if (value !== 'public' && value !== 'private') {
     throw new MatrixError(
       400,
@@ -194,7 +206,8 @@ export async function setVisibility(
     );
   }
   if (
-    (await membershipOf(theApp().server, roomId, user))?.membership !== 'join'
+    (await membershipOf(theApp().server, roomId, user, 'admission'))
+      ?.membership !== 'join'
   ) {
     throw new MatrixError(
       403,
@@ -261,8 +274,9 @@ export async function assertFederationDirectoryAllowed() {
 
 export async function listLocalPublishedRooms(
   opts: DirectoryRequest,
+  access: 'read' | 'admission' = 'read',
 ) {
-  await theApp().replica?.requireScope('directory');
+  await requireDirectoryScope('directory', access);
   const limit = opts.limit != null && opts.limit > 0
       ? Math.min(opts.limit, 100)
       : 100,
@@ -274,7 +288,10 @@ export async function listLocalPublishedRooms(
     search = opts.filter?.generic_search_term;
   const all: Record<string, unknown>[] = [];
   for (const id of await directory.listedRooms(theApp().server)) {
-    const chunk = await publicRoomSummary(id);
+    if (access === 'admission') {
+      await theApp().replica?.requireScope('room:' + id);
+    }
+    const chunk = await publicRoomSummary(id, access);
     if (
       roomTypes !== undefined &&
       !roomTypes.includes(
@@ -306,6 +323,15 @@ export async function listLocalPublishedRooms(
   if (offset + limit < all.length) out.next_batch = String(offset + limit);
   if (offset > 0) out.prev_batch = String(Math.max(0, offset - limit));
   return out;
+}
+
+async function requireDirectoryScope(
+  scope: string,
+  access: 'read' | 'admission',
+) {
+  const replica = theApp().replica;
+  if (access === 'read') await replica?.requireReadScope(scope);
+  else await replica?.requireScope(scope);
 }
 export async function searchUsers(searcher: string, term: string, limit = 10) {
   const candidates = new Set<string>(),

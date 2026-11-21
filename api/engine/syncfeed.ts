@@ -58,11 +58,10 @@ import {
 import { filterEvents, type RoomFilter } from '#engine/tenant/filters.ts';
 import { waitForSync } from '#engine/sync-wait.ts';
 import {
-  getPresence,
+  presenceFor,
   receiptRoomsSince,
   receiptSnapshot,
   setPresenceValue,
-  sharedUsers,
 } from '#engine/server/ephemeral.ts';
 import {
   captureTyping,
@@ -291,8 +290,8 @@ async function relevantChanged(
   if (
     (await receiptRoomsSince(app.server, i.userId, i.since.rSeq)).size > 0
   ) return true;
-  for (const u of await sharedUsers(app.server, i.userId)) {
-    if ((await getPresence(app.server, u)).seq > i.since.pSeq) return true;
+  for (const row of (await presenceFor(app.server, i.userId)).values()) {
+    if (row.seq > i.since.pSeq) return true;
   }
   return false;
 }
@@ -623,9 +622,10 @@ async function assembleSync(i: SyncInputs): Promise<Record<string, unknown>> {
     for (const u of result.joiners) allJoiners.add(u);
   }
   const presenceEvents = new Map<string, Record<string, unknown>>();
-  const shared = await sharedUsers(app.server, i.userId);
-  const includePresence = async (u: string) => {
-    const row = await getPresence(app.server, u);
+  const visiblePresence = await presenceFor(app.server, i.userId);
+  const includePresence = (u: string) => {
+    const row = visiblePresence.get(u);
+    if (row === undefined) return;
     const content: Record<string, unknown> = { presence: row.presence };
     if (row.statusMsg !== null) content.status_msg = row.statusMsg;
     if (row.presence !== 'offline' && row.lastActiveMs > 0) {
@@ -633,16 +633,16 @@ async function assembleSync(i: SyncInputs): Promise<Record<string, unknown>> {
     }
     presenceEvents.set(u, { type: 'm.presence', sender: u, content });
   };
-  for (const u of shared) {
+  for (const [u, row] of visiblePresence) {
     if (
       i.since === null ||
-      (await getPresence(app.server, u)).seq > i.since.pSeq ||
+      row.seq > i.since.pSeq ||
       allJoiners.has(i.userId)
-    ) await includePresence(u);
+    ) includePresence(u);
   }
   if (i.since !== null) {
     for (const u of allJoiners) {
-      await includePresence(u);
+      includePresence(u);
     }
   }
   const deviceLists = recoveryReset

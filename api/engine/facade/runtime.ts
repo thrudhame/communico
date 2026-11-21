@@ -4,6 +4,7 @@ import { config, serverName } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { drainResources } from '#engine/lifetime.ts';
 import { ContactObservations } from '#engine/federation/pending-contacts.ts';
+import { inboxFailure } from '#engine/request-diagnostics.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
@@ -451,10 +452,19 @@ export async function openFacadeRuntime(
           ).apply(journal, stream)
           : await apply(journal, stream),
       changed: () => notices.changed(),
-      failed: (error) =>
-        console.error(
-          'facade inbox:',
-          error instanceof LinkError ? error.code : 'LINK_UNAVAILABLE',
+      failed: (error, stream, after) =>
+        inboxFailure(
+          {
+            server: identity.server,
+            node: identity.node,
+            peer: 'home',
+            initialized: !!node,
+            tenantAvailable: !!tenant,
+            phase: settings.phase,
+          },
+          error,
+          stream,
+          after,
         ),
     });
   }
@@ -684,6 +694,20 @@ export async function openFacadeRuntime(
         'SELECT 1 FROM account_auth_snapshots a JOIN credentials c ON c.localpart=a.localpart JOIN users u ON u.localpart=a.localpart WHERE a.credentials=1 AND u.deactivated=0 LIMIT 1',
       );
       return rows.length !== 0;
+    },
+    async requireReadScope(scope: string, allowAbsent?: boolean) {
+      return await new DirectoryReplicas(
+        server,
+        await pairings(),
+        identity.server,
+      ).requireReadScope(scope, allowAbsent);
+    },
+    async prepareReadRoomScope(roomId: string, allowAbsent?: boolean) {
+      return await new DirectoryReplicas(
+        server,
+        await pairings(),
+        identity.server,
+      ).prepareReadRoomScope(roomId, allowAbsent);
     },
     async requireScope(scope: string, allowAbsent?: boolean) {
       return await new DirectoryReplicas(

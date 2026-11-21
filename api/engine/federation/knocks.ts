@@ -213,7 +213,7 @@ export async function knockRemote(
             }
             return await eventStreamTx(deps.server, async (tx) => {
               await admission?.check(tx);
-              return await withMembershipFence(admission, async () => {
+              return await withMembershipFence(admission, tx, async () => {
                 const rows = await tx.query(
                   'SELECT revision FROM prejoin_memberships WHERE room_id=? AND user_id=?',
                   [roomId, userId],

@@ -15,6 +15,7 @@ import { Pairings } from '#engine/facade/pairing.ts';
 import {
   LINK_CAPABILITIES,
   LINK_SUPPORTED,
+  LinkError,
   type LinkRecord,
   recordHash,
 } from '#engine/facade/protocol.ts';
@@ -968,6 +969,77 @@ Deno.test('to-device ingress: missing tenant control cannot fall back to standal
     await f.close();
   }
 });
+
+for (
+  const cut of ['home-export', 'account-selection', 'tenant-authority'] as const
+) {
+  Deno.test(`to-device readiness: ${cut} waits without inbox or cursor effects`, async () => {
+    const f = await fixture();
+    try {
+      const home = cut === 'home-export';
+      const store = home ? f.home : f.edge;
+      const db = await store.tenant('logical.test');
+      const server = await store.server();
+      const table = home
+        ? 'facade_exports'
+        : cut === 'account-selection'
+        ? 'account_auth_snapshots'
+        : 'tenant_authority';
+      const owner = home ? server : db;
+      const predicate = home
+        ? "scope='auth:@alice:logical.test'"
+        : cut === 'account-selection'
+        ? "localpart='alice'"
+        : 'singleton=1';
+      const [held] = await owner.query(
+        'SELECT * FROM ' + table + ' WHERE ' + predicate,
+      );
+      await owner.execute('DELETE FROM ' + table + ' WHERE ' + predicate);
+      const before = await server.query(
+        'SELECT * FROM facade_streams ORDER BY stream',
+      );
+      const content = {
+        sender: '@remote:remote.test',
+        type: 'm.room_key',
+        message_id: 'held-' + cut,
+        messages: {
+          '@alice:logical.test': { [home ? 'LAN' : 'PHONE']: { key: cut } },
+        },
+      };
+      const attempt = () =>
+        home
+          ? f.hs.ingress('remote.test', content, undefined, f.bundle.id)
+          : f.es.ingress('remote.test', content);
+      const pending = await assertRejects(attempt, LinkError);
+      assertEquals(pending.code, 'LINK_UNAVAILABLE');
+      assertEquals(pending.status, 503);
+      assertEquals(
+        await server.query('SELECT * FROM facade_streams ORDER BY stream'),
+        before,
+      );
+      for (
+        const table of [
+          'to_device_inbox',
+          'to_device_routes',
+          'to_device_admissions',
+          'inbound_to_device',
+        ]
+      ) {
+        assertEquals(await db.query('SELECT * FROM ' + table), []);
+      }
+      const columns = Object.keys(held);
+      await owner.execute(
+        'INSERT INTO ' + table + '(' + columns.join(',') + ') VALUES(' +
+          columns.map(() => '?').join(',') + ')',
+        Object.values(held),
+      );
+      await attempt();
+      assertEquals((await db.query('SELECT * FROM to_device_inbox')).length, 1);
+    } finally {
+      await f.close();
+    }
+  });
+}
 
 Deno.test('to-device ingress: a completed legacy home receipt discharges imported frozen work without re-expansion', async () => {
   const f = await fixture();

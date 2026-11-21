@@ -17,7 +17,7 @@ import {
   roomUpgrade,
   withRoomUpgrade,
 } from '#engine/server/room-upgrades.ts';
-import { requireRoom, stateAtSeq } from './room.ts';
+import { requireRoomForAdmission, stateAtSeq } from './room.ts';
 import { powerFor } from './directory.ts';
 import { writeStateKey } from './write.ts';
 import { reconcileRoomRules } from './rule-migration.ts';
@@ -45,7 +45,7 @@ export async function upgradeRoom(
   const additionalCreators = creationCreators(spec, requestedCreators);
   const app = theApp();
   return await withRoomUpgrade(app.server, oldRoomId, userId, async () => {
-    const room = await requireRoom(oldRoomId);
+    const room = await requireRoomForAdmission(oldRoomId);
     let retained = await roomUpgrade(app.server, oldRoomId);
     if (retained && retained.user !== userId) {
       throw new MatrixError(
@@ -63,7 +63,7 @@ export async function upgradeRoom(
     if (power.level < power.need) {
       throw new MatrixError(403, 'M_FORBIDDEN', 'You cannot upgrade this room');
     }
-    const state = await stateAtSeq(oldRoomId, null),
+    const state = await stateAtSeq(oldRoomId, null, undefined, 'admission'),
       oldCreate = state.find((r) =>
         r.type === 'm.room.create' && r.stateKey === ''
       )
@@ -167,8 +167,9 @@ export async function upgradeRoom(
       type: string,
       content: Record<string, unknown>,
     ) => {
-      const current = (await stateAtSeq(roomId, null, [[type, '']]))[0]
-        ?.content;
+      const current =
+        (await stateAtSeq(roomId, null, [[type, '']], 'admission'))[0]
+          ?.content;
       if (
         current === undefined ||
         canonicalJson(current) !== canonicalJson(content)
@@ -189,7 +190,7 @@ export async function upgradeRoom(
         // A prior shared-handler upgrade already published its tombstone. Never
         // create another replacement just because it predates the local journal.
         try {
-          await requireRoom(retained.replacement);
+          await requireRoomForAdmission(retained.replacement);
         } catch (error) {
           if (error instanceof MatrixError && error.status === 404) {
             throw new MatrixError(
@@ -221,9 +222,13 @@ export async function upgradeRoom(
       await advanceRoomUpgrade(app.server, retained, 2);
     }
     if (retained.phase === 2) {
-      const existing =
-        (await stateAtSeq(oldRoomId, null, [['m.room.tombstone', '']]))[0]
-          ?.content.replacement_room;
+      const existing = (await stateAtSeq(
+        oldRoomId,
+        null,
+        [['m.room.tombstone', '']],
+        'admission',
+      ))[0]
+        ?.content.replacement_room;
       if (typeof existing === 'string') {
         if (existing !== retained.replacement) {
           throw new MatrixError(

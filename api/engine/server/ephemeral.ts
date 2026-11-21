@@ -162,7 +162,7 @@ export async function ensurePresenceRow(
   });
 }
 export async function getPresence(
-  server: Db,
+  server: Pick<Db, 'query'>,
   userId: string,
 ): Promise<PresenceRow> {
   const rows = await server.query('SELECT * FROM presence WHERE user_id=?', [
@@ -179,7 +179,7 @@ export async function getPresence(
     };
 }
 export async function sharedUsers(
-  server: Db,
+  server: Pick<Db, 'query'>,
   userId: string,
 ): Promise<string[]> {
   const rows = await server.query(
@@ -188,6 +188,26 @@ export async function sharedUsers(
     [userId],
   );
   return rows.map((r) => String(r.user));
+}
+
+/** Presence disclosure is self or a current shared join, never an invitation
+ * or historical participation. Capture eligibility and values together so a
+ * departure cannot leave a stale audience paired with a later private status. */
+export async function presenceFor(
+  server: Db,
+  observer: string,
+  subjects?: readonly string[],
+  authorize?: (tx: Conn) => Promise<void>,
+): Promise<Map<string, PresenceRow>> {
+  return await server.tx(async (tx) => {
+    await authorize?.(tx);
+    const visible = new Set([observer, ...await sharedUsers(tx, observer)]);
+    const rows = new Map<string, PresenceRow>();
+    for (const user of subjects ?? visible) {
+      if (visible.has(user)) rows.set(user, await getPresence(tx, user));
+    }
+    return rows;
+  });
 }
 export async function setReceipt(
   server: Db,

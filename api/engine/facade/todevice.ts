@@ -33,8 +33,10 @@ import { checkLocalpart } from '#engine/tenant/users.ts';
 import { syncStreamHeads } from '#engine/tenant/streams.ts';
 import {
   type DomainBinding,
+  requireAccountExport,
   requireAccountSelection,
   requireDomainControl,
+  requireSelectionReady,
 } from './domain-control.ts';
 import type { NodeIdentity } from './identity.ts';
 import { appendRecord, type Journal } from './journal.ts';
@@ -160,13 +162,13 @@ export class ToDeviceOperations {
     if (row?.state !== 'paired' || row.grant_json !== canonicalJson(grant)) {
       mismatch('to-device exchange grant changed');
     }
-    if (
-      !this.node && !(await conn.query(
-        'SELECT 1 FROM facade_exports WHERE peer=? AND incarnation=? AND scope=?',
-        [context.node, context.id, 'auth:@' + localpart + ':' + context.server],
-      )).length
-    ) {
-      mismatch('to-device account not selected');
+    if (!this.node) {
+      await requireAccountExport(conn, {
+        peer: context.node,
+        pairing: context.id,
+        server: context.server,
+        localpart,
+      });
     }
   }
 
@@ -229,10 +231,10 @@ export class ToDeviceOperations {
     });
     const application = await (await this.store.tenant(context.server)).tx(
       async (conn) => {
-        unchanged();
+        conn.admit(unchanged);
         for (const view of bindings) await this.tenantSelected(conn, view);
         const identity = await tenantAuthority(conn);
-        if (!identity) mismatch('ingress source unavailable');
+        requireSelectionReady(!!identity, 'ingress awaits tenant authority');
         const before = await syncStreamHeads(conn);
         const [beforeOperation] = await conn.query(
           'SELECT operation_id FROM to_device_operations ORDER BY rowid DESC LIMIT 1',
@@ -272,8 +274,8 @@ export class ToDeviceOperations {
           conn,
           'local',
           captureIdentity(
-            identity.node,
-            identity.incarnation,
+            identity!.node,
+            identity!.incarnation,
             'to-device-ingress:' + canonicalJson([origin, input.id]),
             0,
             toDeviceMessageHash(
@@ -310,7 +312,6 @@ export class ToDeviceOperations {
         );
         const changed = (await syncStreamHeads(conn)).inbox !== before.inbox ||
           beforeOperation?.operation_id !== afterOperation?.operation_id;
-        unchanged();
         return { ...applied, changed };
       },
     );
@@ -368,7 +369,7 @@ export class ToDeviceOperations {
     const after = exported ? Number(exported.source_cut) : 0;
     const application = await (await this.store.tenant(binding.server)).tx(
       async (conn) => {
-        unchanged();
+        conn.admit(unchanged);
         await this.tenantSelected(conn, binding);
         const before = await syncStreamHeads(conn);
         const applied = await applyLinkApplication(
@@ -398,7 +399,6 @@ export class ToDeviceOperations {
         );
         const inboxChanged =
           (await syncStreamHeads(conn)).inbox !== before.inbox;
-        unchanged();
         return { ...applied, inboxChanged };
       },
     );
@@ -530,7 +530,7 @@ export class ToDeviceOperations {
     });
     const application = await tenant.tx(
       async (conn) => {
-        unchanged();
+        conn.admit(unchanged);
         await this.tenantSelected(conn, view);
         const applied = await applyLinkApplication(
           conn,
@@ -550,9 +550,7 @@ export class ToDeviceOperations {
             return { result: { ...result, inboxChanged } };
           },
         );
-        // Revocation before this admission cut rolls back fact, inbox and receipt.
-        // A successful commit is immutable admitted work even across retirement.
-        unchanged();
+        // The connection retains authority through native COMMIT.
         return applied;
       },
     );

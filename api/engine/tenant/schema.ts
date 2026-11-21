@@ -17,6 +17,7 @@ import {
 import { SESSION_AUTHORITY_SQL } from '#engine/tenant/session-authority.ts';
 import {
   TO_DEVICE_ADMISSION_POLICY_SQL,
+  TO_DEVICE_ROUTE_LOOKUPS_SQL,
   TO_DEVICE_ROUTING_SQL,
 } from '#engine/tenant/todevice-routing.ts';
 import { UIA_BINDING_SQL } from '#engine/tenant/uia.ts';
@@ -298,7 +299,7 @@ INSERT INTO deactivation_work SELECT localpart,EXISTS(SELECT 1 FROM erased_users
 `;
 
 export const tenantSchema: SchemaProvider = {
-  version: 41,
+  version: 42,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
     await db.exec(E2EE_SQL);
@@ -338,9 +339,11 @@ export const tenantSchema: SchemaProvider = {
     await db.exec(DEVICE_CHECKPOINT_SQL);
     await db.exec(TO_DEVICE_ROUTING_SQL);
     await db.exec(TO_DEVICE_ADMISSION_POLICY_SQL);
+    await db.exec(TO_DEVICE_ROUTE_LOOKUPS_SQL);
   },
   migrations: {
-    40: (conn) => conn.exec(LINK_APPLICATION_PROJECTION_SQL),
+    41: (conn) => conn.exec(LINK_APPLICATION_PROJECTION_SQL),
+    40: (conn) => conn.exec(TO_DEVICE_ROUTE_LOOKUPS_SQL),
     39: (conn) => conn.exec(TO_DEVICE_ADMISSION_POLICY_SQL),
     38: (conn) => conn.exec(TO_DEVICE_ROUTING_SQL),
     37: (conn) => conn.exec(DEVICE_CHECKPOINT_SQL),

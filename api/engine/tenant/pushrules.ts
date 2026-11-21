@@ -587,7 +587,7 @@ export async function pushStreamSeq(
   localpart: string,
 ): Promise<number> {
   return await tenant.tx(async (tx) => {
-    await tx.ingress.check({ kind: 'domain', localpart });
+    await tx.ingress.check({ kind: 'domain-read', localpart });
     return await tx.pushRules.streamSeq(localpart);
   });
 }
@@ -599,7 +599,7 @@ export async function rulesetFor(
   localpart: string,
 ): Promise<Record<PushKind, PushRule[]>> {
   return await tenant.tx(async (tx) => {
-    await tx.ingress.check({ kind: 'domain', localpart });
+    await tx.ingress.check({ kind: 'domain-read', localpart });
     return await rulesetAt(tx, localpart, tenant.serverName);
   });
 }

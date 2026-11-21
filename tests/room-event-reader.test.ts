@@ -1,4 +1,5 @@
-import { assertEquals, assertRejects } from '@std/assert';
+import { assert, assertEquals, assertRejects } from '@std/assert';
+import { canonicalJson } from '#engine/canonical.ts';
 import {
   initializeRoom,
   openRoom,
@@ -151,7 +152,7 @@ Deno.test('event receipt: concurrent verification cannot downgrade an already ve
   assertEquals(wasHashRedacted(admitted.pdu), true);
 });
 
-Deno.test('event reader: verified signature writes update the attempt view without rehydration and roll back with their intent', async () => {
+Deno.test('event reader: internal signature evidence preserves the wire view and rolls back with its intent', async () => {
   await withRoom(async (room) => {
     const author = await makeRemoteServer('author.test');
     const witness = await makeRemoteServer('witness.test');
@@ -170,12 +171,11 @@ Deno.test('event reader: verified signature writes update the attempt view witho
       signatures: { ...base.signatures, ...extra.signatures },
     };
     // Older ordinary admission validates required signatures only. A valid
-    // later witness must repair this optional entry in the effective overlay.
+    // later witness is retained in the internal map, never spliced into wire.
     base.signatures[witness.name] = { [witness.keyId]: 'invalid old optional' };
     base.signatures['unverified.test'] = {
       'ed25519:old': 'unverified optional',
     };
-    const effective = { ...base.signatures, ...combined.signatures };
     const { evidence } = await prepareEventSignatures(
       combined,
       '11',
@@ -187,11 +187,11 @@ Deno.test('event reader: verified signature writes update the attempt view witho
       () =>
         room.tx(async (tx) => {
           await tx.events.get(id);
-          assertEquals(await tx.events.mergeSignatures(evidence), true);
-          throw new Error('rollback signature union');
+          assertEquals(await tx.events.mergeSignatures(evidence), false);
+          throw new Error('rollback signature evidence');
         }),
       Error,
-      'rollback signature union',
+      'rollback signature evidence',
     );
     assertEquals(await room.tx((tx) => tx.changes.head()), 0);
     assertEquals(
@@ -208,25 +208,23 @@ Deno.test('event reader: verified signature writes update the attempt view witho
       await room.tx(async (tx) => {
         await tx.events.list([id]);
         assertEquals(reads, 1);
-        assertEquals(await tx.events.mergeSignatures(evidence), true);
+        assertEquals(await tx.events.mergeSignatures(evidence), false);
         assertEquals(
           JSON.parse((await tx.events.get(id))!.pdu).signatures,
-          effective,
+          base.signatures,
         );
         assertEquals(
           JSON.parse((await tx.events.list([id])).get(id)!.pdu).signatures,
-          effective,
+          base.signatures,
         );
         assertEquals(await tx.events.mergeSignatures(evidence), false);
         assertEquals(reads, 1);
-        assertEquals((await tx.changes.after(0, 10)).map((row) => row.kind), [
-          'signature',
-        ]);
+        assertEquals(await tx.changes.after(0, 10), []);
       });
       await room.tx(async (tx) => {
         assertEquals(
           JSON.parse((await tx.events.list([id])).get(id)!.pdu).signatures,
-          effective,
+          base.signatures,
         );
         assertEquals(reads, 2);
       });
@@ -299,16 +297,20 @@ Deno.test('event reader: verified signature candidates converge across arrival o
       await room.tx(async (tx) => {
         await tx.events.insert(id, JSON.stringify(base));
         for (const proof of proofs) await tx.events.mergeSignatures(proof);
-        const actual =
-          JSON.parse((await tx.events.get(id))!.pdu).signatures['witness.test'];
-        if (expected === undefined) expected = actual;
-        else assertEquals(actual, expected);
+        assertEquals(JSON.parse((await tx.events.get(id))!.pdu), base);
         const head = await tx.changes.head();
         for (const proof of proofs) {
           assertEquals(await tx.events.mergeSignatures(proof), false);
         }
         assertEquals(await tx.changes.head(), head);
       });
+      const [held] = await (await room.store.room(room.id)).query(
+        'SELECT signatures FROM event_signatures WHERE event=?',
+        [id],
+      );
+      const actual = JSON.parse(String(held.signatures))['witness.test'];
+      if (expected === undefined) expected = actual;
+      else assertEquals(actual, expected);
       const padded = await prepareEventSignatures(
         {
           ...base,
@@ -325,6 +327,86 @@ Deno.test('event reader: verified signature candidates converge across arrival o
       });
     });
   }
+});
+
+Deno.test('signature evidence: wire is one accepted original, never an oversized signature union', async () => {
+  await withRoom(async (room) => {
+    const author = await makeRemoteServer('author.test');
+    const witness = await makeRemoteServer('witness.test');
+    const partial = {
+      type: 'm.room.message',
+      sender: '@author:author.test',
+      content: { body: 'same immutable event' },
+      prev_events: [],
+      depth: 1,
+      origin_server_ts: 1,
+    };
+    const base = await remoteEvent(room.id, author, '11', partial);
+    const signed = await remoteEvent(room.id, witness, '11', partial);
+    const signature = signed.signatures[witness.name][witness.keyId];
+    const aliases = Array.from({ length: 720 }, (_, n) => ({
+      ...witness,
+      keyId: 'ed25519:size_proof_' + n,
+    }));
+    const keys = fakeKeyResolver(author, ...aliases);
+    const size = (value: unknown) =>
+      new TextEncoder().encode(canonicalJson(value)).length;
+    const inputs = [aliases.slice(0, 360), aliases.slice(360)].map((half) => ({
+      ...base,
+      signatures: {
+        ...base.signatures,
+        [witness.name]: Object.fromEntries(
+          half.map((key) => [key.keyId, signature]),
+        ),
+      },
+    }));
+    for (const input of inputs) assert(size(input) < 65536);
+    const id = String(base.event_id);
+    await room.tx((tx) => tx.events.insert(id, inputs[0]));
+    for (const input of inputs) {
+      const prepared = await prepareEventSignatures(input, '11', keys);
+      assertEquals(
+        Object.keys(prepared.evidence.signatures[witness.name]).length,
+        360,
+      );
+      await room.tx((tx) => tx.events.mergeSignatures(prepared.evidence));
+    }
+    const wire = JSON.parse((await room.tx((tx) => tx.events.get(id)))!.pdu);
+    console.log(
+      JSON.stringify({ inputBytes: inputs.map(size), wireBytes: size(wire) }),
+    );
+    assert(
+      size(wire) <= 65536,
+      'signature union exceeds the normal wire bound',
+    );
+    assertEquals(wire, inputs[0]);
+    assertEquals((await verify(wire, '11', keys)).eventId, id);
+    const [held] = await (await room.store.room(room.id)).query(
+      'SELECT signatures FROM event_signatures WHERE event=?',
+      [id],
+    );
+    assertEquals(
+      Object.keys(JSON.parse(String(held.signatures))[witness.name]).length,
+      720,
+    );
+    const home = await prepareEventSignatures(inputs[1], '11', keys);
+    await room.tx(async (tx) => {
+      assertEquals(await tx.events.mergeSignatures(home.evidence, true), true);
+      assertEquals(JSON.parse((await tx.events.get(id))!.pdu), inputs[1]);
+      assertEquals(
+        JSON.parse((await tx.events.list([id])).get(id)!.pdu),
+        inputs[1],
+      );
+      assertEquals(JSON.parse((await tx.events.stored(id))!), inputs[0]);
+    });
+    const original = await prepareEventSignatures(inputs[0], '11', keys);
+    await room.tx((tx) => tx.events.mergeSignatures(original.evidence));
+    const selected = JSON.parse(
+      (await room.tx((tx) => tx.events.get(id)))!.pdu,
+    );
+    assertEquals(selected, inputs[1]);
+    assertEquals((await verify(selected, '11', keys)).eventId, id);
+  });
 });
 
 Deno.test('signature evidence: optional wire failures are omitted but local faults and cancellation propagate', async (t) => {

@@ -52,6 +52,7 @@ import {
 } from '#engine/tenant/key-bootstrap.ts';
 import {
   type DomainBinding,
+  requireAccountExport,
   requireAccountSelection,
   requireDomainControl,
 } from './domain-control.ts';
@@ -257,12 +258,14 @@ export class DeviceOperations {
     if (row?.state !== 'paired' || row.grant_json !== canonicalJson(grant)) {
       mismatch('device exchange grant changed');
     }
-    if (
-      !this.node && !(await conn.query(
-        'SELECT 1 FROM facade_exports WHERE peer=? AND incarnation=? AND scope=?',
-        [context.node, context.id, 'auth:@' + localpart + ':' + context.server],
-      )).length
-    ) mismatch('device account not selected');
+    if (!this.node) {
+      await requireAccountExport(conn, {
+        peer: context.node,
+        pairing: context.id,
+        server: context.server,
+        localpart,
+      });
+    }
   }
 
   private async tenantSelected(conn: Conn, view: DomainBinding) {
@@ -571,7 +574,7 @@ export class DeviceOperations {
     await server.tx(check);
     const application = await tenant.tx(
       async (conn) => {
-        unchanged();
+        conn.admit(unchanged);
         await this.tenantSelected(conn, view);
         const applied = await applyLinkApplication(
           conn,
@@ -637,10 +640,7 @@ export class DeviceOperations {
             return { result: { ...result, publicKeysChanged } };
           },
         );
-        // This synchronous fence is the admission cut. A retirement begun before
-        // it rolls back fact + receipt. Once it passes, a successful owner commit
-        // is admitted immutable work, even if revocation overlaps native COMMIT.
-        unchanged();
+        // The connection retains authority through native COMMIT.
         return applied;
       },
     );

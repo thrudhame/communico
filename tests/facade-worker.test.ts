@@ -6,7 +6,6 @@ import {
   LINK_VERSION,
   LinkError,
   type Stream,
-  streamOf,
 } from '#engine/facade/protocol.ts';
 import type { LinkClient } from '#engine/facade/transport.ts';
 import { startInboxWorker } from '#engine/facade/worker.ts';
@@ -83,6 +82,8 @@ Deno.test('inbox reports the original pre-apply rejection without blocking anoth
     source: 'home',
     incarnation: 'pair',
     stream,
+    received: { sequence: 1, hash: 'a'.repeat(64) },
+    applied: EMPTY_CUT,
   }));
   const heads = (stream: Stream) => ({
     ...stream,
@@ -96,7 +97,7 @@ Deno.test('inbox reports the original pre-apply rejection without blocking anoth
     heads: (_peer, _direction, stream) => Promise.resolve(heads(stream)),
   } satisfies Pick<Journal, 'streams' | 'heads'>;
   const worker = startInboxWorker({
-    journal: journal as unknown as Journal,
+    journal,
     peer: 'home',
     pollseconds: 3600,
     apply: (stream) => {
@@ -106,7 +107,7 @@ Deno.test('inbox reports the original pre-apply rejection without blocking anoth
       return Promise.resolve(true);
     },
     failed: (error, stream, after) => {
-      assertEquals(stream && streamOf(stream), streams[0]);
+      assertEquals(stream, streams[0]);
       assertEquals(after, 0);
       failed.resolve(error);
     },

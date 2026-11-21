@@ -146,6 +146,8 @@ async function fixture() {
       );
       return await todevice.export('alice', bundle.id);
     },
+    homeAuthority: new AccountSnapshots(home, ht, hp),
+    homeJournal: new Journal(await home.server(), LINK_SUPPORTED),
     async reopen() {
       await edge.close();
       edge = await open('edge');
@@ -164,6 +166,101 @@ async function unavailable(fn: () => Promise<unknown>) {
   const error = await assertRejects(fn, LinkError);
   assertEquals(error.code, 'LINK_UNAVAILABLE');
   assertEquals(error.status, 503);
+}
+
+for (const kind of ['domain', 'bootstrap', 'devices', 'authority'] as const) {
+  Deno.test(`account selection: held home export blocks ${kind} until selected`, async () => {
+    const f = await fixture();
+    try {
+      await f.consumer.auth.apply(f.consumer.journal, f.auth);
+      const authority = kind === 'authority'
+        ? await f.consumer.authority()
+        : null;
+      if (authority) await f.homeJournal.receive('edge_a', [authority]);
+      const server = await f.home.server();
+      const scope = 'auth:@alice:logical.test';
+      const [selection] = await server.query(
+        'SELECT * FROM facade_exports WHERE incarnation=? AND scope=?',
+        [f.bundle.id, scope],
+      );
+      await server.execute(
+        'DELETE FROM facade_exports WHERE incarnation=? AND scope=?',
+        [f.bundle.id, scope],
+      );
+      const before = await server.query(
+        'SELECT * FROM facade_streams ORDER BY stream',
+      );
+      const attempt = () =>
+        authority
+          ? f.homeAuthority.applyFromFacade(
+            f.homeJournal,
+            f.bundle.id,
+            authority,
+          )
+          : f[kind as 'domain' | 'bootstrap' | 'devices']();
+      await unavailable(attempt);
+      await unavailable(attempt);
+      await server.execute(
+        "UPDATE facade_pairings SET state='revoked' WHERE id=? AND side='home'",
+        [f.bundle.id],
+      );
+      const wrongGrant = await assertRejects(attempt, LinkError);
+      assertEquals(wrongGrant.status, 403);
+      await server.execute(
+        "UPDATE facade_pairings SET state='paired' WHERE id=? AND side='home'",
+        [f.bundle.id],
+      );
+      assertEquals(
+        await server.query('SELECT * FROM facade_streams ORDER BY stream'),
+        before,
+      );
+      await server.execute(
+        'INSERT INTO facade_exports(peer,incarnation,scope,source_cut) VALUES(?,?,?,?)',
+        [
+          selection.peer,
+          selection.incarnation,
+          selection.scope,
+          selection.source_cut,
+        ],
+      );
+      const result = await attempt();
+      if (authority) {
+        assertEquals(result, true);
+        assertEquals(
+          (await f.homeJournal.heads('edge_a', 'in', authority)).applied
+            .sequence,
+          authority.sequence,
+        );
+      } else {
+        assertEquals(Array.isArray(result), true);
+        assertEquals((result as LinkRecord[]).length > 0, true);
+        const owner = kind === 'devices'
+          ? f.consumer.devices
+          : f.consumer.domain;
+        for (const record of result as LinkRecord[]) {
+          await f.consumer.journal.receive('home', [record]);
+          await owner.apply(f.consumer.journal, record);
+        }
+        if (kind === 'devices') {
+          assertEquals(
+            await (await f.edge.tenant('logical.test')).tx(async (conn) =>
+              (await publicDeviceValues(conn, 'alice')).map((device) =>
+                device.deviceId
+              )
+            ),
+            ['LAN'],
+          );
+        } else {
+          assertEquals(
+            await getAccountData(f.consumer.et, 'alice', '', 'm.direct'),
+            { held: 'selection' },
+          );
+        }
+      }
+    } finally {
+      await f.close();
+    }
+  });
 }
 
 Deno.test('account selection: tenant domain transaction shares the readiness fence', async () => {

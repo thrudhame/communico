@@ -99,6 +99,11 @@ export type App = {
 /** Granted read dependencies are supplied by the node composition root. The
  * endpoint tree never reconstructs a home identity or reaches into a link owner. */
 export type ReplicaAccess = {
+  requireReadScope(scope: string, allowAbsent?: boolean): Promise<void>;
+  prepareReadRoomScope(
+    roomId: string,
+    allowAbsent?: boolean,
+  ): Promise<ReplicaRoomAdmission>;
   requireScope(scope: string, allowAbsent?: boolean): Promise<void>;
   prepareRoomScope(
     roomId: string,
