@@ -63,6 +63,7 @@ import {
   clearJoinAttempt,
   type JoinAttempt,
   joinAttemptCommitted,
+  refuseJoinAttempt,
   releaseJoinAttempt,
 } from '#engine/server/join-attempts.ts';
 
@@ -426,7 +427,11 @@ async function joinVia(
     return { roomId: args.roomId, eventId };
   } finally {
     try {
-      if (refused || await joinAttemptCommitted(store, attempt)) {
+      if (refused) {
+        const server = await store.server();
+        await refuseJoinAttempt(server, attempt);
+        await clearJoinAttempt(server, attempt);
+      } else if (await joinAttemptCommitted(store, attempt)) {
         await clearJoinAttempt(await store.server(), attempt);
       } else if (deps.leave !== undefined) {
         await deps.leave(attempt);

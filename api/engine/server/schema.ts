@@ -450,8 +450,11 @@ CREATE INDEX notification_own_events_event ON notification_own_events(event);
 CREATE INDEX notification_horizons_room ON notification_horizons(room);
 `;
 
+const JOIN_REFUSAL_SQL =
+  'ALTER TABLE federation_join_attempts ADD COLUMN remote_refused INTEGER NOT NULL DEFAULT 0 CHECK(remote_refused IN (0,1))';
+
 export const serverSchema: SchemaProvider = {
-  version: 52,
+  version: 53,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -510,6 +513,7 @@ export const serverSchema: SchemaProvider = {
       'ALTER TABLE prejoin_memberships ADD COLUMN source_binding TEXT',
     );
     await db.exec(PREJOIN_JOBS_SQL);
+    await db.exec(JOIN_REFUSAL_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -593,5 +597,6 @@ INSERT INTO device_publication_predecessors SELECT DISTINCT p.subject,p.destinat
       await conn.exec(PREJOIN_JOBS_SQL);
       await migratePrejoinJobs(conn);
     },
+    52: (conn) => conn.exec(JOIN_REFUSAL_SQL),
   },
 };
