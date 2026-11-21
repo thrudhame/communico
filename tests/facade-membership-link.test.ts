@@ -2266,7 +2266,52 @@ Deno.test('membership terminal authority: missing departure evidence cannot eras
   }
 });
 
-Deno.test('membership terminal authority: joined source evidence completes only behind authentic held DAG authority without an OOB join', async () => {
+Deno.test('membership terminal application: superseded source facts and an unheld join complete the account prefix without display authority', async () => {
+  const f = await fixture();
+  try {
+    const { record, state, keys, operation } = await incoming(f);
+    const db = await f.home.server();
+    const journal = new Journal(db, LINK_SUPPORTED);
+    state.status = 'joined';
+    const next = await exportSuccessor(f, operation, state);
+    await journal.receive(record.source, [record, next.record]);
+    // Retention may run ahead of application. The first record is now dominated
+    // by a verified terminal fact, but neither record has display/DAG authority.
+    await f.hs.retain(record, keys, f.bundle.id);
+    await f.hs.retain(next.record, keys, f.bundle.id);
+    const before = await db.query('SELECT * FROM counters ORDER BY name');
+    for (const item of [record, next.record]) {
+      assertEquals(
+        await lifecycleApplication(f.hs)(journal, item, keys, f.bundle.id),
+        true,
+      );
+      assertEquals(
+        (await journal.heads(item.source, 'in', item)).applied.sequence,
+        item.sequence,
+      );
+    }
+    assertEquals(await f.home.rooms(), []);
+    assertEquals(await db.query('SELECT * FROM memberships'), []);
+    assertEquals(await invitesOf(state.userId, { server: db }), []);
+    assertEquals(await db.query('SELECT * FROM prejoin_jobs'), []);
+    assertEquals(
+      await db.query('SELECT * FROM counters ORDER BY name'),
+      before,
+    );
+    assertEquals(
+      (await db.query('SELECT * FROM membership_operations')).length,
+      2,
+    );
+    assertEquals(
+      await db.query('SELECT applied FROM domain_operations ORDER BY sequence'),
+      [{ applied: 1 }, { applied: 1 }],
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership terminal display: joined source evidence withdraws only the imported invite without an OOB join', async () => {
   for (const held of [false, true]) {
     const f = await fixture();
     try {
@@ -2292,38 +2337,65 @@ Deno.test('membership terminal authority: joined source evidence completes only 
       await lifecycleApplication(f.hs)(journal, record, keys, f.bundle.id);
       const before = await db.query('SELECT * FROM memberships');
       const displayed = await invitesOf(state.userId, { server: db });
-      const counters = await db.query('SELECT * FROM counters ORDER BY name');
+      const counters = await db.query(
+        "SELECT * FROM counters WHERE name='events'",
+      );
+      if (!held) {
+        assertEquals(displayed.length, 1);
+        assertEquals(
+          await db.query('SELECT withdrawn FROM notifications WHERE event=?', [
+            state.eventId,
+          ]),
+          [{ withdrawn: 0 }],
+        );
+      }
       state.status = 'joined';
       const next = await exportSuccessor(f, operation, state);
       await journal.receive(next.record.source, [next.record]);
-      if (held) {
+      assertEquals(
+        await lifecycleApplication(f.hs)(
+          journal,
+          next.record,
+          keys,
+          f.bundle.id,
+        ),
+        true,
+      );
+      assertEquals(await db.query('SELECT * FROM memberships'), before);
+      assertEquals(
+        await invitesOf(state.userId, { server: db }),
+        held ? displayed : [],
+      );
+      assertEquals(await f.home.rooms(), held ? [roomId] : []);
+      if (!held) {
         assertEquals(
-          await lifecycleApplication(f.hs)(
-            journal,
-            next.record,
-            keys,
-            f.bundle.id,
-          ),
-          true,
+          await db.query('SELECT withdrawn FROM notifications WHERE event=?', [
+            state.eventId,
+          ]),
+          [{ withdrawn: 1 }],
         );
-      } else {
-        await assertRejects(
-          () =>
-            lifecycleApplication(f.hs)(journal, next.record, keys, f.bundle.id),
-          Error,
-          'display evidence',
+        assertEquals(
+          await db.query(
+            'SELECT unread,highlight FROM notification_counts WHERE user=? AND room=?',
+            [state.userId, roomId],
+          ),
+          [{ unread: 0, highlight: 0 }],
+        );
+        assertEquals(
+          await db.query('SELECT * FROM prejoin_memberships WHERE room_id=?', [
+            roomId,
+          ]),
+          [],
         );
       }
-      assertEquals(await db.query('SELECT * FROM memberships'), before);
-      assertEquals(await invitesOf(state.userId, { server: db }), displayed);
       assertEquals(
-        await db.query('SELECT * FROM counters ORDER BY name'),
+        await db.query("SELECT * FROM counters WHERE name='events'"),
         counters,
       );
       assertEquals(
         (await journal.heads(next.record.source, 'in', next.record)).applied
           .sequence,
-        held ? next.record.sequence : record.sequence,
+        next.record.sequence,
       );
       assertEquals(await db.query('SELECT * FROM prejoin_jobs'), []);
     } finally {

@@ -20,6 +20,7 @@ import { membershipDisplay } from '#engine/server/membership-display.ts';
 import {
   materializeMembershipDisplay,
   type MembershipEvidence,
+  withdrawCompletedMembershipDisplay,
 } from '#engine/server/membership-application.ts';
 import { prejoinResult, savePrejoinResult } from '#engine/server/prejoin.ts';
 import { withProjectionLock } from '#engine/server/project.ts';
@@ -509,7 +510,7 @@ export class MembershipOperations {
     }
     // A source lifecycle fact may have no OOB display (notably a completed
     // join). Verified execution intent is retained without client news;
-    // completed outcomes need display evidence or locked receiver DAG authority.
+    // source completion and receiver room-DAG authority are separate contracts.
     const prepared = normalized[0] ?? await preparedState(view.operation, keys);
     const state = prepared.state;
     const event = JSON.parse(state.eventJson) as Pdu;
@@ -550,6 +551,10 @@ export class MembershipOperations {
       ['attempting', 'failed-attempt'].includes(state.status)) ||
       (state.localLeaveJson === null &&
         ['rejecting', 'failed-retract'].includes(state.status));
+    const sourceOnly = state.status === 'joined' ||
+      !selection.frontier.some((op) =>
+        op.operationId === view.operation.operationId
+      );
     const result = await withRoomLock(
       state.roomId,
       () =>
@@ -565,7 +570,9 @@ export class MembershipOperations {
             await (await openRoom(this.store, state.roomId)).tx(async (tx) =>
               (await tx.segments.openStay()) !== null
             );
-          if (!held && !selection.display.length && !intentOnly) {
+          if (
+            !held && !selection.display.length && !intentOnly && !sourceOnly
+          ) {
             throw new LinkError(
               'LINK_UNAVAILABLE',
               'membership application awaits display evidence',
@@ -590,10 +597,11 @@ export class MembershipOperations {
             // newer normal publication or replace a held room's DAG authority.
             if (
               !held && publication !== null &&
-              (!published || normalized.every((value) =>
-                value.state.publication?.eventId === published.event &&
-                value.state.publication.follows
-              ))
+              (!published ||
+                normalized.every((value) =>
+                  value.state.publication?.eventId === published.event &&
+                  value.state.publication.follows
+                ))
             ) {
               await materializeMembershipDisplay(
                 conn,
@@ -602,6 +610,12 @@ export class MembershipOperations {
                 evidence,
                 publication,
                 Date.now(),
+              );
+            }
+            if (!held && publication === null) {
+              await withdrawCompletedMembershipDisplay(
+                conn,
+                view.operation.semanticKey,
               );
             }
             await conn.execute(

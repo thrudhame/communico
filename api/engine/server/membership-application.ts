@@ -25,6 +25,41 @@ export type MembershipEvidence = {
   provenance: { event: boolean; localLeave: boolean };
 };
 
+/** A source join retires its imported OOB display, not the receiver's room
+ * membership. Re-read selection and the exact import binding in the commit so
+ * concurrent/local work cannot be erased by an earlier prepared observation. */
+export async function withdrawCompletedMembershipDisplay(
+  conn: Conn,
+  semanticKey: string,
+): Promise<void> {
+  const selection = await membershipDisplay(conn, semanticKey, false);
+  if (selection.display.length) return;
+  const joined = selection.ready.map((operation) =>
+    JSON.parse(operation.payload) as MembershipState
+  ).filter((state) => state.status === 'joined');
+  if (!joined.length) return;
+  const { roomId, userId } = joined[0];
+  const [previous] = await conn.query(
+    'SELECT * FROM prejoin_memberships WHERE room_id=? AND user_id=?',
+    [roomId, userId],
+  );
+  if (!previous || previous.source_binding == null) return;
+  const binding = JSON.parse(String(previous.source_binding));
+  if (
+    canonicalJson(binding.state) !==
+      canonicalJson(membershipStateOf(previous)) ||
+    !joined.some((state) => state.eventId === previous.event_id)
+  ) return;
+  await withdrawInvitePush(conn, userId, roomId, String(previous.event_id));
+  await conn.execute(
+    'DELETE FROM prejoin_memberships WHERE room_id=? AND user_id=?',
+    [roomId, userId],
+  );
+  await conn.execute('DELETE FROM domain_frontiers WHERE semantic_key=?', [
+    semanticKey,
+  ]);
+}
+
 // Signature overlays and stripped hints enrich evidence for an existing event;
 // they do not create another membership transition, position or push decision.
 function publicationMaterial(state: Omit<MembershipState, 'publication'>) {
