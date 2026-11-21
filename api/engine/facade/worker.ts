@@ -8,14 +8,17 @@ import {
   type Cut,
   EMPTY_CUT,
   LinkError,
+  type LiveActivity,
   type Stream,
   streamOf,
 } from './protocol.ts';
 
-type Peer = Pick<
-  JournalClient,
-  'peer' | 'hello' | 'pull' | 'push' | 'ack' | 'notices'
->;
+type Peer =
+  & Pick<
+    JournalClient,
+    'peer' | 'hello' | 'pull' | 'push' | 'ack' | 'notices'
+  >
+  & Partial<Pick<JournalClient, 'activity'>>;
 type Options = {
   journal: Journal;
   client: Peer;
@@ -25,6 +28,7 @@ type Options = {
   apply(stream: Stream): Promise<boolean>;
   failed(error: unknown, stream?: Stream): void;
   acknowledged?(stream: Stream): void;
+  activity?: LiveActivity;
 };
 function key(stream: Stream) {
   return canonicalJson(streamOf(stream));
@@ -309,6 +313,21 @@ export function startHomeLinkWorker(
         await reconciler.reconcile(signal);
       } catch (error) {
         if (!signal.aborted) options.failed(error);
+      }
+      // Activity is a fresh pull once per serialized wake, never a side effect
+      // of the global/per-stream hello reads or a durable journal backlog.
+      if (options.activity && !signal.aborted) {
+        try {
+          if (!options.client.activity) {
+            throw new LinkError(
+              'LINK_CAPABILITY_MISMATCH',
+              'live activity client unavailable',
+            );
+          }
+          await options.client.activity(options.activity, signal);
+        } catch (error) {
+          if (!signal.aborted) options.failed(error);
+        }
       }
     }
   })();

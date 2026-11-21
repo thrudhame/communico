@@ -11,6 +11,8 @@ import {
   LINK_SUPPORTED,
   LINK_VERSION,
   LinkError,
+  LIVE_ACTIVITY_CAPABILITY,
+  type LiveActivity,
   negotiate,
   object,
   recordOf,
@@ -204,7 +206,9 @@ export function linkHandler(options: {
   reconciling?(): (pairing: string, heads: unknown) => void;
   connected?(pairing: string, signal: AbortSignal): void;
   signKeyDocument?(raw: unknown): Promise<string>;
+  activity?: LiveActivity;
 }): (request: Request, peerPin: string) => Promise<Response> {
+  const challenges = new Map<string, { token: string; started: number }>();
   const enroll = enrollmentHandler(options);
   const json = (raw: string | null) => {
     try {
@@ -228,7 +232,7 @@ export function linkHandler(options: {
       !((request.method === 'GET' &&
         ['hello', 'records', 'notices'].includes(route)) ||
         (request.method === 'POST' &&
-          ['records', 'ack', 'key-signature'].includes(route)))
+          ['records', 'ack', 'key-signature', 'activity'].includes(route)))
     ) {
       return new Response(null, { status: 404 });
     }
@@ -262,6 +266,45 @@ export function linkHandler(options: {
         pairing: id,
         ...value,
       });
+    if (route === 'activity') {
+      const required = body.required as { type: string; version: number }[];
+      if (
+        !options.activity ||
+        !required.some((entry) =>
+          entry.type === LIVE_ACTIVITY_CAPABILITY.type &&
+          entry.version === LIVE_ACTIVITY_CAPABILITY.version
+        )
+      ) {
+        throw new LinkError(
+          'LINK_CAPABILITY_MISMATCH',
+          'live activity not negotiated',
+        );
+      }
+      const challenge = text(body.challenge);
+      const answer = body.answer === undefined
+        ? undefined
+        : object(body.answer);
+      const held = challenges.get(id);
+      if (answer && held && answer.challenge === held.token) {
+        // Consume before awaiting an owner. A replay, late answer or restarted
+        // handler cannot grant an imported observation another fresh lifetime.
+        challenges.delete(id);
+        await options.activity.apply(
+          id,
+          answer.snapshot,
+          () => Math.max(0, performance.now() - held.started),
+        );
+      }
+      const snapshot = await options.activity.capture(id);
+      const nextChallenge = crypto.randomUUID();
+      challenges.set(id, { token: nextChallenge, started: performance.now() });
+      return response({
+        required: [...LINK_CAPABILITIES, LIVE_ACTIVITY_CAPABILITY],
+        challenge,
+        snapshot,
+        nextChallenge,
+      });
+    }
     if (route === 'key-signature') {
       if (!options.signKeyDocument) {
         throw new LinkError(

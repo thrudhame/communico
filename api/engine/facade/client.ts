@@ -18,6 +18,8 @@ import {
   LINK_SUPPORTED,
   LINK_VERSION,
   LinkError,
+  LIVE_ACTIVITY_CAPABILITY,
+  type LiveActivity,
   negotiate,
   object,
   recordOf,
@@ -103,6 +105,8 @@ export async function openJournalClient(
 }
 
 export class JournalClient {
+  private activityChallenge?: string;
+  private activityRequest?: string;
   constructor(
     private readonly wire: LinkClient,
     readonly peer: {
@@ -219,6 +223,58 @@ export class JournalClient {
       outgoing: heads(value.outgoing, false),
       exportAcks: heads(value.exportAcks, false),
     };
+  }
+
+  /** One home-initiated pull also answers the facade receiver's previous pull.
+   * Neither challenge nor snapshot is a journal record or durable retry item. */
+  async activity(owner: LiveActivity, signal?: AbortSignal): Promise<void> {
+    const challenge = crypto.randomUUID();
+    const started = performance.now();
+    this.activityRequest = challenge;
+    try {
+      const answer = this.activityChallenge
+        ? {
+          challenge: this.activityChallenge,
+          snapshot: await owner.capture(this.peer.pairing),
+        }
+        : undefined;
+      const value = await this.call('activity', {
+        required: [...LINK_CAPABILITIES, LIVE_ACTIVITY_CAPABILITY],
+        challenge,
+        ...(answer ? { answer } : {}),
+      }, signal);
+      await this.authorized();
+      if (this.activityRequest !== challenge) return;
+      if (
+        !negotiate(value, this.peer.server, LINK_SUPPORTED).required.some((
+          entry,
+        ) =>
+          entry.type === LIVE_ACTIVITY_CAPABILITY.type &&
+          entry.version === LIVE_ACTIVITY_CAPABILITY.version
+        )
+      ) {
+        throw new LinkError(
+          'LINK_CAPABILITY_MISMATCH',
+          'live activity response not negotiated',
+        );
+      }
+      if (value.challenge !== challenge) {
+        throw new LinkError('LINK_DIVERGED', 'wrong live activity challenge');
+      }
+      this.activityChallenge = text(value.nextChallenge);
+      this.activityRequest = undefined;
+      await owner.apply(
+        this.peer.pairing,
+        value.snapshot,
+        () => Math.max(0, performance.now() - started),
+      );
+    } catch (error) {
+      if (this.activityRequest === challenge) {
+        this.activityRequest = undefined;
+        this.activityChallenge = undefined;
+      }
+      throw error;
+    }
   }
 
   async signKeyDocument(
