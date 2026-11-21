@@ -251,10 +251,16 @@ const REMOTE_TYPING_TTL_MS = 30_000;
 export type EduHandler = (
   origin: string,
   content: Record<string, unknown>,
+  receivedMs: number,
 ) => Promise<void>;
 
 export type EduState = {
-  dispatch(origin: string, raw: unknown, required?: boolean): Promise<void>;
+  dispatch(
+    origin: string,
+    raw: unknown,
+    required?: boolean,
+    receivedMs?: number,
+  ): Promise<void>;
   register(type: string, handler: EduHandler, reliable?: boolean): void;
   // Reads share the durable stream owner; typing remains ephemeral.
   typingOf(roomId: string): { userIds: string[] };
@@ -300,7 +306,7 @@ export function eduState(server: Db, self: string, store: Store): EduState {
       if (await roomAllows(store, roomId, origin)) await fn();
     });
 
-  handlers.set('m.typing', async (origin, content) => {
+  handlers.set('m.typing', async (origin, content, receivedMs) => {
     const { roomId, userId, typing } = typingContent(content);
     if (domainOf(userId) !== origin) return; // users belong to origin
     await admitted(roomId, origin, () =>
@@ -310,6 +316,8 @@ export function eduState(server: Db, self: string, store: Store): EduState {
         userId,
         typing,
         REMOTE_TYPING_TTL_MS,
+        undefined,
+        receivedMs,
       ));
   });
 
@@ -353,7 +361,7 @@ export function eduState(server: Db, self: string, store: Store): EduState {
     }
   });
 
-  handlers.set('m.presence', async (origin, content) => {
+  handlers.set('m.presence', async (origin, content, receivedMs) => {
     const push = arrayOf(content.push, (entry) => entry, 'presence');
     for (const entry of push) {
       let p: ReturnType<typeof presenceContent>;
@@ -383,13 +391,19 @@ export function eduState(server: Db, self: string, store: Store): EduState {
           lastActiveAgo: p.lastActiveAgo,
           currentlyActive: p.currentlyActive,
           remote: true,
+          receivedMs,
         },
       );
     }
   });
 
   return {
-    dispatch: async (origin, raw, required = false) => {
+    dispatch: async (
+      origin,
+      raw,
+      required = false,
+      receivedMs = Date.now(),
+    ) => {
       const { type, content } = eduEnvelope(raw);
       const handler = handlers.get(type);
       if (handler === undefined) {
@@ -408,7 +422,7 @@ export function eduState(server: Db, self: string, store: Store): EduState {
         return;
       }
       try {
-        await handler(origin, content);
+        await handler(origin, content, receivedMs);
       } catch (error) {
         if (malformedEntry(error)) return;
         if (error instanceof PermanentEduRefusal) {

@@ -243,6 +243,7 @@ export async function setPresence(
     lastActiveAgo?: number;
     currentlyActive?: boolean;
     remote?: boolean;
+    receivedMs?: number;
     device?: PresenceDevice;
   } = {},
 ): Promise<void> {
@@ -428,6 +429,7 @@ async function writePresence(
     lastActiveAgo?: number;
     currentlyActive?: boolean;
     remote?: boolean;
+    receivedMs?: number;
     device?: PresenceDevice;
   },
   skipUnchanged: boolean,
@@ -435,12 +437,16 @@ async function writePresence(
   if (!['online', 'offline', 'unavailable'].includes(presence)) {
     throw new MatrixError(400, 'M_INVALID_PARAM', 'bad presence: ' + presence);
   }
-  const receivedMs = Date.now();
+  const receivedMs = opts.remote ? opts.receivedMs ?? Date.now() : Date.now();
   const lastActiveMs = receivedMs - (opts.lastActiveAgo ?? 0);
   const row = await eventStreamTx(server, async (tx) => {
     const [current] = await tx.query('SELECT * FROM presence WHERE user_id=?', [
       userId,
     ]);
+    if (
+      opts.remote && current?.remote_received_ms != null &&
+      Number(current.remote_received_ms) > receivedMs
+    ) return null;
     if (
       !opts.remote &&
       !await observeLocalPresence(
@@ -453,7 +459,12 @@ async function writePresence(
       )
     ) return null;
     const projected = opts.remote
-      ? { presence, lastActiveMs }
+      ? {
+        presence: Date.now() - receivedMs >= REMOTE_PRESENCE_FRESHNESS_MS
+          ? 'offline'
+          : presence,
+        lastActiveMs,
+      }
       : await projectedPresence(
         tx,
         userId,

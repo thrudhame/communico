@@ -118,6 +118,7 @@ async function fixture(seedServer = serverSchema) {
   let accepted = 0;
   let phase: 'f1' | 'f2' = 'f1';
   const acceptedPhases: (string | undefined)[] = [];
+  const acceptedReceipts: number[] = [];
   let fail: ((sql: string, args: readonly unknown[]) => boolean) | undefined;
   let blocked = false;
   const absent = new Set<string>();
@@ -170,9 +171,15 @@ async function fixture(seedServer = serverSchema) {
           : absent.has(scope)
           ? Promise.resolve('absent')
           : Promise.resolve('ready'),
-      acceptEdu: (_origin: string, _raw: unknown, admittedPhase?: string) => {
+      acceptEdu: (
+        _origin: string,
+        _raw: unknown,
+        admittedPhase: string,
+        receivedMs: number,
+      ) => {
         accepted++;
         acceptedPhases.push(admittedPhase);
+        acceptedReceipts.push(receivedMs);
         return Promise.resolve({ kind: 'retained' });
       },
       changed() {},
@@ -243,6 +250,7 @@ async function fixture(seedServer = serverSchema) {
     edge: () => edge,
     accepted: () => accepted,
     acceptedPhases: () => acceptedPhases,
+    acceptedReceipts: () => acceptedReceipts,
     phase(value: 'f1' | 'f2') {
       phase = value;
     },
@@ -320,6 +328,7 @@ Deno.test('mailbox old pending evidence retains F1 admission across F2 upgrade',
       200,
     );
     assertEquals(f.acceptedPhases(), ['f1']);
+    assertEquals(f.acceptedReceipts(), [proof.admitted]);
     const [held] = await (await f.edge().server()).query(
       'SELECT * FROM facade_ingress',
     );
@@ -1389,7 +1398,19 @@ Deno.test('home drain reconciles room and reliable EDU commits across child and 
           message_id: 'home-' + cut,
           messages: { ['@target:' + f.self]: { '*': { cut } } },
         },
-      }, { edu_type: 'm.typing', content: {} }];
+      }, {
+        edu_type: 'm.typing',
+        content: {
+          room_id: f.g.roomId,
+          user_id: '@remote:remote.test',
+          typing: true,
+        },
+      }, {
+        edu_type: 'm.presence',
+        content: {
+          push: [{ user_id: '@remote:remote.test', presence: 'online' }],
+        },
+      }];
       const box = await f.mailbox();
       await box.stage(
         'home-' + cut,
@@ -1444,6 +1465,15 @@ Deno.test('home drain reconciles room and reliable EDU commits across child and 
         const tenant = await openTenant(f.home(), f.self);
         const edus = eduState(real, f.self, f.home());
         registerToDevice(edus, tenant);
+        for (const type of ['m.typing', 'm.presence']) {
+          edus.register(
+            type,
+            () =>
+              Promise.reject(
+                new Error('durable drain must never replay activity'),
+              ),
+          );
+        }
         const journal = new Journal(db, LINK_CAPABILITIES);
         const drain = new HomeIngress(db, {
           peer: f.node.node,

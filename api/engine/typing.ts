@@ -17,6 +17,7 @@ type Observation = {
   source: string;
   generation: number;
   expiresAt: number;
+  receivedMs: number;
 };
 // Inactive observations retain only their generation fence for this process
 // epoch. They are not live users and never become a durable activity backlog.
@@ -102,6 +103,7 @@ export async function setTyping(
   isTyping: boolean,
   timeoutMs?: number,
   device?: TypingDevice,
+  receivedMs = Date.now(),
 ): Promise<boolean> {
   integerParameter(timeoutMs, 'timeout', 0);
   integerParameter(device?.generation, 'device generation', 0);
@@ -127,11 +129,15 @@ export async function setTyping(
     const generation = device?.generation ?? 0;
     const held = observations.get(id);
     if (held && held.generation > generation) return true;
+    if (held?.generation === generation && held.receivedMs > receivedMs) {
+      return true;
+    }
     observations.set(id, {
       deviceId,
       source,
       generation,
-      expiresAt: isTyping ? Date.now() + (timeoutMs ?? 30000) : 0,
+      expiresAt: isTyping ? receivedMs + (timeoutMs ?? 30000) : 0,
+      receivedMs,
     });
     sweepRoom(roomId);
     bump(roomId);
@@ -247,6 +253,7 @@ export async function replaceTypingSource(
         deviceId: value.deviceId,
         generation: value.generation,
         expiresAt: now + remaining,
+        receivedMs: now,
       });
       room.set(value.userId, observations);
       typing.set(value.roomId, room);

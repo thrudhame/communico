@@ -8,6 +8,108 @@ import {
 } from '#engine/federation/edus.ts';
 import { openStore } from '#engine/store/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
+import { getPresence } from '#engine/server/ephemeral.ts';
+import { setTyping, typingIn } from '#engine/typing.ts';
+
+Deno.test('F2 fresh federation activity reaches the ordinary membership-checked owners without local devices', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'fresh-federation-' });
+  const store = await openStore({
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  }, { schemas: { server: serverSchema } });
+  const room = '!fresh-federation:remote.test';
+  const user = '@alice:remote.test';
+  try {
+    const server = await store.server();
+    for (const member of [user, '@bob:home.test']) {
+      await server.execute('INSERT INTO memberships VALUES(?,?,?,?,?)', [
+        member,
+        room,
+        'join',
+        '$join',
+        1,
+      ]);
+    }
+    const edus = eduState(server, self, store);
+    const presence = {
+      edu_type: 'm.presence',
+      content: {
+        push: [{
+          user_id: user,
+          presence: 'online',
+          last_active_ago: 90 * 60_000,
+        }],
+      },
+    };
+    await acceptIngressEdu(origin, self, presence, edus, 'f2');
+    assertEquals((await getPresence(server, user)).presence, 'online');
+    await acceptIngressEdu(
+      origin,
+      self,
+      {
+        ...presence,
+        content: {
+          push: [{ user_id: '@forged:elsewhere.test', presence: 'online' }],
+        },
+      },
+      edus,
+      'f2',
+    );
+    assertEquals(
+      (await getPresence(server, '@forged:elsewhere.test')).presence,
+      'offline',
+    );
+    // No shared room means no remote presence, even for an authentic origin.
+    await acceptIngressEdu(
+      origin,
+      self,
+      {
+        ...presence,
+        content: {
+          push: [{ user_id: '@unjoined:remote.test', presence: 'online' }],
+        },
+      },
+      edus,
+      'f2',
+    );
+    assertEquals(
+      (await getPresence(server, '@unjoined:remote.test')).presence,
+      'offline',
+    );
+    const typing = {
+      edu_type: 'm.typing',
+      content: { room_id: room, user_id: user, typing: true },
+    };
+    await acceptIngressEdu(origin, self, typing, edus, 'f2');
+    assertEquals(typingIn(room).userIds, [user]);
+    await acceptIngressEdu(
+      origin,
+      self,
+      { ...typing, content: { ...typing.content, typing: false } },
+      edus,
+      'f2',
+    );
+    assertEquals(typingIn(room).userIds, []);
+    await acceptIngressEdu(
+      origin,
+      self,
+      {
+        ...typing,
+        content: { ...typing.content, user_id: '@unjoined:remote.test' },
+      },
+      edus,
+      'f2',
+    );
+    assertEquals(typingIn(room).userIds, []);
+  } finally {
+    await setTyping(await store.server(), room, user, false);
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
 
 const origin = 'remote.test', self = 'home.test';
 const direct = {
@@ -21,6 +123,165 @@ const direct = {
 const unused = {
   dispatch: () => Promise.reject(new Error('must not deliver at facade')),
 };
+
+Deno.test('F2 delayed federation activity keeps its original receipt expiry and cannot replace a newer observation', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'federation-receipt-' });
+  const store = await openStore({
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  }, { schemas: { server: serverSchema } });
+  const clock = Date.now;
+  const received = clock();
+  const user = '@alice:remote.test', room = '!receipt:remote.test';
+  try {
+    const server = await store.server();
+    for (const member of [user, '@bob:home.test']) {
+      await server.execute('INSERT INTO memberships VALUES(?,?,?,?,?)', [
+        member,
+        room,
+        'join',
+        '$join',
+        1,
+      ]);
+    }
+    const edus = eduState(server, self, store);
+    const presence = {
+      edu_type: 'm.presence',
+      content: {
+        push: [{
+          user_id: user,
+          presence: 'online',
+          status_msg: 'original status',
+          last_active_ago: 0,
+        }],
+      },
+    };
+    const typing = {
+      edu_type: 'm.typing',
+      content: { room_id: room, user_id: user, typing: true },
+    };
+    Date.now = () => received + 29_000;
+    await acceptIngressEdu(
+      origin,
+      self,
+      typing,
+      edus,
+      'f2',
+      undefined,
+      received,
+    );
+    assertEquals(typingIn(room).userIds, [user]);
+    Date.now = () => received + 30_001;
+    assertEquals(typingIn(room).userIds, []);
+    await acceptIngressEdu(
+      origin,
+      self,
+      typing,
+      edus,
+      'f2',
+      undefined,
+      received,
+    );
+    assertEquals(
+      typingIn(room).userIds,
+      [],
+      'retry is not a fresh typing observation',
+    );
+    Date.now = () => received + 29 * 60_000;
+    await acceptIngressEdu(
+      origin,
+      self,
+      presence,
+      edus,
+      'f2',
+      undefined,
+      received,
+    );
+    assertEquals((await getPresence(server, user)).presence, 'online');
+    assertEquals((await getPresence(server, user)).lastActiveMs, received);
+    Date.now = () => received + 31 * 60_000;
+    assertEquals((await getPresence(server, user)).presence, 'offline');
+    await acceptIngressEdu(
+      origin,
+      self,
+      presence,
+      edus,
+      'f2',
+      undefined,
+      received,
+    );
+    assertEquals(
+      (await getPresence(server, user)).presence,
+      'offline',
+      'retry cannot renew remote online',
+    );
+    const newer = Date.now();
+    await acceptIngressEdu(
+      origin,
+      self,
+      presence,
+      edus,
+      'f2',
+      undefined,
+      newer,
+    );
+    await acceptIngressEdu(origin, self, typing, edus, 'f2', undefined, newer);
+    await acceptIngressEdu(
+      origin,
+      self,
+      {
+        ...presence,
+        content: { push: [{ user_id: user, presence: 'offline' }] },
+      },
+      edus,
+      'f2',
+      undefined,
+      received,
+    );
+    await acceptIngressEdu(
+      origin,
+      self,
+      { ...typing, content: { ...typing.content, typing: false } },
+      edus,
+      'f2',
+      undefined,
+      received,
+    );
+    assertEquals((await getPresence(server, user)).presence, 'online');
+    assertEquals(typingIn(room).userIds, [user]);
+    // A caller queued behind a writer still consumes the ORIGINAL receipt time.
+    let entered!: () => void, release!: () => void;
+    const inside = new Promise<void>((resolve) => entered = resolve);
+    const gate = new Promise<void>((resolve) => release = resolve);
+    const held = server.tx(async () => {
+      entered();
+      await gate;
+    });
+    await inside;
+    const pending = acceptIngressEdu(
+      origin,
+      self,
+      presence,
+      edus,
+      'f2',
+      undefined,
+      newer,
+    );
+    Date.now = () => newer + 31 * 60_000;
+    release();
+    await held;
+    await pending;
+    assertEquals((await getPresence(server, user)).presence, 'offline');
+  } finally {
+    Date.now = clock;
+    await setTyping(await store.server(), room, user, false);
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
 
 Deno.test('retained F2 ingress requires its handler instead of checkpointing F1 unknown-type ignore', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'retained-f2-edu-' });

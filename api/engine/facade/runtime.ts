@@ -652,7 +652,7 @@ export async function openFacadeRuntime(
         transaction,
         phase: settings.phase as 'f1' | 'f2',
         scopeState: (scope) => directory.scopeState(scope),
-        acceptEdu: (origin, raw, phase) =>
+        acceptEdu: (origin, raw, phase, receivedMs) =>
           acceptIngressEdu(
             origin,
             identity.server,
@@ -670,6 +670,7 @@ export async function openFacadeRuntime(
               return await new ToDeviceOperations(store, tenant, owner, node!)
                 .ingress(origin, raw);
             },
+            receivedMs,
           ),
         changed: () => notices.changed(),
       });
