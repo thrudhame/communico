@@ -134,6 +134,17 @@ function operationId(view: MembershipView) {
     ])).digest('hex');
 }
 
+function applicationId(peer: string, record: LinkRecord): string {
+  return canonicalJson([
+    'link',
+    peer,
+    record.source,
+    record.incarnation,
+    record.stream,
+    record.sequence,
+  ]);
+}
+
 function bootstrapScope(binding: DomainBinding) {
   return 'membership-bootstrap:' + canonicalJson(binding);
 }
@@ -457,14 +468,7 @@ export class MembershipOperations {
       (!this.node && view.pairing !== pairing)
     ) mismatch('membership completion differs from local scope');
     const server = await this.store.server();
-    const application = canonicalJson([
-      'link',
-      peer,
-      record.source,
-      record.incarnation,
-      record.stream,
-      record.sequence,
-    ]);
+    const application = applicationId(peer, record);
     const prior = await prejoinResult(server, application, record.hash);
     if (prior !== null) {
       await journal.complete(peer, stream, record, prior);
@@ -811,10 +815,37 @@ export class MembershipOperations {
               : 'membership-history',
           operation: { ...view.operation, operationId: predecessor },
         });
-        const sent = owned ? true : (await conn.query(
+        let sent = owned ? true : (await conn.query(
           "SELECT 1 FROM facade_records WHERE peer=? AND direction='out' AND source=? AND incarnation=? AND operation_id=?",
           [peer, view.source, this.node ? view.incarnation : context.id, prior],
         )).length > 0;
+        if (!sent && this.node && retained.length) {
+          // Home may attest a retired source's exact dot. Its authenticated
+          // application receipt proves that home already knows that predecessor;
+          // raw receipt/retention alone does not. The facade never authors home
+          // history, nor assumes the attestation used today's owner revision.
+          const inbound = await conn.query(
+            "SELECT record_json FROM facade_records WHERE peer='home' AND direction='in' AND source='home' AND incarnation=? AND stream=? AND json_extract(record_json,'$.payload.body.operation.operationId')=? AND json_extract(record_json,'$.payload.body.operation.semanticKey')=?",
+            [
+              context.id,
+              view.operation.stream,
+              predecessor,
+              view.operation.semanticKey,
+            ],
+          );
+          for (const row of inbound) {
+            const record = JSON.parse(String(row.record_json)) as LinkRecord;
+            const result = await prejoinResult(
+              conn,
+              applicationId('home', record),
+              record.hash,
+            );
+            if (result?.operationId === predecessor) {
+              sent = true;
+              break;
+            }
+          }
+        }
         if (!retained.length || !sent) {
           throw new LinkError(
             'LINK_UNAVAILABLE',

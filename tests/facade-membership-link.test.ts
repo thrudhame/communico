@@ -2911,6 +2911,92 @@ Deno.test('membership admission: an accepted local-user knock keeps the remote r
   }
 });
 
+Deno.test('membership export: completed home attestation discharges retired-home predecessor without facade history authorship', async () => {
+  const f = await fixture();
+  try {
+    const fact = await incoming(f);
+    const predecessor = {
+      ...fact.operation,
+      source: 'home',
+      incarnation: 'retired-home',
+    };
+    predecessor.operationId = canonicalJson([
+      predecessor.source,
+      predecessor.incarnation,
+      predecessor.stream,
+      predecessor.sequence,
+    ]);
+    const home = await f.home.server(), edge = await f.edge.server();
+    await home.tx((conn) => retainMembershipOperation(conn, predecessor));
+    const [history] = await f.hs.bootstrap('alice', f.bundle.id);
+    assertEquals(
+      (history.payload as { body: { kind: string } }).body.kind,
+      'membership-history',
+    );
+    await f.es.retain(history, fact.keys);
+    const successor = await source(f, 2);
+    successor.context = [{
+      source: predecessor.source,
+      incarnation: predecessor.incarnation,
+      sequence: predecessor.sequence,
+    }];
+    successor.payload = fact.operation.payload;
+    successor.payloadHash = fact.operation.payloadHash;
+    await edge.execute(
+      'UPDATE domain_operations SET context_json=?,payload_json=?,payload_hash=? WHERE operation_id=?',
+      [
+        canonicalJson(successor.context),
+        successor.payload,
+        successor.payloadHash,
+        successor.operationId,
+      ],
+    );
+    await assertRejects(
+      () => f.es.export('alice'),
+      LinkError,
+      'historical predecessors',
+    );
+    await f.ej.receive('home', [history]);
+    await assertRejects(
+      () => f.es.export('alice'),
+      LinkError,
+      'historical predecessors',
+    );
+    assertEquals(await f.es.apply(f.ej, history, fact.keys), true);
+    const exported = await f.es.export('alice');
+    assertEquals(
+      exported.length,
+      1,
+      'completed authenticated home evidence releases the local successor',
+    );
+    const body = (exported[0].payload as {
+      body: { kind: string; operation: MembershipOperation };
+    }).body;
+    assertEquals(body.kind, 'membership-operation');
+    assertEquals(body.operation, successor);
+    const records = await edge.query(
+      "SELECT record_json FROM facade_records WHERE peer='home' AND direction='out' AND stream=?",
+      [successor.stream],
+    );
+    assertEquals(
+      records.map((r) => JSON.parse(String(r.record_json)).payload.body.kind),
+      ['membership-operation', 'membership-operation'],
+    );
+    const journal = new Journal(home, LINK_SUPPORTED);
+    await journal.receive(f.node.node, [fact.record, ...exported]);
+    assertEquals(
+      await f.hs.apply(journal, fact.record, fact.keys, f.bundle.id),
+      true,
+    );
+    assertEquals(
+      await f.hs.apply(journal, exported[0], fact.keys, f.bundle.id),
+      true,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('membership history: home attests exact retained foreign dots without restamping or advancing a local source cut', async () => {
   const f = await fixture();
   try {
