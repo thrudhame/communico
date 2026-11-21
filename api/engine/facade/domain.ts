@@ -33,7 +33,14 @@ import {
   importReportOperation,
   reportOperations,
 } from '#engine/server/reports.ts';
-import { importReceiptOperation } from '#engine/server/ephemeral.ts';
+import {
+  importPresenceStatus,
+  importReceiptOperation,
+} from '#engine/server/ephemeral.ts';
+import {
+  capturePresenceStatus,
+  presenceStatusOperations,
+} from '#engine/server/presence-operations.ts';
 import {
   captureNotificationOperations,
   notificationOperations,
@@ -79,6 +86,7 @@ export type DomainBootstrap = DomainBinding & {
   pusherChoices?: Fact[];
   notifications?: Fact[];
   schedules?: Fact[];
+  presenceStatus?: Fact[];
 };
 
 function facts(operations: Fact[]): Fact[] {
@@ -137,6 +145,9 @@ function bootstrapOf(raw: unknown): DomainBootstrap {
       ? { notifications: refs(row.notifications) }
       : {}),
     ...(row.schedules !== undefined ? { schedules: refs(row.schedules) } : {}),
+    ...(row.presenceStatus !== undefined
+      ? { presenceStatus: refs(row.presenceStatus) }
+      : {}),
   };
   if (canonicalJson(view) !== canonicalJson(raw) || view.source !== 'home') {
     mismatch('unexpected domain bootstrap material');
@@ -161,6 +172,7 @@ async function requireFacts(
     | 'pushers'
     | 'pusherChoices'
     | 'notifications'
+    | 'presenceStatus'
     | 'schedules',
 ) {
   const keys = new Set<string>();
@@ -205,6 +217,8 @@ async function requireFacts(
           ? ['pusher-choice']
           : file === 'notifications'
           ? ['notification']
+          : file === 'presenceStatus'
+          ? ['presence-status']
           : file === 'schedules'
           ? ['delayed-event']
           : ['account-data', 'tags', 'profile', 'push-rules']).includes(
@@ -311,6 +325,7 @@ function viewOf(raw: unknown): DomainOperation | DomainHistory {
         'pusher',
         'pusher-choice',
         'notification',
+        'presence-status',
         'delayed-event',
       ]
         .includes(
@@ -482,6 +497,9 @@ export class DomainOperations {
       ...await db.tx((conn) =>
         notificationOperations(conn, '@' + localpart + ':' + context.server)
       ),
+      ...await db.tx((conn) =>
+        presenceStatusOperations(conn, '@' + localpart + ':' + context.server)
+      ),
     );
     const records = [];
     for (const operation of operations) {
@@ -597,6 +615,14 @@ export class DomainOperations {
         '@' + localpart + ':' + context.server,
       );
     });
+    const presenceFacts = await server.tx(async (conn) => {
+      await this.selected(conn, grant, localpart);
+      await requireDomainControl(conn, binding);
+      return await capturePresenceStatus(
+        conn,
+        '@' + localpart + ':' + context.server,
+      );
+    });
     const records = await this.export(localpart, pairing);
     // Ordinary export never echoes replica intent. Bootstrap separately attests
     // exactly the authentic history home retained, including a receiver's own
@@ -608,6 +634,7 @@ export class DomainOperations {
         ...reportFacts,
         ...forgetFacts,
         ...notificationFacts,
+        ...presenceFacts,
       ]
     ) {
       if (
@@ -653,6 +680,7 @@ export class DomainOperations {
         tenantFacts.filter((op) => op.kind === 'pusher-choice'),
       ),
       notifications: facts(notificationFacts),
+      presenceStatus: facts(presenceFacts),
       schedules: facts(tenantFacts.filter((op) => op.kind === 'delayed-event')),
     });
     records.push(await this.publish(body, grant));
@@ -740,6 +768,16 @@ export class DomainOperations {
         await requireFacts(conn, view, 'reports');
         await requireFacts(conn, view, 'forget');
         await requireFacts(conn, view, 'notifications');
+        await requireFacts(conn, view, 'presenceStatus');
+        await conn.execute(
+          'INSERT INTO facade_scopes(incarnation,scope,source_cut,ready,pending_hash) VALUES(?,?,?,?,NULL) ON CONFLICT(incarnation,scope) DO UPDATE SET source_cut=excluded.source_cut,ready=excluded.ready,pending_hash=NULL',
+          [
+            view.pairing,
+            'presence-status:@' + view.localpart + ':' + view.server,
+            record.sequence,
+            view.presenceStatus !== undefined ? 1 : 0,
+          ],
+        );
         await conn.execute(
           'INSERT INTO facade_scopes(incarnation,scope,source_cut,ready,pending_hash) VALUES(?,?,?,?,NULL) ON CONFLICT(incarnation,scope) DO UPDATE SET source_cut=excluded.source_cut,ready=excluded.ready,pending_hash=NULL',
           [
@@ -826,7 +864,14 @@ export class DomainOperations {
         context.home.publicKey,
       )
       : undefined;
-    if (view.operation.kind === 'notification') {
+    if (view.operation.kind === 'presence-status') {
+      await importPresenceStatus(
+        await this.store.server(),
+        view.operation,
+        check,
+        history,
+      );
+    } else if (view.operation.kind === 'notification') {
       await receiveNotificationOperation(
         await this.store.server(),
         view.operation,

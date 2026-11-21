@@ -8,6 +8,13 @@ import { eventStreamTx } from '#engine/server/stream.ts';
 import { isJoined, receiptTargetInThread } from '#engine/server/read.ts';
 import { advanceNotificationRead } from '#engine/server/notifications.ts';
 import {
+  acceptPresenceStatus,
+  recordPresenceStatus,
+  requirePresenceStatus,
+} from '#engine/server/presence-operations.ts';
+import type { DomainHistoryProof } from '#engine/facade/domain-control.ts';
+import type { RegisterOperation } from '#engine/facade/registers.ts';
+import {
   graphReceiptsEnabled,
   receiptFrontier,
 } from '#engine/server/receipt-frontier.ts';
@@ -328,6 +335,9 @@ async function writePresence(
     const status = skipUnchanged
       ? current?.status_msg == null ? null : String(current.status_msg)
       : statusMsg;
+    if (!opts.remote && !skipUnchanged) {
+      await recordPresenceStatus(tx, userId, status ?? null);
+    }
     if (
       skipUnchanged && current?.presence === projected.presence &&
       Number(current.last_active_ms) === projected.lastActiveMs
@@ -417,6 +427,7 @@ export async function getPresence(
   server: Db,
   userId: string,
 ): Promise<PresenceRow> {
+  await requirePresenceStatus(server, userId);
   const [current] = await server.query(
     'SELECT * FROM presence WHERE user_id=?',
     [userId],
@@ -438,6 +449,41 @@ export async function getPresence(
   return value.row;
 }
 
+export async function importPresenceStatus(
+  server: Db,
+  operation: RegisterOperation,
+  check: (conn: Conn) => Promise<void>,
+  history?: DomainHistoryProof,
+) {
+  const change = await eventStreamTx(server, async (tx) => {
+    await check(tx);
+    const value = await acceptPresenceStatus(tx, operation, history);
+    if (!value.available) return null;
+    const [current] = await tx.query('SELECT * FROM presence WHERE user_id=?', [
+      value.user,
+    ]);
+    if (current && current.status_msg === value.status) return null;
+    const seq = await next(tx, 'presence');
+    await tx.execute(
+      `INSERT INTO presence(user_id,presence,status_msg,last_active_ms,seq) VALUES(?,'offline',?,0,?)
+      ON CONFLICT(user_id) DO UPDATE SET status_msg=excluded.status_msg,seq=excluded.seq`,
+      [value.user, value.status, seq],
+    );
+    return {
+      userId: value.user,
+      row: presenceRow(
+        current ? { ...current, status_msg: value.status, seq } : {
+          presence: 'offline',
+          status_msg: value.status,
+          last_active_ms: 0,
+          seq,
+        },
+      ),
+    };
+  });
+  if (change) notify(server, { kind: 'presence', ...change });
+}
+
 /** Capture the exact presence view in the sync owner's existing server
  * transaction, BEFORE it captures counters. Rendering cannot publish a lazy
  * expiry after next_batch or mix a newer presence row into an older cut. */
@@ -445,6 +491,7 @@ export async function capturePresence(tx: Conn, userId: string, server?: Db) {
   const rows = new Map<string, PresenceRow>();
   const changes: { userId: string; row: PresenceRow }[] = [];
   for (const user of await sharedUsers(tx, userId)) {
+    await requirePresenceStatus(tx, user);
     const value = await normalizePresence(tx, user, server);
     rows.set(user, value.row);
     if (value.changed) changes.push({ userId: user, row: value.row });

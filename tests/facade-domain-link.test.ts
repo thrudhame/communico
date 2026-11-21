@@ -70,6 +70,12 @@ import {
 import { queueBadge } from '#engine/server/push-queue.ts';
 import { applyPushPublication } from '#engine/server/notifications.ts';
 import { notificationOperations } from '#engine/server/notification-operations.ts';
+import {
+  capturePresence,
+  getPresence,
+  setPresence,
+  setPresenceValue,
+} from '#engine/server/ephemeral.ts';
 import { onEventStream } from '#engine/server/stream.ts';
 import { DelayedEvents } from '#engine/delayed-events.ts';
 import { startPushSender } from '#engine/push/sender.ts';
@@ -126,6 +132,7 @@ import {
 } from '#engine/tenant/pushrules.ts';
 import {
   importRegisterOperation,
+  readRegister,
   writeRegister,
 } from '#engine/facade/registers.ts';
 import {
@@ -251,6 +258,157 @@ async function fixture(applyAuth = true) {
     },
   };
 }
+
+Deno.test('domain presence status: bootstrap and causal suffix preserve status without replaying activity', async () => {
+  const f = await fixture();
+  try {
+    const user = '@alice:logical.test';
+    const home = await f.home.server(), edge = await f.edge.server();
+    await setPresence(home, user, 'online', 'home status');
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    await f.toEdge(records);
+    assertEquals((await getPresence(edge, user)).statusMsg, 'home status');
+    assertEquals((await getPresence(edge, user)).presence, 'offline');
+    await setPresenceValue(edge, user, 'unavailable', {
+      deviceId: 'PHONE',
+      generation: 1,
+    });
+    await setPresence(home, user, 'offline', 'new home status');
+    const suffix = await f.hs.export('alice', f.bundle.id);
+    await f.toEdge(suffix);
+    assertEquals((await getPresence(edge, user)).statusMsg, 'new home status');
+    assertEquals((await getPresence(edge, user)).presence, 'unavailable');
+    await setPresence(edge, user, 'offline', 'edge successor');
+    for (const record of await f.es.export('alice', f.bundle.id)) {
+      await f.hj.receive('edge_a', [record]);
+      await f.hs.apply(f.hj, record, f.bundle.id);
+    }
+    assertEquals((await getPresence(home, user)).statusMsg, 'edge successor');
+    assertEquals((await getPresence(home, user)).presence, 'offline');
+    await f.toEdge(records);
+    assertEquals((await getPresence(edge, user)).statusMsg, 'edge successor');
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain presence status: completeness, concurrent losers, observed clear and cold reopen', async () => {
+  const f = await fixture();
+  let cold: Awaited<ReturnType<typeof f.open>> | undefined;
+  try {
+    const user = '@alice:logical.test';
+    const home = await f.home.server(), edge = await f.edge.server();
+    await assertRejects(
+      () => getPresence(edge, user),
+      MatrixError,
+      'presence status unavailable',
+    );
+    await edge.execute(
+      "INSERT INTO memberships(user,room,membership,event,seq) VALUES(?,?,'join','$join',0)",
+      [user, '!status:logical.test'],
+    );
+    await assertRejects(
+      () => edge.tx((conn) => capturePresence(conn, user, edge)),
+      MatrixError,
+      'presence status unavailable',
+    );
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    assertEquals((await getPresence(edge, user)).statusMsg, null);
+    await setPresence(home, user, 'online', 'concurrent home');
+    await setPresence(edge, user, 'unavailable', 'concurrent edge');
+    const fromHome = await f.hs.export('alice', f.bundle.id);
+    const fromEdge = await f.es.export('alice', f.bundle.id);
+    await f.toEdge(fromHome);
+    for (const record of fromEdge) {
+      await f.hj.receive('edge_a', [record]);
+      await f.hs.apply(f.hj, record, f.bundle.id);
+    }
+    assertEquals((await getPresence(home, user)).statusMsg, 'concurrent home');
+    assertEquals((await getPresence(edge, user)).statusMsg, 'concurrent home');
+    const view = await edge.tx((conn) =>
+      readRegister(conn, JSON.stringify(['presence-status', 'alice']))
+    );
+    assertEquals(view.frontier.length, 2);
+    assert(
+      view.conflicts.some((op) =>
+        JSON.parse(op.payload).status === 'concurrent edge'
+      ),
+    );
+    await setPresence(edge, user, 'offline');
+    assertEquals((await getPresence(edge, user)).statusMsg, null);
+    const cleared = await getPresence(edge, user);
+    await f.toEdge(fromHome);
+    assertEquals(await getPresence(edge, user), cleared);
+    await f.edge.close();
+    cold = await f.open('edge');
+    assertEquals(
+      (await getPresence(await cold.server(), user)).statusMsg,
+      null,
+    );
+  } finally {
+    await cold?.close();
+    await f.close();
+  }
+});
+
+Deno.test('domain presence status: stale pairing inventory and missing activation cannot authorize a read', async () => {
+  const f = await fixture();
+  try {
+    const user = '@alice:logical.test';
+    const edge = await f.edge.server();
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    await edge.execute('UPDATE facade_scopes SET incarnation=? WHERE scope=?', [
+      'retired-pairing',
+      'presence-status:' + user,
+    ]);
+    await assertRejects(
+      () => getPresence(edge, user),
+      MatrixError,
+      'presence status unavailable',
+    );
+    await edge.execute('UPDATE facade_scopes SET incarnation=? WHERE scope=?', [
+      f.bundle.id,
+      'presence-status:' + user,
+    ]);
+    await edge.execute('DELETE FROM facade_owner_activation');
+    await assertRejects(
+      () => getPresence(edge, user),
+      MatrixError,
+      'presence status unavailable',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain presence status: received but unapplied suffix refuses without renewing activity', async () => {
+  const f = await fixture();
+  try {
+    const user = '@alice:logical.test';
+    const home = await f.home.server(), edge = await f.edge.server();
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    await setPresenceValue(edge, user, 'unavailable', {
+      deviceId: 'PHONE',
+      generation: 1,
+    });
+    const before = await getPresence(edge, user);
+    await setPresence(home, user, 'online', 'awaited status');
+    const records = await f.hs.export('alice', f.bundle.id);
+    await f.ej.receive('home', records);
+    await assertRejects(
+      () => getPresence(edge, user),
+      MatrixError,
+      'presence status unavailable',
+    );
+    await f.toEdge(records);
+    const after = await getPresence(edge, user);
+    assertEquals(after.statusMsg, 'awaited status');
+    assertEquals(after.presence, before.presence);
+    assertEquals(after.lastActiveMs, before.lastActiveMs);
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('domain bootstrap waits for its retained auth dependency without an identity rejection', async () => {
   const f = await fixture(false);
