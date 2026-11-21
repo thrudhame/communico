@@ -151,6 +151,8 @@ function bind(
     return value;
   };
   return {
+    admit: (check: import('#engine/store/commit.ts').CommitCheck) =>
+      conn.admit(check),
     ingress: { check: authorize },
     domains: {
       authorize: async (

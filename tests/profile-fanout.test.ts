@@ -542,3 +542,66 @@ Deno.test('local submission: grounded receipt reconciles after admission is with
     await f.close();
   }
 });
+
+Deno.test('local submission: signing dependency survives preparation and retained retries', async (t) => {
+  for (const retained of [false, true]) {
+    await t.step(
+      retained ? 'retained signature' : 'fresh signature',
+      async () => {
+        const f = await workerFixture();
+        try {
+          const room = await openRoom(f.store, f.rooms[0]);
+          const partial = {
+            type: 'm.room.message',
+            sender: f.user,
+            content: { body: 'signing authority must survive preparation' },
+          };
+          let prepared: PreparedSubmission | null = retained
+            ? await room.tx(async (tx) => {
+              const pdu = await buildInTx(
+                tx,
+                room.id,
+                partial,
+                f.tenant.signer(),
+              );
+              return { eventId: pdu.event_id!, pdu };
+            })
+            : null;
+          let current = !retained;
+          const signer = {
+            ...f.tenant.signer(),
+            admit: () => {
+              if (!current) throw new Error('signing authority retired');
+            },
+          };
+          let finished = false;
+          await assertRejects(
+            () =>
+              sendLocal(room, partial, signer, {
+                lookup: () => Promise.resolve(prepared),
+                prepare: (pdu) => {
+                  current = false;
+                  prepared = { eventId: pdu.event_id!, pdu };
+                  return Promise.resolve(prepared);
+                },
+                finish: () => {
+                  finished = true;
+                  return Promise.resolve();
+                },
+              }),
+            Error,
+            'signing authority retired',
+          );
+          assert(prepared);
+          assertEquals(
+            await room.tx((tx) => tx.events.get(prepared!.eventId)),
+            null,
+          );
+          assertEquals(finished, false);
+        } finally {
+          await f.close();
+        }
+      },
+    );
+  }
+});

@@ -197,7 +197,10 @@ export type LocalSubmission = {
   // room-write transaction. Grounded receipts reconcile without re-admission.
   admit?(tx: RoomTx): Promise<void>;
   lookup(): Promise<PreparedSubmission | null>;
-  prepare(pdu: Pdu): Promise<PreparedSubmission>;
+  prepare(
+    pdu: Pdu,
+    admit?: import('#engine/store/commit.ts').CommitCheck,
+  ): Promise<PreparedSubmission>;
   finish(
     eventId: string,
     accepted: boolean,
@@ -285,7 +288,7 @@ async function submitLocal(
             );
             return pdu;
           });
-          prepared = await submission.prepare(built);
+          prepared = await submission.prepare(built, signer.admit);
         }
         const result = await room.tx(async (tx) => {
           const receipt = await submissionReceipt(
@@ -294,6 +297,7 @@ async function submitLocal(
             prepared.pdu,
           );
           if (receipt !== null) return receipt;
+          if (signer.admit) tx.admit(signer.admit);
           await submission.admit?.(tx);
           if (prepared.pdu === null) {
             throw new Error('E_SUBMISSION_EVENT_MISSING: ' + prepared.eventId);

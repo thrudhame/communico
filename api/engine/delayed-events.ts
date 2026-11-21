@@ -253,8 +253,14 @@ export class DelayedEvents {
       const room = await openRoom(store, e.roomId);
       const submission = {
         lookup: () => tenant.tx((tx) => tx.delayedEvents.submission(id)),
-        prepare: (pdu: import('#engine/pdu.ts').Pdu) =>
-          tenant.tx((tx) => tx.delayedEvents.prepare(id, pdu)),
+        prepare: (
+          pdu: import('#engine/pdu.ts').Pdu,
+          admit?: import('#engine/store/commit.ts').CommitCheck,
+        ) =>
+          tenant.tx((tx) => {
+            if (admit) tx.admit(admit);
+            return tx.delayedEvents.prepare(id, pdu);
+          }),
         finish: () => tenant.tx((tx) => tx.delayedEvents.finish(id)),
         admit: async (tx: RoomTx) => {
           if (await this.#cancelled(e, tx)) notFound();
