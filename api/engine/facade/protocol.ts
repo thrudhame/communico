@@ -70,6 +70,10 @@ export const DOMAIN_OPERATION_CAPABILITY: Capability = {
   type: 'domain-operation',
   version: 1,
 };
+export const DOMAIN_OPERATION_V2_CAPABILITY: Capability = {
+  type: 'domain-operation',
+  version: 2,
+};
 export const DEVICE_OPERATION_CAPABILITY: Capability = {
   type: 'device-operation',
   version: 1,
@@ -131,6 +135,7 @@ export const LINK_SUPPORTED: readonly Capability[] = [
   OWNER_CONTROL_CAPABILITY,
   ACCOUNT_AUTH_CAPABILITY,
   DOMAIN_OPERATION_CAPABILITY,
+  DOMAIN_OPERATION_V2_CAPABILITY,
   DEVICE_OPERATION_CAPABILITY,
   SIGNING_OPERATION_CAPABILITY,
   SIGNATURE_OPERATION_CAPABILITY,

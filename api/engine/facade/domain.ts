@@ -265,6 +265,19 @@ function operationId(view: DomainOperation | DomainHistory | DomainBootstrap) {
     ])).digest('hex');
 }
 
+// The status kind and its complete bootstrap inventory are not understood by
+// v1 readers. Negotiate them before journal receipt, not after a semantic apply
+// failure. Unchanged kinds retain their original reader requirement.
+function recordVersion(
+  view: DomainOperation | DomainHistory | DomainBootstrap,
+) {
+  return (view.kind === 'domain-bootstrap'
+      ? view.presenceStatus !== undefined
+      : view.operation.kind === 'presence-status')
+    ? 2
+    : 1;
+}
+
 function viewOf(raw: unknown): DomainOperation | DomainHistory {
   const row = object(raw), operation = object(row.operation);
   const localpart = text(row.localpart);
@@ -428,7 +441,7 @@ export class DomainOperations {
         incarnation: this.node ? view.incarnation : context.id,
         stream: streamName(view.localpart, context.server),
         type: 'domain-operation',
-        version: 1,
+        version: recordVersion(view),
         operationId: operationId(view),
         payload: signed,
       });
@@ -700,13 +713,22 @@ export class DomainOperations {
     const peer = this.node ? 'home' : context.node;
     const record = await journal.next(peer, stream);
     if (!record) return false;
-    if (record.type !== 'domain-operation' || record.version !== 1) {
+    if (
+      record.type !== 'domain-operation' ||
+      (record.version !== 1 && record.version !== 2)
+    ) {
       throw new LinkError('LINK_CAPABILITY_MISMATCH', 'not domain operation');
     }
     const signed = object(record.payload);
     const view = object(signed.body).kind === 'domain-bootstrap'
       ? bootstrapOf(signed.body)
       : viewOf(signed.body);
+    if (record.version < recordVersion(view)) {
+      throw new LinkError(
+        'LINK_CAPABILITY_MISMATCH',
+        'domain operation requires status reader',
+      );
+    }
     const sender = this.node ? 'home' : context.node;
     if (
       view.server !== context.server || view.pairing !== context.id ||

@@ -259,6 +259,62 @@ async function fixture(applyAuth = true) {
   };
 }
 
+Deno.test('domain rolling readers: status requires its reader before receipt or activation', async () => {
+  const f = await fixture();
+  try {
+    // The pre-status reader supported domain-operation/1. Its journal and
+    // negotiation implementations are unchanged; only the reader set differs.
+    const old = new Journal(
+      await f.edge.server(),
+      LINK_SUPPORTED.filter((cap) =>
+        cap.type !== 'domain-operation' || cap.version === 1
+      ),
+    );
+    const server = await f.home.server();
+    await setPresence(server, '@alice:logical.test', 'online', 'new status');
+    const bootstrap = await f.hs.bootstrap('alice', f.bundle.id);
+    const status = bootstrap.filter((record) => {
+      const body =
+        (record.payload as { body: DomainBootstrap | DomainOperation }).body;
+      return body.kind === 'domain-bootstrap' ||
+        body.operation.kind === 'presence-status';
+    });
+    assertEquals(status.length, 2);
+    const before = await old.heads('home', 'in', bootstrap[0]);
+    await assertRejects(
+      () => old.receive('home', bootstrap),
+      LinkError,
+      'unsupported record type',
+    );
+    assertEquals(status.map((record) => record.version), [2, 2]);
+    assertEquals(await old.heads('home', 'in', bootstrap[0]), before);
+    assertEquals(await old.pending('home', bootstrap[0]), []);
+    await assertRejects(
+      async () => getPresence(await f.edge.server(), '@alice:logical.test'),
+      MatrixError,
+      'presence status unavailable',
+    );
+    await f.toEdge(bootstrap);
+    assertEquals(
+      (await getPresence(await f.edge.server(), '@alice:logical.test'))
+        .statusMsg,
+      'new status',
+    );
+    await putAccountData(f.ht, 'alice', '', 'rolling.control', {
+      unchanged: true,
+    });
+    const legacy = await f.hs.export('alice', f.bundle.id);
+    const account = legacy.filter((record) =>
+      (record.payload as { body: DomainOperation }).body.operation.kind ===
+        'account-data'
+    );
+    assert(account.length > 0);
+    assert(account.every((record) => record.version === 1));
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('domain presence status: bootstrap and causal suffix preserve status without replaying activity', async () => {
   const f = await fixture();
   try {
@@ -287,6 +343,53 @@ Deno.test('domain presence status: bootstrap and causal suffix preserve status w
     assertEquals((await getPresence(home, user)).presence, 'offline');
     await f.toEdge(records);
     assertEquals((await getPresence(edge, user)).statusMsg, 'edge successor');
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain rolling readers: legacy bootstrap cannot enable status and downgraded status cannot apply', async () => {
+  const f = await fixture();
+  try {
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    await f.toEdge(records);
+    const payload = structuredClone(records.at(-1)!.payload) as {
+      body: DomainBootstrap;
+      signature: string;
+    };
+    delete payload.body.presenceStatus;
+    payload.signature = await f.ht.signer().sign(canonicalJson(payload.body));
+    const legacy = await appendRecordForBackup(f, payload);
+    assertEquals(legacy.version, 1);
+    await f.toEdge([legacy]);
+    assertEquals(
+      await getAccountData(f.et, 'alice', '', 'rolling.absent'),
+      null,
+    );
+    await assertRejects(
+      async () => getPresence(await f.edge.server(), '@alice:logical.test'),
+      MatrixError,
+      'presence status unavailable',
+    );
+    await setPresence(
+      await f.home.server(),
+      '@alice:logical.test',
+      'online',
+      'new status',
+    );
+    const suffix = await f.hs.export('alice', f.bundle.id);
+    const record = suffix.find((record) => record.sequence > legacy.sequence)!;
+    assertEquals(record.version, 2);
+    const { hash: _hash, ...body } = { ...record, version: 1 };
+    const downgraded = { ...body, hash: recordHash(body) };
+    await f.ej.receive('home', [downgraded]);
+    const before = await f.ej.heads('home', 'in', downgraded);
+    await assertRejects(
+      () => f.es.apply(f.ej, downgraded),
+      LinkError,
+      'domain operation requires status reader',
+    );
+    assertEquals(await f.ej.heads('home', 'in', downgraded), before);
   } finally {
     await f.close();
   }
@@ -2998,7 +3101,7 @@ async function appendRecordForBackup(
       incarnation: f.bundle.id,
       stream: 'domain:@alice:logical.test',
       type: 'domain-operation',
-      version: 1,
+      version: payload.body.presenceStatus === undefined ? 1 : 2,
       operationId: 'domain-bootstrap:' +
         createHash('sha256').update(canonicalJson(payload.body)).digest('hex'),
       payload,
