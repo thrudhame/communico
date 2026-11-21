@@ -87,6 +87,7 @@ import {
   createPrejoinJob,
   type PrejoinJob,
   prejoinJob,
+  prejoinJobActive,
   prejoinJobId,
   prejoinJobs,
   type PrejoinWork,
@@ -1185,6 +1186,7 @@ export function inviteIntentProvider(
       } satisfies IntentJob;
     }
     for (const pending of await prejoinJobs(server)) {
+      if (prejoinJobActive(deps.store, pending.work)) continue;
       if (
         !prejoinLeaveActive(
           deps.store,
