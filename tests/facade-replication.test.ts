@@ -7,6 +7,17 @@ import {
 } from '#engine/app.ts';
 import { setConfigForTests } from '#engine/config.ts';
 import { claimKeys, queryKeys } from '#engine/client/e2ee.ts';
+import { canSeeEvent } from '#engine/client/visibility.ts';
+import { versionOf } from '#engine/client/room.ts';
+import {
+  createRoom as createClientRoom,
+  inviteDeps,
+  redactEvent,
+  sendEvent,
+  writeStateKey,
+} from '#engine/client/write.ts';
+import { type PreparedSubmission, sendLocal } from '#engine/room/ingest.ts';
+import * as localMembership from '#engine/room/membership.ts';
 import { deviceListService } from '#engine/federation/device-lists.ts';
 import { eduState } from '#engine/federation/edus.ts';
 import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
@@ -16,6 +27,7 @@ import { serveEvent } from '#engine/federation/serve.ts';
 import { admit } from '#engine/federation/gate.ts';
 import { federationPolicy } from '#engine/federation/policy.ts';
 import { keyStore } from '#engine/federation/keys.ts';
+import { inviteDependencies } from '#engine/federation/dependencies.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
 import { exportKeyRoster, FacadeKeys } from '#engine/facade/control.ts';
 import { startInboxWorker } from '#engine/facade/worker.ts';
@@ -59,9 +71,9 @@ import {
 import { listedRooms, setVisibility } from '#engine/server/directory.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { setReceipt as writeClientReceipt } from '#engine/receipts.ts';
-import { Journal } from '#engine/facade/journal.ts';
+import { appendRecord, Journal } from '#engine/facade/journal.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
-import { LINK_CAPABILITIES } from '#engine/facade/protocol.ts';
+import { LINK_CAPABILITIES, LINK_SUPPORTED } from '#engine/facade/protocol.ts';
 import { applyReplicaScope } from '#engine/facade/scopes.ts';
 import type { Database } from '#engine/store/db.ts';
 import {
@@ -72,13 +84,29 @@ import {
 import { bounded } from './helpers/server-process.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
-import { importReplicaGenesis } from '#engine/room/replica.ts';
+import { setRoomHooks } from '#engine/room/hooks.ts';
+import {
+  importReplicaBoundary,
+  importReplicaGenesis,
+} from '#engine/room/replica.ts';
+import { importReplicaRoom } from '#engine/room/replica-import.ts';
+import { contentHashMatches } from '#engine/room/verify.ts';
+import { stageSnapshotEvidence } from '#engine/room/snapshot-install.ts';
+import { verifySnapshot } from '#engine/room/snapshot.ts';
+import { exportReplicaRoom } from '#engine/room/replica-export.ts';
+import { canonicalJson } from '#engine/canonical.ts';
+import { redact } from '#engine/eventid.ts';
+import { b64encodeStd } from '#engine/signing-primitives.js';
 import { ingestRemote } from '#engine/room/remote.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { historicalServerSchema } from './fixtures/server-schema-history.ts';
-import { roomOf } from '#engine/server/read.ts';
+import {
+  membershipOf as projectedMembershipOf,
+  roomOf,
+} from '#engine/server/read.ts';
+import { installServerHooks, recoverServer } from '#engine/server/startup.ts';
+import { registerRoom } from '#engine/server/registry.ts';
 import { directoryFactsOf } from '#engine/server/public-replica.ts';
-import { recoverServer } from '#engine/server/startup.ts';
 import { project } from '#engine/server/project.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
@@ -98,7 +126,6 @@ import {
 import { facadeTls } from './support/facade-tls.ts';
 import { object, recordHash } from '#engine/facade/protocol.ts';
 import { registerUser } from '#engine/tenant/users.ts';
-import { writeStateKey } from '#engine/client/write.ts';
 import { getPresence } from '#engine/client/presence.ts';
 import { setPresence } from '#engine/server/ephemeral.ts';
 import {
@@ -115,7 +142,11 @@ import {
   resolveAlias,
 } from '#engine/client/directory.ts';
 
-async function fixture(seedServer = serverSchema, facadePin = 'b'.repeat(64)) {
+async function fixture(
+  seedServer = serverSchema,
+  version = '11',
+  facadePin = 'b'.repeat(64),
+) {
   const dir = await Deno.makeTempDir({ prefix: 'facade-replication-' });
   const open = (name: string, schema = serverSchema) =>
     openStore({
@@ -127,7 +158,7 @@ async function fixture(seedServer = serverSchema, facadePin = 'b'.repeat(64)) {
     }, {
       schemas: { server: schema, tenant: tenantSchema, room: roomSchema },
     });
-  const home = await open('home', seedServer);
+  let home = await open('home', seedServer);
   let edge = await open('edge', seedServer);
   const tenant = await openTenant(home, 'logical.test', { create: true });
   const node = await initializeNode(
@@ -135,7 +166,7 @@ async function fixture(seedServer = serverSchema, facadePin = 'b'.repeat(64)) {
     tenant.serverName,
     'edge_a',
   );
-  const hp = new Pairings(
+  let hp = new Pairings(
     await home.server(),
     tenant.signer(),
     tenant.publicB64,
@@ -170,6 +201,7 @@ async function fixture(seedServer = serverSchema, facadePin = 'b'.repeat(64)) {
   const source = await makeFakeRoom({
     roomId: '!replicated:logical.test',
     server: signing,
+    version,
   });
   const keys = fakeKeyResolver(signing);
   const pdus = [...source.events.values()];
@@ -198,8 +230,13 @@ async function fixture(seedServer = serverSchema, facadePin = 'b'.repeat(64)) {
   const replicas = async () =>
     new RoomReplicas(edge, await edgePairings(), signing.name, keys);
   return {
+    get home() {
+      return home;
+    },
+    get homePairings() {
+      return hp;
+    },
     dir,
-    home,
     source,
     room,
     ingest,
@@ -254,6 +291,16 @@ async function fixture(seedServer = serverSchema, facadePin = 'b'.repeat(64)) {
       await edge.close();
       edge = await open('edge');
     },
+    async reopenHome() {
+      await home.close();
+      home = await open('home');
+      hp = new Pairings(
+        await home.server(),
+        tenant.signer(),
+        tenant.publicB64,
+        'a'.repeat(64),
+      );
+    },
     async close() {
       await home.close();
       await edge.close();
@@ -261,6 +308,573 @@ async function fixture(seedServer = serverSchema, facadePin = 'b'.repeat(64)) {
     },
   };
 }
+
+Deno.test('replica signature evidence replays hash-redacted non-create events without duplicate news', async () => {
+  const f = await fixture();
+  try {
+    const message = await f.source.addEvent({
+      type: 'm.room.message',
+      content: { msgtype: 'm.text', body: 'original retained content' },
+    });
+    await f.ingest([structuredClone(message)]);
+    const manifest = await exportReplicaRoom(f.room, f.tenant.serverName);
+    const target = manifest.events.find((pdu) =>
+      pdu.event_id === message.event_id
+    )!;
+    target.content = { msgtype: 'm.text', body: 'hash mismatched in transit' };
+    const apply = () =>
+      importReplicaRoom(f.edgeStore(), structuredClone(manifest), {
+        self: f.tenant.serverName,
+        keys: fakeKeyResolver(f.signing),
+        signatureUnion: true,
+      });
+    await apply();
+    const replica = await f.replica();
+    const before = await replica.tx(async (tx) => ({
+      row: await tx.events.get(String(message.event_id)),
+      head: await tx.changes.head(),
+      position: await tx.segments.positionOf(String(message.event_id)),
+    }));
+    assertEquals(JSON.parse(before.row!.pdu).content, {});
+    assert(before.position);
+    await f.reopen();
+    await apply();
+    const after = await (await f.replica()).tx(async (tx) => ({
+      row: await tx.events.get(String(message.event_id)),
+      head: await tx.changes.head(),
+      position: await tx.segments.positionOf(String(message.event_id)),
+    }));
+    assertEquals(after, before);
+    // A peer may retain the authentic full form while this replica retained
+    // hash-redacted bytes. Its signatures can be learned without rewriting us.
+    target.content = structuredClone(message.content);
+    await apply();
+    assertEquals(
+      await (await f.replica()).tx((tx) =>
+        tx.events.get(String(message.event_id))
+      ),
+      before.row,
+    );
+    assertEquals(
+      await (await f.replica()).tx((tx) => tx.changes.head()),
+      before.head,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('replica signature replay retains provenance when redaction restores the advertised content hash', async () => {
+  const f = await fixture();
+  try {
+    const message = await f.source.addEvent({
+      type: 'm.room.message',
+      content: {},
+    });
+    await f.ingest([structuredClone(message)]);
+    const manifest = await exportReplicaRoom(f.room, f.tenant.serverName);
+    manifest.events.find((pdu) => pdu.event_id === message.event_id)!.content =
+      {
+        injected: true,
+      };
+    const apply = () =>
+      importReplicaRoom(f.edgeStore(), structuredClone(manifest), {
+        self: f.tenant.serverName,
+        keys: fakeKeyResolver(f.signing),
+        signatureUnion: true,
+      });
+    await apply();
+    const replica = await f.replica();
+    const before = await replica.tx(async (tx) => ({
+      row: await tx.events.get(String(message.event_id)),
+      head: await tx.changes.head(),
+      position: await tx.segments.positionOf(String(message.event_id)),
+    }));
+    assertEquals(JSON.parse(before.row!.pdu).content, {});
+    assertEquals(await contentHashMatches(JSON.parse(before.row!.pdu)), true);
+    assertEquals(
+      await (await f.edgeStore().room(replica.id)).query(
+        'SELECT hash_redacted FROM events WHERE id=?',
+        [String(message.event_id)],
+      ),
+      [{ hash_redacted: 1 }],
+    );
+    await f.reopen();
+    await apply();
+    assertEquals(
+      await (await f.replica()).tx(async (tx) => ({
+        row: await tx.events.get(String(message.event_id)),
+        head: await tx.changes.head(),
+        position: await tx.segments.positionOf(String(message.event_id)),
+      })),
+      before,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('replica signature evidence omits invalid optional entries admitted by ordinary ingress', async () => {
+  const f = await fixture();
+  try {
+    const witness = await makeRemoteServer('optional.test');
+    const message = await f.source.addEvent({
+      type: 'm.room.message',
+      content: { msgtype: 'm.text', body: 'required sender is valid' },
+    });
+    message.signatures![witness.name] = { [witness.keyId]: 'A'.repeat(86) };
+    await f.ingest([structuredClone(message)]);
+    const retained = await f.room.tx((tx) =>
+      tx.events.get(String(message.event_id))
+    );
+    assert(retained);
+    assertEquals(
+      JSON.parse(retained.pdu).signatures[witness.name],
+      message.signatures![witness.name],
+    );
+    const manifest = await exportReplicaRoom(f.room, f.tenant.serverName);
+    await importReplicaRoom(f.edgeStore(), structuredClone(manifest), {
+      self: f.tenant.serverName,
+      keys: fakeKeyResolver(f.signing, witness),
+      signatureUnion: true,
+    });
+    const replica = await f.replica();
+    assertEquals(
+      (await replica.tx((tx) => tx.events.getStatus(String(message.event_id))))
+        ?.grounding,
+      'grounded',
+    );
+    assertEquals(
+      await (await f.edgeStore().room(replica.id)).query(
+        'SELECT * FROM event_signatures WHERE event=?',
+        [String(message.event_id)],
+      ),
+      [],
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('replica signature receipt provenance is owned by ordinary live and snapshot admission too', async () => {
+  const f = await fixture();
+  try {
+    const message = await f.source.addEvent({
+      type: 'm.room.message',
+      content: {},
+    });
+    const incoming = structuredClone(message);
+    incoming.content = { injected: true };
+    await f.ingest([incoming]);
+    assertEquals(
+      await (await f.home.room(f.room.id)).query(
+        'SELECT hash_redacted FROM events WHERE id=?',
+        [String(message.event_id)],
+      ),
+      [{ hash_redacted: 1 }],
+    );
+    const topic = await f.source.addEvent({
+      type: 'm.room.topic',
+      state_key: '',
+      content: {},
+    });
+    const rawTopic = structuredClone(topic);
+    rawTopic.content = { injected: true };
+    const create = [...f.source.events.values()].find((pdu) =>
+      pdu.type === 'm.room.create'
+    )!;
+    const verified = await verifySnapshot({
+      roomId: f.room.id,
+      roomVersion: '11',
+      resident: f.signing.name,
+      self: f.signing.name,
+      keys: fakeKeyResolver(f.signing),
+      state: [structuredClone(create), rawTopic],
+      authChain: [...f.source.events.values()].map((pdu) =>
+        structuredClone(pdu)
+      ),
+    });
+    await f.room.tx((tx) =>
+      stageSnapshotEvidence(tx, verified, '$not-in-snapshot')
+    );
+    assertEquals(
+      await (await f.home.room(f.room.id)).query(
+        'SELECT hash_redacted FROM events WHERE id=?',
+        [String(topic.event_id)],
+      ),
+      [{ hash_redacted: 1 }],
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('replica signature evidence preserves full material for hash-valid already-redacted-shaped events', async () => {
+  const f = await fixture();
+  try {
+    const message = await f.source.addEvent({
+      type: 'm.room.message',
+      content: {},
+    });
+    await f.ingest([structuredClone(message)]);
+    const manifest = await exportReplicaRoom(f.room, f.tenant.serverName);
+    const apply = () =>
+      importReplicaRoom(f.edgeStore(), structuredClone(manifest), {
+        self: f.tenant.serverName,
+        keys: fakeKeyResolver(f.signing),
+        signatureUnion: true,
+      });
+    await apply();
+    const replica = await f.replica();
+    const before = await replica.tx((tx) => tx.changes.head());
+    manifest.after = manifest.cut;
+    manifest.steps = [];
+    manifest.events.find((pdu) => pdu.event_id === message.event_id)!.content =
+      {
+        injected: true,
+      };
+    await assertRejects(apply, MatrixError, 'replica changes a retained event');
+    assertEquals(await replica.tx((tx) => tx.changes.head()), before);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('replica signature-only packs authenticate the actual room version before any overlay commit', async () => {
+  const f = await fixture(serverSchema, '5');
+  try {
+    const initial = await f.exports();
+    assert(initial);
+    const journal = await f.journal();
+    await journal.receive('home', [initial]);
+    await (await f.replicas()).apply(journal, initial);
+    const replica = await f.replica();
+    const head = await replica.tx((tx) => tx.changes.head());
+    const manifest = await exportReplicaRoom(f.room, f.tenant.serverName);
+    manifest.after = manifest.cut;
+    manifest.steps = [];
+    // v4 and v5 share event hashing/redaction, but only the real v5 version
+    // enforces this key's validity floor. The signed create still declares v5.
+    manifest.roomVersion = '4';
+    const target = manifest.events.find((pdu) => pdu.type === 'm.room.create')!;
+    const witness = await makeRemoteServer('expired.test', { validUntilMs: 0 });
+    const body = redact(target as unknown as Record<string, unknown>, '4');
+    delete body.event_id;
+    delete body.signatures;
+    target.signatures[witness.name] = {
+      [witness.keyId]: b64encodeStd(
+        new Uint8Array(
+          await crypto.subtle.sign(
+            { name: 'Ed25519' },
+            witness.kp.privateKey,
+            new TextEncoder().encode(canonicalJson(body)),
+          ),
+        ),
+      ),
+    };
+    await assertRejects(() =>
+      importReplicaRoom(f.edgeStore(), manifest, {
+        self: f.tenant.serverName,
+        keys: fakeKeyResolver(f.signing, witness),
+        signatureUnion: true,
+      })
+    );
+    assertEquals(await replica.tx((tx) => tx.changes.head()), head);
+    const retained = JSON.parse(
+      (await replica.tx((tx) => tx.events.get(String(target.event_id))))!.pdu,
+    );
+    assertEquals(retained.signatures[witness.name], undefined);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('replica signature-only packs reject substituted creates before any retained overlay commit', async () => {
+  const f = await fixture(serverSchema, '5');
+  try {
+    const initial = await f.exports();
+    assert(initial);
+    const journal = await f.journal();
+    await journal.receive('home', [initial]);
+    await (await f.replicas()).apply(journal, initial);
+    const replica = await f.replica();
+    const head = await replica.tx((tx) => tx.changes.head());
+    const manifest = await exportReplicaRoom(f.room, f.tenant.serverName);
+    manifest.after = manifest.cut;
+    manifest.steps = [];
+    manifest.roomVersion = '4';
+    const target = manifest.events.find((pdu) => pdu.type === 'm.room.create')!;
+    const witness = await makeRemoteServer('expired.test', { validUntilMs: 0 });
+    const body = redact(target as unknown as Record<string, unknown>, '4');
+    delete body.event_id;
+    delete body.signatures;
+    target.signatures[witness.name] = {
+      [witness.keyId]: b64encodeStd(
+        new Uint8Array(
+          await crypto.subtle.sign(
+            { name: 'Ed25519' },
+            witness.kp.privateKey,
+            new TextEncoder().encode(canonicalJson(body)),
+          ),
+        ),
+      ),
+    };
+    // A valid alternate create authenticates v4, but not this retained room.
+    // Rejected auth-chain evidence must not confer that version on known PDUs.
+    const substitute = await makeFakeRoom({
+      roomId: manifest.roomId,
+      server: f.signing,
+      version: '4',
+    });
+    manifest.events.push(substitute.events.get(substitute.createId)!);
+    manifest.stays[0].opening.createId = substitute.createId;
+    await assertRejects(() =>
+      importReplicaRoom(f.edgeStore(), manifest, {
+        self: f.tenant.serverName,
+        keys: fakeKeyResolver(f.signing, witness),
+        signatureUnion: true,
+      })
+    );
+    assertEquals(await replica.tx((tx) => tx.changes.head()), head);
+    const retained = JSON.parse(
+      (await replica.tx((tx) => tx.events.get(String(target.event_id))))!.pdu,
+    );
+    assertEquals(retained.signatures[witness.name], undefined);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('replica v2 verified join bootstrap preserves evidence-only rooms with no prior participation', async () => {
+  const f = await fixture();
+  try {
+    const manifest = await exportReplicaRoom(f.room, f.tenant.serverName);
+    const keys = fakeKeyResolver(f.signing);
+    const evidence = await verifySnapshot({
+      self: f.tenant.serverName,
+      keys,
+      roomId: manifest.roomId,
+      roomVersion: manifest.roomVersion,
+      resident: f.tenant.serverName,
+      state: [manifest.events.find((event) => event.type === 'm.room.create')!],
+      authChain: manifest.events,
+    });
+    // Present the original signed creator join as an authentic snapshot opening,
+    // not as an unpublished-file genesis. Its create belongs to before-state.
+    const opening = manifest.stays[0].opening;
+    opening.kind = 'join';
+    const boundary = manifest.boundaries.find((entry) =>
+      entry.eventId === opening.eventId
+    )!;
+    boundary.state = [opening.createId];
+    boundary.authChain = [];
+    manifest.steps = manifest.steps.filter((step) =>
+      step.eventId !== opening.createId
+    );
+    const room = await openRoom(f.edgeStore(), manifest.roomId, {
+      create: true,
+    });
+    await room.tx((tx) => stageSnapshotEvidence(tx, evidence, opening.eventId));
+    assertEquals(await room.tx((tx) => tx.segments.latestStay()), null);
+    assert(await room.tx((tx) => tx.events.get(evidence.createId)));
+    await importReplicaRoom(f.edgeStore(), manifest, {
+      self: f.tenant.serverName,
+      keys,
+      signatureUnion: true,
+    });
+    assert(await room.tx((tx) => tx.segments.latestStay()));
+    assertEquals(
+      (await room.tx((tx) => tx.events.getStatus(opening.eventId)))
+        ?.grounding,
+      'grounded',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('replica signature-only packs retain verified evidence without changing wire bytes or live news', async () => {
+  const f = await fixture();
+  try {
+    const initial = await f.exports();
+    assert(initial);
+    const journal = await f.journal();
+    await journal.receive('home', [initial]);
+    await (await f.replicas()).apply(journal, initial);
+    const replica = await f.replica();
+    const manifest = await exportReplicaRoom(f.room, f.tenant.serverName);
+    manifest.after = manifest.cut;
+    manifest.steps = [];
+    const target = manifest.events.find((pdu) => pdu.type === 'm.room.create')!;
+    const id = String(target.event_id);
+    const witness = await makeRemoteServer('witness.test');
+    const body = redact(
+      target as unknown as Record<string, unknown>,
+      manifest.roomVersion,
+    );
+    delete body.event_id;
+    delete body.signatures;
+    const signature = b64encodeStd(
+      new Uint8Array(
+        await crypto.subtle.sign(
+          { name: 'Ed25519' },
+          witness.kp.privateKey,
+          new TextEncoder().encode(canonicalJson(body)),
+        ),
+      ),
+    );
+    target.signatures![witness.name] = { [witness.keyId]: signature };
+    const db = await f.edgeStore().room(replica.id);
+    await project(f.edgeStore(), replica.id);
+    const server = await f.edgeServer();
+    const feed = await server.query(
+      'SELECT * FROM feed WHERE room=? ORDER BY seq',
+      [replica.id],
+    );
+    assert(feed.length > 0);
+    const base = await db.query('SELECT pdu FROM events WHERE id=?', [id]);
+    const head = await replica.tx((tx) => tx.changes.head());
+    const position = await replica.tx((tx) => tx.segments.positionOf(id));
+    const apply = () =>
+      importReplicaRoom(f.edgeStore(), structuredClone(manifest), {
+        self: f.tenant.serverName,
+        keys: fakeKeyResolver(f.signing, witness),
+        signatureUnion: true,
+      });
+    await apply();
+    await project(f.edgeStore(), replica.id);
+    assertEquals(
+      await server.query('SELECT * FROM feed WHERE room=? ORDER BY seq', [
+        replica.id,
+      ]),
+      feed,
+    );
+    assertEquals(
+      JSON.parse((await replica.tx((tx) => tx.events.get(id)))!.pdu)
+        .signatures[witness.name],
+      undefined,
+    );
+    assertEquals(
+      await db.query('SELECT pdu FROM events WHERE id=?', [id]),
+      base,
+    );
+    assertEquals(
+      await replica.tx((tx) => tx.segments.positionOf(id)),
+      position,
+    );
+    const suffix = await exportReplicaRoom(replica, f.tenant.serverName, head);
+    assertEquals(suffix.steps, []);
+    assertEquals(suffix.cut, head);
+    assertEquals(
+      suffix.events.find((pdu) => pdu.event_id === id)!
+        .signatures![witness.name],
+      undefined,
+    );
+    await apply();
+    assertEquals(await replica.tx((tx) => tx.changes.head()), head);
+    await f.reopen();
+    assertEquals(
+      JSON.parse((await (await f.replica()).tx((tx) => tx.events.get(id)))!.pdu)
+        .signatures[witness.name],
+      undefined,
+    );
+    // Invalid optional evidence is omitted, never a reason to reject the pack
+    // or replace the verified witness. Full material remains immutable.
+    target.signatures![witness.name][witness.keyId] = 'A'.repeat(86);
+    await apply();
+    assertEquals(
+      JSON.parse((await (await f.replica()).tx((tx) => tx.events.get(id)))!.pdu)
+        .signatures[witness.name],
+      undefined,
+    );
+    const [held] = await (await f.edgeStore().room(replica.id)).query(
+      'SELECT signatures FROM event_signatures WHERE event=?',
+      [id],
+    );
+    assertEquals(JSON.parse(String(held.signatures))[witness.name], {
+      [witness.keyId]: signature,
+    });
+    assertEquals(
+      await (await f.replica()).tx((tx) => tx.changes.head()),
+      head,
+    );
+    target.signatures![witness.name][witness.keyId] = signature;
+    target.content = { ...target.content, injected: true };
+    await assertRejects(apply);
+    assertEquals(
+      await (await f.replica()).tx((tx) => tx.changes.head()),
+      head,
+    );
+  } finally {
+    await f.close();
+  }
+});
+Deno.test('replica wire: authenticated home copy supersedes the facade first copy without synthesizing a PDU', async () => {
+  const f = await fixture();
+  try {
+    const original = await exportReplicaRoom(f.room, f.tenant.serverName);
+    const own = structuredClone(original);
+    const target = own.events.find((pdu) => pdu.type === 'm.room.create')!;
+    const id = String(target.event_id);
+    const witness = await makeRemoteServer('facade-witness.test');
+    const body = redact(
+      target as unknown as Record<string, unknown>,
+      own.roomVersion,
+    );
+    delete body.event_id;
+    delete body.signatures;
+    target.signatures[witness.name] = {
+      [witness.keyId]: b64encodeStd(
+        new Uint8Array(
+          await crypto.subtle.sign(
+            { name: 'Ed25519' },
+            witness.kp.privateKey,
+            new TextEncoder().encode(canonicalJson(body)),
+          ),
+        ),
+      ),
+    };
+    await importReplicaRoom(f.edgeStore(), own, {
+      self: f.tenant.serverName,
+      keys: fakeKeyResolver(f.signing, witness),
+      signatureUnion: true,
+    });
+    const replica = await f.replica();
+    assertEquals(
+      JSON.parse((await replica.tx((tx) => tx.events.get(id)))!.pdu),
+      target,
+    );
+    const record = await exportRoomReplica(
+      f.home,
+      f.room,
+      f.tenant.serverName,
+      f.node.node,
+      f.bundle.id,
+      2,
+    );
+    assert(record);
+    const journal = new Journal(await f.edgeServer(), LINK_SUPPORTED);
+    await journal.receive('home', [record]);
+    await (await f.replicas()).apply(journal, record);
+    const home = original.events.find((pdu) => pdu.event_id === id)!;
+    assertEquals(
+      JSON.parse((await replica.tx((tx) => tx.events.get(id)))!.pdu),
+      home,
+    );
+    assertEquals(
+      JSON.parse((await replica.tx((tx) => tx.events.stored(id)))!),
+      target,
+    );
+    await f.reopen();
+    const wire = await exportReplicaRoom(
+      await f.replica(),
+      f.tenant.serverName,
+    );
+    assertEquals(wire.events.find((pdu) => pdu.event_id === id), home);
+  } finally {
+    await f.close();
+  }
+});
 
 // Register HTTP compositions after the low-level/historical-schema cases. App
 // recovery installs process-wide projection hooks, which require current schemas.
@@ -632,8 +1246,6 @@ function appliedReadTests() {
         b64decode(f.tenant.publicB64),
       );
       const keys = productionKeyResolver(
-        await f.edgeServer(),
-        f.node.signer(),
         {
           getVerifyKey(name, keyId) {
             assertEquals(name, f.tenant.serverName);
@@ -934,7 +1546,7 @@ Deno.test('directory inventory rejects malformed room identities', async (t) => 
 
 Deno.test('cold inbox rejection before Journal.apply rejects the finite tail promptly', async () => {
   const tls = await facadeTls();
-  const f = await fixture(serverSchema, certificatePin(tls.facade.cert));
+  const f = await fixture(serverSchema, '11', certificatePin(tls.facade.cert));
   let child: Awaited<ReturnType<typeof facadeProcess>> | undefined;
   try {
     const record = await f.directoryExport();
@@ -1037,6 +1649,631 @@ Deno.test('room replication pins bootstrap, applies only durable semantic suffix
   }
 });
 
+Deno.test('room replication exports an enrolled facade suffix under its own source incarnation', async () => {
+  const f = await fixture();
+  try {
+    const initial = await f.exports();
+    assert(initial);
+    const journal = await f.journal();
+    await journal.receive('home', [initial]);
+    await (await f.replicas()).apply(journal, initial);
+    const reverse = await exportRoomReplica(
+      f.edgeStore(),
+      await f.replica(),
+      f.tenant.serverName,
+      'home',
+      f.bundle.id,
+    );
+    assert(reverse);
+    assertEquals(reverse.source, f.node.node);
+    assertEquals(reverse.incarnation, f.node.incarnation);
+    assertEquals(reverse.version, 2);
+    assertEquals(
+      await exportRoomReplica(
+        f.edgeStore(),
+        await f.replica(),
+        f.tenant.serverName,
+        'home',
+        f.bundle.id,
+      ),
+      null,
+    );
+    const incoming = new Journal(await f.home.server(), LINK_SUPPORTED);
+    await incoming.receive(f.node.node, [reverse]);
+    const owner = new RoomReplicas(
+      f.home,
+      f.homePairings,
+      f.tenant.serverName,
+      fakeKeyResolver(f.signing),
+    );
+    const head = await f.room.tx((tx) => tx.changes.head());
+    assert(await owner.apply(incoming, reverse, f.bundle.id));
+    assertEquals(await owner.apply(incoming, reverse, f.bundle.id), false);
+    assertEquals(await f.room.tx((tx) => tx.changes.head()), head);
+
+    const branch = f.source.tipId;
+    const homeEvent = await f.source.addEvent({
+      type: 'm.room.encrypted',
+      prev_events: [branch],
+      content: { algorithm: 'm.megolm.v1.aes-sha2', ciphertext: 'home branch' },
+    });
+    const edgeEvent = await f.source.addEvent({
+      type: 'm.room.encrypted',
+      prev_events: [branch],
+      content: { algorithm: 'm.megolm.v1.aes-sha2', ciphertext: 'edge branch' },
+    });
+    await f.ingest([homeEvent]);
+    const replica = await f.replica();
+    await ingestRemote(replica, [edgeEvent], f.signing.name, {
+      keys: fakeKeyResolver(f.signing),
+      self: f.signing.name,
+      fetcher: fakeFetcher({}).fetcher,
+      limits: { waitMs: 0, limit: 100, budgetMs: 1000 },
+      ungroundedMs: 3600000,
+    });
+    const edgeSuffix = await exportRoomReplica(
+      f.edgeStore(),
+      replica,
+      f.tenant.serverName,
+      'home',
+      f.bundle.id,
+    );
+    assert(edgeSuffix);
+    await incoming.receive(f.node.node, [edgeSuffix]);
+    assert(await owner.apply(incoming, edgeSuffix, f.bundle.id));
+    const homeSuffix = await exportRoomReplica(
+      f.home,
+      f.room,
+      f.tenant.serverName,
+      f.node.node,
+      f.bundle.id,
+      2,
+    );
+    assert(homeSuffix);
+    const supported = new Journal(await f.edgeServer(), LINK_SUPPORTED);
+    await supported.receive('home', [homeSuffix]);
+    assert(await (await f.replicas()).apply(supported, homeSuffix));
+    for (const room of [f.room, replica]) {
+      for (const event of [homeEvent, edgeEvent]) {
+        assertEquals(
+          (await room.tx((tx) => tx.events.getStatus(String(event.event_id))))
+            ?.standing,
+          'accepted',
+        );
+        assert(
+          await room.tx((tx) => tx.segments.positionOf(String(event.event_id))),
+        );
+        const news = await room.tx((tx) => tx.changes.after(0, 100));
+        assertEquals(
+          news.filter((change) =>
+            change.kind === 'event' && change.event === event.event_id
+          ).length,
+          1,
+        );
+      }
+    }
+    const next = await exportRoomReplica(
+      f.edgeStore(),
+      replica,
+      f.tenant.serverName,
+      'home',
+      f.bundle.id,
+    );
+    assert(next);
+    await incoming.receive(f.node.node, [next]);
+    const manifest =
+      (next.payload as { manifest: { after: number; cut: number } }).manifest;
+    // Completion independently rechecks the grant even when its caller
+    // supplied no room effect and changed the database directly.
+    await assertRejects(
+      async () =>
+        await applyReplicaScope({
+          db: await f.home.server(),
+          pairings: f.homePairings,
+          self: f.tenant.serverName,
+          journal: incoming,
+          stream: next,
+          record: next,
+          scope: next.stream,
+          after: manifest.after,
+          cut: manifest.cut,
+          pairing: f.bundle.id,
+          apply: async () => {
+            await (await f.home.server()).execute(
+              'UPDATE facade_pairings SET grant_json=? WHERE id=?',
+              ['{}', f.bundle.id],
+            );
+            return {};
+          },
+        }),
+      Error,
+      'replica grant changed',
+    );
+    assertEquals(
+      (await incoming.heads(f.node.node, 'in', next)).applied.sequence,
+      edgeSuffix.sequence,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('reverse room admission: revocation during verification cannot commit room effects', async () => {
+  const f = await fixture();
+  try {
+    const initial = await f.exports();
+    assert(initial);
+    const journal = await f.journal();
+    await journal.receive('home', [initial]);
+    await (await f.replicas()).apply(journal, initial);
+    const replica = await f.replica();
+    const message = await f.source.addEvent({
+      type: 'm.room.message',
+      content: { msgtype: 'm.text', body: 'not admitted after revocation' },
+    });
+    await ingestRemote(replica, [message], f.signing.name, {
+      keys: fakeKeyResolver(f.signing),
+      self: f.signing.name,
+      fetcher: fakeFetcher({}).fetcher,
+      limits: { waitMs: 0, limit: 100, budgetMs: 1000 },
+      ungroundedMs: 3600000,
+    });
+    const reverse = await exportRoomReplica(
+      f.edgeStore(),
+      replica,
+      f.tenant.serverName,
+      'home',
+      f.bundle.id,
+    );
+    assert(reverse);
+    const incoming = new Journal(await f.home.server(), LINK_SUPPORTED);
+    await incoming.receive(f.node.node, [reverse]);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const keys = fakeKeyResolver(f.signing);
+    const owner = new RoomReplicas(
+      f.home,
+      f.homePairings,
+      f.tenant.serverName,
+      {
+        verifyEventSignature: async (args) => {
+          entered.resolve();
+          await release.promise;
+          return await keys.verifyEventSignature(args);
+        },
+      },
+    );
+    const before = await f.room.tx((tx) => tx.changes.head());
+    const applying = owner.apply(incoming, reverse, f.bundle.id).then(
+      () => null,
+      (error) => error,
+    );
+    await entered.promise;
+    await f.homePairings.revoke(f.bundle.id);
+    release.resolve();
+    assert(await applying instanceof Error);
+    assertEquals(
+      await f.room.tx((tx) => tx.events.get(String(message.event_id))),
+      null,
+    );
+    assertEquals(await f.room.tx((tx) => tx.changes.head()), before);
+    assertEquals(
+      (await incoming.heads(f.node.node, 'in', reverse)).applied.sequence,
+      0,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('replica participation reconciles concurrent last-local leave and join in both arrival orders', async (t) => {
+  for (const closedFirst of [true, false]) {
+    await t.step(
+      closedFirst ? 'closed receiver first' : 'closed source first',
+      async () => {
+        const f = await fixture();
+        try {
+          const options = {
+            self: f.signing.name,
+            keys: fakeKeyResolver(f.signing),
+            signatureUnion: true,
+          };
+          await importReplicaRoom(
+            f.edgeStore(),
+            await exportReplicaRoom(f.room, options.self),
+            options,
+          );
+          const replica = await f.replica();
+          const homeCut = await f.room.tx((tx) => tx.changes.head());
+          const edgeCut = await replica.tx((tx) => tx.changes.head());
+          const parent = f.source.tipId;
+          const historical = await replica.tx((tx) =>
+            tx.state.eventReadState(parent)
+          );
+          const newcomer = '@newcomer:' + options.self;
+          const leave = await f.source.addEvent({
+            type: 'm.room.member',
+            state_key: f.source.creator,
+            content: { membership: 'leave' },
+            prev_events: [parent],
+          });
+          const join = await f.source.addEvent({
+            type: 'm.room.member',
+            sender: newcomer,
+            state_key: newcomer,
+            content: { membership: 'join' },
+            prev_events: [parent],
+          });
+          await f.ingest([leave]);
+          assertEquals(await f.room.tx((tx) => tx.segments.openStay()), null);
+          await ingestRemote(replica, [join], options.self, {
+            ...options,
+            fetcher: fakeFetcher({}).fetcher,
+            limits: { waitMs: 0, limit: 100, budgetMs: 1000 },
+            ungroundedMs: 3600000,
+          });
+          const homeSuffix = await exportReplicaRoom(
+            f.room,
+            options.self,
+            homeCut,
+          );
+          const edgeSuffix = await exportReplicaRoom(
+            replica,
+            options.self,
+            edgeCut,
+          );
+          const reopen = () =>
+            importReplicaRoom(f.home, structuredClone(edgeSuffix), options);
+          const retain = () =>
+            importReplicaRoom(
+              f.edgeStore(),
+              structuredClone(homeSuffix),
+              options,
+            );
+          for (
+            const apply of closedFirst ? [reopen, retain] : [retain, reopen]
+          ) await apply();
+          for (const room of [f.room, replica]) {
+            const retained = await room.tx(async (tx) => {
+              const stay = await tx.segments.openStay();
+              assert(stay);
+              const group = await tx.state.current(stay.id);
+              assert(group !== null);
+              return {
+                creator: await tx.state.groupKey(
+                  group,
+                  'm.room.member',
+                  f.source.creator,
+                ),
+                newcomer: await tx.state.groupKey(
+                  group,
+                  'm.room.member',
+                  newcomer,
+                ),
+                frontier: await tx.extremities.frontier(stay.id),
+              };
+            });
+            assertEquals(retained.creator, leave.event_id);
+            assertEquals(retained.newcomer, join.event_id);
+            assertEquals(
+              retained.frontier.sort(),
+              [String(leave.event_id), String(join.event_id)].sort(),
+            );
+            for (const pdu of [leave, join]) {
+              assertEquals(
+                (await room.tx((tx) =>
+                  tx.events.getStatus(String(pdu.event_id))
+                ))?.standing,
+                'accepted',
+              );
+              assertEquals(
+                (await room.tx((tx) => tx.changes.after(0, 100))).filter((
+                  change,
+                ) =>
+                  ['event', 'transition'].includes(change.kind) &&
+                  change.event === pdu.event_id &&
+                  JSON.parse(change.data).grounding === 'grounded'
+                ).length,
+                1,
+              );
+            }
+            assert(await canSeeEvent(f.source.creator, room, parent));
+            assert(await canSeeEvent(newcomer, room, parent));
+            assertEquals(
+              await canSeeEvent('@unjoined:' + options.self, room, parent),
+              false,
+            );
+          }
+          assertEquals(
+            await replica.tx((tx) => tx.state.eventReadState(parent)),
+            historical,
+          );
+          const heads = await Promise.all(
+            [f.room, replica].map((room) => room.tx((tx) => tx.changes.head())),
+          );
+          await reopen();
+          await retain();
+          assertEquals(
+            await Promise.all(
+              [f.room, replica].map((room) =>
+                room.tx((tx) => tx.changes.head())
+              ),
+            ),
+            heads,
+          );
+        } finally {
+          await f.close();
+        }
+      },
+    );
+  }
+});
+
+Deno.test('replica participation merges a new source stay into an active receiver without replacing its branch', async () => {
+  const f = await fixture();
+  try {
+    const options = {
+      self: f.signing.name,
+      keys: fakeKeyResolver(f.signing),
+      signatureUnion: true,
+    };
+    await importReplicaRoom(
+      f.edgeStore(),
+      await exportReplicaRoom(f.room, options.self),
+      options,
+    );
+    const replica = await f.replica();
+    const parent = f.source.tipId;
+    const leave = await f.source.addEvent({
+      type: 'm.room.member',
+      state_key: f.source.creator,
+      content: { membership: 'leave' },
+      prev_events: [parent],
+    });
+    const resident = '@resident:' + options.self;
+    const localJoin = await f.source.addEvent({
+      type: 'm.room.member',
+      sender: resident,
+      state_key: resident,
+      content: { membership: 'join' },
+      prev_events: [parent],
+    });
+    await f.ingest([localJoin]);
+    await ingestRemote(replica, [leave], options.self, {
+      ...options,
+      fetcher: fakeFetcher({}).fetcher,
+      limits: { waitMs: 0, limit: 100, budgetMs: 1000 },
+      ungroundedMs: 3600000,
+    });
+    assertEquals(await replica.tx((tx) => tx.segments.openStay()), null);
+    const noBoundary = await exportReplicaRoom(f.room, options.self);
+    noBoundary.boundaries = noBoundary.boundaries.filter((boundary) =>
+      boundary.eventId !== localJoin.event_id
+    );
+    await assertRejects(
+      () => importReplicaRoom(f.edgeStore(), noBoundary, options),
+      MatrixError,
+      'replica live participation',
+    );
+    assertEquals(await replica.tx((tx) => tx.segments.openStay()), null);
+    const newcomer = '@newcomer:' + options.self;
+    const join = await f.source.addEvent({
+      type: 'm.room.member',
+      sender: newcomer,
+      state_key: newcomer,
+      content: { membership: 'join' },
+      prev_events: [String(leave.event_id)],
+    });
+    const before = f.source.stateIdsAt(String(join.event_id))!;
+    // A previously staged authentic join must be promoted once, not treated as
+    // a completed receipt that opens an empty stay.
+    const child = await f.source.addEvent({
+      type: 'm.room.message',
+      sender: newcomer,
+      content: { msgtype: 'm.text', body: 'evidence only' },
+    });
+    const evidenceIds = f.source.stateIdsAt(String(child.event_id))!;
+    const evidence = await verifySnapshot({
+      ...options,
+      roomId: replica.id,
+      roomVersion: f.source.version,
+      resident: options.self,
+      state: evidenceIds.pduIds.map((id) => f.source.event(id)!),
+      authChain: evidenceIds.authChainIds.map((id) => f.source.event(id)!),
+    });
+    await replica.tx((tx) =>
+      stageSnapshotEvidence(tx, evidence, String(child.event_id))
+    );
+    assertEquals(
+      (await replica.tx((tx) => tx.events.getStatus(String(join.event_id))))
+        ?.grounding,
+      'evidence',
+    );
+    await importReplicaBoundary(f.edgeStore(), {
+      ...options,
+      reconcile: true,
+      roomId: replica.id,
+      roomVersion: f.source.version,
+      resident: options.self,
+      join,
+      state: before.pduIds.map((id) => f.source.event(id)!),
+      authChain: before.authChainIds.map((id) => f.source.event(id)!),
+    });
+    const active = await f.room.tx((tx) => tx.segments.openStay());
+    assert(active);
+    const suffix = await exportReplicaRoom(replica, options.self);
+    await importReplicaRoom(f.home, structuredClone(suffix), options);
+    assertEquals(
+      (await f.room.tx((tx) => tx.segments.openStay()))?.id,
+      active.id,
+    );
+    const held = await f.room.tx(async (tx) => {
+      const group = await tx.state.current(active.id);
+      assert(group !== null);
+      return {
+        resident: await tx.state.groupKey(group, 'm.room.member', resident),
+        newcomer: await tx.state.groupKey(group, 'm.room.member', newcomer),
+        creator: await tx.state.groupKey(
+          group,
+          'm.room.member',
+          f.source.creator,
+        ),
+        frontier: await tx.extremities.frontier(active.id),
+      };
+    });
+    assertEquals(held.resident, localJoin.event_id);
+    assertEquals(held.newcomer, join.event_id);
+    assertEquals(held.creator, leave.event_id);
+    assertEquals(
+      held.frontier.sort(),
+      [String(localJoin.event_id), String(join.event_id)].sort(),
+    );
+    const count = await f.room.tx((tx) => tx.segments.list());
+    const head = await f.room.tx((tx) => tx.changes.head());
+    await importReplicaRoom(f.home, suffix, options);
+    assertEquals(await f.room.tx((tx) => tx.changes.head()), head);
+    assertEquals(await f.room.tx((tx) => tx.segments.list()), count);
+    const residentLeave = await f.source.addEvent({
+      type: 'm.room.member',
+      sender: resident,
+      state_key: resident,
+      content: { membership: 'leave' },
+      prev_events: [String(localJoin.event_id), String(join.event_id)],
+    });
+    const newcomerLeave = await f.source.addEvent({
+      type: 'm.room.member',
+      sender: newcomer,
+      state_key: newcomer,
+      content: { membership: 'leave' },
+    });
+    await f.ingest([residentLeave, newcomerLeave]);
+    assertEquals(await f.room.tx((tx) => tx.segments.openStay()), null);
+    const archived = await f.room.tx((tx) => tx.segments.list());
+    const archivedHead = await f.room.tx((tx) => tx.changes.head());
+    // That old source opening was grounded in our existing stay. Replaying it
+    // after a later departure must not manufacture an empty reopened stay.
+    await importReplicaRoom(f.home, structuredClone(suffix), options);
+    assertEquals(await f.room.tx((tx) => tx.segments.openStay()), null);
+    assertEquals(await f.room.tx((tx) => tx.segments.list()), archived);
+    assertEquals(await f.room.tx((tx) => tx.changes.head()), archivedHead);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('reverse room bootstrap requires selected authentic participation and survives cold retry', async () => {
+  const f = await fixture();
+  try {
+    const source = await makeFakeRoom({
+      roomId: '!facade-created:logical.test',
+      server: f.signing,
+    });
+    const pdus = [...source.events.values()];
+    const keys = fakeKeyResolver(f.signing);
+    await importReplicaGenesis(f.edgeStore(), {
+      roomId: source.roomId,
+      roomVersion: source.version,
+      self: f.signing.name,
+      keys,
+      create: pdus[0],
+      join: pdus[1],
+    });
+    const room = await openRoom(f.edgeStore(), source.roomId);
+    await ingestRemote(room, pdus.slice(2), f.signing.name, {
+      keys,
+      self: f.signing.name,
+      fetcher: fakeFetcher({}).fetcher,
+      limits: { waitMs: 0, limit: 100, budgetMs: 1000 },
+      ungroundedMs: 3600000,
+    });
+    const record = await exportRoomReplica(
+      f.edgeStore(),
+      room,
+      f.signing.name,
+      'home',
+      f.bundle.id,
+    );
+    assert(record);
+    const oldReader = new Journal(await f.home.server(), LINK_CAPABILITIES);
+    await assertRejects(
+      () => oldReader.receive(f.node.node, [record]),
+      Error,
+      'unsupported record type',
+    );
+    const journal = new Journal(await f.home.server(), LINK_SUPPORTED);
+    await journal.receive(f.node.node, [record]);
+    const owner = new RoomReplicas(
+      f.home,
+      f.homePairings,
+      f.signing.name,
+      keys,
+    );
+    for (
+      const changed of [{ source: 'home' }, { incarnation: 'foreign-store' }]
+    ) {
+      const forged = await (await f.edgeServer()).tx((conn) =>
+        appendRecord(conn, 'home', {
+          source: record.source,
+          incarnation: record.incarnation,
+          stream: record.stream,
+          type: record.type,
+          version: record.version,
+          payload: record.payload,
+          operationId: 'foreign-' + Object.keys(changed)[0],
+          ...changed,
+        })
+      );
+      await journal.receive(f.node.node, [forged]);
+      await assertRejects(
+        () => owner.apply(journal, forged, f.bundle.id),
+        Error,
+        'source or scope',
+      );
+      assertEquals((await f.home.rooms()).includes(source.roomId), false);
+      assertEquals(
+        (await journal.heads(f.node.node, 'in', forged)).applied.sequence,
+        0,
+      );
+    }
+    await assertRejects(
+      () => owner.apply(journal, record, f.bundle.id),
+      Error,
+      'selected account',
+    );
+    assertEquals((await f.home.rooms()).includes(source.roomId), false);
+    assertEquals(
+      (await journal.heads(f.node.node, 'in', record)).applied.sequence,
+      0,
+    );
+    // This is the selection fact owned by the auth exporter, not a prior room
+    // export. No home room row exists for this authentic facade genesis.
+    await (await f.home.server()).execute(
+      'INSERT INTO facade_exports(peer,incarnation,scope,source_cut) VALUES(?,?,?,?)',
+      [f.node.node, f.bundle.id, 'auth:' + source.creator, 1],
+    );
+    assert(await owner.apply(journal, record, f.bundle.id));
+    const imported = await openRoom(f.home, source.roomId);
+    const head = await imported.tx((tx) => tx.changes.head());
+    await f.reopenHome();
+    const reopened = new RoomReplicas(
+      f.home,
+      f.homePairings,
+      f.signing.name,
+      keys,
+    );
+    const resumed = new Journal(await f.home.server(), LINK_SUPPORTED);
+    assertEquals(await reopened.apply(resumed, record, f.bundle.id), false);
+    const held = await openRoom(f.home, source.roomId);
+    assertEquals(await held.tx((tx) => tx.changes.head()), head);
+    assertEquals(
+      (await held.tx((tx) => tx.events.getStatus(source.tipId)))?.standing,
+      'accepted',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('room readiness waits for missing and held verification authority without refusing its consumer or moving its cut', async () => {
   const f = await fixture();
   const entered = Promise.withResolvers<void>();
@@ -1071,7 +2308,7 @@ Deno.test('room readiness waits for missing and held verification authority with
       f.edgeStore(),
       await f.edgePairings(),
       f.tenant.serverName,
-      productionKeyResolver(server, f.node.signer(), keys.verificationKeys()),
+      productionKeyResolver(keys.verificationKeys()),
     );
     let finished = false;
     const consumer = observations.fact(
@@ -2199,6 +3436,344 @@ Deno.test('replica device composition borrows the node service and binds its dis
     await recovery?.stop();
     await closeApp();
     await peer.close();
+    await f.close();
+    setConfigForTests({});
+  }
+});
+
+Deno.test('facade authorship captures room permits and never exposes the raw tenant signer', async () => {
+  const f = await fixture();
+  let allowed = true, preparations = 0, signatures = 0;
+  const raw = f.node.signer();
+  const guarded = {
+    serverName: raw.serverName,
+    keyId: raw.keyId,
+    sign: () =>
+      Promise.reject(
+        new MatrixError(
+          503,
+          'M_UNAVAILABLE',
+          'request signer is not a room permit',
+        ),
+      ),
+    prepare: async () => {
+      preparations++;
+      // The store rejects this cross-file access if preparation happens inside
+      // a room transaction. The byte signer below must not open this file.
+      await (await f.edgeServer()).query('SELECT 1');
+      if (!allowed) {
+        throw new MatrixError(503, 'M_UNAVAILABLE', 'signing expired');
+      }
+      return {
+        serverName: raw.serverName,
+        keyId: raw.keyId,
+        sign: async (bytes: string) => {
+          if (!allowed) {
+            throw new MatrixError(503, 'M_UNAVAILABLE', 'signing expired');
+          }
+          signatures++;
+          return await raw.sign(bytes);
+        },
+      };
+    },
+  };
+  try {
+    setConfigForTests({
+      server: { name: 'logical.test', role: 'facade' },
+      facade: { phase: 'f2', nodeid: 'edge_a' },
+    });
+    const app = await openReplicaApp(f.edgeStore(), await f.edgeTenant(), {
+      requireScope: () => Promise.resolve(),
+      prepareRoomScope: () => Promise.reject(new Error('unused')),
+      requireReadScope: () => Promise.resolve(),
+      prepareReadRoomScope: () => Promise.reject(new Error('unused')),
+      keys: keyStore(await f.edgeServer(), { signer: guarded }),
+      signer: guarded,
+      keyDocument: () => Promise.reject(new Error('unused')),
+      publicRooms: () => Promise.resolve(false),
+    });
+    await assertRejects(
+      () => app.tenant.signer().sign('unprepared'),
+      MatrixError,
+      'request signer',
+    );
+    const user = '@alice:logical.test';
+    const created = await createClientRoom({
+      creator: user,
+      preset: 'public_chat',
+    });
+    const room = await openRoom(app.store, created.roomId);
+    const joined = await localMembership.membershipOf(room, user);
+    assert(joined);
+    const joiningCut = { preparations, signatures };
+    allowed = false;
+    for (
+      const retry of [
+        () => localMembership.join(room, user, app.tenant.signer()),
+        () => localMembership.joinResident(room, user, app.tenant.signer()),
+        () => localMembership.reopen(room, user, app.tenant.signer(), {}),
+      ]
+    ) {
+      assertEquals(await retry(), {
+        roomId: room.id,
+        eventId: joined.eventId,
+        created: false,
+      });
+      assertEquals({ preparations, signatures }, joiningCut);
+    }
+    allowed = true;
+    const message = await sendEvent(
+      room.id,
+      user,
+      'm.room.encrypted',
+      { algorithm: 'm.megolm.v1.aes-sha2', ciphertext: 'opaque' },
+      null,
+      'send',
+    );
+    await writeStateKey(room.id, user, 'm.room.topic', '', { topic: 'facade' });
+    await redactEvent(
+      room.id,
+      user,
+      message.event_id,
+      undefined,
+      null,
+      'redact',
+    );
+    // Hold the ordinary projection hook to model the room-commit / server-cut
+    // crash window, then let the same expired-authority retry repair it.
+    setRoomHooks({
+      project: (store, id) =>
+        store === app.store ? Promise.resolve() : project(store, id),
+      register: registerRoom,
+    });
+    const left = await localMembership.leave(room, user, app.tenant.signer());
+    assertEquals(
+      (await projectedMembershipOf(app.server, room.id, user))?.membership,
+      'join',
+    );
+    installServerHooks();
+    const leavingCut = { preparations, signatures };
+    allowed = false;
+    assertEquals(await localMembership.leave(room, user, app.tenant.signer()), {
+      ...left,
+      created: false,
+    });
+    assertEquals({ preparations, signatures }, leavingCut);
+    assertEquals(
+      (await projectedMembershipOf(app.server, room.id, user))?.membership,
+      'leave',
+    );
+    // No resident means remote routing, not a fresh local signature. This is
+    // also required after a last-local departure with expired authority.
+    assertEquals(
+      await localMembership.joinResident(room, user, app.tenant.signer()),
+      null,
+    );
+    assertEquals({ preparations, signatures }, leavingCut);
+    allowed = true;
+    await localMembership.reopen(room, user, app.tenant.signer(), {});
+    let saved: PreparedSubmission | null = null;
+    const submission = {
+      lookup: () => Promise.resolve(saved),
+      prepare: (pdu: Pdu) =>
+        Promise.resolve(saved = { eventId: String(pdu.event_id), pdu }),
+      finish: () => Promise.resolve(),
+    };
+    const partial = {
+      type: 'm.room.encrypted',
+      sender: user,
+      content: { algorithm: 'm.megolm.v1.aes-sha2', ciphertext: 'receipt' },
+    };
+    const original = await sendLocal(
+      room,
+      partial,
+      app.tenant.signer(),
+      submission,
+    );
+    const cut = { preparations, signatures };
+    allowed = false;
+    const replay = await sendLocal(
+      room,
+      { ...partial, content: { ciphertext: 'changed retry' } },
+      app.tenant.signer(),
+      submission,
+    );
+    assertEquals(replay.eventId, original.eventId);
+    assertEquals(replay.receipt, true);
+    assertEquals({ preparations, signatures }, cut);
+    await assertRejects(
+      () => sendLocal(room, partial, app.tenant.signer()),
+      MatrixError,
+      'expired',
+    );
+    assertEquals(signatures, cut.signatures);
+    assert(preparations >= 8);
+  } finally {
+    installServerHooks();
+    await closeApp();
+    await f.close();
+    setConfigForTests({});
+  }
+});
+
+Deno.test('client room dependencies preserve the App approved logical-server key owner', async () => {
+  const f = await fixture();
+  try {
+    const owner = new FacadeKeys(
+      await f.edgeServer(),
+      f.node.signer(),
+      f.node.publicKey,
+      await f.edgePairings(),
+    );
+    const record = await exportKeyRoster(
+      f.home,
+      f.tenant,
+      f.node.node,
+      f.bundle.id,
+      (_key, document) => owner.cosign(document),
+    );
+    const journal = await f.journal();
+    await journal.receive('home', [record]);
+    await owner.apply(journal, record);
+    setConfigForTests({
+      server: { name: 'logical.test', role: 'facade' },
+      facade: { phase: 'f2', nodeid: 'edge_a' },
+    });
+    const app = await openReplicaApp(f.edgeStore(), await f.edgeTenant(), {
+      requireScope: () => Promise.resolve(),
+      prepareRoomScope: () => Promise.reject(new Error('unused')),
+      requireReadScope: () => Promise.resolve(),
+      prepareReadRoomScope: () => Promise.reject(new Error('unused')),
+      keys: owner.verificationKeys(),
+      signer: f.node.signer(),
+      keyDocument: () => owner.document(),
+      publicRooms: () => Promise.resolve(false),
+    });
+    const created = await createClientRoom({ creator: '@alice:logical.test' });
+    const room = await openRoom(app.store, created.roomId);
+    const join = await localMembership.membershipOf(
+      room,
+      '@alice:logical.test',
+    );
+    assert(join);
+    const event = await room.tx((tx) => tx.events.get(join.eventId));
+    assert(event);
+    const args = {
+      pdu: JSON.parse(event.pdu) as Pdu,
+      roomVersion: await versionOf(room),
+      server: 'logical.test',
+      keyId: f.node.keyId,
+      minValidUntilMs: Date.now(),
+    };
+    assert(await inviteDependencies(app).keys.verifyEventSignature(args));
+    assert(await inviteDeps().keys.verifyEventSignature(args));
+    // The same authority also verifies home-authored PDUs without self-HTTP.
+    const homeCreated = await (await import('#engine/room/create.ts'))
+      .createRoom(
+        f.home,
+        { creator: '@alice:logical.test' },
+        f.tenant.signer(),
+      );
+    const homeRoom = await openRoom(f.home, homeCreated.roomId);
+    const homeJoin = await localMembership.membershipOf(
+      homeRoom,
+      '@alice:logical.test',
+    );
+    assert(homeJoin);
+    const homeEvent = await homeRoom.tx((tx) =>
+      tx.events.get(homeJoin.eventId)
+    );
+    assert(homeEvent);
+    assert(
+      await inviteDeps().keys.verifyEventSignature({
+        ...args,
+        pdu: JSON.parse(homeEvent.pdu) as Pdu,
+        keyId: f.tenant.keyId,
+      }),
+    );
+  } finally {
+    await closeApp();
+    await f.close();
+    setConfigForTests({});
+  }
+});
+
+Deno.test('facade create variants refuse home-owned directory writes before any room or signature', async (t) => {
+  const f = await fixture();
+  let signatures = 0;
+  const raw = f.node.signer();
+  const signer = {
+    ...raw,
+    sign: (bytes: string) => {
+      signatures++;
+      return raw.sign(bytes);
+    },
+  };
+  try {
+    setConfigForTests({
+      server: { name: 'logical.test', role: 'facade' },
+      facade: { phase: 'f2', nodeid: 'edge_a' },
+    });
+    const app = await openReplicaApp(f.edgeStore(), await f.edgeTenant(), {
+      requireScope: () => Promise.resolve(),
+      prepareRoomScope: () => Promise.reject(new Error('unused')),
+      requireReadScope: () => Promise.resolve(),
+      prepareReadRoomScope: () => Promise.reject(new Error('unused')),
+      keys: keyStore(await f.edgeServer(), { signer }),
+      signer,
+      keyDocument: () => Promise.reject(new Error('unused')),
+      publicRooms: () => Promise.resolve(false),
+    });
+    await registerAlias(
+      app.server,
+      '#held:logical.test',
+      f.room.id,
+      '@alice:logical.test',
+    );
+    const before = {
+      rooms: await app.store.rooms(),
+      aliases: await app.server.query('SELECT * FROM aliases'),
+      visibility: await app.server.query('SELECT * FROM visibility'),
+    };
+    for (
+      const variant of [
+        { alias: 'fresh' },
+        { alias: 'held' },
+        { visibility: 'public' },
+        { alias: 'fresh', visibility: 'public' },
+      ]
+    ) {
+      await t.step(JSON.stringify(variant), async () => {
+        const error = await assertRejects(
+          () =>
+            createClientRoom({ creator: '@alice:logical.test', ...variant }),
+          MatrixError,
+        );
+        assertEquals(error.status, 503);
+        assertEquals(error.errcode, 'M_UNAVAILABLE');
+        assertEquals(signatures, 0);
+        assertEquals({
+          rooms: await app.store.rooms(),
+          aliases: await app.server.query('SELECT * FROM aliases'),
+          visibility: await app.server.query('SELECT * FROM visibility'),
+        }, before);
+      });
+    }
+    // Public join rules are room PDUs, not directory publication authority.
+    const created = await createClientRoom({
+      creator: '@alice:logical.test',
+      preset: 'public_chat',
+      visibility: 'private',
+    });
+    assert(await openRoom(app.store, created.roomId));
+    assert(signatures > 0);
+    assertEquals(await lookupAlias(app.server, '#fresh:logical.test'), null);
+    assertEquals(
+      await app.server.query('SELECT * FROM visibility'),
+      before.visibility,
+    );
+  } finally {
+    await closeApp();
     await f.close();
     setConfigForTests({});
   }

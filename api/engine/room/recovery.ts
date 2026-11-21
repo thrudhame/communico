@@ -3,7 +3,6 @@
 // batches. A changed room cut invalidates the prepared decisions, never an
 // imported state prefix. The final caller still imports its whole boundary in
 // one transaction after lifecycle/ACL/auth revalidation.
-import { canonicalJson } from '#engine/canonical.ts';
 import { withAuthProofs } from '#engine/auth-proofs.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { aclAllows } from '#engine/room/acl.ts';
@@ -147,7 +146,7 @@ export async function stageRecoveryEvidence(
             const standing = auth.ok ? 'accepted' : 'rejected';
             await tx.events.insert(
               id,
-              canonicalJson(pdu as unknown as Record<string, unknown>),
+              pdu,
             );
             await tx.events.setStatus(id, {
               standing,

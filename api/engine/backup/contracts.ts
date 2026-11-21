@@ -22,6 +22,7 @@ export const tableContracts = {
     // Immutable room truth and its local reference indexes: auditRoom.
     truth: [
       'events',
+      'event_signatures',
       'event_status',
       'event_topology',
       'prev_edges',

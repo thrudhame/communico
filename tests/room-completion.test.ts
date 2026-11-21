@@ -222,7 +222,7 @@ Deno.test('completion: supported v7 upgrade fixes one legacy baseline across reo
     apply: async (db: Parameters<typeof roomSchema.apply>[0]) => {
       await roomSchema.apply(db);
       await db.exec(
-        'DROP TABLE completion_receipts; DROP TABLE completion_state;',
+        'DROP TABLE event_signatures; ALTER TABLE events DROP COLUMN hash_redacted; DROP TABLE completion_receipts; DROP TABLE completion_state;',
       );
     },
   };
@@ -295,7 +295,7 @@ Deno.test('completion: legacy retry keeps its original grounding witness after a
     );
     const db = await store.room(g.roomId);
     await db.exec(
-      'DROP TABLE completion_receipts; DROP TABLE completion_state',
+      'DROP TABLE event_signatures; ALTER TABLE events DROP COLUMN hash_redacted; DROP TABLE completion_receipts; DROP TABLE completion_state',
     );
     await db.execute("UPDATE meta SET v='7' WHERE k='schema_version'");
     await store.close();
@@ -365,7 +365,7 @@ Deno.test('completion: old prepared submission uses its verified fixed upgrade w
     const baseline = await g.room.tx((tx) => tx.changes.head());
     const db = await store.room(g.roomId);
     await db.exec(
-      'DROP TABLE completion_receipts; DROP TABLE completion_state',
+      'DROP TABLE event_signatures; ALTER TABLE events DROP COLUMN hash_redacted; DROP TABLE completion_receipts; DROP TABLE completion_state',
     );
     await db.execute("UPDATE meta SET v='7' WHERE k='schema_version'");
     await store.close();
@@ -408,6 +408,22 @@ Deno.test('completion: old prepared submission uses its verified fixed upgrade w
       ),
       [{ basis: 'legacy-reconciled' }],
     );
+    // A verified signature learned after the room commit is an overlay; the
+    // retried submission still names the same immutable PDU.
+    await (await store.room(g.roomId)).execute(
+      'INSERT INTO event_signatures(event,signatures) VALUES(?,?)',
+      [
+        g.tipId,
+        JSON.stringify({ 'peer.test': { 'ed25519:peer': 'learned' } }),
+      ],
+    );
+    const overlaid = await sendLocal(
+      room,
+      { type: 'm.room.message', sender: g.creator, content: {} },
+      g.signer,
+      submission,
+    );
+    assertEquals(overlaid.eventId, g.tipId);
     const wrong = {
       ...submission,
       lookup: () =>

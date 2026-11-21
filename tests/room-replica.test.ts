@@ -535,11 +535,18 @@ Deno.test('whole-room export includes older departed stays and isolated historic
       entry.eventId === anchor.event_id
     );
     assert(boundary);
-    assertEquals(boundary.state, ids.pduIds);
+    // The compact wire lists are a delta, not a complete before-state. Keep
+    // the original full-list assertion and prove both encodings at import.
+    const full = await exportReplicaRoom(room, f.input.self, 0, false);
+    assertEquals(
+      full.boundaries.find((entry) => entry.eventId === anchor.event_id)!.state,
+      ids.pduIds,
+    );
     assert(
       manifest.boundaries.some((entry) => entry.eventId === rejoin.event_id),
     );
     await roundTrip(f, manifest);
+    await roundTrip(f, full);
   } finally {
     await f.close();
   }

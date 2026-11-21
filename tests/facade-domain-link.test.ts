@@ -1,6 +1,7 @@
-import { assertEquals, assertRejects } from '@std/assert';
+import { assertEquals, assertRejects, assertThrows } from '@std/assert';
 import { createHash } from 'node:crypto';
 import { canonicalJson } from '#engine/canonical.ts';
+import { setConfigForTests } from '#engine/config.ts';
 import {
   AccountSnapshots,
   exportAccountAuth,
@@ -15,7 +16,6 @@ import { AuthLinkHealth, FacadeAuth } from '#engine/facade/auth.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { drainResources } from '#engine/lifetime.ts';
 import { closeApp, openReplicaApp } from '#engine/app.ts';
-import { setConfigForTests } from '#engine/config.ts';
 import { keyStore } from '#engine/federation/keys.ts';
 import { hashToken, insertAccessToken } from '#engine/tenant/auth.ts';
 import { ignoredSenders } from '#engine/client/ignored.ts';
@@ -33,6 +33,24 @@ import {
   recordHash,
 } from '#engine/facade/protocol.ts';
 import { serverSchema } from '#engine/server/schema.ts';
+import { openRoom, roomSchema } from '#engine/room/index.ts';
+import { createRoom } from '#engine/room/create.ts';
+import { joinRemote } from '#engine/room/join.ts';
+import { importReplicaGenesis } from '#engine/room/replica.ts';
+import { recoverServer } from '#engine/server/startup.ts';
+import {
+  DirectoryReplicas,
+  exportDirectoryReplica,
+} from '#engine/facade/directory.ts';
+import { appendRecord } from '#engine/facade/journal.ts';
+import { exportRoomReplica } from '#engine/facade/replication.ts';
+import {
+  fakeFetcher,
+  fakeKeyResolver,
+  makeRemoteServer,
+} from './fixtures/remote.ts';
+import { makeFakeRoom } from './fixtures/remote-room.ts';
+import { testRemoteServer, testSigner } from './fixtures/signer.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import {
@@ -76,7 +94,9 @@ async function fixture(token?: string) {
       checkpointlogbytes: 65536,
       maxopenfiles: 8,
       idleseconds: 300,
-    }, { schemas: { server: serverSchema, tenant: tenantSchema } });
+    }, {
+      schemas: { server: serverSchema, tenant: tenantSchema, room: roomSchema },
+    });
   const home = await open('home'), edge = await open('edge');
   await bindRole(home, { role: 'home', server: 'logical.test', node: '' });
   await bindRole(edge, {
@@ -186,6 +206,235 @@ async function fixture(token?: string) {
     },
   };
 }
+
+Deno.test('directory scope retains selected local initiation without hiding unapplied home cuts', async (t) => {
+  for (const mode of ['create', 'stock join']) {
+    await t.step(mode, async () => {
+      const f = await fixture();
+      try {
+        setConfigForTests({ facade: { phase: 'f2' } });
+        const server = await f.edge.server();
+        const owner = new DirectoryReplicas(server, f.fp, 'logical.test');
+        const inventory = await exportDirectoryReplica(
+          f.home,
+          f.ht,
+          f.node.node,
+          f.bundle.id,
+        );
+        if (!inventory) throw new Error('missing initial directory');
+        await f.ej.receive('home', [inventory]);
+        await owner.apply(f.ej, inventory);
+        const signer = await testSigner('logical.test');
+        let roomId: string;
+        if (mode === 'create') {
+          roomId = (await createRoom(f.edge, {
+            creator: '@alice:logical.test',
+            preset: 'public_chat',
+          }, signer)).roomId;
+        } else {
+          const source = await makeFakeRoom({ roomId: '!stock:remote.test' });
+          const { fetcher } = fakeFetcher({
+            makeJoin: (user) => source.makeJoinAnswer(user),
+            sendJoin: (event) => source.acceptSendJoin(event),
+          });
+          roomId = (await joinRemote(f.edge, {
+            roomId: source.roomId,
+            user: '@alice:logical.test',
+            via: [source.server.name],
+            signer,
+            deps: {
+              self: 'logical.test',
+              keys: fakeKeyResolver(
+                source.server,
+                await testRemoteServer('logical.test'),
+              ),
+              fetcher,
+            },
+          })).roomId;
+        }
+        await recoverServer(f.edge);
+        assertEquals(await owner.scopeState('room:' + roomId), 'ready');
+        const admission = await owner.prepareRoomScope(roomId);
+        await server.tx(admission.check);
+        assertEquals(await owner.scopeState('rooms'), 'ready');
+        assertEquals((await owner.snapshot())?.rooms, []);
+        setConfigForTests({ facade: { phase: 'f1' } });
+        assertEquals(await owner.scopeState('room:' + roomId), 'absent');
+        setConfigForTests({ facade: { phase: 'f2' } });
+        const refreshedAuth = await exportAccountAuth(
+          f.home,
+          f.ht,
+          f.hp,
+          f.bundle.id,
+          'alice',
+          false,
+        );
+        await f.ej.receive('home', [refreshedAuth]);
+        assertThrows(
+          admission.checkCurrent,
+          MatrixError,
+          'replica unavailable',
+        );
+        await assertRejects(
+          () => owner.scopeState('room:' + roomId),
+          MatrixError,
+          'replica unavailable',
+        );
+        await assertRejects(
+          () => owner.scopeState('rooms'),
+          MatrixError,
+          'replica unavailable',
+        );
+        await new AccountSnapshots(f.edge, f.et, f.fp, f.owners).apply(
+          f.ej,
+          refreshedAuth,
+        );
+        assertEquals(await owner.scopeState('room:' + roomId), 'ready');
+        const control = await exportOwnerControl(
+          f.home,
+          f.ht,
+          f.hp,
+          f.bundle.id,
+        );
+        const repeatedControl = await (await f.home.server()).tx((conn) =>
+          appendRecord(conn, f.node.node, {
+            source: control.source,
+            incarnation: control.incarnation,
+            stream: control.stream,
+            type: control.type,
+            version: control.version,
+            operationId: 'scope-control-replay',
+            payload: control.payload,
+          })
+        );
+        const beforeControl = await owner.prepareRoomScope(roomId);
+        await f.ej.receive('home', [repeatedControl]);
+        assertThrows(
+          beforeControl.checkCurrent,
+          MatrixError,
+          'replica unavailable',
+        );
+        await assertRejects(
+          () => owner.scopeState('room:' + roomId),
+          MatrixError,
+          'replica unavailable',
+        );
+        await f.owners.apply(f.ej, repeatedControl);
+        assertEquals(await owner.scopeState('room:' + roomId), 'ready');
+        const currentAdmission = await owner.prepareRoomScope(roomId);
+        const unselected = await createRoom(f.edge, {
+          creator: '@bob:logical.test',
+          preset: 'public_chat',
+        }, signer);
+        const received = await makeFakeRoom({
+          roomId: '!received:logical.test',
+          creator: '@alice:logical.test',
+          server: await makeRemoteServer('logical.test'),
+        });
+        const events = [...received.events.values()];
+        await importReplicaGenesis(f.edge, {
+          roomId: received.roomId,
+          roomVersion: received.version,
+          self: 'logical.test',
+          keys: fakeKeyResolver(received.server),
+          create: events[0],
+          join: events[1],
+        });
+        await recoverServer(f.edge);
+        for (
+          const id of [
+            unselected.roomId,
+            received.roomId,
+            '!arbitrary:logical.test',
+          ]
+        ) {
+          assertEquals(await owner.scopeState('room:' + id), 'absent');
+        }
+        // The same old home inventory still cannot erase the authorized local fact.
+        await f.ej.receive('home', [inventory]);
+        assertEquals(await owner.scopeState('room:' + roomId), 'ready');
+        const room = await openRoom(f.edge, roomId);
+        const reverse = await exportRoomReplica(
+          f.edge,
+          room,
+          'logical.test',
+          'home',
+          f.bundle.id,
+        );
+        if (!reverse) throw new Error('missing reverse bootstrap');
+        const pending = await (await f.home.server()).tx((conn) =>
+          appendRecord(conn, f.node.node, {
+            source: 'home',
+            incarnation: f.bundle.id,
+            stream: reverse.stream,
+            type: reverse.type,
+            version: reverse.version,
+            operationId: 'home-cut',
+            payload: reverse.payload,
+          })
+        );
+        await f.ej.receive('home', [pending]);
+        await assertRejects(
+          () => owner.scopeState('room:' + roomId),
+          MatrixError,
+          'replica unavailable',
+        );
+        await assertRejects(
+          () => owner.scopeState('rooms'),
+          MatrixError,
+          'replica unavailable',
+        );
+        assertThrows(
+          currentAdmission.checkCurrent,
+          MatrixError,
+          'replica unavailable',
+        );
+        const independent = await createRoom(f.edge, {
+          creator: '@alice:logical.test',
+          preset: 'public_chat',
+        }, signer);
+        await recoverServer(f.edge);
+        assertEquals(
+          await owner.scopeState('room:' + independent.roomId),
+          'ready',
+        );
+        await f.edge.close();
+        const reopened = await f.open('edge');
+        try {
+          const pairings = new Pairings(
+            await reopened.server(),
+            f.node.signer(),
+            f.node.publicKey,
+            'b'.repeat(64),
+            f.node,
+          );
+          const cold = new DirectoryReplicas(
+            await reopened.server(),
+            pairings,
+            'logical.test',
+          );
+          await assertRejects(
+            () => cold.scopeState('room:' + roomId),
+            MatrixError,
+            'replica unavailable',
+          );
+          // A different selected local room stays ready across the same reopen;
+          // the pending home stream fences only its own room.
+          await recoverServer(reopened);
+          assertEquals(
+            await cold.scopeState('room:' + independent.roomId),
+            'ready',
+          );
+        } finally {
+          await reopened.close();
+        }
+      } finally {
+        await f.close();
+        setConfigForTests({});
+      }
+    });
+  }
+});
 
 Deno.test('domain link: semantic operations have an explicitly negotiated reader', () => {
   assertEquals(

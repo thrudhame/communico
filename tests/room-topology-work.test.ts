@@ -25,7 +25,7 @@ Deno.test('topology repair settles each affected descendant once across convergi
       for (let i = 0; i < count; i++) {
         for (const id of ['source-' + i, 'child-' + i]) {
           await conn.execute(
-            "INSERT INTO events VALUES(?,'{}','test',NULL,'@a:test',1,1)",
+            "INSERT INTO events(id,pdu,type,state_key,sender,depth,origin_ts) VALUES(?,'{}','test',NULL,'@a:test',1,1)",
             [id],
           );
           await conn.execute('INSERT INTO event_topology VALUES(?,?)', [
@@ -49,7 +49,7 @@ Deno.test('topology repair settles each affected descendant once across convergi
         ]);
       }
       await conn.execute(
-        "INSERT INTO events VALUES('late','{}','test',NULL,'@a:test',1,1)",
+        "INSERT INTO events(id,pdu,type,state_key,sender,depth,origin_ts) VALUES('late','{}','test',NULL,'@a:test',1,1)",
       );
       await conn.execute('INSERT INTO prev_edges VALUES(?,?,0)', [
         'late',
@@ -87,7 +87,7 @@ Deno.test('topology repair settles each affected descendant once across convergi
       () =>
         db.tx(async (conn) => {
           await conn.execute(
-            "INSERT INTO events VALUES('cycle','{}','test',NULL,'@a:test',1,1)",
+            "INSERT INTO events(id,pdu,type,state_key,sender,depth,origin_ts) VALUES('cycle','{}','test',NULL,'@a:test',1,1)",
           );
           await conn.execute(
             "INSERT INTO prev_edges VALUES('cycle','cycle',0)",

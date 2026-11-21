@@ -369,7 +369,10 @@ async function joinVia(
           if (
             existing?.standing === 'accepted' &&
             existing.grounding === 'grounded'
-          ) return;
+          ) {
+            await tx.changes.localParticipation(eventId, args.user);
+            return;
+          }
           throw new MatrixError(
             400,
             'M_BAD_STATE',
@@ -394,6 +397,7 @@ async function joinVia(
           resident: candidate,
           self: deps.self,
           previousStay: prevStay?.id ?? null,
+          localInitiator: args.user,
         });
       }));
     await afterRoomCommit(room, deps.self);

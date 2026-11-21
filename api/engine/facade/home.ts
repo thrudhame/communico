@@ -3,13 +3,14 @@
 import type { App } from '#engine/app.ts';
 import { config } from '#engine/config.ts';
 import { capabilities } from './capabilities.ts';
-import { exportKeyRoster } from './control.ts';
+import { exportKeyRoster, refreshRetiredKeyDocument } from './control.ts';
+import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
 import { openJournalClient } from './client.ts';
 import { certificatePin, readProtectedFile } from './identity.ts';
 import { Journal } from './journal.ts';
 import { enrollLink } from './link.ts';
 import { Pairings } from './pairing.ts';
-import { startRoomExports } from './replication.ts';
+import { RoomReplicas, startRoomExports } from './replication.ts';
 import { startPublicExports } from './public.ts';
 import { startDirectoryExports } from './directory.ts';
 import { HomeIngress } from './drain.ts';
@@ -48,6 +49,11 @@ export async function startHomeLinks(
       403,
     );
   }
+  await refreshRetiredKeyDocument(
+    app.server,
+    app.tenant.signer(),
+    app.tenant.publicB64,
+  );
   if (!settings.nodes.length) {
     if (
       (await app.server.query('SELECT 1 FROM facade_egress_routes LIMIT 1'))
@@ -87,6 +93,12 @@ export async function startHomeLinks(
   const domains = new DomainOperations(app.store, app.tenant, pairings);
   const devices = new DeviceOperations(app.store, app.tenant, pairings);
   const toDevice = new ToDeviceOperations(app.store, app.tenant, pairings);
+  const roomReplicas = new RoomReplicas(
+    app.store,
+    pairings,
+    app.tenant.serverName,
+    productionKeyResolver(app.federationKeys),
+  );
   const collectKeySignature = async (
     keyId: string,
     document: import('#engine/federation/keys.ts').KeyDoc,
@@ -231,6 +243,8 @@ export async function startHomeLinks(
             ? devices.apply(journal, stream, id)
             : settings.phase === 'f2' && isToDeviceStream(stream)
             ? toDevice.apply(journal, stream, id)
+            : settings.phase === 'f2' && stream.stream.startsWith('room:')
+            ? roomReplicas.apply(journal, stream, id)
             : apply(node, stream),
         failed: (error) => failed(node, error),
         acknowledged: (stream) => {
@@ -245,6 +259,7 @@ export async function startHomeLinks(
       self: app.tenant.serverName,
       peer: node,
       pairing: id,
+      version: settings.phase === 'f2' ? 2 : 1,
       changed: () => workers.get(id)?.wake(),
       failed: (error) => failed(node, error),
     });
@@ -328,6 +343,11 @@ export async function startHomeLinks(
   const scan = () =>
     scanning ??= (async () => {
       try {
+        await refreshRetiredKeyDocument(
+          app.server,
+          app.tenant.signer(),
+          app.tenant.publicB64,
+        );
         for (const peer of await pairings.status()) {
           if (controller.signal.aborted) break;
           if (!settings.nodes.includes(peer.node) || jobs.has(peer.id)) {

@@ -522,7 +522,13 @@ Deno.test('local submission: grounded receipt reconciles after admission is with
     };
     const original = await sendLocal(room, partial, f.tenant.signer());
     let finished: string | undefined;
-    const replay = await sendLocal(room, partial, f.tenant.signer(), {
+    const retiredSigner = {
+      ...f.tenant.signer(),
+      prepare: () => {
+        throw new Error('signing authority retired');
+      },
+    };
+    const replay = await sendLocal(room, partial, retiredSigner, {
       lookup: () => Promise.resolve({ eventId: original.eventId, pdu: null }),
       prepare: () => {
         throw new Error('must not prepare twice');
@@ -544,9 +550,17 @@ Deno.test('local submission: grounded receipt reconciles after admission is with
 });
 
 Deno.test('local submission: signing dependency survives preparation and retained retries', async (t) => {
-  for (const retained of [false, true]) {
+  for (
+    const [retained, dynamic] of [
+      [false, false],
+      [true, false],
+      [false, true],
+      [true, true],
+    ]
+  ) {
     await t.step(
-      retained ? 'retained signature' : 'fresh signature',
+      (retained ? 'retained signature' : 'fresh signature') +
+        (dynamic ? ' through request preparation' : ''),
       async () => {
         const f = await workerFixture();
         try {
@@ -568,12 +582,15 @@ Deno.test('local submission: signing dependency survives preparation and retaine
             })
             : null;
           let current = !retained;
-          const signer = {
+          const permit = {
             ...f.tenant.signer(),
             admit: () => {
               if (!current) throw new Error('signing authority retired');
             },
           };
+          const signer = dynamic
+            ? { ...f.tenant.signer(), prepare: () => Promise.resolve(permit) }
+            : permit;
           let finished = false;
           await assertRejects(
             () =>

@@ -238,10 +238,27 @@ export class HomeIngress {
                 ),
               };
             }
-            const [scope] = await this.db.query(
-              'SELECT 1 FROM facade_exports WHERE peer=? AND incarnation=? AND scope=?',
-              [peer, pairing, 'room:' + roomId],
-            );
+            const scope = await this.db.tx(async (conn) => {
+              await checkBinding(conn);
+              const name = 'room:' + roomId;
+              const [exported] = await conn.query(
+                'SELECT 1 FROM facade_exports WHERE peer=? AND incarnation=? AND scope=?',
+                [peer, pairing, name],
+              );
+              if (exported || phase !== 'f2') return exported;
+              // F2 can start a room on the facade under a selected-account
+              // grant. Only the verified reverse bootstrap's completed journal
+              // cut grants ingress, never mere room-file presence or receipt.
+              const [imported] = await conn.query(
+                "SELECT r.record_json FROM facade_streams s JOIN facade_scopes v ON v.incarnation=? AND v.scope=s.stream JOIN facade_records r ON r.peer=s.peer AND r.direction=s.direction AND r.source=s.source AND r.incarnation=s.incarnation AND r.stream=s.stream AND r.sequence=s.applied WHERE s.peer=? AND s.direction='in' AND s.source=? AND s.incarnation=? AND s.stream=? AND s.applied>0 AND s.received=s.applied AND s.received_hash=s.applied_hash AND v.ready=1 AND v.pending_hash IS NULL AND v.source_cut>0",
+                [pairing, peer, peer, record.incarnation, name],
+              );
+              if (!imported) return undefined;
+              const applied = JSON.parse(String(imported.record_json));
+              return applied.type === 'room-replica' && applied.version === 2
+                ? imported
+                : undefined;
+            });
             if (!scope) {
               throw new MatrixError(
                 503,

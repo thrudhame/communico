@@ -34,7 +34,7 @@ export function inviteDeps() {
     store: app.store,
     server: app.server,
     signer,
-    keys: productionKeyResolver(app.server, signer),
+    keys: productionKeyResolver(app.federationKeys),
     self: serverName(),
     wake: (destination: string) => app.sender?.wake(destination),
   };
@@ -42,6 +42,17 @@ export function inviteDeps() {
 
 export async function createRoom(opts: CreateRoomOptions) {
   const app = theApp();
+  // Alias uniqueness and directory publication belong to home. Refuse the
+  // complete variant before lookup, signing or creating a room on a replica.
+  if (
+    app.replica && (opts.alias !== undefined || opts.visibility === 'public')
+  ) {
+    throw new MatrixError(
+      503,
+      'M_UNAVAILABLE',
+      'room aliases and directory publication require home authority',
+    );
+  }
   const alias = opts.alias === undefined
     ? undefined
     : '#' + opts.alias + ':' + serverName();

@@ -7,6 +7,11 @@ import { changedColumns } from '#engine/store/changed.ts';
 import type { Row } from '#engine/store/ffi.ts';
 import type { EdgeKind, EdgeOverlay } from '#engine/room/edges.ts';
 import { indexTopology } from './topology.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
+import { canonicalJson } from '#engine/canonical.ts';
+import type { Pdu } from '#engine/pdu.ts';
+import { eventMaterial, type SignatureEvidence } from './signatures.ts';
+import { contentHashMatches, wasHashRedacted } from './verify.ts';
 
 export type EventRow = {
   id: string;
@@ -58,9 +63,11 @@ function remember(cache: EdgeOverlay | undefined, id: string, pdu: string) {
 export async function insertEvent(
   conn: Conn,
   id: string,
-  pdu: string,
+  input: string | Pdu,
   cache?: EdgeOverlay,
 ): Promise<void> {
+  const hashRedacted = typeof input !== 'string' && wasHashRedacted(input);
+  const pdu = typeof input === 'string' ? input : canonicalJson(input);
   const parsed: Record<string, unknown> = JSON.parse(pdu);
   const { type, sender, depth, origin_server_ts: originTs } = parsed;
   if (
@@ -75,8 +82,8 @@ export async function insertEvent(
     throw new TypeError('event state_key must be a string when present');
   }
   await conn.execute(
-    'INSERT INTO events(id, pdu, type, state_key, sender, depth, origin_ts) VALUES(?,?,?,?,?,?,?)',
-    [id, pdu, type, stateKey, sender, depth, originTs],
+    'INSERT INTO events(id, pdu, type, state_key, sender, depth, origin_ts, hash_redacted) VALUES(?,?,?,?,?,?,?,?)',
+    [id, pdu, type, stateKey, sender, depth, originTs, hashRedacted ? 1 : 0],
   );
   const seenPrevs = new Set<string>();
   for (const [ord, prev] of edgeIds(parsed.prev_events).entries()) {
@@ -103,7 +110,9 @@ export async function insertEvent(
 function eventOf(row: Row): EventRow {
   return {
     id: String(row.id),
-    pdu: String(row.pdu),
+    // One complete accepted PDU, never a synthetic signature union. The home
+    // copy supersedes our own first copy only at the authenticated home import.
+    pdu: String(row.home_pdu ?? row.pdu),
     type: String(row.type),
     state_key: row.state_key === null ? null : String(row.state_key),
     sender: String(row.sender),
@@ -140,7 +149,10 @@ export async function getEvent(
   id: string,
   cache?: EdgeOverlay,
 ): Promise<EventRow | null> {
-  const rows = await conn.query('SELECT * FROM events WHERE id = ?', [id]);
+  const rows = await conn.query(
+    'SELECT *, (SELECT home_pdu FROM event_signatures WHERE event=events.id) AS home_pdu FROM events WHERE id = ?',
+    [id],
+  );
   if (rows.length === 0) return null;
   const event = eventOf(rows[0]);
   remember(cache, event.id, event.pdu);
@@ -193,7 +205,7 @@ export async function getEvents(
   for (const chunk of chunks(ids)) {
     const marks = chunk.map(() => '?').join(',');
     const rows = await conn.query(
-      `SELECT * FROM events WHERE id IN (${marks})`,
+      `SELECT *, (SELECT home_pdu FROM event_signatures WHERE event=events.id) AS home_pdu FROM events WHERE id IN (${marks})`,
       chunk,
     );
     for (const row of rows) {
@@ -254,6 +266,21 @@ export class EventReads {
     return row === null ? null : { ...row };
   }
 
+  /** Exact accepted bytes for prepared receipts, without learned signatures. */
+  async stored(id: string): Promise<string | null> {
+    this.check();
+    const [row] = await this.conn.query('SELECT pdu FROM events WHERE id = ?', [
+      id,
+    ]);
+    this.check();
+    return row === undefined ? null : String(row.pdu);
+  }
+
+  replace(row: EventRow): void {
+    this.check();
+    this.rows.set(row.id, Promise.resolve({ ...row }));
+  }
+
   async list(ids: readonly string[]): Promise<Map<string, EventRow>> {
     this.check();
     const wanted = [...new Set(ids)];
@@ -277,6 +304,67 @@ export class EventReads {
 }
 
 export type AncestryNode = { prevs: string[]; grounded: boolean };
+
+/** Retain verified evidence internally. Only an authenticated home import can
+ * select a different complete wire PDU; it never rewrites immutable base bytes,
+ * status or live publication. No resolver/network call occurs under the lock. */
+export async function mergeEventSignatures(
+  conn: Conn,
+  rows: EventReads,
+  evidence: SignatureEvidence,
+  home = false,
+): Promise<boolean> {
+  const row = await rows.get(evidence.eventId);
+  if (row === null) return false;
+  const pdu = JSON.parse(row.pdu) as Pdu;
+  const material = eventMaterial(pdu);
+  const [held] = await conn.query(
+    'SELECT e.hash_redacted, s.signatures, s.home_pdu FROM events e LEFT JOIN event_signatures s ON s.event=e.id WHERE e.id=?',
+    [row.id],
+  );
+  if (
+    material !== evidence.material &&
+    (material !== evidence.redactedMaterial || pdu.type === 'm.room.create' ||
+      (Number(held.hash_redacted) !== 1 && await contentHashMatches(pdu)))
+  ) {
+    throw new MatrixError(
+      400,
+      'M_BAD_JSON',
+      'replica changes a retained event',
+    );
+  }
+  // The wire copy may contain optional signatures ordinary admission did not
+  // verify. Only this internal map compares verified candidates.
+  const overlay: Pdu['signatures'] = held.signatures !== null
+    ? JSON.parse(String(held.signatures))
+    : {};
+  let learned = false;
+  for (const [server, entries] of Object.entries(evidence.signatures)) {
+    for (const [keyId, signature] of Object.entries(entries)) {
+      const prior = overlay[server]?.[keyId];
+      if (prior !== undefined && prior <= signature) continue;
+      Object.defineProperty(overlay, server, {
+        value: { ...overlay[server], [keyId]: signature },
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+      learned = true;
+    }
+  }
+  const homePdu = held.home_pdu ?? (home ? evidence.pdu : null);
+  const selected = homePdu !== null &&
+    canonicalJson(JSON.parse(String(homePdu))) !== canonicalJson(pdu);
+  if (!learned && !selected && !(home && held.home_pdu === null)) return false;
+  await conn.execute(
+    'INSERT INTO event_signatures(event,signatures,home_pdu) VALUES(?,?,?) ON CONFLICT(event) DO UPDATE SET signatures=excluded.signatures,home_pdu=excluded.home_pdu',
+    [row.id, JSON.stringify(overlay), homePdu],
+  );
+  if (selected) rows.replace({ ...row, pdu: String(homePdu) });
+  // Internal evidence is not publication intent. Only a changed complete home
+  // copy needs to advance the wire export cut.
+  return selected;
+}
 
 /** Recovery needs held graph facts, not immutable PDU bodies. Genuine after-state
  * is the grounding proof; unknown IDs have no map entry, not a cached verdict. */

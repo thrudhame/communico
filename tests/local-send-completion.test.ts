@@ -5,6 +5,63 @@ import { sendLocal } from '#engine/room/ingest.ts';
 import { startHttp } from '#tests/http-app.ts';
 import { completionService } from '#engine/server/completion.ts';
 import { holdPublication } from '#tests/support/hold-publication.ts';
+import { completeAccepted } from '#tests/complete-accepted.ts';
+
+Deno.test('local acceptance: the new send path consumes the guarded byte permit instead of its request signer', async () => {
+  const http = await startHttp();
+  const app = http.app;
+  const signer = app.tenant.signer();
+  const original = app.tenant.signer;
+  let prepared = 0;
+  try {
+    const alice = await http.registerTestUser('guarded-acceptance', 'pw');
+    const created = await createRoom(app.store, {
+      creator: alice.user_id,
+      preset: 'public_chat',
+    }, signer);
+    app.tenant.signer = () => ({
+      ...signer,
+      prepare: () => {
+        prepared++;
+        return Promise.resolve(signer);
+      },
+      sign: () =>
+        Promise.reject(
+          new Error('unprepared signer reached local transaction'),
+        ),
+    });
+    const response = await http.matrix(
+      new Request(
+        'http://x/_matrix/client/v3/rooms/' +
+          encodeURIComponent(created.roomId) +
+          '/send/m.room.message/guarded-acceptance',
+        {
+          method: 'PUT',
+          headers: {
+            Authorization: 'Bearer ' + alice.access_token,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            msgtype: 'm.text',
+            body: 'prepared acceptance',
+          }),
+        },
+      ),
+    );
+    assertEquals(response.status, 200);
+    const result = await response.json();
+    assertEquals(prepared, 1);
+    await completeAccepted(app, created.roomId, result.event_id);
+    const room = await openRoom(app.store, created.roomId);
+    const event = await room.tx((tx) => tx.events.get(result.event_id));
+    assert(event);
+    assertEquals(JSON.parse(event.pdu).content.body, 'prepared acceptance');
+    assert(JSON.parse(event.pdu).signatures[signer.serverName][signer.keyId]);
+  } finally {
+    app.tenant.signer = original;
+    await http.close();
+  }
+});
 
 for (const holder of ['foreign', 'own'] as const) {
   Deno.test(

@@ -9,16 +9,12 @@
 // keyfailminutes, bounding re-dials).
 import { redact } from '#engine/eventid.ts';
 import type { KeyResolver } from '#engine/room/deps.ts';
-import type { Signer } from '#engine/room/signer.ts';
-import type { Database as Db } from '#engine/store/db.ts';
 import { verifyJson } from '#engine/signing-primitives.js';
-import { KeyChangeRefused, type KeyStore, keyStore } from './keys.ts';
+import { KeyChangeRefused, type KeyStore } from './keys.ts';
 import { recoverableUpstream } from '#engine/net/upstream-error.ts';
 
 export function productionKeyResolver(
-  server: Db,
-  signer: Signer,
-  keys: Pick<KeyStore, 'getVerifyKey'> = keyStore(server, { signer }),
+  keys: Pick<KeyStore, 'getVerifyKey'>,
 ): KeyResolver {
   return {
     verifyEventSignature: async (args) => {
@@ -30,7 +26,7 @@ export function productionKeyResolver(
           args.keyId,
           args.minValidUntilMs,
           'event',
-          { signal: args.signal },
+          { signal: args.signal, discovery: args.discovery },
         );
       } catch (error) {
         args.signal?.throwIfAborted();

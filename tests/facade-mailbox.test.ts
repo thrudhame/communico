@@ -26,7 +26,7 @@ import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { signJson } from '#engine/signing-primitives.js';
 import { directOnly, makeDoc } from './federation/doc-helper.ts';
 import { HomeIngress } from '#engine/facade/drain.ts';
-import { exportRoomReplica } from '#engine/facade/replication.ts';
+import { exportRoomReplica, RoomReplicas } from '#engine/facade/replication.ts';
 import { eduState } from '#engine/federation/edus.ts';
 import { registerToDevice } from '#engine/federation/todevice.ts';
 import { registerUser } from '#engine/tenant/users.ts';
@@ -377,6 +377,131 @@ Deno.test('mailbox logical to-device admission retains F1 policy across differen
     );
   } finally {
     await f.close();
+  }
+});
+
+Deno.test('home ingress requires applied reverse bootstrap rather than prior home export for F2 rooms', async (t) => {
+  for (const phase of ['f1', 'f2'] as const) {
+    await t.step(phase, async () => {
+      const f = await fixture();
+      try {
+        f.phase(phase);
+        const reverse = await exportRoomReplica(
+          f.edge(),
+          f.g.room,
+          f.self,
+          'home',
+          f.bundle.id,
+        );
+        assert(reverse);
+        const join = await f.join();
+        const box = await f.mailbox();
+        await box.stage(
+          'new-local-room',
+          await f.evidence('new-local-room', [join], []),
+        );
+        assertEquals(
+          (await box.receive(f.remote.name, 'new-local-room')).body,
+          { pdus: { [String(join.event_id)]: {} } },
+        );
+        const [row] = await (await f.edge().server()).query(
+          "SELECT record_json FROM facade_records WHERE stream LIKE 'ingress:%'",
+        );
+        const ingress = JSON.parse(String(row.record_json));
+        const home = await f.home().server();
+        const pairings = await f.homePairings();
+        const journal = new Journal(home, LINK_SUPPORTED);
+        await journal.receive(f.node.node, [ingress]);
+        await journal.receive(f.node.node, [reverse]);
+        const drain = new HomeIngress(home, {
+          peer: f.node.node,
+          pairing: f.bundle.id,
+          pairings,
+          transaction: {
+            self: f.self,
+            store: f.home(),
+            keys: fakeKeyResolver(f.remote, await testRemoteServer()),
+            fetcher: fakeFetcher({}).fetcher,
+            edus: { dispatch: () => Promise.resolve() },
+          },
+        });
+        await assertRejects(
+          () => drain.apply(journal, ingress),
+          MatrixError,
+          'not granted',
+        );
+        await home.execute(
+          'INSERT INTO facade_exports(peer,incarnation,scope,source_cut) VALUES(?,?,?,?)',
+          [f.node.node, f.bundle.id, 'auth:' + f.g.creator, 1],
+        );
+        const replicas = new RoomReplicas(
+          f.home(),
+          pairings,
+          f.self,
+          fakeKeyResolver(await testRemoteServer()),
+        );
+        const apply = journal.apply.bind(journal);
+        journal.apply = () =>
+          Promise.reject(new Error('interrupt bootstrap completion'));
+        await assertRejects(
+          () => replicas.apply(journal, reverse, f.bundle.id),
+          Error,
+          'interrupt bootstrap completion',
+        );
+        assertEquals((await f.home().rooms()).includes(f.g.roomId), true);
+        await assertRejects(
+          () => drain.apply(journal, ingress),
+          MatrixError,
+          'not granted',
+        );
+        journal.apply = apply;
+        assert(await replicas.apply(journal, reverse, f.bundle.id));
+        assertEquals(
+          await home.query('SELECT 1 FROM facade_exports WHERE scope=?', [
+            'room:' + f.g.roomId,
+          ]),
+          [],
+        );
+        if (phase === 'f1') {
+          await assertRejects(
+            () => drain.apply(journal, ingress),
+            MatrixError,
+            'not granted',
+          );
+          return;
+        }
+        assert(await drain.apply(journal, ingress));
+        const room = await openRoom(f.home(), f.g.roomId);
+        assertEquals(
+          (await room.tx((tx) => tx.events.getStatus(String(join.event_id))))
+            ?.standing,
+          'accepted',
+        );
+        const head = await room.tx((tx) => tx.changes.head());
+        await f.reopenHome();
+        const reopened = await f.home().server();
+        const resumed = new HomeIngress(reopened, {
+          peer: f.node.node,
+          pairing: f.bundle.id,
+          pairings: await f.homePairings(),
+          transaction: {
+            self: f.self,
+            store: f.home(),
+            keys: fakeKeyResolver(f.remote, await testRemoteServer()),
+            fetcher: fakeFetcher({}).fetcher,
+            edus: { dispatch: () => Promise.resolve() },
+          },
+        });
+        assertEquals(
+          await resumed.apply(new Journal(reopened, LINK_SUPPORTED), ingress),
+          false,
+        );
+        const held = await openRoom(f.home(), f.g.roomId);
+        assertEquals(await held.tx((tx) => tx.changes.head()), head);
+      } finally {
+        await f.close();
+      }
+    });
   }
 });
 

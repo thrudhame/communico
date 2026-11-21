@@ -227,7 +227,6 @@ Deno.test('F2 manifest enables delivered auth, registers and device keys without
   for (
     const [path, method] of [
       ['v3/sync', 'GET'],
-      ['v3/createRoom', 'POST'],
       ['v3/keys/changes', 'GET'],
       ['v3/user/%40alice%3Atest/filter', 'POST'],
     ]
@@ -284,5 +283,63 @@ Deno.test('F2 manifest enables delivered auth, registers and device keys without
     ]
   ) {
     assertEquals(facade.service(service), false);
+  }
+});
+
+Deno.test('F2 room authoring and reads use client scope, not federation availability', () => {
+  const facade = capabilities('facade', 'f2');
+  const f1 = capabilities('facade', 'f1');
+  for (
+    const [method, path] of [
+      ['POST', 'createRoom'],
+      ['PUT', 'rooms/room/send/m.room.encrypted/txn'],
+      ['PUT', 'rooms/room/redact/event/txn'],
+      ['PUT', 'rooms/room/state/m.room.topic'],
+      ['PUT', 'rooms/room/state/m.room.topic/'],
+      ['PUT', 'rooms/room/state/m.room.topic/key'],
+      ['GET', 'rooms/room/state'],
+      ['GET', 'rooms/room/state/m.room.topic'],
+      ['GET', 'rooms/room/state/m.room.topic/'],
+      ['GET', 'rooms/room/state/m.room.topic/key'],
+      ['GET', 'rooms/room/event/event'],
+      ['GET', 'rooms/room/context/event'],
+      ['GET', 'rooms/room/messages'],
+      ['GET', 'rooms/room/members'],
+      ['GET', 'rooms/room/joined_members'],
+      ['GET', 'rooms/room/initialSync'],
+    ]
+  ) {
+    const request = new Request(
+      'https://logical.test/_matrix/client/v3/' + path,
+      { method },
+    );
+    const scopes: string[] = [];
+    assertEquals(
+      facade.gate(request, (scope) => {
+        scopes.push(scope);
+        return true;
+      }),
+      null,
+    );
+    assertEquals(scopes, ['clientrooms']);
+    assertEquals(facade.gate(request, () => false)?.status, 503);
+    assertEquals(f1.gate(request, () => true)?.status, 404);
+  }
+  for (
+    const [method, path] of [
+      ['POST', 'rooms/room/join'],
+      ['POST', 'rooms/room/invite'],
+      ['GET', 'sync'],
+    ]
+  ) {
+    assertEquals(
+      facade.gate(
+        new Request('https://logical.test/_matrix/client/v3/' + path, {
+          method,
+        }),
+        () => true,
+      )?.status,
+      404,
+    );
   }
 });

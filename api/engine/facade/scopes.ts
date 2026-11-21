@@ -3,8 +3,11 @@
 import type { Conn, Database } from '#engine/store/db.ts';
 import { changedColumns } from '#engine/store/changed.ts';
 import type { Journal } from './journal.ts';
+import { canonicalJson } from '#engine/canonical.ts';
 import type { Pairings } from './pairing.ts';
 import { LinkError, type LinkRecord, type Stream } from './protocol.ts';
+import { verificationFence } from './signing-authority.ts';
+import type { CommitCheck } from '#engine/store/commit.ts';
 
 export async function applyReplicaScope(options: {
   db: Database;
@@ -16,25 +19,42 @@ export async function applyReplicaScope(options: {
   scope: string;
   after: number;
   cut: number;
+  // Only home composition supplies a pairing. Facade readers retain their
+  // single active home binding and the F1 source contract by default.
+  pairing?: string;
+  authorize?(conn: Conn): Promise<void>;
   // A snapshot owner may prove these predecessors subsumed by record. They
   // still receive individual durable results in the same contiguous commit.
   superseded?: readonly { record: LinkRecord; result: unknown }[];
-  apply(): Promise<unknown>;
+  apply(admit: CommitCheck): Promise<unknown>;
   // A control revision may supersede an authenticated snapshot while its
   // independent stream drains. Consume that source cut without enabling it.
   ready?(conn: Conn): Promise<boolean>;
 }): Promise<boolean> {
   const { db, journal, stream, record, scope, after, cut } = options;
+  const connection = options.pairing
+    ? await options.pairings.connection(options.pairing)
+    : undefined;
+  const grant = connection?.grant ??
+    (connection ? null : await options.pairings.active());
+  if (!grant || (connection && connection.state !== 'paired')) {
+    throw new LinkError('LINK_UNPAIRED', 'replica requires paired source', 403);
+  }
   const prefix = [...(options.superseded ?? []), { record, result: undefined }];
   const entries = new Map(
     prefix.map((entry) => [entry.record.sequence, entry]),
   );
-  const grant = await options.pairings.active();
   const context = grant.body.transcript.body.context;
+  const peer = connection ? context.node : 'home';
+  const source = peer;
+  const incarnation = connection
+    ? grant.body.transcript.body.incarnation
+    : context.id;
   if (
+    (connection && context.id !== options.pairing) ||
     prefix.some((entry, index) =>
-      entry.record.source !== 'home' ||
-      entry.record.incarnation !== context.id ||
+      entry.record.source !== source ||
+      entry.record.incarnation !== incarnation ||
       entry.record.stream !== scope ||
       (index > 0 &&
         entry.record.sequence !== prefix[index - 1].record.sequence + 1)
@@ -43,21 +63,25 @@ export async function applyReplicaScope(options: {
   ) {
     throw new LinkError(
       'LINK_IDENTITY_MISMATCH',
-      'replica source or scope does not match home grant',
+      'replica source or scope does not match grant',
       403,
     );
   }
   const checkGrant = async (conn: Conn) => {
     const [binding] = await conn.query(
-      "SELECT state,revision FROM facade_pairings WHERE id=? AND side='facade'",
-      [context.id],
+      'SELECT state,revision,grant_json FROM facade_pairings WHERE id=? AND side=?',
+      [context.id, connection ? 'home' : 'facade'],
     );
     if (
       binding?.state !== 'paired' ||
-      Number(binding.revision) !== grant.body.revision
+      Number(binding.revision) !== grant.body.revision ||
+      binding.grant_json !== canonicalJson(grant)
     ) throw new LinkError('LINK_UNPAIRED', 'replica grant changed', 403);
+    await options.authorize?.(conn);
   };
+  const admit = verificationFence(db);
   await db.tx(async (conn) => {
+    conn.admit(admit);
     await checkGrant(conn);
     const [prior] = await conn.query(
       'SELECT source_cut,pending_hash FROM facade_scopes WHERE incarnation=? AND scope=?',
@@ -78,9 +102,9 @@ export async function applyReplicaScope(options: {
       [context.id, scope, after, record.hash],
     );
   });
-  const result = await options.apply();
+  const result = await options.apply(admit);
   return await journal.apply(
-    'home',
+    peer,
     stream,
     async (conn, current) => {
       await checkGrant(conn);

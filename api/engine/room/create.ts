@@ -24,7 +24,7 @@ import {
   encryptedInitialState,
   encryptionError,
 } from '#engine/room/encryption-policy.ts';
-import type { Signer } from '#engine/room/signer.ts';
+import { prepareSigner, type Signer } from '#engine/room/signer.ts';
 import type { Store } from '#engine/store/index.ts';
 
 export type CreateRoomOptions = {
@@ -296,6 +296,7 @@ export async function createRoom(
   // The room id: v12 derives it from the pre-authored create (on the
   // astronomical collision with an existing room, re-author with the next
   // millisecond — old D2); the older versions mint one.
+  signer = await prepareSigner(signer);
   let createPdu;
   let finalRoomId: string;
   if (spec.roomIdFromCreateEvent) {

@@ -1,4 +1,5 @@
-import { assertEquals, assertRejects } from '@std/assert';
+import { assert, assertEquals, assertRejects } from '@std/assert';
+import { canonicalJson } from '#engine/canonical.ts';
 import {
   initializeRoom,
   openRoom,
@@ -9,6 +10,20 @@ import {
 import { Conn } from '#engine/store/db.ts';
 import { StoreError, Turso } from '#engine/store/ffi.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
+import { prepareEventSignatures } from '#engine/room/signatures.ts';
+import {
+  contentHashMatches,
+  copyEventReceipt,
+  verify,
+  wasHashRedacted,
+} from '#engine/room/verify.ts';
+import { UpstreamError } from '#engine/net/upstream-error.ts';
+import { b64encodeStd } from '#engine/signing-primitives.js';
+import {
+  fakeKeyResolver,
+  makeRemoteServer,
+  remoteEvent,
+} from './fixtures/remote.ts';
 
 const pdu = (body: string) =>
   JSON.stringify({
@@ -42,6 +57,424 @@ async function withRoom(fn: (room: Room) => Promise<void>) {
   );
 }
 
+Deno.test('event receipt: hash-redaction provenance survives repeated verification and atomic insertion, never wire copying or mutation', async () => {
+  await withRoom(async (room) => {
+    const author = await makeRemoteServer('author.test');
+    const keys = fakeKeyResolver(author);
+    const original = await remoteEvent(room.id, author, '11', {
+      type: 'm.room.message',
+      sender: '@dev:author.test',
+      content: {},
+      prev_events: [],
+      depth: 1,
+      origin_server_ts: 1,
+    });
+    const raw = structuredClone(original);
+    raw.content = { injected: true };
+    const first = await verify(raw, '11', keys);
+    assertEquals(await contentHashMatches(first.pdu), true);
+    assertEquals(wasHashRedacted(first.pdu), true);
+    const second = await verify(first.pdu, '11', keys);
+    assertEquals(wasHashRedacted(second.pdu), true);
+    const ingestCopy = copyEventReceipt(second.pdu);
+    assertEquals(wasHashRedacted(ingestCopy), true);
+    await assertRejects(
+      () =>
+        room.tx(async (tx) => {
+          await tx.events.insert(first.eventId, ingestCopy);
+          throw new Error('rollback receipt');
+        }),
+      Error,
+      'rollback receipt',
+    );
+    const db = await room.store.room(room.id);
+    assertEquals(await db.query('SELECT id FROM events'), []);
+    await room.tx((tx) => tx.events.insert(first.eventId, ingestCopy));
+    assertEquals(
+      await db.query('SELECT hash_redacted FROM events WHERE id=?', [
+        first.eventId,
+      ]),
+      [{ hash_redacted: 1 }],
+    );
+    const copied = await verify(structuredClone(second.pdu), '11', keys);
+    assertEquals(wasHashRedacted(copied.pdu), false);
+    const changed = await verify(
+      { ...structuredClone(original), content: { injected: true } },
+      '11',
+      keys,
+    );
+    changed.pdu.content = { changedAfterVerification: true };
+    await assertRejects(
+      () => room.tx((tx) => tx.events.insert('$changed', changed.pdu)),
+      Error,
+      'E_VERIFIED_EVENT_MATERIAL_CHANGED',
+    );
+    assertEquals(await room.tx((tx) => tx.events.get('$changed')), null);
+  });
+});
+
+Deno.test('event receipt: concurrent verification cannot downgrade an already verified redaction receipt', async () => {
+  const author = await makeRemoteServer('author.test');
+  const pdu = await remoteEvent('!reader:test', author, '11', {
+    type: 'm.room.message',
+    sender: '@dev:author.test',
+    content: {},
+    prev_events: [],
+    depth: 1,
+    origin_server_ts: 1,
+  });
+  pdu.content = { injected: true };
+  const firstEntered = Promise.withResolvers<void>();
+  const secondEntered = Promise.withResolvers<void>();
+  const firstRelease = Promise.withResolvers<void>();
+  const secondRelease = Promise.withResolvers<void>();
+  const base = fakeKeyResolver(author);
+  let calls = 0;
+  const keys = {
+    verifyEventSignature: async (
+      args: Parameters<typeof base.verifyEventSignature>[0],
+    ) => {
+      const first = ++calls === 1;
+      (first ? firstEntered : secondEntered).resolve();
+      await (first ? firstRelease : secondRelease).promise;
+      return await base.verifyEventSignature(args);
+    },
+  };
+  const first = verify(pdu, '11', keys);
+  await firstEntered.promise;
+  const second = verify(pdu, '11', keys);
+  await secondEntered.promise;
+  firstRelease.resolve();
+  const admitted = await first;
+  assertEquals(wasHashRedacted(admitted.pdu), true);
+  secondRelease.resolve();
+  await second;
+  assertEquals(wasHashRedacted(admitted.pdu), true);
+});
+
+Deno.test('event reader: internal signature evidence preserves the wire view and rolls back with its intent', async () => {
+  await withRoom(async (room) => {
+    const author = await makeRemoteServer('author.test');
+    const witness = await makeRemoteServer('witness.test');
+    const partial = {
+      type: 'm.room.message',
+      sender: '@dev:author.test',
+      content: { body: 'immutable' },
+      prev_events: [],
+      depth: 1,
+      origin_server_ts: 1,
+    };
+    const base = await remoteEvent(room.id, author, '11', partial);
+    const extra = await remoteEvent(room.id, witness, '11', partial);
+    const combined = {
+      ...base,
+      signatures: { ...base.signatures, ...extra.signatures },
+    };
+    // Older ordinary admission validates required signatures only. A valid
+    // later witness is retained in the internal map, never spliced into wire.
+    base.signatures[witness.name] = { [witness.keyId]: 'invalid old optional' };
+    base.signatures['unverified.test'] = {
+      'ed25519:old': 'unverified optional',
+    };
+    const { evidence } = await prepareEventSignatures(
+      combined,
+      '11',
+      fakeKeyResolver(author, witness),
+    );
+    const id = String(base.event_id);
+    await room.tx((tx) => tx.events.insert(id, JSON.stringify(base)));
+    await assertRejects(
+      () =>
+        room.tx(async (tx) => {
+          await tx.events.get(id);
+          assertEquals(await tx.events.mergeSignatures(evidence), false);
+          throw new Error('rollback signature evidence');
+        }),
+      Error,
+      'rollback signature evidence',
+    );
+    assertEquals(await room.tx((tx) => tx.changes.head()), 0);
+    assertEquals(
+      JSON.parse((await room.tx((tx) => tx.events.get(id)))!.pdu).signatures,
+      base.signatures,
+    );
+    const original = Conn.prototype.query;
+    let reads = 0;
+    Conn.prototype.query = function (sql, values) {
+      if (sql.includes('FROM events WHERE id')) reads++;
+      return original.call(this, sql, values);
+    };
+    try {
+      await room.tx(async (tx) => {
+        await tx.events.list([id]);
+        assertEquals(reads, 1);
+        assertEquals(await tx.events.mergeSignatures(evidence), false);
+        assertEquals(
+          JSON.parse((await tx.events.get(id))!.pdu).signatures,
+          base.signatures,
+        );
+        assertEquals(
+          JSON.parse((await tx.events.list([id])).get(id)!.pdu).signatures,
+          base.signatures,
+        );
+        assertEquals(await tx.events.mergeSignatures(evidence), false);
+        assertEquals(reads, 1);
+        assertEquals(await tx.changes.after(0, 10), []);
+      });
+      await room.tx(async (tx) => {
+        assertEquals(
+          JSON.parse((await tx.events.list([id])).get(id)!.pdu).signatures,
+          base.signatures,
+        );
+        assertEquals(reads, 2);
+      });
+    } finally {
+      Conn.prototype.query = original;
+    }
+    const [overlay] = await (await room.store.room(room.id)).query(
+      'SELECT signatures FROM event_signatures WHERE event=?',
+      [id],
+    );
+    assertEquals(JSON.parse(String(overlay.signatures)), combined.signatures);
+    assertEquals(
+      await (await room.store.room(room.id)).query(
+        'SELECT pdu FROM events WHERE id=?',
+        [id],
+      ),
+      [{ pdu: JSON.stringify(base) }],
+    );
+  });
+});
+
+Deno.test('event reader: verified signature candidates converge across arrival orders and equivalent encodings', async () => {
+  const author = await makeRemoteServer('author.test');
+  const baseKeys = fakeKeyResolver(author);
+  const a = b64encodeStd(new Uint8Array(64).fill(17));
+  const b = b64encodeStd(new Uint8Array(64).fill(34));
+  let expected: unknown;
+  for (const order of [[a, b], [b, a]]) {
+    await withRoom(async (room) => {
+      const base = await remoteEvent(room.id, author, '11', {
+        type: 'm.room.message',
+        sender: '@dev:author.test',
+        content: { body: 'same' },
+        prev_events: [],
+        depth: 1,
+        origin_server_ts: 1,
+      });
+      const keys = {
+        verifyEventSignature: (
+          args: Parameters<typeof baseKeys.verifyEventSignature>[0],
+        ) => {
+          // Two accepted candidates exercise the merge algebra independently
+          // of crypto. The other signature tests use real Ed25519 witnesses.
+          if (args.server === 'witness.test') {
+            return Promise.resolve(
+              [a, b, a + '==', b + '=='].includes(
+                args.pdu.signatures[args.server]?.[args.keyId],
+              ),
+            );
+          }
+          return baseKeys.verifyEventSignature(args);
+        },
+      };
+      const proofs = await Promise.all(
+        order.map(async (signature) =>
+          (await prepareEventSignatures(
+            {
+              ...base,
+              signatures: {
+                ...base.signatures,
+                'witness.test': { 'ed25519:1': signature },
+              },
+            },
+            '11',
+            keys,
+          )).evidence
+        ),
+      );
+      const id = String(base.event_id);
+      await room.tx(async (tx) => {
+        await tx.events.insert(id, JSON.stringify(base));
+        for (const proof of proofs) await tx.events.mergeSignatures(proof);
+        assertEquals(JSON.parse((await tx.events.get(id))!.pdu), base);
+        const head = await tx.changes.head();
+        for (const proof of proofs) {
+          assertEquals(await tx.events.mergeSignatures(proof), false);
+        }
+        assertEquals(await tx.changes.head(), head);
+      });
+      const [held] = await (await room.store.room(room.id)).query(
+        'SELECT signatures FROM event_signatures WHERE event=?',
+        [id],
+      );
+      const actual = JSON.parse(String(held.signatures))['witness.test'];
+      if (expected === undefined) expected = actual;
+      else assertEquals(actual, expected);
+      const padded = await prepareEventSignatures(
+        {
+          ...base,
+          signatures: {
+            ...base.signatures,
+            'witness.test': { 'ed25519:1': b + '==' },
+          },
+        },
+        '11',
+        keys,
+      );
+      await room.tx(async (tx) => {
+        assertEquals(await tx.events.mergeSignatures(padded.evidence), false);
+      });
+    });
+  }
+});
+
+Deno.test('signature evidence: wire is one accepted original, never an oversized signature union', async () => {
+  await withRoom(async (room) => {
+    const author = await makeRemoteServer('author.test');
+    const witness = await makeRemoteServer('witness.test');
+    const partial = {
+      type: 'm.room.message',
+      sender: '@author:author.test',
+      content: { body: 'same immutable event' },
+      prev_events: [],
+      depth: 1,
+      origin_server_ts: 1,
+    };
+    const base = await remoteEvent(room.id, author, '11', partial);
+    const signed = await remoteEvent(room.id, witness, '11', partial);
+    const signature = signed.signatures[witness.name][witness.keyId];
+    const aliases = Array.from({ length: 720 }, (_, n) => ({
+      ...witness,
+      keyId: 'ed25519:size_proof_' + n,
+    }));
+    const keys = fakeKeyResolver(author, ...aliases);
+    const size = (value: unknown) =>
+      new TextEncoder().encode(canonicalJson(value)).length;
+    const inputs = [aliases.slice(0, 360), aliases.slice(360)].map((half) => ({
+      ...base,
+      signatures: {
+        ...base.signatures,
+        [witness.name]: Object.fromEntries(
+          half.map((key) => [key.keyId, signature]),
+        ),
+      },
+    }));
+    for (const input of inputs) assert(size(input) < 65536);
+    const id = String(base.event_id);
+    await room.tx((tx) => tx.events.insert(id, inputs[0]));
+    for (const input of inputs) {
+      const prepared = await prepareEventSignatures(input, '11', keys);
+      assertEquals(
+        Object.keys(prepared.evidence.signatures[witness.name]).length,
+        360,
+      );
+      await room.tx((tx) => tx.events.mergeSignatures(prepared.evidence));
+    }
+    const wire = JSON.parse((await room.tx((tx) => tx.events.get(id)))!.pdu);
+    console.log(
+      JSON.stringify({ inputBytes: inputs.map(size), wireBytes: size(wire) }),
+    );
+    assert(
+      size(wire) <= 65536,
+      'signature union exceeds the normal wire bound',
+    );
+    assertEquals(wire, inputs[0]);
+    assertEquals((await verify(wire, '11', keys)).eventId, id);
+    const [held] = await (await room.store.room(room.id)).query(
+      'SELECT signatures FROM event_signatures WHERE event=?',
+      [id],
+    );
+    assertEquals(
+      Object.keys(JSON.parse(String(held.signatures))[witness.name]).length,
+      720,
+    );
+    const home = await prepareEventSignatures(inputs[1], '11', keys);
+    await room.tx(async (tx) => {
+      assertEquals(await tx.events.mergeSignatures(home.evidence, true), true);
+      assertEquals(JSON.parse((await tx.events.get(id))!.pdu), inputs[1]);
+      assertEquals(
+        JSON.parse((await tx.events.list([id])).get(id)!.pdu),
+        inputs[1],
+      );
+      assertEquals(JSON.parse((await tx.events.stored(id))!), inputs[0]);
+    });
+    const original = await prepareEventSignatures(inputs[0], '11', keys);
+    await room.tx((tx) => tx.events.mergeSignatures(original.evidence));
+    const selected = JSON.parse(
+      (await room.tx((tx) => tx.events.get(id)))!.pdu,
+    );
+    assertEquals(selected, inputs[1]);
+    assertEquals((await verify(selected, '11', keys)).eventId, id);
+  });
+});
+
+Deno.test('signature evidence: optional wire failures are omitted but local faults and cancellation propagate', async (t) => {
+  const author = await makeRemoteServer('author.test');
+  const baseKeys = fakeKeyResolver(author);
+  const base = await remoteEvent('!reader:test', author, '11', {
+    type: 'm.room.message',
+    sender: '@dev:author.test',
+    content: { body: 'valid required signature' },
+    prev_events: [],
+    depth: 1,
+    origin_server_ts: 1,
+  });
+  const optional = b64encodeStd(new Uint8Array(64).fill(17));
+  for (
+    const mode of ['malformed', 'invalid', 'unavailable', 'local', 'abort']
+  ) {
+    await t.step(mode, async () => {
+      const controller = new AbortController();
+      const fault = new Error('optional resolver local failure');
+      let calls = 0;
+      const keys = {
+        verifyEventSignature: (
+          args: Parameters<typeof baseKeys.verifyEventSignature>[0],
+        ) => {
+          if (args.server !== 'optional.test') {
+            return baseKeys.verifyEventSignature(args);
+          }
+          calls++;
+          if (mode === 'local') throw fault;
+          if (mode === 'unavailable') {
+            throw new UpstreamError('transport', {
+              phase: 'keys',
+              reason: 'unavailable optional key',
+            });
+          }
+          if (mode === 'abort') controller.abort(fault);
+          return Promise.resolve(false);
+        },
+      };
+      const prepare = () =>
+        prepareEventSignatures(
+          {
+            ...structuredClone(base),
+            signatures: {
+              ...base.signatures,
+              'optional.test': {
+                'ed25519:1': mode === 'malformed'
+                  ? 'invalid encoding'
+                  : optional,
+              },
+            },
+          },
+          '11',
+          keys,
+          { signal: controller.signal },
+        );
+      if (mode === 'local' || mode === 'abort') {
+        await assertRejects(prepare, Error, fault.message);
+      } else {
+        const { evidence } = await prepare();
+        assertEquals(evidence.signatures, base.signatures);
+      }
+      assertEquals(calls, mode === 'malformed' ? 0 : 1);
+    });
+  }
+});
+
 Deno.test('event reader: scalar and bulk requests share one hydration and return isolated rows', async () => {
   await withRoom(async (room) => {
     await room.tx(async (tx) => {
@@ -52,7 +485,7 @@ Deno.test('event reader: scalar and bulk requests share one hydration and return
     const original = Conn.prototype.query;
     let reads = 0;
     Conn.prototype.query = function (sql, values) {
-      if (sql.startsWith('SELECT * FROM events WHERE id')) reads++;
+      if (sql.includes('FROM events WHERE id')) reads++;
       return original.call(this, sql, values);
     };
     try {
@@ -121,7 +554,7 @@ Deno.test('event reader: misses, failed reads and mutable status remain fresh', 
       const original = Conn.prototype.query;
       let fail = true;
       Conn.prototype.query = function (sql, values) {
-        if (fail && sql.startsWith('SELECT * FROM events WHERE id')) {
+        if (fail && sql.includes('FROM events WHERE id')) {
           fail = false;
           return Promise.reject(new Error('injected event read fault'));
         }

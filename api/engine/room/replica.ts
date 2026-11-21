@@ -17,7 +17,10 @@ import {
   type SnapshotInput,
   verifySnapshot,
 } from './snapshot.ts';
-import { installSnapshotBoundary } from './snapshot-install.ts';
+import {
+  installSnapshotBoundary,
+  stageSnapshotEvidence,
+} from './snapshot-install.ts';
 import { oversizedOf, verify } from './verify.ts';
 
 export { exportReplicaRoom, type ReplicaRoom } from './replica-export.ts';
@@ -116,6 +119,8 @@ export async function importReplicaBoundary(
   store: Store,
   input: SnapshotInput & {
     join: Pdu;
+    reconcile?: boolean;
+    admit?: () => void;
   },
 ): Promise<{ roomId: string; eventId: string }> {
   const verified = await verifySnapshot(input);
@@ -140,8 +145,10 @@ export async function importReplicaBoundary(
     : verified.pack.get(aclId)?.content ?? {};
   assertServerAllowed(input.self, acl);
   assertServerAllowed(input.resident, acl);
-  const room = await openRoom(store, input.roomId, { create: true });
-  await registerCreatedRoom(store, input.roomId);
+  const room = await openRoom(store, input.roomId, {
+    create: true,
+    admit: input.admit,
+  });
   await withRoomLock(input.roomId, () =>
     room.tx(async (tx) => {
       const existing = await tx.events.getStatus(admitted.eventId);
@@ -152,7 +159,8 @@ export async function importReplicaBoundary(
         stays.some((stay) => stay.opened_by === admitted.eventId) &&
         existing?.standing === 'accepted' && existing.grounding === 'grounded'
       ) return;
-      if (await tx.segments.openStay() !== null) {
+      const active = await tx.segments.openStay();
+      if (active !== null && !input.reconcile) {
         throw new MatrixError(
           400,
           'M_BAD_STATE',
@@ -170,6 +178,32 @@ export async function importReplicaBoundary(
           'snapshot replaces the room create',
         );
       }
+      // A previously grounded join is retained history, not permission to
+      // reopen again after a later local departure.
+      if (input.reconcile && existing?.grounding === 'grounded') return;
+      if (active !== null) {
+        // A source's new stay is not a new receiver stay. Verify its evidence,
+        // then let ordinary ingest retain and resolve this branch locally.
+        await stageSnapshotEvidence(tx, verified, admitted.eventId);
+        const result = await ingestInTx(tx, input.roomId, join, {
+          remote: {
+            origin: input.resident,
+            self: input.self,
+            oversized: admitted.oversized,
+            ungroundedMs: 0,
+            promoteEvidence: true,
+            boundary: verified.snapshot,
+          },
+        });
+        if (result.grounding !== 'grounded') {
+          throw new MatrixError(
+            503,
+            'M_UNAVAILABLE',
+            'replica join did not ground',
+          );
+        }
+        return;
+      }
       await installSnapshotBoundary(tx, {
         roomId: input.roomId,
         roomVersion: input.roomVersion,
@@ -178,8 +212,10 @@ export async function importReplicaBoundary(
         resident: input.resident,
         self: input.self,
         previousStay: previous?.id ?? null,
+        preserveFrontier: input.reconcile,
       });
     }));
+  await registerCreatedRoom(store, input.roomId);
   await afterRoomCommit(room, input.self);
   return { roomId: input.roomId, eventId: admitted.eventId };
 }
@@ -194,6 +230,7 @@ export async function importReplicaGenesis(store: Store, input: {
   keys: KeyResolver;
   create: Pdu;
   join: Pdu;
+  admit?: () => void;
 }): Promise<{ roomId: string; eventId: string }> {
   const verified = await verifySnapshot({
     ...input,
@@ -222,7 +259,7 @@ export async function importReplicaGenesis(store: Store, input: {
   await withRoomLock(input.roomId, async () => {
     let existing;
     try {
-      existing = await openRoom(store, input.roomId);
+      existing = await openRoom(store, input.roomId, { admit: input.admit });
     } catch (error) {
       if (!(error instanceof Deno.errors.NotFound)) throw error;
     }
@@ -266,7 +303,7 @@ export async function importReplicaGenesis(store: Store, input: {
           );
         }
       }
-    });
+    }, input.admit);
   });
   await registerCreatedRoom(store, input.roomId);
   await afterRoomCommit(await openRoom(store, input.roomId), input.self);

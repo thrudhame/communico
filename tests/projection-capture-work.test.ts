@@ -52,7 +52,7 @@ Deno.test('projection capture: unchanged state is reconstructed once per room pa
       let stateReads = 0;
       const groupReads = new Map<number, number>();
       Turso.prototype.query = function (...args) {
-        if (args[1] === 'SELECT * FROM events WHERE id = ?') {
+        if (args[1].endsWith('FROM events WHERE id = ?')) {
           const key = String(args[0]) + ':' + String(epochs.get(args[0])) +
             ':' + String(args[2]?.[0]);
           reads.set(key, (reads.get(key) ?? 0) + 1);

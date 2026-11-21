@@ -74,12 +74,26 @@ function bind(
         remoteBatches.saveRemoteBatch(conn, operationId, inputHash, outcomes),
     },
     events: {
-      insert: async (id: string, pdu: string) => {
+      insert: async (
+        id: string,
+        pdu: string | import('#engine/pdu.ts').Pdu,
+      ) => {
         await events.insertEvent(conn, id, pdu, edges);
         await waits.readyFor(conn, id);
       },
       get: (id: string) => rows.get(id),
+      stored: (id: string) => rows.stored(id),
       list: (ids: readonly string[]) => rows.list(ids),
+      mergeSignatures: async (
+        evidence: import('./signatures.ts').SignatureEvidence,
+        home = false,
+      ) => {
+        if (!await events.mergeEventSignatures(conn, rows, evidence, home)) {
+          return false;
+        }
+        await changes.appendChange(conn, 'signature', evidence.eventId, {});
+        return true;
+      },
       ancestry: (ids: readonly string[]) => events.ancestryNodes(conn, ids),
       prevsOf: (event: string) => events.prevsOf(conn, event, edges),
       authsOf: (event: string) => events.authsOf(conn, event, edges),
@@ -215,6 +229,19 @@ function bind(
       removeOf: (waiting: string) => waits.removeWaitsOf(conn, waiting),
     },
     changes: {
+      localParticipation: async (event: string, user: string) => {
+        const row = await rows.get(event);
+        const status = await events.getStatus(conn, event);
+        const pdu = row === null
+          ? null
+          : JSON.parse(row.pdu) as import('#engine/pdu.ts').Pdu;
+        if (
+          pdu?.type !== 'm.room.member' || pdu.sender !== user ||
+          pdu.state_key !== user || pdu.content?.membership !== 'join' ||
+          status?.standing !== 'accepted' || status.grounding !== 'grounded'
+        ) throw new Error('E_LOCAL_PARTICIPATION_IDENTITY');
+        await changes.recordLocalParticipation(conn, event, user);
+      },
       head: () => changes.head(conn),
       append: (kind: string, event: string | null, data: unknown) =>
         changes.appendChange(conn, kind, event, data),

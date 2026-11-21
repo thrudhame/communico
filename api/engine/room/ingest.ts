@@ -65,9 +65,9 @@ import {
   redactionEffectAllowed,
   redactionTarget,
 } from '#engine/room/redaction.ts';
-import type { Signer } from '#engine/room/signer.ts';
+import { prepareSigner, type Signer } from '#engine/room/signer.ts';
 import { mapEntries } from '#engine/room/state.ts';
-import { oversizedOf } from '#engine/room/verify.ts';
+import { copyEventReceipt, oversizedOf } from '#engine/room/verify.ts';
 import { assertLocalEncryption } from '#engine/room/encryption-policy.ts';
 import { assertAcl } from '#engine/room/acl.ts';
 import type { CompletionTarget } from '#engine/room/completion.ts';
@@ -131,7 +131,7 @@ export async function sendLocal(
   return await submitLocal(
     room,
     signer,
-    (tx) => buildInTx(tx, room.id, partial, signer),
+    (tx, permit) => buildInTx(tx, room.id, partial, permit),
     submission,
     localJoiningUser(partial),
   );
@@ -148,7 +148,7 @@ export async function acceptLocal(
   return await submitLocal(
     room,
     signer,
-    (tx) => buildInTx(tx, room.id, partial, signer),
+    (tx, permit) => buildInTx(tx, room.id, partial, permit),
     submission,
     localJoiningUser(partial),
     false,
@@ -221,7 +221,8 @@ async function submissionReceipt(
   }
   if (
     prepared !== null &&
-    event.pdu !== canonicalJson(prepared as unknown as Record<string, unknown>)
+    await tx.events.stored(eventId) !==
+      canonicalJson(prepared as unknown as Record<string, unknown>)
   ) {
     throw new Error('E_SUBMISSION_PDU_MISMATCH: ' + eventId);
   }
@@ -246,7 +247,7 @@ async function submissionReceipt(
 async function submitLocal(
   room: Room,
   signer: Signer,
-  build: (tx: RoomTx) => Promise<Pdu>,
+  build: (tx: RoomTx, signer: Signer) => Promise<Pdu>,
   submission?: LocalSubmission,
   joiningUser?: string,
   completed = true,
@@ -261,8 +262,9 @@ async function submitLocal(
           await admitLocalJoin(room.store, room.id, joiningUser);
         }
         if (submission === undefined) {
+          const permit = await prepareSigner(signer);
           committed = await room.tx(async (tx) => {
-            const pdu = await build(tx);
+            const pdu = await build(tx, permit);
             await assertLocalAnnotation(tx, pdu);
             return await ingestInTx(tx, room.id, pdu, {
               self: signer.serverName,
@@ -271,10 +273,21 @@ async function submitLocal(
           return committed;
         }
         let prepared = await submission.lookup();
+        // A grounded receipt completes existing work without fresh signing
+        // authority. Otherwise retain the actual prepared signer's dependency
+        // across both tenant preparation and room installation.
+        const receipt = prepared === null
+          ? null
+          : await room.tx((tx) =>
+            submissionReceipt(tx, prepared!.eventId, prepared!.pdu)
+          );
+        const permit = receipt === null
+          ? await prepareSigner(signer)
+          : undefined;
         if (prepared === null) {
           const built = await room.tx(async (tx) => {
             await submission.admit?.(tx);
-            const pdu = await build(tx);
+            const pdu = await build(tx, permit!);
             await assertLocalAnnotation(tx, pdu);
             const stay = await tx.segments.openStay();
             const group = stay === null
@@ -288,7 +301,7 @@ async function submitLocal(
             );
             return pdu;
           });
-          prepared = await submission.prepare(built, signer.admit);
+          prepared = await submission.prepare(built, permit!.admit);
         }
         const result = await room.tx(async (tx) => {
           const receipt = await submissionReceipt(
@@ -297,7 +310,7 @@ async function submitLocal(
             prepared.pdu,
           );
           if (receipt !== null) return receipt;
-          if (signer.admit) tx.admit(signer.admit);
+          if (permit?.admit) tx.admit(permit.admit);
           await submission.admit?.(tx);
           if (prepared.pdu === null) {
             throw new Error('E_SUBMISSION_EVENT_MISSING: ' + prepared.eventId);
@@ -435,7 +448,7 @@ export async function ingestInTx(
   }
   // unsigned is stripped on receipt — never stored (it is covered by
   // neither the signatures nor the content hash).
-  pdu = { ...pdu };
+  pdu = copyEventReceipt(pdu);
   delete pdu.unsigned;
   let expect: string;
   try {
@@ -693,7 +706,7 @@ export async function ingestInTx(
   if (existing === null) {
     await tx.events.insert(
       eventId,
-      canonicalJson(pdu as unknown as Record<string, unknown>),
+      pdu,
     );
   }
   await tx.events.setStatus(eventId, {
@@ -769,6 +782,14 @@ export async function ingestInTx(
       ...payload,
     })
     : await tx.changes.append('event', eventId, payload);
+
+  if (
+    remote === null && standing === 'accepted' &&
+    pdu.type === 'm.room.member' && pdu.sender === pdu.state_key &&
+    pdu.content?.membership === 'join'
+  ) {
+    await tx.changes.localParticipation(eventId, String(pdu.sender));
+  }
 
   // Publication (R6/R7): the live stay's current state is the single
   // extremity's after-group or the resolution over the new frontier —
@@ -1006,7 +1027,7 @@ async function storePending(
     // still ungrounded on a redelivery — refresh the waiting set
     await tx.waits.removeOf(eventId);
   } else {
-    await tx.events.insert(eventId, canonical);
+    await tx.events.insert(eventId, pdu);
     await tx.changes.append('event', eventId, {
       standing: 'rejected',
       reason: null,
@@ -1231,7 +1252,7 @@ export async function redactEvent(
   reason?: string,
   submission?: LocalSubmission,
 ): Promise<{ eventId: string }> {
-  const res = await submitLocal(room, signer, async (tx) => {
+  const res = await submitLocal(room, signer, async (tx, permit) => {
     const stay = await tx.segments.openStay();
     if (stay === null) {
       throw new Error('E_ROOM_ARCHIVED: no open stay for ' + room.id);
@@ -1276,7 +1297,7 @@ export async function redactEvent(
       partial.redacts = targetEventId;
     }
     if (reason !== undefined) content.reason = reason;
-    return await buildInTx(tx, room.id, partial, signer);
+    return await buildInTx(tx, room.id, partial, permit);
   }, submission);
   if (res.standing === 'rejected') {
     throw new MatrixError(

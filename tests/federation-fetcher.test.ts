@@ -18,6 +18,7 @@ import { ingestRemote } from '#engine/room/remote.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import { productionFetcher } from '#engine/federation/fetcher.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
+import { keyStore } from '#engine/federation/keys.ts';
 import { ourKeyDocument } from '#engine/federation/keys.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { installServerHooks } from '#engine/server/startup.ts';
@@ -196,7 +197,7 @@ async function ourPubB64(signer: Signer): Promise<string> {
 
 function productionDeps(server: Db, signer: Signer, store: Store): RemoteDeps {
   return {
-    keys: productionKeyResolver(server, signer),
+    keys: productionKeyResolver(keyStore(server, { signer })),
     fetcher: productionFetcher(server, signer, store),
     self: signer.serverName,
     limits: { waitMs: 25, limit: 10, budgetMs: 8000 },
@@ -616,7 +617,9 @@ Deno.test('key resolver: refuses an unknown key id and a wrong key', async () =>
     await withStore(async (store) => {
       const b = await boot(store, { roomId: '!ff5:test' });
       try {
-        const resolver = productionKeyResolver(b.server, b.g.signer);
+        const resolver = productionKeyResolver(
+          keyStore(b.server, { signer: b.g.signer }),
+        );
         const signed = await msg(b, 'signed', [b.joinId], 60);
         // the fake's own signed PDU verifies (the production half of the
         // 3c verification path)
@@ -699,7 +702,7 @@ Deno.test('key resolver: refuses an expired document for a later event', async (
           keyId: fake.keyId,
           kp: fake.kp,
         };
-        const resolver = productionKeyResolver(server, signer);
+        const resolver = productionKeyResolver(keyStore(server, { signer }));
         const pdu = await remoteEvent('!ff6:test', remote, '11', {
           type: 'm.room.message',
           sender: '@rudy:' + remote.name,

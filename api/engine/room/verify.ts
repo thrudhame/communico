@@ -63,6 +63,35 @@ type VerifyOptions = {
   localSnapshotFallback?: { self: string; resident: string };
 };
 
+export function eventMaterial(pdu: Pdu): string {
+  const { signatures: _s, unsigned: _u, ...material } = pdu;
+  void _s, _u;
+  return canonicalJson(material);
+}
+
+// Verification may normalize a hash-mismatched receipt into a hash-valid PDU.
+// Keep that fact until the owning insertion commits it. It is not a wire field
+// and is valid only for the exact normalized immutable material verified here.
+const hashRedactions = new WeakMap<Pdu, string>();
+
+export function wasHashRedacted(pdu: Pdu): boolean {
+  const material = hashRedactions.get(pdu);
+  if (material === undefined) return false;
+  if (material !== eventMaterial(pdu)) {
+    throw new Error('E_VERIFIED_EVENT_MATERIAL_CHANGED');
+  }
+  return true;
+}
+
+/** The ingest owner removes unsigned without mutating its caller's object.
+ * Transfer only exact verified receipt provenance across that defensive copy. */
+export function copyEventReceipt(pdu: Pdu): Pdu {
+  const redacted = wasHashRedacted(pdu);
+  const copy = { ...pdu };
+  if (redacted) hashRedactions.set(copy, eventMaterial(copy));
+  return copy;
+}
+
 // Check 1: the wire bounds and the per-version format checks (old
 // federation/pdu.ts checkRemoteFormat). A hard failure throws; the
 // lenient size case is returned. The backfill count exemption
@@ -273,21 +302,11 @@ export function authorizerServer(pdu: Pdu, roomVersion: string): string | null {
   return domainOf(via);
 }
 
-async function verifyRequired(
-  pdu: Pdu,
-  roomVersion: string,
-  keys: KeyResolver,
-  opts: VerifyOptions,
-  deferredLocalAuthorizer?: string,
-): Promise<Verified> {
-  const spec = getRulebook(roomVersion).spec;
-  const { eventId, oversized } = await identify(pdu, roomVersion, opts);
-
+export async function contentHashMatches(pdu: Pdu): Promise<boolean> {
   // Check 3: the content hash covers the complete event minus unsigned,
   // signatures and hashes (the v11+ wire form has no event_id — strip
   // our annotation as at signing time). A body that does not
   // canonicalize is malformed (dropped), never redact-accepted.
-  let hashOk = false;
   try {
     const { event_id: _drop, ...noId } = pdu as unknown as Record<
       string,
@@ -298,13 +317,29 @@ async function verifyRequired(
     const received = matrixBase64(pdu.hashes.sha256, 32);
     // Hashes are binary values. Equivalent permitted padding must not redact
     // content, and the original signed representation must remain untouched.
-    hashOk = expected.every((byte: number, index: number) =>
+    return expected.every((byte: number, index: number) =>
       byte === received[index]
     );
   } catch (e) {
     invalidEvent('M_BAD_EVENT: content cannot be canonicalized', e);
   }
-  if (!hashOk) {
+}
+
+async function verifyRequired(
+  pdu: Pdu,
+  roomVersion: string,
+  keys: KeyResolver,
+  opts: VerifyOptions,
+  deferredLocalAuthorizer?: string,
+): Promise<Verified> {
+  const spec = getRulebook(roomVersion).spec;
+  const { eventId, oversized } = await identify(pdu, roomVersion, opts);
+
+  const priorRedaction = hashRedactions.get(pdu);
+  const inheritedRedaction = priorRedaction !== undefined &&
+    priorRedaction === eventMaterial(pdu);
+  const hashRedacted = !await contentHashMatches(pdu);
+  if (hashRedacted) {
     // We were given a redacted version of the event: use the redacted
     // copy we calculated (server-server-api.md:1525-1530).
     const redacted = redact(
@@ -372,6 +407,18 @@ async function verifyRequired(
     invalidEvent(
       'M_UNAUTHORIZED: authorising server signature missing or invalid',
     );
+  }
+  // Another verifier may finish while our required signature checks await.
+  // Exact verified provenance is monotone for unchanged normalized material.
+  const concurrentRedaction = hashRedactions.get(pdu);
+  if (
+    hashRedacted || inheritedRedaction ||
+    (concurrentRedaction !== undefined &&
+      concurrentRedaction === eventMaterial(pdu))
+  ) {
+    hashRedactions.set(pdu, eventMaterial(pdu));
+  } else {
+    hashRedactions.delete(pdu);
   }
   return { eventId, oversized, pdu };
 }

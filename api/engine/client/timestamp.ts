@@ -40,7 +40,7 @@ export async function timestampToEvent(
     {
       self: serverName(),
       fetcher: productionFetcher(app.server, signer, app.store),
-      keys: productionKeyResolver(app.server, signer),
+      keys: productionKeyResolver(app.federationKeys),
     },
   );
   if (hit === null) {

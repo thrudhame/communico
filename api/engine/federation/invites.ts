@@ -33,7 +33,7 @@ import { buildInTx, finalizeBuilt, roomVersionOf } from '#engine/room/build.ts';
 import type { KeyResolver } from '#engine/room/deps.ts';
 import { ingestLocal } from '#engine/room/ingest.ts';
 import { openRoom, type Room } from '#engine/room/index.ts';
-import type { Signer } from '#engine/room/signer.ts';
+import { prepareSigner, type Signer } from '#engine/room/signer.ts';
 import { getRulebook, supportedRoomVersions } from '#engine/rulebook/index.ts';
 import type { Conn, Database as Db } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
@@ -159,6 +159,7 @@ export async function inviteRemote(
     if (stay === null) throw new MatrixError(404, 'M_NOT_FOUND', roomId);
     return await roomVersionOf(tx, stay.id);
   });
+  const permit = await prepareSigner(deps.signer);
   const pdu = await room.tx((tx) =>
     buildInTx(tx, roomId, {
       type: 'm.room.member',
@@ -166,7 +167,7 @@ export async function inviteRemote(
       sender,
       content,
       origin_server_ts: Date.now(),
-    }, deps.signer)
+    }, permit)
   );
   const eventId = String(pdu.event_id);
   const inviteRoomState = await prejoinState(room, sender);

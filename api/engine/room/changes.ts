@@ -52,6 +52,26 @@ export async function changesAfter(
   return rows.map(changeOf);
 }
 
+// Only a local create/join owner calls this after accepted, grounded admission.
+// Received same-server participation must never manufacture local initiation.
+export async function recordLocalParticipation(
+  conn: Conn,
+  event: string,
+  user: string,
+): Promise<void> {
+  const [held] = await conn.query(
+    "SELECT data FROM changes WHERE kind='local-participation' AND event=? LIMIT 1",
+    [event],
+  );
+  if (held) {
+    if (JSON.parse(String(held.data)).user !== user) {
+      throw new Error('E_LOCAL_PARTICIPATION_IDENTITY');
+    }
+    return;
+  }
+  await appendChange(conn, 'local-participation', event, { user });
+}
+
 // The change position of an event's live-ingest entry ('event' or
 // 'transition' — the kinds a publication can hang off; history entries
 // never map to publications).

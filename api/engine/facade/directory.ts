@@ -289,10 +289,14 @@ export class DirectoryReplicas {
         "SELECT DISTINCT stream FROM facade_streams WHERE peer='home' AND direction='in' AND source='home' AND incarnation=? AND stream LIKE 'room:%'",
         [grant.body.transcript.body.context.id],
       );
+      const local = await this.db.tx((conn) =>
+        this.localScopesAt(conn, grant.body.transcript.body.context.id)
+      );
       for (
         const room of new Set([
           ...view!.rooms.map((id) => 'room:' + id),
           ...incoming.map((row) => String(row.stream)),
+          ...local.map((row) => 'room:' + String(row.room)),
         ])
       ) await this.requireScope(room);
       return 'ready';
@@ -303,6 +307,7 @@ export class DirectoryReplicas {
         conn,
         scope,
         grant.body.transcript.body.context.id,
+        grant.body.revision,
         view!.cuts[scope],
         access,
       )
@@ -340,10 +345,13 @@ export class DirectoryReplicas {
     };
     if (!view) unavailable();
     const scope = 'room:' + roomId;
+    const localAuth = new Set<string>();
     const checkCurrent = commitCheck(() => {
       authority();
-      if (access === 'applied') return;
-      for (const stream of ['directory', scope]) {
+      const streams = access === 'applied'
+        ? [...localAuth]
+        : ['directory', scope, ...localAuth];
+      for (const stream of streams) {
         if (
           !received('home', { source: 'home', incarnation: pairing, stream })
         ) unavailable();
@@ -363,8 +371,10 @@ export class DirectoryReplicas {
         conn,
         scope,
         pairing,
+        grant.body.revision,
         view!.cuts[scope],
         access,
+        localAuth,
       );
       if (state === 'absent' && !allowAbsent) {
         throw new MatrixError(404, 'M_NOT_FOUND', 'scope not found');
@@ -374,12 +384,26 @@ export class DirectoryReplicas {
     return { check, checkCurrent };
   }
 
+  /** Selection comes from the authenticated account stream, initiation from
+   * the room-first projection. A received replica or an arbitrary room file
+   * supplies neither a local initiation nor a selected-account grant. */
+  private async localScopesAt(conn: Conn, pairing: string, roomId?: string) {
+    if (config().facade.phase !== 'f2') return [];
+    return await conn.query(
+      "SELECT DISTINCT e.room,e.local_join_user,s.stream,s.received,s.received_hash,s.applied,s.applied_hash,v.source_cut,v.ready,v.pending_hash,r.record_json,a.revision AS owner_revision,c.received AS owner_received,c.applied AS owner_applied,c.received_hash AS owner_received_hash,c.applied_hash AS owner_applied_hash FROM event_index e JOIN facade_streams s ON s.stream='auth:'||e.local_join_user AND s.peer='home' AND s.direction='in' AND s.source='home' AND s.incarnation=? LEFT JOIN facade_scopes v ON v.incarnation=s.incarnation AND v.scope=s.stream LEFT JOIN facade_records r ON r.peer=s.peer AND r.direction=s.direction AND r.source=s.source AND r.incarnation=s.incarnation AND r.stream=s.stream AND r.sequence=s.applied LEFT JOIN facade_owner_activation a ON a.pairing=s.incarnation LEFT JOIN facade_streams c ON c.peer=s.peer AND c.direction=s.direction AND c.source=s.source AND c.incarnation=s.incarnation AND c.stream='owner-control' WHERE e.local_join_user IS NOT NULL AND e.standing='accepted' AND e.grounding='grounded'" +
+        (roomId === undefined ? '' : ' AND e.room=?'),
+      roomId === undefined ? [pairing] : [pairing, roomId],
+    );
+  }
+
   private async scopeStateAt(
     conn: Conn,
     scope: string,
     pairing: string,
+    grantRevision: number,
     required?: number,
     access: ScopeAccess = 'current',
+    localAuth?: Set<string>,
   ): Promise<'ready' | 'absent'> {
     const [held] = await conn.query(
       "SELECT s.received,s.applied,v.source_cut,v.ready,v.pending_hash FROM facade_streams s LEFT JOIN facade_scopes v ON v.incarnation=s.incarnation AND v.scope=s.stream WHERE s.peer='home' AND s.direction='in' AND s.source='home' AND s.incarnation=? AND s.stream=?",
@@ -401,6 +425,38 @@ export class DirectoryReplicas {
     ) return 'ready';
     if (required !== undefined || held) {
       throw new MatrixError(503, 'M_UNAVAILABLE', 'replica unavailable');
+    }
+    if (scope.startsWith('room:')) {
+      const local = await this.localScopesAt(conn, pairing, scope.slice(5));
+      for (const row of local) {
+        if (
+          Number(row.ready) !== 1 || row.pending_hash !== null ||
+          Number(row.source_cut) < 1 || Number(row.applied) < 1 ||
+          row.received !== row.applied ||
+          row.received_hash !== row.applied_hash ||
+          Number(row.owner_applied) < 1 ||
+          row.owner_received !== row.owner_applied ||
+          row.owner_received_hash !== row.owner_applied_hash ||
+          !row.record_json
+        ) continue;
+        const record = JSON.parse(String(row.record_json));
+        const account = record.payload?.signed?.body;
+        if (
+          record.type !== 'account-auth' || record.version !== 1 ||
+          account?.pairing !== pairing ||
+          account.grantRevision !== grantRevision ||
+          account.ownerRevision !== Number(row.owner_revision) ||
+          account.sourceCut !== Number(row.source_cut) ||
+          account.server !== this.self ||
+          '@' + account.localpart + ':' + this.self !== row.local_join_user
+        ) continue;
+        localAuth?.add(String(row.stream));
+        localAuth?.add('owner-control');
+        return 'ready';
+      }
+      if (local.length) {
+        throw new MatrixError(503, 'M_UNAVAILABLE', 'replica unavailable');
+      }
     }
     return 'absent';
   }

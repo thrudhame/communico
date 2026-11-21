@@ -8,9 +8,11 @@ import {
   type ReplicaRoom,
 } from '#engine/room/replica.ts';
 import type { Store } from '#engine/store/index.ts';
+import { canonicalJson } from '#engine/canonical.ts';
+import { domainOf } from '#engine/ids.ts';
 import { onProjected } from '#engine/server/project.ts';
 import { appendRecord, type Journal } from './journal.ts';
-import type { Pairings } from './pairing.ts';
+import type { Grant, Pairings } from './pairing.ts';
 import { applyReplicaScope } from './scopes.ts';
 import {
   integer,
@@ -45,23 +47,68 @@ export async function exportRoomReplica(
   self: string,
   peer: string,
   pairing: string,
+  version?: 1 | 2,
 ): Promise<LinkRecord | null> {
   const db = await store.server();
   const scope = 'room:' + room.id;
   for (;;) {
+    const [binding] = await db.query(
+      'SELECT side,node,state,revision,grant_json FROM facade_pairings WHERE id=?',
+      [pairing],
+    );
+    const reverse = binding?.side === 'facade';
+    const grant = binding?.grant_json
+      ? JSON.parse(String(binding.grant_json)) as Grant
+      : null;
+    const context = grant?.body.transcript.body.context;
+    if (
+      !grant || !context || binding?.state !== 'paired' ||
+      Number(binding.revision) !== grant.body.revision ||
+      context.id !== pairing || context.server !== self ||
+      context.node !== binding.node ||
+      (reverse
+        ? peer !== 'home'
+        : binding.side !== 'home' || binding.node !== peer)
+    ) {
+      throw new LinkError(
+        'LINK_UNPAIRED',
+        'room export requires active pairing',
+        403,
+      );
+    }
+    const wireVersion = version ?? (reverse ? 2 : 1);
+    if (reverse && wireVersion !== 2) {
+      throw new LinkError(
+        'LINK_CAPABILITY_MISMATCH',
+        'reverse room export requires version 2',
+      );
+    }
+    const source = reverse ? context.node : 'home';
+    const incarnation = reverse
+      ? grant.body.transcript.body.incarnation
+      : pairing;
     const [prior] = await db.query(
       'SELECT source_cut FROM facade_exports WHERE peer=? AND incarnation=? AND scope=?',
       [peer, pairing, scope],
     );
     const after = prior ? Number(prior.source_cut) : 0;
-    const manifest = await exportReplicaRoom(room, self, after);
+    const manifest = await exportReplicaRoom(
+      room,
+      self,
+      after,
+      wireVersion === 2,
+    );
     if (prior && manifest.cut === after) return null;
     const result = await db.tx(async (conn) => {
-      const [binding] = await conn.query(
-        "SELECT node,state FROM facade_pairings WHERE id=? AND side='home'",
-        [pairing],
+      const [currentBinding] = await conn.query(
+        'SELECT state,revision,grant_json FROM facade_pairings WHERE id=? AND side=?',
+        [pairing, reverse ? 'facade' : 'home'],
       );
-      if (binding?.node !== peer || binding.state !== 'paired') {
+      if (
+        currentBinding?.state !== 'paired' ||
+        Number(currentBinding.revision) !== grant.body.revision ||
+        currentBinding.grant_json !== canonicalJson(grant)
+      ) {
         throw new LinkError(
           'LINK_UNPAIRED',
           'room export requires active pairing',
@@ -74,12 +121,14 @@ export async function exportRoomReplica(
       );
       if ((current ? Number(current.source_cut) : 0) !== after) return null;
       const record = await appendRecord(conn, peer, {
-        source: 'home',
-        incarnation: pairing,
+        source,
+        incarnation,
         stream: scope,
         type: 'room-replica',
-        version: 1,
-        operationId: `room:${pairing}:${room.id}:${manifest.cut}`,
+        version: wireVersion,
+        operationId: wireVersion === 1
+          ? `room:${pairing}:${room.id}:${manifest.cut}`
+          : `room:${pairing}:${source}:${room.id}:${manifest.cut}`,
         payload: { kind: 'room-replica', manifest },
       });
       await conn.execute(
@@ -100,6 +149,7 @@ export function startRoomExports(options: {
   self: string;
   peer: string;
   pairing: string;
+  version?: 1 | 2;
   changed(): void;
   failed(error: unknown, roomId?: string): void;
 }) {
@@ -139,6 +189,7 @@ export function startRoomExports(options: {
                           options.self,
                           options.peer,
                           options.pairing,
+                          options.version,
                         )
                       ) {
                         options.changed();
@@ -217,10 +268,22 @@ export class RoomReplicas {
       : null;
   }
 
-  async apply(journal: Journal, stream: Stream): Promise<boolean> {
-    const record = await journal.next('home', stream);
+  async apply(
+    journal: Journal,
+    stream: Stream,
+    pairing?: string,
+  ): Promise<boolean> {
+    const connection = pairing
+      ? await this.pairings.connection(pairing)
+      : undefined;
+    const peer = connection ? connection.context.node : 'home';
+    const record = await journal.next(peer, stream);
     if (!record) return false;
-    if (record.type !== 'room-replica' || record.version !== 1) {
+    if (
+      record.type !== 'room-replica' ||
+      (record.version !== 1 && record.version !== 2) ||
+      (connection && record.version !== 2)
+    ) {
       throw new LinkError('LINK_CAPABILITY_MISMATCH', 'not a room replica');
     }
     const payload = object(record.payload);
@@ -239,10 +302,48 @@ export class RoomReplicas {
       scope,
       after: manifest.after,
       cut: manifest.cut,
-      apply: async () => {
+      pairing,
+      // A reverse bootstrap either extends our own retained room export or
+      // carries authentic participation by an account selected for this peer.
+      // The room owner still verifies every event before installing anything.
+      authorize: connection
+        ? async (conn) => {
+          const [known] = await conn.query(
+            'SELECT 1 FROM facade_exports WHERE peer=? AND incarnation=? AND scope=?',
+            [peer, pairing!, scope],
+          );
+          if (known) return;
+          const openings = new Set(
+            manifest.stays.map((stay) => stay.opening.eventId),
+          );
+          for (const event of manifest.events) {
+            if (
+              !openings.has(String(event.event_id)) ||
+              event.type !== 'm.room.member' ||
+              event.sender !== event.state_key ||
+              domainOf(event.sender) !== this.self ||
+              event.content?.membership !== 'join'
+            ) continue;
+            const [selected] = await conn.query(
+              'SELECT 1 FROM facade_exports WHERE peer=? AND incarnation=? AND scope=?',
+              [peer, pairing!, 'auth:' + event.sender],
+            );
+            if (selected) return;
+          }
+          throw new LinkError(
+            'LINK_IDENTITY_MISMATCH',
+            'room has no selected account participation',
+            403,
+          );
+        }
+        : undefined,
+      apply: async (admit) => {
         await importReplicaRoom(this.store, manifest, {
           self: this.self,
           keys: this.keys,
+          signatureUnion: record.version === 2,
+          home: !connection,
+          admit,
         });
         return { roomId: manifest.roomId, cut: manifest.cut };
       },

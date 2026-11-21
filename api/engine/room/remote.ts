@@ -943,7 +943,7 @@ export async function ingestRemote(
             if (rejected) localRejected.add(id);
             await tx.events.insert(
               id,
-              canonicalJson(pdu as unknown as Record<string, unknown>),
+              pdu,
             );
             await tx.events.setStatus(id, {
               standing: rejected ? 'rejected' : 'accepted',
@@ -1021,6 +1021,15 @@ export async function ingestRemote(
           }
           for (const index of outcomeIndex.get(item.eventId) ?? []) {
             results.set(index, result);
+          }
+        }
+        if (deps.localJoin !== undefined) {
+          const { eventId, userId } = deps.localJoin;
+          const status = await tx.events.getStatus(eventId);
+          if (
+            status?.standing === 'accepted' && status.grounding === 'grounded'
+          ) {
+            await tx.changes.localParticipation(eventId, userId);
           }
         }
         const completed = outcomes.map((outcome, index) =>

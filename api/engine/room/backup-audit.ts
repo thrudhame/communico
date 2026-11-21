@@ -42,6 +42,7 @@ export async function auditRoom(
   for (
     const [table, column, target, key] of [
       ['prev_edges', 'event', 'events', 'id'],
+      ['event_signatures', 'event', 'events', 'id'],
       ['auth_edges', 'event', 'events', 'id'],
       ['state_entries', 'grp', 'state_groups', 'id'],
       ['state_entries', 'event', 'events', 'id'],

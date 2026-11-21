@@ -124,7 +124,7 @@ export async function withRestrictedAdmission<T>(
   self: string,
   operation: (tx: RoomTx, authorizer: string | null) => T | Promise<T>,
   nominated?: string,
-  before?: () => Promise<void>,
+  before?: (resident: boolean) => Promise<void>,
   absent?: (tx: RoomTx) => T | Promise<T>,
 ): Promise<T> {
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -152,7 +152,10 @@ export async function withRestrictedAdmission<T>(
       }
     }
     const result = await withRoomLock(room.id, async () => {
-      await before?.();
+      if (before) {
+        const { stay, group } = await room.tx(current);
+        await before(stay !== null && group !== null);
+      }
       if (proof !== null) {
         const now = await witness(proof.room, user);
         if (
