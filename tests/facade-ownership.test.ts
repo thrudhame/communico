@@ -15,6 +15,7 @@ import {
   LinkError,
 } from '#engine/facade/protocol.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { VerificationUnavailable } from '#engine/facade/signing-authority.ts';
 import { historicalServerSchema } from './fixtures/server-schema-history.ts';
 import { historicalTenantSchema } from './fixtures/tenant-schema-history.ts';
 import { serverSchema } from '#engine/server/schema.ts';
@@ -156,7 +157,7 @@ Deno.test('F2 ownership control is signed, durable, first-ingress and isolated f
     const owner = await f.owner();
     await assertRejects(
       () => owner.ready(),
-      MatrixError,
+      VerificationUnavailable,
       'ownership control unavailable',
     );
     assertEquals(await owner.apply(journal, record), true);

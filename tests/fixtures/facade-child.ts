@@ -6,6 +6,7 @@ import { AuthLinkHealth } from '#engine/facade/auth.ts';
 import { FacadeKeys } from '#engine/facade/control.ts';
 import { HomeEgress } from '#engine/facade/home-egress.ts';
 import { InboxWorker } from '#engine/facade/worker.ts';
+import { ActivityExchange } from '#engine/facade/activity.ts';
 import { noticeHeads } from '#engine/facade/notices.ts';
 import {
   type Cut,
@@ -21,6 +22,8 @@ import {
   type FacadeObservation,
   observationPrefix,
   type ObservationScope,
+  observeActivityApplication,
+  observeActivityCapture,
   observeJournalApplication,
   observeJournalCompletion,
   publicationCommand,
@@ -138,6 +141,16 @@ function completed(peer: string, record: LinkRecord) {
 
 // Preserve the finite prefix argument and observe only the last installed fact,
 // never the superseded prefix receipts or an uncommitted transaction attempt.
+ActivityExchange.prototype.apply = observeActivityApplication(
+  ActivityExchange.prototype.apply,
+  (pairing, snapshot, appliedMs) =>
+    emit({ kind: 'activity', pairing, snapshot, appliedMs }),
+);
+ActivityExchange.prototype.capture = observeActivityCapture(
+  ActivityExchange.prototype.capture,
+  emit,
+);
+
 Journal.prototype.apply = observeJournalApplication(
   Journal.prototype.apply,
   completed,

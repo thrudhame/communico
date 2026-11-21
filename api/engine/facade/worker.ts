@@ -75,7 +75,10 @@ export class JournalReconciler {
   private readonly running = new Map<string, Promise<void>>();
   private readonly rerun = new Set<string>();
   private readonly dependencies = new ApplicationDependencies();
-  constructor(private readonly options: Options) {}
+  constructor(
+    private readonly options: Options,
+    private readonly changed: () => void = () => {},
+  ) {}
 
   async reconcile(signal?: AbortSignal): Promise<Hello> {
     const hello = await this.options.client.hello(signal);
@@ -197,6 +200,7 @@ export class JournalReconciler {
       );
       if (next.applied.sequence > ack.applied.sequence) {
         this.options.acknowledged?.(stream);
+        this.changed();
       }
       const progressed = !sameCut(ack.received, next.received) ||
         !sameCut(ack.applied, next.applied);
@@ -275,6 +279,7 @@ export class JournalReconciler {
       held = next;
       track();
       this.dependencies.progressed(stream);
+      this.changed();
       await acknowledge();
     }
     signal?.throwIfAborted();
@@ -291,13 +296,17 @@ export function startHomeLinkWorker(
 ): { wake(): void; close(): Promise<void> } {
   const controller = new AbortController();
   const signal = controller.signal;
-  const reconciler = new JournalReconciler(options);
   let dirty = true;
   let waiting: (() => void) | undefined;
   const wake = () => {
     dirty = true;
     waiting?.();
   };
+  // A live pull may precede its authority's application. Preserve progress in
+  // either direction as a serialized wake, without draining unrelated streams.
+  const reconciler = new JournalReconciler(options, () => {
+    if (options.activity) wake();
+  });
   const periodic = setInterval(wake, options.pollseconds * 1000);
   const loop = (async () => {
     while (!signal.aborted) {
@@ -309,13 +318,10 @@ export function startHomeLinkWorker(
       waiting = undefined;
       if (signal.aborted) break;
       dirty = false;
-      try {
-        await reconciler.reconcile(signal);
-      } catch (error) {
-        if (!signal.aborted) options.failed(error);
-      }
       // Activity is a fresh pull once per serialized wake, never a side effect
       // of the global/per-stream hello reads or a durable journal backlog.
+      // Use the applied cut that woke us before reconciliation can admit a
+      // newer received tail. Otherwise continuous auth freshness can starve it.
       if (options.activity && !signal.aborted) {
         try {
           if (!options.client.activity) {
@@ -328,6 +334,11 @@ export function startHomeLinkWorker(
         } catch (error) {
           if (!signal.aborted) options.failed(error);
         }
+      }
+      try {
+        await reconciler.reconcile(signal);
+      } catch (error) {
+        if (!signal.aborted) options.failed(error);
       }
     }
   })();

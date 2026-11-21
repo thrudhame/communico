@@ -6,6 +6,7 @@ import {
   type Cut,
   LinkError,
   type LinkRecord,
+  type LiveActivity,
   type Stream,
 } from '#engine/facade/protocol.ts';
 import type { Journal } from '#engine/facade/journal.ts';
@@ -17,6 +18,15 @@ export const observationPrefix = 'facade-test: ';
 export type ObservationScope = Stream & { peer: string; after?: number };
 export type FacadeObservation =
   | { kind: 'applied'; peer: string; record: LinkRecord }
+  | { kind: 'activity'; pairing: string; snapshot: unknown; appliedMs: number }
+  | {
+    kind: 'capture';
+    pairing: string;
+    snapshot: unknown;
+    fence?: string;
+    startedMs: number;
+    capturedMs: number;
+  }
   | { kind: 'pairing'; id: string; state: 'paired' | 'revoked' }
   | { kind: 'listener'; port: number }
   | { kind: 'fence'; id: string }
@@ -86,6 +96,7 @@ const publications = new Map<
   ReturnType<typeof Promise.withResolvers<void>>
 >();
 let publicationEvent: ((event: FacadeObservation) => void) | undefined;
+let activityFence: string | undefined;
 
 /** Used only by private mutation-proof source overlays, outside transactions.
  * Normal product modules never import this helper. */
@@ -102,6 +113,7 @@ export function publicationCommand(
 ) {
   publicationEvent = emit;
   if (command.action === 'fence') {
+    activityFence = command.id;
     emit({ kind: 'fence', id: command.id });
     return;
   }
@@ -118,6 +130,37 @@ export function publicationCommand(
     held.resolve();
     emit({ kind: 'publication', name: command.name, state: 'released' });
   }
+}
+
+/** A live completion observes the exchange input, not a consumer predicate. */
+export function observeActivityCapture<Snapshot>(
+  capture: (this: LiveActivity, pairing: string) => Promise<Snapshot>,
+  completed: (event: Extract<FacadeObservation, { kind: 'capture' }>) => void,
+): (this: LiveActivity, pairing: string) => Promise<Snapshot> {
+  return async function (this: LiveActivity, pairing) {
+    const fence = activityFence, startedMs = Date.now();
+    const snapshot = await capture.call(this, pairing);
+    completed({
+      kind: 'capture',
+      pairing,
+      snapshot,
+      fence,
+      startedMs,
+      capturedMs: Date.now(),
+    });
+    return snapshot;
+  };
+}
+
+export function observeActivityApplication(
+  apply: LiveActivity['apply'],
+  completed: (pairing: string, snapshot: unknown, appliedMs: number) => void,
+): LiveActivity['apply'] {
+  return async function (this: LiveActivity, ...args) {
+    await apply.apply(this, args);
+    // Observe completion and its input, never predicate-retry the consumer.
+    completed(args[0], args[1], Date.now());
+  };
 }
 
 /** Retained completions close the arm/capture race without a timer or a retrying
@@ -269,7 +312,9 @@ export class FacadeObservations {
     matches: (event: FacadeObservation) => boolean,
     after = 0,
     failureMatches: (scope: ObservationScope) => boolean = () => false,
+    signal?: AbortSignal,
   ) {
+    if (signal?.aborted) return Promise.reject(signal.reason);
     if (this.failure) return Promise.reject(this.failure);
     const history = this.history.slice(after);
     const held = history.find(matches);
@@ -286,8 +331,30 @@ export class FacadeObservations {
       );
     }
     return new Promise<FacadeObservation>((resolve, reject) => {
-      this.waiting.add({ matches, failureMatches, resolve, reject });
+      const dispose = () => signal?.removeEventListener('abort', abort);
+      const pending = {
+        matches,
+        failureMatches,
+        resolve: (event: FacadeObservation) => {
+          dispose();
+          resolve(event);
+        },
+        reject: (error: Error) => {
+          dispose();
+          reject(error);
+        },
+      };
+      const abort = () => {
+        this.waiting.delete(pending);
+        pending.reject(signal!.reason);
+      };
+      this.waiting.add(pending);
+      signal?.addEventListener('abort', abort, { once: true });
     });
+  }
+
+  find(matches: (event: FacadeObservation) => boolean, after = 0) {
+    return this.history.slice(after).find(matches);
   }
 
   async applied(
@@ -340,6 +407,77 @@ export class FacadeObservations {
           record.hash === stream.received.hash,
       );
     }));
+  }
+}
+
+type LiveObserver = {
+  observations: FacadeObservations;
+  fence(signal?: AbortSignal): Promise<string>;
+};
+
+/** Private finite-input observation. The ordinary consumer remains a separate,
+ * strict assertion, including when the operation completed without its effect. */
+export async function observeLiveInput(
+  source: LiveObserver,
+  receiver: LiveObserver,
+  pairing: string,
+  after: number,
+  matches: (snapshot: unknown) => boolean,
+  signal?: AbortSignal,
+) {
+  const controller = new AbortController();
+  const abort = () => controller.abort(signal!.reason);
+  signal?.addEventListener('abort', abort, { once: true });
+  if (signal?.aborted) abort();
+  const waiting: Promise<FacadeObservation>[] = [];
+  try {
+    const sourceMark = source.observations.mark();
+    const fence = await source.fence(controller.signal);
+    controller.signal.throwIfAborted();
+    const applicationMatches = (event: FacadeObservation) =>
+      event.kind === 'activity' && event.pairing === pairing &&
+      matches(event.snapshot);
+    const absenceMatches = (event: FacadeObservation) =>
+      event.kind === 'capture' && event.pairing === pairing &&
+      event.fence === fence && !matches(event.snapshot);
+    waiting.push(
+      receiver.observations.wait(
+        applicationMatches,
+        after,
+        undefined,
+        controller.signal,
+      ),
+      source.observations.wait(
+        absenceMatches,
+        sourceMark,
+        undefined,
+        controller.signal,
+      ),
+    );
+    const first = await Promise.race(waiting);
+    // Pipes from two children can be consumed in the opposite order to their
+    // events. Flush the other pipe before comparing completion timestamps.
+    // Captures begun before the action fence cannot prove missing live input.
+    if (first.kind === 'activity') await source.fence(controller.signal);
+    else await receiver.fence(controller.signal);
+    controller.signal.throwIfAborted();
+    const applied = receiver.observations.find(applicationMatches, after);
+    const absent = source.observations.find(absenceMatches, sourceMark);
+    assert(!applied || applied.kind === 'activity');
+    assert(!absent || absent.kind === 'capture');
+    if (applied && (!absent || applied.appliedMs <= absent.capturedMs)) {
+      return applied;
+    }
+    assert(absent);
+    throw new Error(
+      'input expired before application: ' +
+        `startedMs=${absent.startedMs} capturedMs=${absent.capturedMs} ` +
+        `appliedMs=${applied?.appliedMs ?? 'none'} observedMs=${Date.now()}`,
+    );
+  } finally {
+    signal?.removeEventListener('abort', abort);
+    controller.abort(new Error('live observation settled'));
+    await Promise.allSettled(waiting);
   }
 }
 
@@ -451,14 +589,17 @@ export async function facadeProcess(
       observations.wait((event) =>
         event.kind === 'listener' && event.port === port
       ),
-    async fence() {
+    async fence(signal?: AbortSignal) {
       const id = crypto.randomUUID();
       const mark = observations.mark();
       await send({ action: 'fence', id });
       await observations.wait(
         (event) => event.kind === 'fence' && event.id === id,
         mark,
+        undefined,
+        signal,
       );
+      return id;
     },
     async holdPublication(name: string) {
       const initial = initialHolds.delete(name);

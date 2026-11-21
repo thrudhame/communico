@@ -762,6 +762,160 @@ Deno.test('live link: existing worker serializes pulls, preserves a wake and kee
   }
 });
 
+Deno.test('live link: applied authority re-drives pending activity without a notice or poll', async (t) => {
+  for (const direction of ['in', 'out'] as const) {
+    await t.step(direction, async () => {
+      const f = await fixture(LINK_SUPPORTED);
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const pending = Promise.withResolvers<void>();
+      const delivered = Promise.withResolvers<void>();
+      const failures: unknown[] = [];
+      let worker: ReturnType<typeof startHomeLinkWorker> | undefined;
+      try {
+        const bundle = await f.create();
+        await f.fp.accept(bundle);
+        await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+        const client = await openJournalClient(f.hp, bundle.id, f.tls.home);
+        const stream = direction === 'in'
+          ? {
+            source: 'edge_a',
+            incarnation: client.peer.incarnation,
+            stream: 'authority:@alice:logical.test',
+          }
+          : {
+            source: 'home',
+            incarnation: bundle.id,
+            stream: 'auth:@alice:logical.test',
+          };
+        const record = await (direction === 'in' ? f.fj : f.hj).append(
+          direction === 'in' ? 'home' : 'edge_a',
+          {
+            ...stream,
+            type: 'control',
+            version: 1,
+            operationId: 'held-authority',
+            payload: {},
+          },
+        );
+        const push = client.push.bind(client);
+        client.push = async (...args) => {
+          await push(...args); // Durable receipt is not application.
+          entered.resolve();
+          await release.promise;
+          await f.fj.complete('home', stream, record, {});
+          return await push(...args);
+        };
+        client.activity = async () => {
+          const heads = direction === 'in'
+            ? await f.hj.heads('edge_a', 'in', stream)
+            : await f.hj.acknowledged('edge_a', stream);
+          if (heads.applied.sequence !== record.sequence) {
+            pending.resolve();
+            throw new LinkError(
+              'LINK_UNAVAILABLE',
+              'live activity awaits applied authority',
+              503,
+            );
+          }
+          delivered.resolve();
+        };
+        worker = startHomeLinkWorker({
+          client,
+          journal: f.hj,
+          limits: { maxItems: 1, maxBytes: 1000 },
+          notify: 'poll',
+          pollseconds: 60,
+          reconnectmaxseconds: 60,
+          failed: (error) => failures.push(error),
+          apply: async (source) => {
+            const next = await f.hj.next('edge_a', source);
+            if (!next) return false;
+            entered.resolve();
+            await release.promise;
+            await f.hj.complete('edge_a', source, next, {});
+            return true;
+          },
+          activity: {
+            capture: () => Promise.resolve({}),
+            apply: () => Promise.resolve(),
+          },
+        });
+        await testDeadline(Promise.all([entered.promise, pending.promise]));
+        assert(
+          failures.every((error) =>
+            error instanceof LinkError && error.code === 'LINK_UNAVAILABLE'
+          ),
+        );
+        release.resolve(); // No explicit wake, notice, reconnect or periodic tick.
+        await testDeadline(delivered.promise);
+      } finally {
+        release.resolve();
+        await worker?.close();
+        await f.close();
+      }
+    });
+  }
+});
+
+Deno.test('live link: a ready wake exchanges before admitting a newer authority tail', async () => {
+  const f = await fixture(LINK_SUPPORTED);
+  const observed = Promise.withResolvers<boolean>();
+  let worker: ReturnType<typeof startHomeLinkWorker> | undefined;
+  try {
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+    const client = await openJournalClient(f.hp, bundle.id, f.tls.home);
+    const stream = {
+      source: 'edge_a',
+      incarnation: client.peer.incarnation,
+      stream: 'authority:@alice:logical.test',
+    };
+    const append = (id: string) =>
+      f.fj.append('home', {
+        ...stream,
+        type: 'control',
+        version: 1,
+        operationId: id,
+        payload: {},
+      });
+    const applied = await append('applied-authority');
+    await f.hj.receive('edge_a', [applied]);
+    await f.hj.complete('edge_a', stream, applied, {});
+    const future = await append('future-authority');
+    const hello = client.hello.bind(client);
+    client.hello = async (signal) => {
+      // Reconciliation can receive a fresh auth declaration on every wake. It
+      // must not invalidate the applied cut before the pending live attempt.
+      await f.hj.receive('edge_a', [future]);
+      return await hello(signal);
+    };
+    client.activity = async () => {
+      const heads = await f.hj.heads('edge_a', 'in', stream);
+      observed.resolve(heads.received.sequence === heads.applied.sequence);
+    };
+    worker = startHomeLinkWorker({
+      client,
+      journal: f.hj,
+      limits: { maxItems: 1, maxBytes: 1000 },
+      notify: 'poll',
+      pollseconds: 60,
+      reconnectmaxseconds: 60,
+      failed: () => {},
+      apply: () => Promise.resolve(false),
+      activity: {
+        capture: () => Promise.resolve({}),
+        apply: () => Promise.resolve(),
+      },
+    });
+    assertEquals(await testDeadline(observed.promise), true);
+  } finally {
+    await worker?.close();
+    await f.close();
+  }
+});
+
 Deno.test('F1 enrollment upgrades ownership over the same authenticated link, with apply ACK after both files', async () => {
   const f = await fixture(LINK_SUPPORTED);
   try {

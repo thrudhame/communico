@@ -1,7 +1,10 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import metadata from '#root/deno.json' with { type: 'json' };
 import { adminCall } from './admin-client.ts';
-import { facadeProcess as process } from './helpers/facade-process.ts';
+import {
+  facadeProcess as process,
+  observeLiveInput,
+} from './helpers/facade-process.ts';
 import { type LinkRecord, object } from '#engine/facade/protocol.ts';
 import type { AccountAuth } from '#engine/tenant/account-auth.ts';
 import type { DeviceOperation } from '#engine/tenant/device-source.ts';
@@ -2269,6 +2272,7 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     // link. Ordinary/sliding consumers, not a durable journal ACK, prove receipt.
     const livePresence = 'presence/' + encodeURIComponent(user) + '/status';
     const liveTyping = roomPath + '/typing/' + encodeURIComponent(user);
+    const liveMark = edge.observations.mark();
     assertEquals(
       (await api(
         livePresence,
@@ -2288,20 +2292,70 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       200,
     );
     const observeLive = async (
+      child: Awaited<ReturnType<typeof process>>,
+      after: number,
+      snapshotMatches: (snapshot: {
+        presence: { userId: string; presence: string }[];
+        typing: { userId: string; roomId: string }[];
+      }) => boolean,
       read: () => ReturnType<typeof api>,
       observed: (body: Awaited<ReturnType<typeof api>>['body']) => boolean,
     ) => {
-      const deadline = Date.now() + 10000;
+      const source = child === edge ? home : edge;
+      assert(source);
+      await observeLiveInput(
+        source,
+        child,
+        pairing,
+        after,
+        (snapshot) =>
+          snapshotMatches(snapshot as Parameters<typeof snapshotMatches>[0]),
+      );
+      const readScopes = new Set([
+        'auth:' + user,
+        'domain:' + user,
+        'membership:' + user,
+        'room:' + roomId,
+        'directory',
+        'owner-control',
+      ]);
       let value;
-      do {
+      for (;;) {
+        const readMark = child.observations.mark();
         value = await read();
-        if (value.status === 200 && observed(value.body)) return value.body;
-        assert([200, 503].includes(value.status), JSON.stringify(value));
-        await new Promise((resolve) => setTimeout(resolve, 25));
-      } while (Date.now() < deadline);
-      throw new Error('live consumer outcome absent: ' + JSON.stringify(value));
+        if (value.status !== 503 || child !== edge) break;
+        assertEquals(value.body.errcode, 'M_UNAVAILABLE');
+        // Live application does not seal the ordinary reader's separate scope
+        // cut. A refused read waits for real selected-owner application, never
+        // an elapsed retry window or a predicate against a missing effect.
+        await child.observations.wait(
+          (event) =>
+            event.kind === 'applied' && event.peer === 'home' &&
+            event.record.source === 'home' &&
+            event.record.incarnation === pairing &&
+            readScopes.has(event.record.stream),
+          readMark,
+          (scope) =>
+            scope.peer === 'home' && scope.source === 'home' &&
+            scope.incarnation === pairing && readScopes.has(scope.stream),
+        );
+      }
+      assertEquals(value.status, 200, JSON.stringify(value));
+      assert(
+        observed(value.body),
+        'completed live exchange omitted consumer effect: ' +
+          JSON.stringify(value),
+      );
+      return value.body;
     };
     const liveSync = await observeLive(
+      edge,
+      liveMark,
+      (snapshot) =>
+        snapshot.presence.some((v) =>
+          v.userId === user && v.presence === 'unavailable'
+        ) &&
+        snapshot.typing.some((v) => v.userId === user && v.roomId === roomId),
       () => edgeApi('sync?timeout=0&set_presence=offline'),
       (body) =>
         body.presence?.events.some((
@@ -2312,6 +2366,7 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
         ) => e.type === 'm.typing' && e.content.user_ids?.includes(user)),
     );
     assertEquals(typeof liveSync.next_batch, 'string');
+    const homeLiveMark = home.observations.mark();
     const liveSliding = await fetch(
       `http://127.0.0.1:${facadePort}/_matrix/client/unstable/org.matrix.simplified_msc3575/sync?set_presence=online`,
       {
@@ -2342,9 +2397,16 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       200,
     );
     await observeLive(
+      home,
+      homeLiveMark,
+      (snapshot) =>
+        snapshot.presence.some((v) =>
+          v.userId === user && v.presence === 'online'
+        ),
       () => api(livePresence, undefined, registered.body.access_token),
       (body) => body.presence === 'online',
     );
+    const stopTypingMark = edge.observations.mark();
     assertEquals(
       (await api(
         liveTyping,
@@ -2355,6 +2417,10 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       200,
     );
     await observeLive(
+      edge,
+      stopTypingMark,
+      (snapshot) =>
+        !snapshot.typing.some((v) => v.userId === user && v.roomId === roomId),
       () => edgeApi('sync?timeout=0&set_presence=offline'),
       (body) =>
         !body.rooms?.join?.[roomId]?.ephemeral?.events.some((

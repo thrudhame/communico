@@ -3,6 +3,7 @@
 import { createHash } from 'node:crypto';
 import { canonicalJson } from '#engine/canonical.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { VerificationUnavailable } from './signing-authority.ts';
 import {
   importPublicKeyFromRaw,
   matrixBase64,
@@ -426,7 +427,7 @@ export class OwnerControls {
       !left || !right || left.revision !== right.revision ||
       left.body_hash !== right.body_hash ||
       left.signed_json !== right.signed_json
-    ) unavailable();
+    ) throw new VerificationUnavailable('ownership control unavailable');
     const signed = await this.verified(
       JSON.parse(String(left.signed_json)),
       grant,
