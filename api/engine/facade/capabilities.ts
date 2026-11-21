@@ -10,7 +10,13 @@ export type Scope =
   | 'auth'
   | 'domain'
   | 'clientrooms';
-type Rule = { method: string; path: RegExp; scope: Scope; action?: 'home' };
+type Rule = {
+  method: string;
+  path: RegExp;
+  scope: Scope;
+  action?: 'home';
+  requiredQuery?: string;
+};
 const f = '/_matrix/federation/v1/';
 const k = '/_matrix/key/v2/';
 const literal = (path: string) =>
@@ -185,6 +191,11 @@ const F2_SYNC: readonly Rule[] = [
 // B6's client room owners enforce their exact room/account cuts. This is not
 // the federation rooms scope: local clients still work with federation off.
 const F2_ROOMS: readonly Rule[] = [
+  // Only the room-scoped legacy operation is delivered, not global old sync.
+  {
+    ...route('GET', literal('/_matrix/client/v3/events'), 'clientrooms'),
+    requiredQuery: 'room_id',
+  },
   ...['GET', 'POST'].map((method) =>
     route(method, literal('/_matrix/client/v3/publicRooms'), 'clientrooms')
   ),
@@ -386,7 +397,8 @@ export function capabilities(role: string, phase = 'f1') {
     },
     gate(request: Request, ready: (scope: Scope) => boolean): Response | null {
       if (role === 'home') return null;
-      const path = new URL(request.url).pathname;
+      const url = new URL(request.url);
+      const path = url.pathname;
       const matching = (phase === 'f2'
         ? [
           ...F1_PUBLIC,
@@ -402,11 +414,14 @@ export function capabilities(role: string, phase = 'f1') {
         : F1_PUBLIC)
         .filter((rule) => rule.path.test(path));
       const rule = matching.find((rule) => rule.method === request.method);
-      if (!rule) {
+      if (
+        !rule ||
+        (rule.requiredQuery && !url.searchParams.get(rule.requiredQuery))
+      ) {
         return Response.json({
           errcode: 'M_UNRECOGNIZED',
           error: 'Unrecognized request',
-        }, { status: matching.length ? 405 : 404 });
+        }, { status: rule ? 404 : matching.length ? 405 : 404 });
       }
       if (rule.action === 'home') {
         return Response.json({

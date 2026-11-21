@@ -117,6 +117,47 @@ suite.test('typing starts/stops/expires, has no room_id, does not leak, and is p
   await call(path, a.access_token!, 'PUT', { typing: false });
 });
 
+suite.test('typing stop is scoped to its authenticated device while sync renders the user union', async () => {
+  const a = await suite.registerTestUser('ep-typing-devices-a', 'pw');
+  const b = await suite.registerTestUser('ep-typing-devices-b', 'pw');
+  const { roomId, base } = await roomFor(a, b);
+  const login = await call('/_matrix/client/v3/login', undefined, 'POST', {
+    type: 'm.login.password',
+    identifier: { type: 'm.id.user', user: a.user_id },
+    password: 'pw',
+    device_id: 'SECOND',
+  });
+  assertEquals(login.status, 200);
+  const second = String(login.body.access_token);
+  const path = base + '/typing/' + encodeURIComponent(a.user_id);
+  for (const token of [a.access_token!, second]) {
+    assertEquals(
+      (await call(path, token, 'PUT', { typing: true, timeout: 30_000 }))
+        .status,
+      200,
+    );
+  }
+  let before = await sync(b.access_token!);
+  assertEquals(
+    (await call(path, a.access_token!, 'PUT', { typing: false })).status,
+    200,
+  );
+  let after = await sync(b.access_token!, '&since=' + before.next_batch);
+  assertEquals((eventOf(after, roomId, 'm.typing')!.content as Json).user_ids, [
+    a.user_id,
+  ]);
+  before = after;
+  assertEquals(
+    (await call(path, second, 'PUT', { typing: false })).status,
+    200,
+  );
+  after = await sync(b.access_token!, '&since=' + before.next_batch);
+  assertEquals(
+    (eventOf(after, roomId, 'm.typing')!.content as Json).user_ids,
+    [],
+  );
+});
+
 suite.test('receipts and read markers round-trip; private receipts stay stored and never broadcast', async () => {
   const a = await suite.registerTestUser('ep-rc-a', 'pw');
   const b = await suite.registerTestUser('ep-rc-b', 'pw');

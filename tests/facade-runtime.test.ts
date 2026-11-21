@@ -1501,6 +1501,68 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     );
     assertEquals(freshRead.status, 200);
     assertEquals(freshRead.body.content, freshContent);
+    const pollInitial = await edgeApi(freshRoomPath + '/initialSync');
+    assertEquals(pollInitial.status, 200, JSON.stringify(pollInitial.body));
+    const pollPath = 'events?room_id=' +
+      encodeURIComponent(fresh.body.room_id) + '&timeout=0&from=';
+    const polledContent = {
+      algorithm: 'm.megolm.v1.aes-sha2',
+      ciphertext: 'offline-event-poll',
+    };
+    const polledEvent = await edgeApi(
+      freshRoomPath + '/send/m.room.encrypted/public-event-poll',
+      polledContent,
+      'PUT',
+    );
+    assertEquals(polledEvent.status, 200);
+    const polled = await edgeApi(
+      pollPath + encodeURIComponent(pollInitial.body.messages.end),
+    );
+    assertEquals(polled.status, 200, JSON.stringify(polled.body));
+    assertEquals(polled.body.start, pollInitial.body.messages.end);
+    const observed = polled.body.chunk.find((event: { event_id: string }) =>
+      event.event_id === polledEvent.body.event_id
+    );
+    assert(observed);
+    assertEquals(observed.content, polledContent);
+    assertEquals(
+      (await edgeApi(pollPath + encodeURIComponent(polled.body.end))).body
+        .chunk,
+      [],
+    );
+    assertEquals(await edgeApi('events'), {
+      status: 404,
+      body: { errcode: 'M_UNRECOGNIZED', error: 'Unrecognized request' },
+    });
+    assertEquals(
+      (await api('events', undefined, undefined, 'GET', facadePort)).status,
+      404,
+    );
+    const foreignPoll = await edgeApi(
+      pollPath + encodeURIComponent(formatPosition(
+        crypto.randomUUID(),
+        parsePosition(pollInitial.body.messages.end)!.payload,
+      )),
+    );
+    assertEquals(foreignPoll.status, 400);
+    assertEquals(foreignPoll.body.errcode, 'M_UNKNOWN_POS');
+    for (
+      const [token, status] of [
+        [undefined, 401],
+        [registered.body.access_token, 503],
+      ] as const
+    ) {
+      assertEquals(
+        (await api(
+          pollPath + encodeURIComponent(polled.body.end),
+          undefined,
+          token,
+          'GET',
+          facadePort,
+        )).status,
+        status,
+      );
+    }
     const context = await edgeApi(
       freshRoomPath + '/context/' + encodeURIComponent(edit.body.event_id),
     );

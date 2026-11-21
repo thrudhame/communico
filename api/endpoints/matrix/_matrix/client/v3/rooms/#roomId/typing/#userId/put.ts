@@ -1,6 +1,5 @@
 import { MatrixError } from '#engine/matrix-error.ts';
-import { theApp } from '#engine/app.ts';
-import { setTyping } from '#engine/typing.ts';
+import { setClientTyping } from '#engine/client/typing.ts';
 import { parseJson } from '#engine/operation-body.ts';
 import { decodeTypingRequest } from '#engine/client/ephemeral-request.ts';
 
@@ -18,19 +17,17 @@ export default async function (
     );
   }
   const body = decodeTypingRequest(await parseJson(request));
-  const accepted = await setTyping(
-    theApp().server,
+  await setClientTyping(
     request.params.roomId as string,
     userId,
     body.typing,
     body.timeout,
+    typeof context.state.device === 'string'
+      ? {
+        deviceId: context.state.device,
+        generation: Number(context.state.deviceGeneration ?? 0),
+      }
+      : undefined,
   );
-  if (!accepted) {
-    throw new MatrixError(
-      403,
-      'M_FORBIDDEN',
-      'not joined to ' + request.params.roomId,
-    );
-  }
   return {};
 }

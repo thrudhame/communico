@@ -17,6 +17,10 @@ import {
   searchUsers,
 } from '#engine/client/directory.ts';
 import { versionOf } from '#engine/client/room.ts';
+import { roomEvents, roomInitialSync } from '#engine/client/peeking.ts';
+import { formatStreamToken } from '#engine/client/tokens.ts';
+import { publicationIdentity } from '#engine/facade/ownership.ts';
+import { setTyping, typingIn } from '#engine/typing.ts';
 import {
   createRoom as createClientRoom,
   inviteDeps,
@@ -40,7 +44,11 @@ import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
 import { exportKeyRoster, FacadeKeys } from '#engine/facade/control.ts';
 import { startInboxWorker } from '#engine/facade/worker.ts';
 import * as serving from '#engine/federation/serve.ts';
-import { pathfinder } from '@pathfinder/pathfinder';
+import {
+  type Context,
+  pathfinder,
+  type PathfinderRequest,
+} from '@pathfinder/pathfinder';
 import {
   directOnly,
   makeDoc,
@@ -3799,6 +3807,194 @@ Deno.test('client directory readers retain required-cut and known-absence distin
     }
     assert(await directory.apply(journal, next));
     assertEquals(await roomAliases(f.source.roomId, f.source.creator), [alias]);
+  } finally {
+    await closeApp();
+    await f.close();
+    setConfigForTests({});
+  }
+});
+
+Deno.test('client typing admits the required replica before membership or ephemeral mutation', async () => {
+  const { default: typingAdapter } = await import(
+    new URL(
+      '../api/endpoints/matrix/_matrix/client/v3/rooms/%23roomId/typing/%23userId/put.ts',
+      import.meta.url,
+    ).href
+  ) as {
+    default: (request: PathfinderRequest, context: Context) => Promise<unknown>;
+  };
+  const f = await fixture();
+  try {
+    setConfigForTests({ server: { name: 'logical.test', role: 'facade' } });
+    const directory = await f.directoryOwner();
+    await openReplicaApp(f.edgeStore(), await f.edgeTenant(), {
+      requireScope: (scope, allowAbsent) =>
+        directory.requireScope(scope, allowAbsent),
+      prepareRoomScope: (roomId, allowAbsent) =>
+        directory.prepareRoomScope(roomId, allowAbsent),
+      keys: keyStore(await f.edgeServer(), { signer: f.node.signer() }),
+      signer: f.node.signer(),
+      keyDocument: () => Promise.reject(new Error('unused')),
+      publicRooms: () => Promise.resolve(true),
+    });
+    const submit = (typing: boolean) => {
+      const url = 'https://facade.test/_matrix/client/v3/rooms/' +
+        encodeURIComponent(f.source.roomId) + '/typing/' +
+        encodeURIComponent(f.source.creator);
+      const bytes = new TextEncoder().encode(JSON.stringify({ typing }));
+      return typingAdapter(
+        {
+          params: { roomId: f.source.roomId, userId: f.source.creator },
+          method: 'PUT',
+          _raw: new Request(url, { method: 'PUT' }),
+          body: { bytes: () => Promise.resolve(bytes) },
+        } as unknown as Parameters<typeof typingAdapter>[0],
+        {
+          state: { user: f.source.creator },
+        } as unknown as Parameters<typeof typingAdapter>[1],
+      );
+    };
+    const unavailable = async () => {
+      const error = await assertRejects(() => submit(true), MatrixError);
+      assertEquals(error.status, 503);
+      assertEquals(error.errcode, 'M_UNAVAILABLE');
+      assertEquals(typingIn(f.source.roomId).userIds, []);
+    };
+    await unavailable();
+    const inventory = await f.directoryExport();
+    assert(inventory);
+    const journal = await f.journal();
+    await journal.receive('home', [inventory]);
+    assert(await directory.apply(journal, inventory));
+    await unavailable();
+    const record = await f.exports();
+    assert(record);
+    await journal.receive('home', [record]);
+    assert(await (await f.replicas()).apply(journal, record));
+    assertEquals(await submit(true), {});
+    assertEquals(typingIn(f.source.roomId).userIds, [f.source.creator]);
+    assertEquals(await submit(false), {});
+    assertEquals(typingIn(f.source.roomId).userIds, []);
+    await setVisibility(await f.home.server(), f.source.roomId, 'public');
+    const next = await f.directoryExport();
+    assert(next);
+    await journal.receive('home', [next]);
+    await unavailable();
+    assert(await directory.apply(journal, next));
+    assertEquals(await submit(true), {});
+    assertEquals(typingIn(f.source.roomId).userIds, [f.source.creator]);
+  } finally {
+    await setTyping(
+      await f.edgeServer(),
+      f.source.roomId,
+      f.source.creator,
+      false,
+    );
+    await closeApp();
+    await f.close();
+    setConfigForTests({});
+  }
+});
+
+Deno.test('room event polling retains replica admission and local stream boundaries', async () => {
+  const f = await fixture();
+  try {
+    setConfigForTests({ server: { name: 'logical.test', role: 'facade' } });
+    const directory = await f.directoryOwner();
+    await publicationIdentity(await f.edgeServer(), f.node.node);
+    await openReplicaApp(f.edgeStore(), await f.edgeTenant(), {
+      requireScope: (scope, allowAbsent) =>
+        directory.requireScope(scope, allowAbsent),
+      prepareRoomScope: (roomId, allowAbsent) =>
+        directory.prepareRoomScope(roomId, allowAbsent),
+      keys: keyStore(await f.edgeServer(), { signer: f.node.signer() }),
+      signer: f.node.signer(),
+      keyDocument: () => Promise.reject(new Error('unused')),
+      publicRooms: () => Promise.resolve(true),
+    });
+    const poll = (from: string | null = null) =>
+      roomEvents(
+        f.source.roomId,
+        f.source.creator,
+        null,
+        from,
+        0,
+        new AbortController().signal,
+      );
+    await assertRejects(poll, MatrixError, 'replica unavailable');
+    const inventory = await f.directoryExport();
+    assert(inventory);
+    const journal = await f.journal();
+    await journal.receive('home', [inventory]);
+    assert(await directory.apply(journal, inventory));
+    await assertRejects(poll, MatrixError, 'replica unavailable');
+    const record = await f.exports();
+    assert(record);
+    await journal.receive('home', [record]);
+    assert(await (await f.replicas()).apply(journal, record));
+    const initial = await roomInitialSync(
+      f.source.roomId,
+      f.source.creator,
+      null,
+      10,
+    );
+    assertEquals(initial.room_id, f.source.roomId);
+    assertEquals(initial.membership, 'join');
+    const empty = await poll(initial.messages.end);
+    assertEquals(empty.chunk, []);
+    assertEquals(empty.start, initial.messages.end);
+    const foreign = formatStreamToken(
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      undefined,
+      undefined,
+      crypto.randomUUID(),
+    );
+    const rejected = await assertRejects(() => poll(foreign), MatrixError);
+    assertEquals(rejected.status, 400);
+    assertEquals(rejected.errcode, 'M_UNKNOWN_POS');
+    const global = await assertRejects(
+      () =>
+        roomEvents(
+          '',
+          f.source.creator,
+          null,
+          null,
+          0,
+          new AbortController().signal,
+        ),
+      MatrixError,
+    );
+    assertEquals(global.status, 400);
+    assertEquals(global.errcode, 'M_INVALID_PARAM');
+    await assertRejects(() => poll('s0'), MatrixError, 'foreign sync position');
+    await assertRejects(() => poll('invalid'), MatrixError, 'bad from token');
+    await assertRejects(
+      () =>
+        roomEvents(
+          '!absent:logical.test',
+          f.source.creator,
+          null,
+          null,
+          0,
+          new AbortController().signal,
+        ),
+      MatrixError,
+      'room not found',
+    );
+    await setVisibility(await f.home.server(), f.source.roomId, 'public');
+    const next = await f.directoryExport();
+    assert(next);
+    await journal.receive('home', [next]);
+    await assertRejects(poll, MatrixError, 'replica unavailable');
+    assert(await directory.apply(journal, next));
+    assertEquals((await poll(empty.end)).chunk, []);
   } finally {
     await closeApp();
     await f.close();

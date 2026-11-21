@@ -12,7 +12,10 @@ import type { Database } from '#engine/store/db.ts';
 import { isJoined } from '#engine/server/read.ts';
 import { integerParameter } from '#engine/operation.ts';
 
-const typing = new Map<string, Map<string, number>>();
+type Observation = { generation: number; expiresAt: number };
+// Inactive observations retain only their generation fence for this process
+// epoch. They are not live users and never become a durable activity backlog.
+const typing = new Map<string, Map<string, Map<string, Observation>>>();
 const lastChangeT = new Map<string, number>();
 let t = 0;
 const epoch = crypto.randomUUID();
@@ -22,6 +25,7 @@ export type TypingSnapshot = {
   seq: number;
   rooms: Map<string, { userIds: string[]; changed: number }>;
 };
+export type TypingDevice = { deviceId: string; generation: number };
 
 /** Copy ephemeral values and their cut synchronously, before async rendering.
  * A persisted sliding position must not compare an old process's counter with
@@ -32,7 +36,7 @@ export function captureTyping(rooms: Iterable<string>): TypingSnapshot {
     epoch,
     seq: t,
     rooms: new Map([...rooms].map((room) => [room, {
-      userIds: [...(typing.get(room)?.keys() ?? [])],
+      userIds: liveUsers(room),
       changed: lastTypingChange(room),
     }])),
   };
@@ -75,8 +79,10 @@ export async function setTyping(
   userId: string,
   isTyping: boolean,
   timeoutMs?: number,
+  device?: TypingDevice,
 ): Promise<boolean> {
   integerParameter(timeoutMs, 'timeout', 0);
+  integerParameter(device?.generation, 'device generation', 0);
   // Serialize admission with the projection's membership transaction. The
   // synchronous memory update cannot land behind its departure reconciliation.
   return await server.tx(async (tx) => {
@@ -84,21 +90,29 @@ export async function setTyping(
       clearTyping(roomId, userId);
       return false;
     }
-    if (isTyping) {
-      const timeout = timeoutMs ?? 30000;
-      let room = typing.get(roomId);
-      if (room === undefined) {
-        room = new Map();
-        typing.set(roomId, room);
-      }
-      room.set(userId, Date.now() + timeout);
-    } else {
-      typing.get(roomId)?.delete(userId);
+    let room = typing.get(roomId);
+    if (room === undefined) {
+      room = new Map();
+      typing.set(roomId, room);
     }
+    let observations = room.get(userId);
+    if (observations === undefined) {
+      observations = new Map();
+      room.set(userId, observations);
+    }
+    const id = device?.deviceId ?? '', generation = device?.generation ?? 0;
+    const held = observations.get(id);
+    if (held && held.generation > generation) return true;
+    observations.set(id, {
+      generation,
+      expiresAt: isTyping ? Date.now() + (timeoutMs ?? 30000) : 0,
+    });
+    sweepRoom(roomId);
     bump(roomId);
+    const active = liveUsers(roomId).includes(userId);
     for (const l of [...listeners]) {
       try {
-        l(roomId, userId, isTyping);
+        l(roomId, userId, active);
       } catch (e) {
         console.error('typing listener error:', e);
       }
@@ -109,8 +123,11 @@ export async function setTyping(
 
 /** All removal paths share the same stream and federation stop notification. */
 function clearTyping(roomId: string, userId: string): void {
-  if (!typing.get(roomId)?.delete(userId)) return;
+  const observations = typing.get(roomId)?.get(userId);
+  if (!observations) return;
+  typing.get(roomId)!.delete(userId);
   if (typing.get(roomId)?.size === 0) typing.delete(roomId);
+  if (![...observations.values()].some((value) => value.expiresAt > 0)) return;
   bump(roomId);
   for (const listener of [...listeners]) {
     try {
@@ -145,17 +162,27 @@ export async function reconcileTyping(
 // (inside roomTimeline's typingIn read) would land after next_batch was
 // computed and make the NEXT sync re-emit the same state.
 export function sweepTyping(): void {
+  for (const roomId of typing.keys()) sweepRoom(roomId);
+}
+
+function sweepRoom(roomId: string): void {
+  let dropped = false;
   const now = Date.now();
-  for (const [roomId, room] of typing) {
-    let dropped = false;
-    for (const [userId, expiresAt] of room) {
-      if (expiresAt <= now) {
-        room.delete(userId);
+  for (const observations of typing.get(roomId)?.values() ?? []) {
+    for (const value of observations.values()) {
+      if (value.expiresAt > 0 && value.expiresAt <= now) {
+        value.expiresAt = 0;
         dropped = true;
       }
     }
-    if (dropped) bump(roomId);
   }
+  if (dropped) bump(roomId);
+}
+
+function liveUsers(roomId: string): string[] {
+  return [...(typing.get(roomId) ?? [])].filter(([, observations]) =>
+    [...observations.values()].some((value) => value.expiresAt > 0)
+  ).map(([user]) => user);
 }
 
 // The live typing set for a room. The sweep runs on read: expired entries
@@ -163,17 +190,6 @@ export function sweepTyping(): void {
 // §3c), so a syncer waiting since before the expiry sees a fresh
 // m.typing with the shrunken list.
 export function typingIn(roomId: string): { userIds: string[]; t: number } {
-  const room = typing.get(roomId);
-  if (room !== undefined) {
-    const now = Date.now();
-    let dropped = false;
-    for (const [userId, expiresAt] of room) {
-      if (expiresAt <= now) {
-        room.delete(userId);
-        dropped = true;
-      }
-    }
-    if (dropped) bump(roomId);
-  }
-  return { userIds: [...(typing.get(roomId)?.keys() ?? [])], t };
+  sweepRoom(roomId);
+  return { userIds: liveUsers(roomId), t };
 }
