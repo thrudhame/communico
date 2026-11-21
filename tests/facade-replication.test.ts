@@ -89,7 +89,11 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import { setReceipt as writeClientReceipt } from '#engine/receipts.ts';
 import { appendRecord, Journal } from '#engine/facade/journal.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
-import { LINK_CAPABILITIES, LINK_SUPPORTED } from '#engine/facade/protocol.ts';
+import {
+  LINK_CAPABILITIES,
+  LINK_SUPPORTED,
+  LinkError,
+} from '#engine/facade/protocol.ts';
 import { applyReplicaScope } from '#engine/facade/scopes.ts';
 import { replicationProgress } from '#engine/facade/progress.ts';
 import type { Database } from '#engine/store/db.ts';
@@ -1787,11 +1791,12 @@ Deno.test('reverse room bootstrap requires selected authentic participation and 
         0,
       );
     }
-    await assertRejects(
+    const pendingSelection = await assertRejects(
       () => owner.apply(journal, record, f.bundle.id),
-      Error,
-      'selected account',
+      LinkError,
     );
+    assertEquals(pendingSelection.code, 'LINK_UNAVAILABLE');
+    assertEquals(pendingSelection.status, 503);
     assertEquals((await f.home.rooms()).includes(source.roomId), false);
     assertEquals(
       (await journal.heads(f.node.node, 'in', record)).applied.sequence,

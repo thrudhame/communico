@@ -39,7 +39,13 @@ import {
   type MembershipState,
   recordMembershipOperation,
 } from '#engine/server/membership-operations.ts';
-import { type DomainBinding, requireDomainControl } from './domain-control.ts';
+import {
+  type DomainBinding,
+  requireAccountExport,
+  requireAccountSelection,
+  requireDomainControl,
+  requireSelectionReady,
+} from './domain-control.ts';
 import type { NodeIdentity } from './identity.ts';
 import { appendRecord, type Journal } from './journal.ts';
 import type { OwnerControl } from './ownership.ts';
@@ -339,17 +345,32 @@ export class MembershipOperations {
     if (row?.state !== 'paired' || row.grant_json !== canonicalJson(grant)) {
       mismatch('membership exchange grant changed');
     }
-    const scope = 'auth:@' + localpart + ':' + context.server;
-    const selected = this.node
-      ? await conn.query(
-        'SELECT 1 FROM facade_scopes WHERE incarnation=? AND scope=? AND ready=1',
-        [context.id, scope],
-      )
-      : await conn.query(
-        'SELECT 1 FROM facade_exports WHERE peer=? AND incarnation=? AND scope=?',
-        [context.node, context.id, scope],
+    if (this.node) {
+      const [selected] = await conn.query(
+        'SELECT ready,pending_hash FROM facade_scopes WHERE incarnation=? AND scope=?',
+        [context.id, 'auth:@' + localpart + ':' + context.server],
       );
-    if (!selected.length) mismatch('membership account not selected');
+      requireSelectionReady(
+        selected?.ready === 1 && selected.pending_hash === null,
+        'membership account not selected: awaiting auth application',
+      );
+    } else {await requireAccountExport(conn, {
+        peer: context.node,
+        pairing: context.id,
+        server: context.server,
+        localpart,
+      });}
+  }
+
+  private async tenantSelected(grant: Grant, localpart: string) {
+    if (!this.node) return;
+    await (await this.store.tenant(this.tenant.serverName)).tx((conn) =>
+      requireAccountSelection(conn, {
+        localpart,
+        pairing: grant.body.transcript.body.context.id,
+        grantRevision: grant.body.revision,
+      })
+    );
   }
 
   /** Retention alone never completes a journal record or changes a display.
@@ -403,6 +424,7 @@ export class MembershipOperations {
     if (view.kind === 'membership-history' && !this.node) {
       mismatch('only home may attest membership history');
     }
+    await this.tenantSelected(grant, view.localpart);
     await server.tx(async (conn) => {
       unchanged();
       await this.selected(conn, grant, view.localpart);
@@ -616,6 +638,7 @@ export class MembershipOperations {
   private async exportBinding(localpart: string, pairing?: string) {
     const grant = await this.binding(pairing),
       context = grant.body.transcript.body.context;
+    await this.tenantSelected(grant, localpart);
     const server = await this.store.server();
     const control = await server.tx(async (conn) => {
       await this.selected(conn, grant, localpart);

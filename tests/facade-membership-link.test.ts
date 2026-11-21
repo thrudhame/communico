@@ -21,7 +21,11 @@ import {
 } from '#engine/facade/directory.ts';
 import { exportOwnerControl, OwnerControls } from '#engine/facade/ownership.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
-import { LINK_CAPABILITIES, LINK_SUPPORTED } from '#engine/facade/protocol.ts';
+import {
+  LINK_CAPABILITIES,
+  LINK_SUPPORTED,
+  LinkError,
+} from '#engine/facade/protocol.ts';
 import { bindRole } from '#engine/facade/role.ts';
 import { recordHash } from '#engine/facade/protocol.ts';
 import {
@@ -517,6 +521,128 @@ Deno.test('membership export: selected account and exact pairing are required in
     await assertRejects(() => f.hs.export('alice'));
     assertEquals((await f.hs.export('alice', f.bundle.id)).length, 1);
     assertEquals((await f.es.export('alice')).length, 1);
+  } finally {
+    await f.close();
+  }
+});
+
+for (const cut of ['pending-scope', 'pairing', 'revision'] as const) {
+  Deno.test(`membership readiness: ${cut} distinguishes pending from conflicting selection`, async () => {
+    const f = await fixture();
+    try {
+      const { record, state, keys } = await incoming(f, 'home');
+      await f.ej.receive('home', [record]);
+      const server = await f.edge.server();
+      const tenant = await f.edge.tenant('logical.test');
+      if (cut === 'pending-scope') {
+        await server.execute(
+          "UPDATE facade_scopes SET ready=0 WHERE scope='auth:@alice:logical.test'",
+        );
+      } else {
+        await tenant.execute(
+          cut === 'pairing'
+            ? "UPDATE account_auth_snapshots SET pairing='other' WHERE localpart='alice'"
+            : "UPDATE account_auth_snapshots SET grant_revision=99 WHERE localpart='alice'",
+        );
+      }
+      const before = await server.query(
+        'SELECT * FROM facade_streams ORDER BY stream',
+      );
+      const refused = await assertRejects(
+        () => f.es.apply(f.ej, record, keys),
+        LinkError,
+      );
+      assertEquals(
+        refused.code,
+        cut === 'pending-scope' ? 'LINK_UNAVAILABLE' : 'LINK_IDENTITY_MISMATCH',
+      );
+      assertEquals(refused.status, cut === 'pending-scope' ? 503 : 403);
+      assertEquals(
+        await server.query('SELECT * FROM facade_streams ORDER BY stream'),
+        before,
+      );
+      assertEquals(
+        await server.query(
+          "SELECT * FROM domain_operations WHERE kind='membership'",
+        ),
+        [],
+      );
+      assertEquals(await invitesOf(state.userId, { server }), []);
+      if (cut === 'pending-scope') {
+        await server.execute(
+          "UPDATE facade_scopes SET ready=1 WHERE scope='auth:@alice:logical.test'",
+        );
+        assertEquals(await f.es.apply(f.ej, record, keys), true);
+        assertEquals(
+          (await invitesOf(state.userId, { server })).map((invite) =>
+            invite.eventId
+          ),
+          [state.eventId],
+        );
+      }
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+Deno.test('membership readiness: home selection blocks retention, export and application without effects', async () => {
+  const f = await fixture();
+  try {
+    const { record, state, keys } = await incoming(f, 'edge');
+    const server = await f.home.server();
+    const journal = new Journal(server, LINK_SUPPORTED);
+    await journal.receive(f.node.node, [record]);
+    const [selection] = await server.query(
+      "SELECT * FROM facade_exports WHERE incarnation=? AND scope='auth:@alice:logical.test'",
+      [f.bundle.id],
+    );
+    await server.execute(
+      "DELETE FROM facade_exports WHERE incarnation=? AND scope='auth:@alice:logical.test'",
+      [f.bundle.id],
+    );
+    const before = await server.query(
+      'SELECT * FROM facade_streams ORDER BY stream',
+    );
+    for (
+      const attempt of [
+        () => f.hs.retain(record, keys, f.bundle.id),
+        () => f.hs.export('alice', f.bundle.id),
+        () => f.hs.bootstrap('alice', f.bundle.id),
+        () => f.hs.apply(journal, record, keys, f.bundle.id),
+      ]
+    ) {
+      const pending = await assertRejects(attempt, LinkError);
+      assertEquals(pending.code, 'LINK_UNAVAILABLE');
+      assertEquals(pending.status, 503);
+    }
+    assertEquals(
+      await server.query('SELECT * FROM facade_streams ORDER BY stream'),
+      before,
+    );
+    assertEquals(
+      await server.query(
+        "SELECT * FROM domain_operations WHERE kind='membership'",
+      ),
+      [],
+    );
+    assertEquals(await invitesOf(state.userId, { server }), []);
+    await server.execute(
+      'INSERT INTO facade_exports(peer,incarnation,scope,source_cut) VALUES(?,?,?,?)',
+      [
+        selection.peer,
+        selection.incarnation,
+        selection.scope,
+        selection.source_cut,
+      ],
+    );
+    assertEquals(await f.hs.apply(journal, record, keys, f.bundle.id), true);
+    assertEquals(
+      (await invitesOf(state.userId, { server })).map((invite) =>
+        invite.eventId
+      ),
+      [state.eventId],
+    );
   } finally {
     await f.close();
   }
@@ -1271,6 +1397,9 @@ Deno.test('membership application: account completion wakes a blocked OOB stream
       },
     });
     await blocked.promise;
+    assertEquals(failures[0] instanceof LinkError, true);
+    assertEquals((failures[0] as LinkError).code, 'LINK_UNAVAILABLE');
+    assertEquals((failures[0] as LinkError).status, 503);
     assertEquals((await f.ej.heads('home', 'in', record)).applied.sequence, 0);
     assertEquals(await invitesOf(state.userId, { server: db }), []);
     release.resolve();

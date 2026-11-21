@@ -52,6 +52,7 @@ import {
 } from '#engine/tenant/key-bootstrap.ts';
 import {
   type DomainBinding,
+  requireAccountExport,
   requireAccountSelection,
   requireDomainControl,
 } from './domain-control.ts';
@@ -257,12 +258,14 @@ export class DeviceOperations {
     if (row?.state !== 'paired' || row.grant_json !== canonicalJson(grant)) {
       mismatch('device exchange grant changed');
     }
-    if (
-      !this.node && !(await conn.query(
-        'SELECT 1 FROM facade_exports WHERE peer=? AND incarnation=? AND scope=?',
-        [context.node, context.id, 'auth:@' + localpart + ':' + context.server],
-      )).length
-    ) mismatch('device account not selected');
+    if (!this.node) {
+      await requireAccountExport(conn, {
+        peer: context.node,
+        pairing: context.id,
+        server: context.server,
+        localpart,
+      });
+    }
   }
 
   private async tenantSelected(conn: Conn, view: DomainBinding) {

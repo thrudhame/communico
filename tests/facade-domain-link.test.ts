@@ -978,11 +978,13 @@ Deno.test('domain pushers: append=false reaches home and affected selected accou
       JSON.stringify(aliceRecords).includes('charlie-private-registration'),
       false,
     );
-    await assertRejects(
+    const pendingSelection = await assertRejects(
       () => f.hs.export('bob', f.bundle.id),
       LinkError,
-      'domain account not selected',
+      'account not selected',
     );
+    assertEquals(pendingSelection.code, 'LINK_UNAVAILABLE');
+    assertEquals(pendingSelection.status, 503);
     const auth = await exportAccountAuth(
       f.home,
       f.ht,
