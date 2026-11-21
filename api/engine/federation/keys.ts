@@ -518,6 +518,7 @@ export function keyStore(
         ctx?.signal?.throwIfAborted();
         return await acquireKeyDoc(name, minimumValidUntilTs, ctx, wantKeyId);
       }
+      const shared = work !== undefined;
       if (work === undefined) {
         work = demandedWork((signal) =>
           doAcquire(name, minimumValidUntilTs, epoch, { ...ctx, signal })
@@ -528,7 +529,23 @@ export function keyStore(
           if (inFlight.get(name) === owned) inFlight.delete(name);
         }).catch(() => {}); // Original failures reach the waiting subscribers.
       }
-      return await joinDemand(work, ctx?.signal);
+      const answer = await joinDemand(work, ctx?.signal);
+      requireCurrent(epoch);
+      // Coalescing owns a fetch, not its subscribers' validity/key demands.
+      // A later subscriber must get its own refresh if the shared result is
+      // insufficient. Its own answer may still genuinely lack the key, in
+      // which case getVerifyKey records the ordinary lookup failure.
+      if (
+        shared &&
+        (Math.min(answer.valid_until_ts, Date.now() + 7 * 86400_000) <
+            minimumValidUntilTs ||
+          (wantKeyId !== undefined &&
+            !Object.hasOwn(answer.verify_keys, wantKeyId) &&
+            !Object.hasOwn(oldKeysOf(answer), wantKeyId)))
+      ) {
+        return await acquireKeyDoc(name, minimumValidUntilTs, ctx, wantKeyId);
+      }
+      return answer;
     });
   }
 

@@ -412,6 +412,99 @@ Deno.test('rotation: missing keys refresh a valid document and share the actual 
   });
 });
 
+Deno.test('review keys: shared discovery rechecks each waiting validity and key demand', async (t) => {
+  for (const demand of ['validity', 'key'] as const) {
+    await t.step(demand, async () => {
+      await withStore(async (store) => {
+        const s = await makeServer('shared-' + demand + '.test');
+        const extra = await makeServer(s.name, 'ed25519:extra');
+        const horizon = Date.now() + 3600_000;
+        const firstDoc = await makeDoc(s, { validUntilMs: horizon + 2000 });
+        const secondDoc = await makeDoc(s, {
+          validUntilMs: horizon + 4000,
+          extraVerifyKeys: {
+            [extra.keyId]: b64encodeStd(
+              await exportPublicKeyRaw(extra.kp.publicKey),
+            ),
+          },
+        });
+        const entered = latch(), release = latch(), joined = latch();
+        const abort = new AbortController();
+        const add = abort.signal.addEventListener.bind(abort.signal);
+        abort.signal.addEventListener = (...args: Parameters<typeof add>) => {
+          add(...args);
+          if (args[0] === 'abort') joined.release();
+        };
+        let calls = 0;
+        const ks = keyStore(await store.server(), {
+          deps: stubDeps({
+            directGet: async () => {
+              calls++;
+              if (calls === 1) {
+                entered.release();
+                await release.wait;
+                return firstDoc;
+              }
+              return secondDoc;
+            },
+          }),
+        });
+        const first = ks.getVerifyKey(s.name, s.keyId, horizon + 1000, 'event');
+        let second: Promise<CryptoKey> | undefined;
+        try {
+          await watchdog(
+            Promise.race([
+              entered.wait,
+              first.then(() => {
+                throw new Error('first lookup ended before dispatch');
+              }),
+            ]),
+            'first key discovery',
+          );
+          const target = demand === 'key' ? extra : s;
+          second = ks.getVerifyKey(
+            s.name,
+            target.keyId,
+            demand === 'validity' ? horizon + 3000 : horizon + 1000,
+            'event',
+            { signal: abort.signal },
+          );
+          await watchdog(
+            Promise.race([
+              joined.wait,
+              second.then(() => {
+                throw new Error('second lookup ended before joining');
+              }),
+            ]),
+            'second key subscriber',
+          );
+          release.release();
+          await first;
+          const key = await second;
+          assertEquals(
+            await exportPublicKeyRaw(key),
+            await exportPublicKeyRaw(target.kp.publicKey),
+          );
+          assertEquals(
+            calls,
+            2,
+            "an insufficient shared answer needs this caller's refresh",
+          );
+          await ks.getVerifyKey(s.name, target.keyId, horizon + 3000, 'event');
+          assertEquals(
+            calls,
+            2,
+            'the sufficient refreshed answer remains shared/cached',
+          );
+        } finally {
+          release.release();
+          await Promise.allSettled([first, ...(second ? [second] : [])]);
+        }
+      });
+    });
+  }
+});
+
 Deno.test('rotation: missing-key failures are remembered per server without blocking cached keys', async () => {
   await withStore(async (store) => {
     const server = await store.server();
