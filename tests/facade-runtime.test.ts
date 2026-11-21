@@ -2473,6 +2473,12 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
     await homeFact(
       edge,
       pairing,
+      'key-bootstrap:@outside:logical.test',
+      () => true,
+    );
+    await homeFact(
+      edge,
+      pairing,
       'room:' + departureRoom.body.room_id,
       (record) => roomView(record).roomId === departureRoom.body.room_id,
     );
@@ -2483,6 +2489,10 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
     await edge.stop();
     edge = await process(file('facade'), 'facade: link/local admin ready');
     await authTail(['outside', 'departure']);
+    await finiteStreams(edge, tls.dir + '/facade-public-auth.sock', [
+      'key-bootstrap:@outside:logical.test',
+      'devices:@outside:logical.test',
+    ]);
     await finiteTail(edge, tls.dir + '/facade-public-auth.sock', [
       'room:' + departureRoom.body.room_id,
     ]);
@@ -2511,6 +2521,71 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
     const session = await api('facade', 'login', login());
     assertEquals(session.status, 200, JSON.stringify(session));
     assertEquals(session.body.device_id, 'public-device');
+    for (const body of [{}, { display_name: 'foreign rename' }]) {
+      assertEquals(
+        await api(
+          'facade',
+          'devices/home-device',
+          body,
+          session.body.access_token,
+          'PUT',
+        ),
+        {
+          status: 503,
+          body: {
+            errcode: 'M_UNAVAILABLE',
+            error: 'operation owner unavailable at this ingress',
+          },
+        },
+      );
+    }
+    assertEquals(
+      await api(
+        'facade',
+        'devices/home-device',
+        undefined,
+        session.body.access_token,
+      ),
+      {
+        status: 200,
+        body: { device_id: 'home-device', display_name: 'outside' },
+      },
+    );
+    const deviceList = await api(
+      'facade',
+      'devices',
+      undefined,
+      session.body.access_token,
+    );
+    assertEquals(deviceList.status, 200);
+    assertEquals(
+      deviceList.body.devices.map((device: { device_id: string }) =>
+        device.device_id
+      ),
+      [
+        'home-device',
+        'public-device',
+      ],
+    );
+    assertEquals(
+      await api(
+        'facade',
+        'devices/public-device',
+        {},
+        session.body.access_token,
+        'PUT',
+      ),
+      { status: 200, body: {} },
+    );
+    assertEquals(
+      (await api(
+        'facade',
+        'devices/unknown',
+        undefined,
+        session.body.access_token,
+      )).status,
+      404,
+    );
     // These reads use the ingress's existing authenticated adapters. Home is
     // stopped, and a supplied home-owned token must not bypass owner admission.
     const rtc = async (token?: string) => {

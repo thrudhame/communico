@@ -6,6 +6,8 @@ import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { registerUser } from '#engine/tenant/users.ts';
 import {
   deleteDevices,
+  getDevice,
+  listDevices,
   updateDeviceName,
   upsertDevice,
 } from '#engine/tenant/devices.ts';
@@ -186,6 +188,75 @@ Deno.test('F2 public device owner retains immutable operations without importing
   }
 });
 
+Deno.test('F2 device metadata reads include foreign devices without execution authority', async (t) => {
+  const f = await setup();
+  try {
+    await f.home.db.tx((conn) =>
+      installSessionAuthority(conn, 'alice', f.facts)
+    );
+    for (const op of f.captured) {
+      await f.home.db.tx((conn) =>
+        operations.importDeviceOperation(conn, op, expected)
+      );
+    }
+    await t.step('list uses merged metadata', async () => {
+      assertEquals(await listDevices(f.home.tenant, 'alice'), [
+        { device_id: 'LAN', display_name: 'home device' },
+        { device_id: 'PHONE', display_name: 'new name' },
+      ]);
+    });
+    await t.step('get uses merged metadata', async () => {
+      assertEquals(await getDevice(f.home.tenant, 'alice', 'PHONE'), {
+        device_id: 'PHONE',
+        display_name: 'new name',
+      });
+      assertEquals(await getDevice(f.home.tenant, 'alice', 'missing'), null);
+    });
+    await t.step(
+      'partial foreign bootstrap is unavailable, not a complete list',
+      async () => {
+        await assertRejects(
+          () => listDevices(f.edge.tenant, 'alice'),
+          Error,
+          'key bootstrap unavailable',
+        );
+      },
+    );
+    await t.step('both rename bodies enforce the same owner', async () => {
+      for (const name of [undefined, 'foreign rename']) {
+        await assertRejects(
+          () => updateDeviceName(f.home.tenant, 'alice', 'PHONE', name),
+          Error,
+          'operation owner unavailable at this ingress',
+        );
+      }
+      assertEquals(await updateDeviceName(f.home.tenant, 'alice', 'LAN'), true);
+      assertEquals(await getDevice(f.home.tenant, 'alice', 'LAN'), {
+        device_id: 'LAN',
+        display_name: 'home device',
+      });
+    });
+    assertEquals(
+      (await f.home.db.query('SELECT device_id FROM devices')).map((row) =>
+        row.device_id
+      ),
+      ['LAN'],
+    );
+    for (
+      const table of [
+        'one_time_keys',
+        'fallback_keys',
+        'access_tokens',
+        'refresh_tokens',
+      ]
+    ) {
+      assertEquals(await f.home.db.query('SELECT * FROM ' + table), []);
+    }
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('F2 public device owner needs authentic matching incarnation facts before retaining material', async () => {
   const f = await setup();
   try {
@@ -295,6 +366,10 @@ Deno.test('F2 public device owner removes stale generations, collision losers an
       view.find((op) => op.deviceId === 'PHONE')?.value?.displayName,
       'replacement',
     );
+    assertEquals(await getDevice(f.home.tenant, 'alice', 'PHONE'), {
+      device_id: 'PHONE',
+      display_name: 'replacement',
+    });
     await upsertDevice(f.home.tenant, 'alice', 'COLLISION', 'home wins');
     await upsertDevice(f.edge.tenant, 'alice', 'COLLISION', 'edge loses');
     const collisionFacts = await f.edge.db.tx((conn) =>
@@ -318,6 +393,10 @@ Deno.test('F2 public device owner removes stale generations, collision losers an
       view.find((op) => op.deviceId === 'COLLISION')?.value?.displayName,
       'home wins',
     );
+    assertEquals(await getDevice(f.home.tenant, 'alice', 'COLLISION'), {
+      device_id: 'COLLISION',
+      display_name: 'home wins',
+    });
     await deleteDevices(f.edge.tenant, 'alice', ['PHONE']);
     const deleted = await f.edge.db.tx((conn) =>
       captureDeviceOperations(conn, 'alice')
@@ -334,6 +413,7 @@ Deno.test('F2 public device owner removes stale generations, collision losers an
       false,
       'public tombstone wins even before the next auth exchange',
     );
+    assertEquals(await getDevice(f.home.tenant, 'alice', 'PHONE'), null);
     for (const op of all) {
       await f.home.db.tx((conn) =>
         operations.importDeviceOperation(conn, op, expected)

@@ -552,10 +552,14 @@ function bind(
       exists: (deviceId: string, localpart: string) =>
         devices.deviceExists(conn, deviceId, localpart),
       ofUser: (localpart: string) => devices.devicesOfUser(conn, localpart),
+      metadata: async (localpart: string) => {
+        await authorize({ kind: 'account', localpart });
+        return await devices.deviceMetadata(conn, localpart);
+      },
       rename: async (
         deviceId: string,
         localpart: string,
-        displayName: string,
+        displayName?: string,
       ) => {
         await authorize({ kind: 'device', localpart, deviceId });
         return await mutation(
