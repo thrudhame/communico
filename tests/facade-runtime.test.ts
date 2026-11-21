@@ -2731,6 +2731,37 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       401,
     );
     timings.phase('offline push and saved notifications');
+    const joined = await api(
+      'facade',
+      'joined_rooms',
+      undefined,
+      session.body.access_token,
+    );
+    assertEquals(joined, {
+      status: 200,
+      body: { joined_rooms: [departureRoom.body.room_id] },
+    });
+    const userSearch = await api('facade', 'user_directory/search', {
+      search_term: 'departure',
+    }, session.body.access_token);
+    assertEquals(userSearch.status, 200);
+    assertEquals(
+      userSearch.body.results.map((user: { user_id: string }) => user.user_id),
+      ['@departure:logical.test'],
+    );
+    assertEquals(userSearch.body.limited, false);
+    for (
+      const [path, body] of [['joined_rooms', undefined], [
+        'user_directory/search',
+        { search_term: 'departure' },
+      ]] as const
+    ) {
+      assertEquals((await api('facade', path, body)).status, 401);
+      assertEquals(
+        (await api('facade', path, body, registered.body.access_token)).status,
+        503,
+      );
+    }
     await finiteTail(edge, tls.dir + '/facade-public-auth.sock', [
       'domain:@outside:logical.test',
       'domain:@departure:logical.test',

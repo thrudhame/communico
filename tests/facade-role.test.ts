@@ -545,6 +545,7 @@ Deno.test('F2 membership activates only delivered methods and their independent 
       'clientrooms',
     ]);
   }
+  routes.push(['GET', '/_matrix/client/v3/joined_rooms', 'clientrooms']);
   for (const [method, path, scope] of routes) {
     const request = new Request('https://logical.test' + path, { method });
     const scopes: string[] = [];
@@ -573,7 +574,6 @@ Deno.test('F2 membership activates only delivered methods and their independent 
       ['PUT', '/_matrix/federation/v1/3pid/onbind'],
       ['GET', '/_matrix/federation/v1/make_join/room'],
       ['POST', '/_matrix/client/v3/join/room/extra'],
-      ['GET', '/_matrix/client/v3/joined_rooms'],
     ]
   ) {
     assertEquals(

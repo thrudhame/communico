@@ -8,7 +8,8 @@ import {
 import { setConfigForTests } from '#engine/config.ts';
 import { claimKeys, queryKeys } from '#engine/client/e2ee.ts';
 import { canSeeEvent } from '#engine/client/visibility.ts';
-import { join as clientJoin } from '#engine/client/membership.ts';
+import { join as clientJoin, joinedRooms } from '#engine/client/membership.ts';
+import { searchUsers } from '#engine/client/directory.ts';
 import { versionOf } from '#engine/client/room.ts';
 import {
   createRoom as createClientRoom,
@@ -3275,6 +3276,96 @@ Deno.test('replica service acquisition releases a failed composition before retr
     assertEquals(delayedStops, 1);
     await access.releaseServices();
     assertEquals(delayedStops, 2);
+  } finally {
+    await closeApp();
+    await f.close();
+    setConfigForTests({});
+  }
+});
+
+Deno.test('enrolled complete-list reads refuse missing inventory and missing room cuts', async (t) => {
+  const f = await fixture();
+  try {
+    let profileReady = false;
+    const profileReads: string[] = [];
+    const tenant = await enrolledTenant(
+      f.edgeStore(),
+      await f.edgePairings(),
+      'logical.test',
+      f.node.node,
+      {
+        check(_conn, intent) {
+          if (intent.kind === 'domain') {
+            profileReads.push(intent.localpart);
+            if (!profileReady) {
+              throw new MatrixError(
+                503,
+                'M_UNAVAILABLE',
+                'profile cut unavailable',
+              );
+            }
+          }
+          return Promise.resolve();
+        },
+      },
+    );
+    setConfigForTests({
+      server: { name: 'logical.test', role: 'facade' },
+      facade: { nodeid: 'edge_a' },
+    });
+    const directory = await f.directoryOwner();
+    await openReplicaApp(f.edgeStore(), tenant, {
+      requireScope: (scope, allowAbsent) =>
+        directory.requireScope(scope, allowAbsent),
+      prepareRoomScope: (roomId, allowAbsent) =>
+        directory.prepareRoomScope(roomId, allowAbsent),
+      keys: keyStore(await f.edgeServer(), { signer: f.node.signer() }),
+      signer: f.node.signer(),
+      keyDocument: () => Promise.reject(new Error('unused')),
+      publicRooms: () => Promise.resolve(false),
+    });
+    const reads = [
+      ['joined rooms', () => joinedRooms(f.source.creator)],
+      ['user search', () => searchUsers(f.source.creator, 'absent')],
+    ] as const;
+    for (const [name, read] of reads) {
+      await t.step(name + ' refuses missing directory', async () => {
+        await assertRejects(read, MatrixError, 'replica unavailable');
+      });
+    }
+    const inventory = await f.directoryExport();
+    assert(inventory);
+    const journal = await f.journal();
+    await journal.receive('home', [inventory]);
+    assert(await directory.apply(journal, inventory));
+    for (const [name, read] of reads) {
+      await t.step(name + ' refuses missing listed room', async () => {
+        await assertRejects(read, MatrixError, 'replica unavailable');
+      });
+    }
+    const room = await f.exports();
+    assert(room);
+    await journal.receive('home', [room]);
+    assert(await (await f.replicas()).apply(journal, room));
+    await directory.requireScope('rooms');
+    await t.step(
+      'user search admits candidate profiles through their domain owner',
+      async () => {
+        await assertRejects(
+          () => searchUsers('@absent:logical.test', 'zoe'),
+          MatrixError,
+          'profile cut unavailable',
+        );
+        assertEquals(profileReads, ['zoe']);
+      },
+    );
+    profileReady = true;
+    assertEquals(await joinedRooms(f.source.creator), [f.source.roomId]);
+    assertEquals(await joinedRooms('@absent:logical.test'), []);
+    assertEquals(await searchUsers(f.source.creator, 'absent'), {
+      results: [],
+      limited: false,
+    });
   } finally {
     await closeApp();
     await f.close();

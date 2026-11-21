@@ -252,6 +252,9 @@ export async function forget(roomId: string, userId: string) {
   await markForgotten(theApp().server, roomId, userId, serverName());
 }
 export async function joinedRooms(userId: string) {
+  // Complete-list consumers must admit the inventory before an empty local
+  // projection can be mistaken for complete nonmembership.
+  await theApp().replica?.requireScope('rooms');
   return (await roomsFor(theApp().server, userId)).filter((m) =>
     m.membership === 'join'
   ).map((m) => m.roomId);

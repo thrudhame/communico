@@ -185,6 +185,12 @@ const F2_SYNC: readonly Rule[] = [
 // B6's client room owners enforce their exact room/account cuts. This is not
 // the federation rooms scope: local clients still work with federation off.
 const F2_ROOMS: readonly Rule[] = [
+  route('GET', literal('/_matrix/client/v3/joined_rooms'), 'clientrooms'),
+  route(
+    'POST',
+    literal('/_matrix/client/v3/user_directory/search'),
+    'clientrooms',
+  ),
   // Discovery and graph reads keep the same room/visibility owners as v3.
   // These are client capabilities even when outbound federation is disabled.
   route('GET', /^\/_matrix\/client\/v1\/room_summary\/[^/]+$/, 'clientrooms'),
