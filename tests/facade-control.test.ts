@@ -21,6 +21,11 @@ import {
 } from '#engine/facade/signing-authority.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { UpstreamError } from '#engine/net/upstream-error.ts';
+import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
+import { prepareEventSignatures } from '#engine/room/signatures.ts';
+import { redact } from '#engine/eventid.ts';
+import { remoteEvent } from './fixtures/remote.ts';
+import { makeServer, seedServer } from './federation/doc-helper.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { historicalServerSchema } from './fixtures/server-schema-history.ts';
 import { openStore } from '#engine/store/index.ts';
@@ -787,6 +792,81 @@ Deno.test('verification distinguishes pending publications from invalid authorit
   } finally {
     await f.close();
     setConfigForTests({});
+  }
+});
+
+Deno.test('optional logical-server evidence skips pending authority without weakening required verification', async (t) => {
+  const f = await fixture();
+  try {
+    const record = await f.receive();
+    await f.keys().apply(f.journal(), record);
+    const author = await makeServer('required-evidence.test');
+    const event = await remoteEvent('!optional:test', author, '11', {
+      type: 'm.room.message',
+      sender: '@alice:' + author.name,
+      content: {
+        body: 'required evidence is independent of optional local authority',
+      },
+      prev_events: [],
+      origin_server_ts: 1,
+    });
+    const signed = redact(event as unknown as Record<string, unknown>, '11');
+    delete signed.event_id;
+    await signWithSigner(signed, f.node.signer());
+    event.signatures = signed.signatures as typeof event.signatures;
+    const original = structuredClone(event);
+    for (const role of ['home', 'facade'] as const) {
+      const server = role === 'home' ? await f.home.server() : f.server();
+      await seedServer(server, author);
+      const keys = role === 'home'
+        ? await f.homeKeys()
+        : f.keys().verificationKeys();
+      const [held] = await server.query(
+        'SELECT revision,roster_json,document_json FROM facade_key_roster WHERE singleton=1',
+      );
+      const restore = () =>
+        server.execute(
+          'UPDATE facade_key_roster SET revision=?,roster_json=?,document_json=? WHERE singleton=1',
+          [held.revision, held.roster_json, held.document_json],
+        );
+      for (const field of ['roster_json', 'document_json'] as const) {
+        await t.step(role + ' pending ' + field, async () => {
+          try {
+            await server.execute(
+              'UPDATE facade_key_roster SET ' + field +
+                '=NULL WHERE singleton=1',
+            );
+            await assertRejects(
+              () => keys.getVerifyKey('logical.test', f.node.keyId, 0, 'event'),
+              VerificationUnavailable,
+              'not ready',
+            );
+            const prepared = await prepareEventSignatures(
+              event,
+              '11',
+              productionKeyResolver(keys),
+            );
+            assertEquals(Object.keys(prepared.evidence.signatures), [
+              author.name,
+            ]);
+            assertEquals(JSON.parse(prepared.evidence.pdu), original);
+          } finally {
+            await restore();
+          }
+        });
+      }
+      const prepared = await prepareEventSignatures(
+        event,
+        '11',
+        productionKeyResolver(keys),
+      );
+      assertEquals(
+        Object.keys(prepared.evidence.signatures).sort(),
+        [author.name, 'logical.test'].sort(),
+      );
+    }
+  } finally {
+    await f.close();
   }
 });
 
