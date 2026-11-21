@@ -54,6 +54,7 @@ import {
 import { testRemoteServer, testSigner } from './fixtures/signer.ts';
 import { assertAuthored } from './fixtures/authored.ts';
 import { sendLocal } from '#engine/room/ingest.ts';
+import { watchdog } from './support/ordering.ts';
 
 async function ourKeyDoc(name: string): Promise<Record<string, unknown>> {
   const us = await testRemoteServer(name);
@@ -531,7 +532,7 @@ Deno.test('inviter: discovered intent reloads a response committed by the live p
       );
       const provider = inviteIntentProvider(deps);
       try {
-        await replyReached.promise;
+        await watchdog(replyReached.promise, 'live invite request dispatch');
         // Discovery normally skips live claims. Capture precisely the durable
         // query result here, then let the live performer finish before the
         // provider examines it. No claim or response is modified by the test.
