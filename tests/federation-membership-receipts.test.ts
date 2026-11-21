@@ -257,6 +257,114 @@ Deno.test('resident membership rechecks prepared scope after network verificatio
   }
 });
 
+Deno.test('review join: resident membership cannot commit its event or receipt after native-boundary scope invalidation', async () => {
+  const f = await fixture();
+  const store = f.store();
+  const originalRoom = store.room.bind(store);
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let applying: Promise<unknown> | undefined;
+  try {
+    const original = await f.deps();
+    const made = await makeJoin(
+      f.roomId,
+      guest,
+      f.remote.name,
+      ['11'],
+      original,
+    );
+    const join = await signTemplate(made.event, f.remote);
+    const operation = JSON.stringify([f.remote.name, 'join', join.event_id]);
+    const db = await originalRoom(f.roomId);
+    const originalTx = db.tx.bind(db);
+    let wrapped = false;
+    store.room = async (id, options) => {
+      const held = await originalRoom(id, options);
+      if (id === f.roomId && !wrapped) {
+        wrapped = true;
+        held.tx = (fn, txOptions) =>
+          originalTx(async (conn) => {
+            const before = await conn.query(
+              'SELECT 1 FROM membership_receipts WHERE operation=?',
+              [operation],
+            );
+            const result = await fn(conn);
+            const after = await conn.query(
+              'SELECT 1 FROM membership_receipts WHERE operation=?',
+              [operation],
+            );
+            if (!before.length && after.length) {
+              entered.resolve();
+              await release.promise;
+            }
+            return result;
+          }, txOptions);
+      }
+      return held;
+    };
+    let current = true;
+    const checkCurrent = () => {
+      if (!current) {
+        throw new MatrixError(
+          503,
+          'M_UNAVAILABLE',
+          'test scope changed at native commit',
+        );
+      }
+    };
+    const deps = {
+      ...original,
+      prepareRoomScope: () =>
+        Promise.resolve({
+          checkCurrent,
+          check: (conn: Conn) => {
+            conn.admit(checkCurrent);
+            checkCurrent();
+            return Promise.resolve();
+          },
+        }),
+    };
+    applying = sendJoin(
+      f.roomId,
+      String(join.event_id),
+      toWire(join, '11'),
+      f.remote.name,
+      'v2',
+      deps,
+    ).then(() => null, (error) => error);
+    await Promise.race([
+      entered.promise,
+      applying.then((result) => {
+        throw new Error(
+          'membership settled before native barrier: ' + String(result),
+        );
+      }),
+    ]);
+    current = false;
+    release.resolve();
+    const outcome = await applying;
+    store.room = originalRoom;
+    db.tx = originalTx;
+    assertEquals(
+      await (await f.room()).tx((tx) => tx.events.get(String(join.event_id))),
+      null,
+    );
+    assertEquals(
+      await db.query('SELECT 1 FROM membership_receipts WHERE operation=?', [
+        operation,
+      ]),
+      [],
+    );
+    assert(outcome instanceof MatrixError);
+    assertEquals(outcome.status, 503);
+  } finally {
+    release.resolve();
+    await applying;
+    store.room = originalRoom;
+    await f.close();
+  }
+});
+
 Deno.test('resident knock and leave new work requires scope while exact results survive its loss', async () => {
   const f = await fixture(true);
   try {
