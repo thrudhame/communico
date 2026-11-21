@@ -32,6 +32,20 @@ export type MembershipOperation = RegisterDot & {
   payload: string;
 };
 
+/** Membership sequences allocate identities, not causal source prefixes. A
+ * prepared completion may branch behind a newer observation of that source. */
+export function membershipContext(dots: readonly RegisterDot[]): RegisterDot[] {
+  return dots.map(({ source, incarnation, sequence }) => ({
+    source,
+    incarnation,
+    sequence,
+  })).sort((a, b) => {
+    const left = canonicalJson([a.source, a.incarnation]);
+    const right = canonicalJson([b.source, b.incarnation]);
+    return left < right ? -1 : left > right ? 1 : a.sequence - b.sequence;
+  });
+}
+
 /** The display owner's normalized local value, without publication authority. */
 export function membershipStateOf(
   row: Record<string, unknown>,
@@ -146,7 +160,7 @@ export async function recordMembershipOperation(
     "SELECT * FROM domain_operations WHERE kind='membership' AND semantic_key=? ORDER BY source,incarnation,sequence",
     [semanticKey],
   )).map(fromRow);
-  const history = completeMembershipHistory(retained).ready;
+  const history = completeMembershipHistory(retained);
   const selected = await conn.query(
     "SELECT o.operation_id,o.payload_json FROM domain_frontiers f JOIN domain_operations o ON o.operation_id=f.operation_id WHERE f.semantic_key=? AND o.kind='membership' ORDER BY o.operation_id",
     [semanticKey],
@@ -156,7 +170,7 @@ export async function recordMembershipOperation(
     if (canonicalJson(binding.state) === canonicalJson(state)) {
       const ids = selected.map((operation) => String(operation.operation_id));
       const complete = new Set(
-        history.map((operation) => operation.operationId),
+        history.ready.map((operation) => operation.operationId),
       );
       if (
         !ids.length ||
@@ -194,7 +208,7 @@ export async function recordMembershipOperation(
     } satisfies MembershipState,
   );
   const own = new Set(
-    history.filter((operation) =>
+    history.ready.filter((operation) =>
       operation.source === source.node &&
       operation.incarnation === source.incarnation
     ).map((operation) => operation.sequence),
@@ -207,28 +221,15 @@ export async function recordMembershipOperation(
       )
     )
   ) throw new Error('local membership predecessor unavailable');
-  // Context binds immutable source facts, never a foreign local revision. The
-  // membership owner will interpret lifecycle relationships, not a register LWW.
-  const vector = new Map<string, RegisterDot>();
-  for (const operation of history) {
-    const key = canonicalJson([operation.source, operation.incarnation]);
-    const prior = vector.get(key);
-    if (!prior || prior.sequence < operation.sequence) {
-      vector.set(key, {
-        source: operation.source,
-        incarnation: operation.incarnation,
-        sequence: operation.sequence,
-      });
-    }
-  }
+  // Capture every observed branch, including distinct dots of the same source.
+  // Prepared completions do not make a source sequence a causal prefix.
   const operation = await appendMembershipFact(
     conn,
     { source: source.node, incarnation: source.incarnation },
     stream,
     semanticKey,
     payload,
-    [...vector.entries()].sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
-      .map(([, dot]) => dot),
+    membershipContext(history.frontier),
   );
   await conn.execute('DELETE FROM domain_frontiers WHERE semantic_key=?', [
     semanticKey,
@@ -254,26 +255,13 @@ export async function appendMembershipSuccessor(
     prior.semanticKey !==
       canonicalJson(['membership', state.roomId, state.userId])
   ) throw new Error('membership successor changed identity');
-  const context = prior.context.filter((dot) =>
-    dot.source !== prior.source || dot.incarnation !== prior.incarnation
-  );
-  context.push({
-    source: prior.source,
-    incarnation: prior.incarnation,
-    sequence: prior.sequence,
-  });
-  context.sort((a, b) => {
-    const left = canonicalJson([a.source, a.incarnation]);
-    const right = canonicalJson([b.source, b.incarnation]);
-    return left < right ? -1 : left > right ? 1 : 0;
-  });
   return await appendMembershipFact(
     conn,
     prior,
     prior.stream,
     prior.semanticKey,
     canonicalJson(state),
-    context,
+    membershipContext([prior]),
   );
 }
 

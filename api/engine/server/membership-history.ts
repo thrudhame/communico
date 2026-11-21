@@ -8,6 +8,7 @@ import type { RegisterDot } from '#engine/facade/registers.ts';
 import type { Conn } from '#engine/store/db.ts';
 import {
   completeMembershipHistory,
+  membershipContext,
   type MembershipOperation,
   membershipOperations,
   type MembershipState,
@@ -136,14 +137,18 @@ export function checkedMembershipOperation(
   ) invalid();
   const seen = new Set<string>();
   const context = raw.context.map((value) => {
-    const predecessor = checkedDot(value), key = domain(predecessor);
+    const predecessor = checkedDot(value), key = identity(predecessor, stream);
     if (
       seen.has(key) ||
-      (key === domain(dot) && predecessor.sequence >= dot.sequence)
+      (domain(predecessor) === domain(dot) &&
+        predecessor.sequence >= dot.sequence)
     ) invalid();
     seen.add(key);
     return predecessor;
   });
+  if (canonicalJson(context) !== canonicalJson(membershipContext(context))) {
+    invalid();
+  }
   const operation: MembershipOperation = {
     ...dot,
     operationId: raw.operationId,
