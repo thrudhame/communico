@@ -38,7 +38,12 @@ import type { DeviceIdentity } from '#engine/tenant/devices.ts';
 import type { Room } from '#engine/room/index.ts';
 import { formatCursor } from '#engine/room/segments.ts';
 import { formatPosition } from '#engine/client/tokens.ts';
-import { feedAfter, feedBefore, roomsFor } from '#engine/server/read.ts';
+import {
+  feedAfter,
+  feedBefore,
+  relevantFeedChanged,
+  roomsFor,
+} from '#engine/server/read.ts';
 import {
   notificationChanged,
   notificationSnapshot,
@@ -263,17 +268,8 @@ async function relevantChanged(
       (await tx.e2ee.status(device)).seq > i.since!.kSeq
     )
   ) return true;
-  const rows = await app.server.query(
-    `SELECT MAX(seq) AS m FROM (
-       SELECT f.seq FROM feed f JOIN memberships m ON m.room = f.room WHERE m.user = ?
-       UNION ALL SELECT seq FROM prejoin_memberships p WHERE user_id = ? AND status NOT IN ('attempting','failed-attempt') AND ${
-      visiblePrejoin('p')
-    }
-     )`,
-    [i.userId, i.userId],
-  );
   if (
-    Number(rows[0].m ?? 0) > i.since.eSeq ||
+    await relevantFeedChanged(app.server, i.userId, i.since.eSeq) ||
     await accountDataMax(app.tenant, localpartOf(i.userId)) > i.since.aSeq
   ) return true;
   const joined = await roomsFor(app.server, i.userId);

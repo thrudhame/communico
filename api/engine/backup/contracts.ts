@@ -188,6 +188,8 @@ export const tableContracts = {
       'federation_join_attempts',
       'federation_invite_attempts',
       'membership_operations',
+      // Original prepared creation identity and request-owned phase/result.
+      'room_upgrades',
       'server_keys',
       'server_key_docs',
       'server_key_changes',

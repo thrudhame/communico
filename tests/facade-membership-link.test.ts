@@ -85,7 +85,7 @@ async function fixture(historicalHome = false, applyAccount = true) {
     await legacy.server();
     await legacy.close();
   }
-  let home = await open('home', historicalHome ? 50 : serverSchema.version);
+  let home = await open('home', historicalHome ? 51 : serverSchema.version);
   const edge = await open('edge');
   await bindRole(home, { role: 'home', server: 'logical.test', node: '' });
   await bindRole(edge, {
@@ -1073,7 +1073,17 @@ async function exportSuccessor(
 Deno.test('membership upgrade: an enrolled historical installation freezes local work and never promotes foreign display into a job', async () => {
   const f = await fixture(true);
   try {
-    const { record, state: foreign, keys, operation } = await incoming(f);
+    // Seed the historical retraction state without publishing a new pending
+    // invite through today's notification schema before the jobs migration.
+    const { record, state: foreign, keys, operation } = await incoming(
+      f,
+      'edge',
+      'invite',
+      undefined,
+      {},
+      undefined,
+      'rejecting',
+    );
     const db = await f.home.server();
     const journal = new Journal(db, [...LINK_SUPPORTED, {
       type: 'membership-operation',
@@ -1121,7 +1131,7 @@ Deno.test('membership upgrade: an enrolled historical installation freezes local
       prev_events: [String(invite.event_id)],
     });
     // Actual pre-jobs schema rows, not a current-schema store with a fake pragma.
-    // This is the pre-upgrade local execution intent that migration 50 owns.
+    // This is the pre-upgrade local execution intent that migration 51 owns.
     await db.tx(async (conn) => {
       const seq = await nextEventSeq(conn);
       await conn.execute(

@@ -22,8 +22,19 @@ import {
   graphReceiptsEnabled,
   rememberGraphRead,
 } from '#engine/server/receipt-frontier.ts';
-import { enqueuePush, queueBadge, removePushWork } from './push-queue.ts';
 import {
+  applyPublicationPushQueue,
+  enqueuePush,
+  queueBadge,
+  removePushWork,
+} from './push-queue.ts';
+import {
+  insertPublicationRows,
+  reservePublicationCounter,
+} from './publication-rows.ts';
+import type { Value } from '#engine/store/ffi.ts';
+import {
+  notificationHistoryCutoff,
   pruneNotificationHistory,
   syncNotificationHistory,
 } from './notification-history.ts';
@@ -321,6 +332,286 @@ export async function applyPushPublication(
     thread,
     'room',
   );
+}
+
+export type IndependentPush = {
+  room: string;
+  event: string;
+  pos: number;
+  publication: PushPublication;
+};
+
+/** Capture only inside the owning server attempt. Independent plain events
+ * have no relation, pending-reference, replay or graph dependencies; all other
+ * meanings retain the general ordered application path below. */
+export async function captureIndependentPushes(
+  tx: Conn,
+  inputs: readonly IndependentPush[],
+): Promise<
+  ((sequences: readonly number[], now: number) => Promise<void>) | null
+> {
+  if (await graphReceiptsEnabled(tx)) return null;
+  const events = JSON.stringify(inputs.map((i) => i.event));
+  const rooms = JSON.stringify(inputs.map((i) => i.room));
+  const dependencies = await tx.query(
+    `
+    SELECT 1 FROM json_each(?) j JOIN relations r ON r.event=CAST(j.value AS TEXT)
+    UNION ALL SELECT 1 FROM json_each(?) j JOIN relations r ON r.relates_to=CAST(j.value AS TEXT)
+    UNION ALL SELECT 1 FROM json_each(?) j JOIN notification_receipt_refs r ON r.room=CAST(j.value AS TEXT)
+    UNION ALL SELECT 1 FROM json_each(?) j JOIN notification_receipt_refs r ON r.event=CAST(j.value AS TEXT)
+    UNION ALL SELECT 1 FROM json_each(?) j JOIN push_evaluations r ON r.event=CAST(j.value AS TEXT)
+    UNION ALL SELECT 1 FROM json_each(?) j JOIN notification_own_events r ON r.event=CAST(j.value AS TEXT)
+    UNION ALL SELECT 1 FROM json_each(?) j JOIN redactions r ON r.target=CAST(j.value AS TEXT)
+    UNION ALL SELECT 1 FROM json_each(?) j JOIN receipts r ON r.room_id=CAST(j.value AS TEXT),json_each(r.event_ids) e
+      WHERE NOT EXISTS (
+        SELECT 1 FROM notification_graph_reads g WHERE g.user=r.user_id AND g.room=r.room_id AND g.scope=r.thread_id AND g.event=CAST(e.value AS TEXT))
+    LIMIT 1`,
+    [events, events, rooms, events, events, events, events, rooms],
+  );
+  if (dependencies.length) return null;
+  const horizons = await tx.query(
+    'SELECT h.user,h.room,h.scope,h.event_seq FROM json_each(?) j JOIN notification_horizons h ON h.room=CAST(j.value AS TEXT)',
+    [rooms],
+  );
+  // A previously seeded receipt must still have its scalar horizon. Otherwise
+  // the general path owns its upgrade/repair and any resulting ordered deltas.
+  if (
+    (await tx.query(
+      `SELECT 1 FROM json_each(?) j JOIN receipts r ON r.room_id=CAST(j.value AS TEXT),json_each(r.event_ids) e JOIN event_index i ON i.event=CAST(e.value AS TEXT)
+    WHERE i.room=r.room_id AND i.seq IS NOT NULL
+      AND i.standing='accepted' AND i.grounding='grounded' AND NOT EXISTS (
+        SELECT 1 FROM notification_horizons h WHERE h.user=r.user_id AND h.room=r.room_id AND h.scope=r.thread_id AND h.event_seq>=i.seq)
+    LIMIT 1`,
+      [rooms],
+    )).length
+  ) return null;
+  if (
+    (await tx.query(
+      `SELECT 1 FROM json_each(?) j JOIN receipts r ON r.room_id=CAST(j.value AS TEXT) JOIN notification_horizons h ON h.user=r.user_id AND h.room=r.room_id AND h.scope=r.thread_id
+    JOIN notifications n ON n.user=h.user AND n.room=h.room AND n.event_seq<=h.event_seq AND (h.scope='' OR n.thread=h.scope)
+    WHERE n.read_ms IS NULL LIMIT 1`,
+      [rooms],
+    )).length
+  ) return null;
+  const unread = await tx.query(
+    `SELECT n.seq,n.user,n.room,n.event_seq,n.highlight,n.withdrawn FROM json_each(?) j
+    JOIN notifications n ON n.room=CAST(json_extract(j.value,'$.room') AS TEXT) AND n.user=CAST(json_extract(j.value,'$.sender') AS TEXT)
+    WHERE n.read_ms IS NULL AND n.thread='main'`,
+    [JSON.stringify(
+      inputs.map((i) => ({ room: i.room, sender: i.publication.sender })),
+    )],
+  );
+  return async (sequences, now) => {
+    const evaluations: Value[][] = [];
+    const notifications: Value[][] = [];
+    const changes: Value[][] = [];
+    const countDeltas = new Map<
+      string,
+      { user: string; room: string; unread: number; highlight: number }
+    >();
+    const own: Value[][] = [];
+    const graphReads: Value[][] = [];
+    const reads: Value[][] = [];
+    const cleared: number[] = [];
+    const historyCleared: number[] = [];
+    const badges: { user: string; incarnation?: string }[] = [];
+    const deliveries: [string, number, string, string, string, number][] = [];
+    let positions = 0;
+    const horizon = (user: string, room: string, scope: string) =>
+      Number(
+        horizons.find((h) =>
+          h.user === user && h.room === room && h.scope === scope
+        )?.event_seq ?? 0,
+      );
+    const delta = (user: string, room: string, n: number, h: number) => {
+      const key = JSON.stringify([user, room]);
+      const prior = countDeltas.get(key) ??
+        { user, room, unread: 0, highlight: 0 };
+      prior.unread += n;
+      prior.highlight += h;
+      countDeltas.set(key, prior);
+      changes.push([positions++, user, room, 'main']);
+      badges.push({ user });
+    };
+    for (let at = 0; at < inputs.length; at++) {
+      const { room, event, pos, publication } = inputs[at];
+      const eventSeq = sequences[at];
+      own.push([room, event, publication.sender, eventSeq]);
+      graphReads.push([publication.sender, room, 'main', event]);
+      const senderHorizon = Math.max(
+        eventSeq,
+        horizon(publication.sender, room, 'main'),
+      );
+      reads.push([publication.sender, room, 'main', senderHorizon]);
+      const clearedHere = unread.filter((n) =>
+        n.room === room && n.user === publication.sender &&
+        Number(n.event_seq) <= senderHorizon
+      );
+      cleared.push(...clearedHere.map((n) => Number(n.seq)));
+      const counted = clearedHere.filter((n) => !Number(n.withdrawn));
+      if (counted.length) {
+        historyCleared.push(...clearedHere.map((n) => Number(n.seq)));
+        delta(
+          publication.sender,
+          room,
+          -counted.length,
+          -counted.reduce((sum, n) => sum + Number(n.highlight), 0),
+        );
+      }
+      for (const input of publication.decisions) {
+        evaluations.push([
+          input.tenant,
+          input.user,
+          event,
+          room,
+          eventSeq,
+          'room',
+          pos,
+          input.ruleRevision,
+          input.ignoreRevision,
+          1,
+          input.decision?.ruleId ?? null,
+          input.decision?.kind ?? null,
+        ]);
+        if (!input.decision?.notify) continue;
+        const read = Math.max(
+          horizon(input.user, room, ''),
+          horizon(input.user, room, 'main'),
+          input.user === publication.sender ? senderHorizon : 0,
+        ) >= eventSeq;
+        const seq = positions++;
+        notifications.push([
+          seq,
+          input.tenant,
+          input.user,
+          event,
+          room,
+          eventSeq,
+          'main',
+          JSON.stringify(input.decision.actions),
+          input.decision.highlight ? 1 : 0,
+          now,
+          read ? now : null,
+          0,
+        ]);
+        if (!read) delta(input.user, room, 1, input.decision.highlight ? 1 : 0);
+        if (!read) {
+          for (const incarnation of input.pusherIncarnations ?? []) {
+            deliveries.push([incarnation, seq, input.user, room, event, now]);
+            badges.push({ user: input.user, incarnation });
+          }
+        }
+      }
+    }
+    const first = positions
+      ? await reservePublicationCounter(tx, 'notifications', positions)
+      : 0;
+    for (const row of notifications) row[0] = Number(row[0]) + first;
+    for (const row of changes) row[0] = Number(row[0]) + first;
+    for (const row of deliveries) row[1] += first;
+    await insertPublicationRows(tx, 'notification_own_events', [
+      'room',
+      'event',
+      'user',
+      'event_seq',
+    ], own);
+    await insertPublicationRows(tx, 'notification_graph_reads', [
+      'user',
+      'room',
+      'scope',
+      'event',
+    ], graphReads);
+    await insertPublicationRows(
+      tx,
+      'notification_horizons',
+      ['user', 'room', 'scope', 'event_seq'],
+      reads,
+      `ON CONFLICT(user,room,scope) DO UPDATE SET event_seq=excluded.event_seq WHERE excluded.event_seq>notification_horizons.event_seq`,
+    );
+    if (historyCleared.length) {
+      await tx.execute(
+        'UPDATE notification_history SET read_ms=? WHERE seq IN (SELECT value FROM json_each(?))',
+        [now, JSON.stringify(historyCleared)],
+      );
+    }
+    if (cleared.length) {
+      await tx.execute(
+        'UPDATE notifications SET read_ms=? WHERE seq IN (SELECT value FROM json_each(?)) AND read_ms IS NULL',
+        [now, JSON.stringify(cleared)],
+      );
+    }
+    // The individual path prunes before inserting any new listing facts. A
+    // zero-day policy therefore must not remove a later event's unread row.
+    if (historyCleared.length) await pruneNotificationHistory(tx, now);
+    await insertPublicationRows(tx, 'push_evaluations', [
+      'tenant',
+      'user',
+      'event',
+      'room',
+      'event_seq',
+      'source',
+      'source_pos',
+      'rule_revision',
+      'ignore_revision',
+      'version',
+      'rule_id',
+      'rule_kind',
+    ], evaluations);
+    await insertPublicationRows(tx, 'notifications', [
+      'seq',
+      'tenant',
+      'user',
+      'event',
+      'room',
+      'event_seq',
+      'thread',
+      'actions',
+      'highlight',
+      'created_ms',
+      'read_ms',
+      'withdrawn',
+    ], notifications);
+    await insertPublicationRows(
+      tx,
+      'notification_counts',
+      ['user', 'room', 'thread', 'unread', 'highlight'],
+      [...countDeltas.values()].map((d) => [d.user, d.room, 'main', 0, 0]),
+    );
+    if (countDeltas.size) {
+      // An INSERT's CHECK constraints precede conflict resolution. Negative
+      // deltas are updates to existing nonnegative totals, never insert values.
+      // Probe the typed composite key, then update only those rowids. The native
+      // planner does not turn a composite IN predicate into indexed lookups.
+      await tx.execute(
+        `WITH deltas AS (
+        SELECT CAST(json_extract(value,'$.user') AS TEXT) AS user,CAST(json_extract(value,'$.room') AS TEXT) AS room,
+          json_extract(value,'$.unread') AS unread,json_extract(value,'$.highlight') AS highlight FROM json_each(?)
+      ) UPDATE notification_counts SET
+        unread=unread+(SELECT d.unread FROM deltas d WHERE d.user=notification_counts.user AND d.room=notification_counts.room),
+        highlight=highlight+(SELECT d.highlight FROM deltas d WHERE d.user=notification_counts.user AND d.room=notification_counts.room)
+      WHERE rowid IN (SELECT n.rowid FROM deltas d JOIN notification_counts n
+        ON n.user=d.user AND n.room=d.room AND n.thread='main')`,
+        [JSON.stringify([...countDeltas.values()])],
+      );
+    }
+    await insertPublicationRows(tx, 'notification_changes', [
+      'seq',
+      'user',
+      'room',
+      'thread',
+    ], changes);
+    if (notifications.length) {
+      await tx.execute(
+        `INSERT INTO notification_history(seq,user,room,highlight,read_ms)
+      SELECT seq,user,room,highlight,read_ms FROM notifications WHERE seq IN (SELECT value FROM json_each(?)) AND withdrawn=0 AND (read_ms IS NULL OR read_ms>?)`,
+        [
+          JSON.stringify(notifications.map((n) => n[0])),
+          notificationHistoryCutoff(now),
+        ],
+      );
+    }
+    await applyPublicationPushQueue(tx, badges, deliveries, now);
+  };
 }
 
 /** An edge's arrival or redaction can affect only itself and descendants within

@@ -336,6 +336,11 @@ await those exact publications. This precedes ordinary stream-head clamping and 
 selection, including timeout-zero, initial, full-state, list-only and encryption
 requests. Only successful rendering conditionally retires each captured revision;
 failed/cancelled consumers and concurrently higher revisions retain their markers.
+The pending-marker revision allocator is scoped to the device generation and
+room incarnation, not shared by independent sends across the tenant. It survives
+marker retirement to fence stale syncs and exact replay, and is removed with the
+device's receipts. Existing global revisions remain valid; first scoped use starts
+above the retained legacy ceiling without rewriting it.
 Shared effect-read admission captures the explicit room or the search/notification
 audience before event/relation/search/receipt/peek selection, regardless of sender,
 leaving client marker retirement to sync. A later acceptance cannot extend a
@@ -1505,6 +1510,22 @@ The listener gives each admitted handler an operation signal that observes
 disconnects and forced listener aborts. Graceful drain still permits readable
 bodies to finish. Transport completion alone cannot release a running callback;
 shutdown retains the store until both handler and transport ownership settle.
+At grace expiry the listener cancels operation signals and derived body reads
+before closing transports. Fully read cancelled requests get retryable 503s
+when delivery completes within grace; after forced transport closure, EOF/reset
+is also retryable, as in Synapse. Unread native bodies likewise end in EOF/reset.
+Returned response streams share operation cancellation. Shutdown first waits
+for handler work, then aborts expired transports without waiting for delivery,
+so a client that stops reading cannot hold that phase open. A response already
+started ends retryably; newly rendered cancellation responses use 503 when the
+transport can still deliver it. Cancellation before federation dispatch leaves
+no effects or cached success; retrying that ID applies the effects once and caches
+the completed answer. Cancellation after EDU dispatch does not roll back earlier
+EDU effects, which can repeat on retry; the replay cache covers completed sends.
+Storage remains owned until transport settlement and asynchronous response-source
+cancellation have both completed.
+Clean storage closure exits successfully even when cancellation was needed;
+fatal rejection and storage-close failures retain their non-zero outcomes.
 (`api/server-lifetime.ts`, `main.ts`)
 
 ## Discovery, TURN and whois

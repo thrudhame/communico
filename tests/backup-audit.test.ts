@@ -9,6 +9,116 @@ import { auditSnapshot } from '#engine/backup/audit.ts';
 import { describePayload } from '#engine/backup/manifest.ts';
 import { roomProjectionSources } from '#engine/store/projection-sources.ts';
 import { recoverServer } from '#engine/server/startup.ts';
+import { upgradeRoom } from '#engine/client/upgrade.ts';
+import { inspectSnapshot } from '#engine/store/inspect.ts';
+import { inventoryRestoredWork } from '#engine/backup/work.ts';
+import { serverSchema } from '#engine/server/schema.ts';
+import { tenantSchema } from '#engine/tenant/index.ts';
+import { roomSchema } from '#engine/room/schema.ts';
+
+Deno.test('backup audit: ordinary valid v12 creation is audited without an upgrade journal', async () => {
+  const f = await fixture();
+  try {
+    await f.audit();
+    await createRoom({
+      creator: '@audit:' + f.app.tenant.serverName,
+      version: '12',
+    });
+    assertEquals(await f.app.server.query('SELECT * FROM room_upgrades'), []);
+    await f.audit();
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('backup audit: actual pending upgrade identity and private restored-work inventory survive the cut', async () => {
+  const f = await fixture();
+  try {
+    const user = '@audit:' + f.app.tenant.serverName;
+    const initialize = f.app.store.initializeRoom.bind(f.app.store);
+    let injected = false;
+    f.app.store.initializeRoom = () => {
+      injected = true;
+      return Promise.reject(new Error('backup-upgrade-cut'));
+    };
+    try {
+      await assertRejects(
+        () => upgradeRoom(f.room, user, '12'),
+        Error,
+        'backup-upgrade-cut',
+      );
+    } finally {
+      f.app.store.initializeRoom = initialize;
+    }
+    assertEquals(injected, true);
+    const [intent] = await f.app.server.query(
+      'SELECT * FROM room_upgrades WHERE old_room_id=?',
+      [f.room],
+    );
+    assertEquals(intent.phase, 0);
+    await f.audit();
+    const cut = await f.capture();
+    await inspectSnapshot(f.storage, cut.path, cut.files, f.root, {
+      server: serverSchema,
+      tenant: tenantSchema,
+      room: roomSchema,
+    }, async (snapshot) => {
+      const inventory = await inventoryRestoredWork(snapshot, Date.now());
+      assertEquals(inventory.upgrades, [{
+        old_room_id: f.room,
+        user_id: user,
+        replacement_room: intent.replacement_room,
+        phase: 0,
+      }]);
+      const text = JSON.stringify(inventory.upgrades);
+      assertEquals(text.includes('plan_json'), false);
+      assertEquals(text.includes('createPdu'), false);
+      assertEquals(text.includes('powerLevels'), false);
+    });
+    const original = JSON.parse(String(intent.plan_json));
+    for (const column of ['user_id', 'replacement_room', 'plan_json']) {
+      const changed = structuredClone(original);
+      changed.prepared.createPdu.content.predecessor.room_id =
+        '!different:test';
+      await f.app.server.execute(
+        'UPDATE room_upgrades SET ' + column + '=? WHERE old_room_id=?',
+        [
+          column === 'plan_json' ? JSON.stringify(changed) : 'different',
+          f.room,
+        ],
+      );
+      try {
+        await assertRejects(
+          f.audit,
+          Error,
+          'room upgrade intent identity differs',
+        );
+      } finally {
+        await f.app.server.execute(
+          'UPDATE room_upgrades SET ' + column + '=? WHERE old_room_id=?',
+          [intent[column], f.room],
+        );
+      }
+    }
+    assertEquals(await upgradeRoom(f.room, user, '12'), {
+      replacement_room: intent.replacement_room,
+    });
+    await f.audit();
+    const completed = await f.capture();
+    await inspectSnapshot(f.storage, completed.path, completed.files, f.root, {
+      server: serverSchema,
+      tenant: tenantSchema,
+      room: roomSchema,
+    }, async (snapshot) => {
+      assertEquals(
+        (await inventoryRestoredWork(snapshot, Date.now())).upgrades,
+        [],
+      );
+    });
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('backup audit: report distributed identity cannot lose its retained source fact', async () => {
   const f = await fixture();
@@ -26,7 +136,7 @@ Deno.test('backup audit: report distributed identity cannot lose its retained so
   }
 });
 
-async function fixture() {
+async function fixture(version = '11') {
   const root = await Deno.makeTempDir({ prefix: 'backup-audit-' });
   const storage = {
     dir: join(root, 'live'),
@@ -42,7 +152,7 @@ async function fixture() {
     localpart: 'audit',
     password: 'pw',
   });
-  const room = await createRoom({ creator: user.user_id });
+  const room = await createRoom({ creator: user.user_id, version });
   const tenant = await openTenant(app.store, 'inactive.test', { create: true });
   await tenant.tx(async (tx) => {
     await tx.users.insert('inactive', 'Inactive');
@@ -80,6 +190,74 @@ async function fixture() {
     },
   };
 }
+
+Deno.test('backup audit: ordinary v12 identity is create-derived and corrupt room fields stay refused', async (t) => {
+  const f = await fixture('12');
+  try {
+    assert(!f.room.includes(':'));
+    const db = await f.app.store.room(f.room);
+    const rows = await db.query('SELECT id,pdu FROM events ORDER BY id');
+    const create = rows.find((row) =>
+      JSON.parse(String(row.pdu)).type === 'm.room.create'
+    )!;
+    const member = rows.find((row) =>
+      JSON.parse(String(row.pdu)).type === 'm.room.member'
+    )!;
+    await t.step(
+      'ordinary room without an upgrade journal audits',
+      async () => {
+        const server = await f.app.store.server();
+        const journalTables = await server.query(
+          "SELECT name FROM sqlite_master WHERE name='room_upgrades'",
+        );
+        assertEquals(
+          journalTables.length
+            ? await server.query('SELECT * FROM room_upgrades')
+            : [],
+          [],
+        );
+        await f.audit();
+      },
+    );
+    for (
+      const [name, row, change] of [
+        ['create reference', create, { event_id: '$' + 'A'.repeat(43) }],
+        ['create reference hash', create, {
+          content: {
+            room_version: '12',
+            additional_creators: ['@other:logical.test'],
+          },
+        }],
+        ['missing create version', create, { content: {} }],
+        ['numeric create version', create, { content: { room_version: 12 } }],
+        ['unsupported create version', create, {
+          content: { room_version: 'unknown' },
+        }],
+        ['create room field', create, { room_id: '!wrong:elsewhere.test' }],
+        ['member room field', member, { room_id: '!wrong:elsewhere.test' }],
+        ['missing member room', member, { room_id: undefined }],
+        ['indexed field', member, { sender: '@wrong:elsewhere.test' }],
+      ] as const
+    ) {
+      await t.step(name, async () => {
+        await db.execute('UPDATE events SET pdu=? WHERE id=?', [
+          JSON.stringify({ ...JSON.parse(String(row.pdu)), ...change }),
+          row.id,
+        ]);
+        try {
+          await assertRejects(f.audit, Error, 'room PDU/index mismatch');
+        } finally {
+          await db.execute('UPDATE events SET pdu=? WHERE id=?', [
+            row.pdu,
+            row.id,
+          ]);
+        }
+      });
+    }
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('backup audit: captured-only identity, streams and uploaded media include inactive tenants without modifying the cut', async () => {
   const f = await fixture();

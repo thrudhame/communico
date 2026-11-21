@@ -133,7 +133,7 @@ import {
   recordReceiptOperation,
 } from '#engine/server/receipt-operations.ts';
 
-async function fixture() {
+async function fixture(applyAuth = true) {
   const dir = await Deno.makeTempDir({ prefix: 'facade-domain-link-' });
   const open = (side: string) =>
     openStore({
@@ -208,7 +208,9 @@ async function fixture() {
   await owners.apply(ej, control);
   const auth = await exportAccountAuth(home, ht, hp, bundle.id, 'alice', false);
   await ej.receive('home', [auth]);
-  await new AccountSnapshots(edge, et, fp, owners).apply(ej, auth);
+  if (applyAuth) {
+    await new AccountSnapshots(edge, et, fp, owners).apply(ej, auth);
+  }
   const hs = new DomainOperations(home, ht, hp),
     es = new DomainOperations(edge, et, fp, node);
   return {
@@ -223,6 +225,7 @@ async function fixture() {
     hj,
     ej,
     owners,
+    auth,
     node,
     bundle,
     hs,
@@ -248,6 +251,36 @@ async function fixture() {
     },
   };
 }
+
+Deno.test('domain bootstrap waits for its retained auth dependency without an identity rejection', async () => {
+  const f = await fixture(false);
+  try {
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    assert(records.length > 0);
+    await f.ej.receive('home', records);
+    const refusal = await assertRejects(
+      () => f.es.apply(f.ej, records[0]),
+      LinkError,
+      'account not selected',
+    );
+    assertEquals(refusal.code, 'LINK_UNAVAILABLE');
+    assertEquals(
+      (await f.ej.heads('home', 'in', records[0])).applied.sequence,
+      0,
+    );
+    await new AccountSnapshots(f.edge, f.et, f.fp, f.owners).apply(
+      f.ej,
+      f.auth,
+    );
+    for (const record of records) assert(await f.es.apply(f.ej, record));
+    assertEquals(
+      (await f.ej.heads('home', 'in', records[0])).applied.sequence,
+      records.at(-1)!.sequence,
+    );
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('domain schedules: signed inventory and suffix retain account-wide replicas without executable jobs', async () => {
   const f = await fixture();

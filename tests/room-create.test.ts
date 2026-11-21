@@ -8,7 +8,12 @@
 import { assert, assertEquals, assertMatch, assertRejects } from '@std/assert';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Pdu } from '#engine/pdu.ts';
-import { createRoom, type CreateRoomOptions } from '#engine/room/create.ts';
+import {
+  createRoom,
+  type CreateRoomOptions,
+  initializePreparedRoom,
+  prepareRoom,
+} from '#engine/room/create.ts';
 import { openRoom, type Room, roomSchema } from '#engine/room/index.ts';
 import { sendLocal } from '#engine/room/ingest.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
@@ -21,6 +26,40 @@ const config = (dir: string) => ({
   maxopenfiles: 8,
   idleseconds: 300,
 });
+
+for (const version of ['11', '12']) {
+  Deno.test(`prepare v${version} does not publish; repeated initialize preserves every initial event`, async () => {
+    await withStore(async (store) => {
+      const signer = await testSigner();
+      const prepared = await prepareRoom(store, {
+        creator: '@creator:' + signer.serverName,
+        version,
+        name: 'retained creation',
+        initial_state: [{
+          type: 'm.room.topic',
+          state_key: '',
+          content: { topic: 'frozen initial state' },
+        }],
+      }, signer);
+      assertEquals(await store.rooms(), []);
+      const one = await initializePreparedRoom(store, prepared, signer);
+      const room = await openRoom(store, one.roomId);
+      const db = await store.room(one.roomId);
+      const events = await db.query('SELECT id,pdu FROM events ORDER BY id');
+      assertEquals(one.roomId, prepared.roomId);
+      assertEquals(one.createEventId, prepared.createPdu.event_id);
+      assertEquals(await initializePreparedRoom(store, prepared, signer), one);
+      assertEquals(
+        await db.query('SELECT id,pdu FROM events ORDER BY id'),
+        events,
+      );
+      assertEquals(await store.rooms(), [one.roomId]);
+      assertEquals(await stateContent(room, 'm.room.topic'), {
+        topic: 'frozen initial state',
+      });
+    });
+  });
+}
 
 async function withStore(
   fn: (store: Store) => Promise<void>,

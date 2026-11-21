@@ -21,7 +21,7 @@ Deno.test('reports v51 upgrade retains legacy rows with fresh-schema identity in
     idleseconds: 300,
   });
   let old = await openStore(settings('old'), {
-    schemas: { server: historicalServerSchema(51) },
+    schemas: { server: historicalServerSchema(52) },
   });
   const fresh = await openStore(settings('fresh'), {
     schemas: { server: serverSchema },
