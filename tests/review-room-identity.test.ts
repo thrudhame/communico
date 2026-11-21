@@ -6,6 +6,7 @@ import { createRoom } from '#engine/room/create.ts';
 import { backfill } from '#engine/room/history.ts';
 import { ingestLocal } from '#engine/room/ingest.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
+import { serverSchema } from '#engine/server/schema.ts';
 import { joinRemote } from '#engine/room/join.ts';
 import { ingestRemote } from '#engine/room/remote.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
@@ -21,7 +22,7 @@ async function withStore(fn: (store: Store) => Promise<void>) {
     checkpointlogbytes: 65536,
     maxopenfiles: 8,
     idleseconds: 300,
-  }, { schemas: { room: roomSchema } });
+  }, { schemas: { room: roomSchema, server: serverSchema } });
   try {
     await fn(store);
   } finally {

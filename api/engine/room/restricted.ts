@@ -16,6 +16,11 @@ import {
 } from './build.ts';
 import { openRoom, type Room, type RoomTx } from './index.ts';
 import { withRoomLock } from './lock.ts';
+import {
+  type PreparedRestrictedKnowledge,
+  prepareRestrictedKnowledge,
+  restrictedKnowledge,
+} from './hooks.ts';
 
 async function current(tx: RoomTx) {
   const stay = await tx.segments.openStay();
@@ -92,6 +97,7 @@ export async function joinedAllowedRoom(
   roomIds: readonly string[],
 ): Promise<boolean> {
   for (const id of roomIds) {
+    if (await restrictedKnowledge(store, id) === 'unavailable') continue;
     let room;
     try {
       room = await openRoom(store, id);
@@ -135,28 +141,44 @@ export async function withRestrictedAdmission<T>(
     let unknown = captured?.unknown ?? false;
     if (captured?.required) {
       for (const id of captured.rooms) {
+        const knowledge = await restrictedKnowledge(room.store, id);
+        if (knowledge === 'unavailable') {
+          unknown = true;
+          continue;
+        }
         let allowed;
         try {
           allowed = await openRoom(room.store, id);
         } catch (error) {
           if (!(error instanceof Deno.errors.NotFound)) throw error;
-          if (domainOf(user) !== self) unknown = true;
+          if (domainOf(user) !== self || knowledge === 'partial') {
+            unknown = true;
+          }
           continue;
         }
         proof = await witness(allowed, user);
         if (proof !== null) break;
         if (
-          domainOf(user) !== self &&
-          await allowed.tx((tx) => tx.segments.openStay()) === null
+          (domainOf(user) !== self || knowledge === 'partial') &&
+          await allowed.tx(async (tx) => {
+            const snapshot = await current(tx);
+            return snapshot.stay === null || snapshot.group === null;
+          })
         ) unknown = true;
       }
     }
     const result = await withRoomLock(room.id, async () => {
+      let allowedScope: PreparedRestrictedKnowledge | undefined;
       if (before) {
         const { stay, group } = await room.tx(current);
         await before(stay !== null && group !== null);
       }
       if (proof !== null) {
+        allowedScope = await prepareRestrictedKnowledge(
+          room.store,
+          proof.room.id,
+        );
+        if (allowedScope.knowledge === 'unavailable') return changed;
         const now = await witness(proof.room, user);
         if (
           now === null || now.stay !== proof.stay || now.group !== proof.group
@@ -185,6 +207,10 @@ export async function withRestrictedAdmission<T>(
               'restricted join eligibility not established',
             );
           }
+          // Scope/control retirement is not an ordinary later DAG departure.
+          // Carry its prepared authority to the target's actual native commit,
+          // without reading another authority file inside this transaction.
+          if (allowedScope?.checkCurrent) tx.admit(allowedScope.checkCurrent);
           let candidates = now.authorizers.filter((u) => domainOf(u) === self);
           if (nominated === undefined) {
             // Both local joins and federation templates author from the selected

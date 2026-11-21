@@ -7,6 +7,10 @@ import { buildInTx } from '#engine/room/build.ts';
 import { genesis } from '#tests/fixtures/genesis.ts';
 import { onProjected, projectThrough } from '#engine/server/project.ts';
 import type { CompletionTarget } from '#engine/room/completion.ts';
+import {
+  historicalRoomFixture,
+  historicalRoomSchema,
+} from '#tests/fixtures/room-schema-history.ts';
 
 async function fixture(fn: (store: Store, dir: string) => Promise<void>) {
   const dir = await Deno.makeTempDir({ prefix: 'completion-' });
@@ -217,15 +221,7 @@ Deno.test('completion: supported v7 upgrade fixes one legacy baseline across reo
     maxopenfiles: 16,
     idleseconds: 300,
   };
-  const v7 = {
-    version: 7,
-    apply: async (db: Parameters<typeof roomSchema.apply>[0]) => {
-      await roomSchema.apply(db);
-      await db.exec(
-        'DROP TABLE event_signatures; ALTER TABLE events DROP COLUMN hash_redacted; DROP TABLE completion_receipts; DROP TABLE completion_state;',
-      );
-    },
-  };
+  const v7 = historicalRoomSchema(7);
   let store = await openStore(config, {
     schemas: { room: v7, server: serverSchema },
   });
@@ -294,10 +290,7 @@ Deno.test('completion: legacy retry keeps its original grounding witness after a
       null,
     );
     const db = await store.room(g.roomId);
-    await db.exec(
-      'DROP TABLE event_signatures; ALTER TABLE events DROP COLUMN hash_redacted; DROP TABLE completion_receipts; DROP TABLE completion_state',
-    );
-    await db.execute("UPDATE meta SET v='7' WHERE k='schema_version'");
+    await historicalRoomFixture(db, 7);
     await store.close();
     store = await openStore(config, { schemas });
     const room = await openRoom(store, g.roomId);
@@ -364,10 +357,7 @@ Deno.test('completion: old prepared submission uses its verified fixed upgrade w
     const pdu = JSON.parse(row.pdu);
     const baseline = await g.room.tx((tx) => tx.changes.head());
     const db = await store.room(g.roomId);
-    await db.exec(
-      'DROP TABLE event_signatures; ALTER TABLE events DROP COLUMN hash_redacted; DROP TABLE completion_receipts; DROP TABLE completion_state',
-    );
-    await db.execute("UPDATE meta SET v='7' WHERE k='schema_version'");
+    await historicalRoomFixture(db, 7);
     await store.close();
     store = await openStore(config, { schemas });
     const room = await openRoom(store, g.roomId);

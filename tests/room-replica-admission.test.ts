@@ -6,6 +6,7 @@ import {
   type RoomTx,
 } from '#engine/room/index.ts';
 import { openStore } from '#engine/store/index.ts';
+import { withMembershipFence } from '#engine/room/hooks.ts';
 
 Deno.test('room admission: invalidation inside normal and unpublished transactions rolls back their facts', async () => {
   const dir = await Deno.makeTempDir();
@@ -52,7 +53,7 @@ Deno.test('room admission: invalidation inside normal and unpublished transactio
   }
 });
 
-Deno.test('room admission: invalidation after the owner callback cannot cross native commit', async () => {
+async function nativeAdmission(membership: boolean) {
   const dir = await Deno.makeTempDir();
   const store = await openStore({
     dir,
@@ -79,25 +80,34 @@ Deno.test('room admission: invalidation after the owner callback cannot cross na
         }, txOptions);
       return db;
     };
-    const guarded = await openRoom(store, '!commit:test', {
-      admit: () => {
-        if (!current) throw new Error('grant retired');
+    const checkCurrent = () => {
+      if (!current) throw new Error('grant retired');
+    };
+    const guarded = await openRoom(
+      store,
+      '!commit:test',
+      membership ? {} : {
+        admit: checkCurrent,
       },
-    });
+    );
     store.room = originalRoom;
-    const applying = guarded.tx((tx) =>
-      tx.events.insert('$late', {
-        type: 'm.room.message',
-        sender: '@dev:test',
-        depth: 1,
-        origin_server_ts: 1,
-        content: {},
-        signatures: {},
-        hashes: { sha256: 'unused' },
-        auth_events: [],
-        prev_events: [],
-      })
-    ).then(() => null, (error) => error);
+    const applying = guarded.tx((tx) => {
+      const write = () =>
+        tx.events.insert('$late', {
+          type: 'm.room.message',
+          sender: '@dev:test',
+          depth: 1,
+          origin_server_ts: 1,
+          content: {},
+          signatures: {},
+          hashes: { sha256: 'unused' },
+          auth_events: [],
+          prev_events: [],
+        });
+      return membership
+        ? withMembershipFence({ checkCurrent }, tx, write)
+        : write();
+    }).then(() => null, (error) => error);
     await entered.promise;
     current = false;
     release.resolve();
@@ -111,4 +121,9 @@ Deno.test('room admission: invalidation after the owner callback cannot cross na
     await store.close();
     await Deno.remove(dir, { recursive: true });
   }
-});
+}
+
+Deno.test('room admission: invalidation after the owner callback cannot cross native commit', () =>
+  nativeAdmission(false));
+Deno.test('membership admission: invalidation after the owner callback cannot cross native commit', () =>
+  nativeAdmission(true));

@@ -13,7 +13,12 @@ import { prepareSigner, type Signer } from '#engine/room/signer.ts';
 import { buildInTx } from '#engine/room/build.ts';
 import { ingestInTx } from '#engine/room/ingest.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
-import { admitLocalJoin } from '#engine/room/hooks.ts';
+import {
+  admitLocalJoin,
+  type MembershipAdmission,
+  prepareMembershipAdmission,
+  withMembershipFence,
+} from '#engine/room/hooks.ts';
 import { withRestrictedAdmission } from './restricted.ts';
 
 export type MembershipOpResult = {
@@ -119,44 +124,52 @@ async function admitJoin(
   prepareAbsent = true,
 ): Promise<MembershipOpResult | null> {
   let prepared = signer;
+  let admission: MembershipAdmission | undefined;
   const result = await withRestrictedAdmission(
     room,
     userId,
     signer.serverName,
-    async (tx, authorizer) => {
-      const current = await membershipInTx(tx, userId);
-      if (current?.membership === 'join') {
-        return { roomId: room.id, eventId: current.eventId, created: false };
-      }
-      const content = { ...extraContent, membership: 'join' } as Record<
-        string,
-        unknown
-      >;
-      delete content.join_authorised_via_users_server;
-      if (authorizer !== null) {
-        content.join_authorised_via_users_server = authorizer;
-      }
-      const pdu = await buildInTx(tx, room.id, {
-        type: 'm.room.member',
-        sender: userId,
-        state_key: userId,
-        content,
-      }, prepared);
-      const res = await ingestInTx(tx, room.id, pdu, {
-        self: signer.serverName,
-      });
-      if (res.standing !== 'accepted') {
-        throw new MatrixError(
-          403,
-          'M_FORBIDDEN',
-          `membership rejected (${res.rule})`,
-        );
-      }
-      return { roomId: room.id, eventId: res.eventId, created: true };
-    },
+    (tx, authorizer) =>
+      withMembershipFence(admission, tx, async () => {
+        const current = await membershipInTx(tx, userId);
+        if (current?.membership === 'join') {
+          return { roomId: room.id, eventId: current.eventId, created: false };
+        }
+        const content = { ...extraContent, membership: 'join' } as Record<
+          string,
+          unknown
+        >;
+        delete content.join_authorised_via_users_server;
+        if (authorizer !== null) {
+          content.join_authorised_via_users_server = authorizer;
+        }
+        const pdu = await buildInTx(tx, room.id, {
+          type: 'm.room.member',
+          sender: userId,
+          state_key: userId,
+          content,
+        }, prepared);
+        const res = await ingestInTx(tx, room.id, pdu, {
+          self: signer.serverName,
+        });
+        if (res.standing !== 'accepted') {
+          throw new MatrixError(
+            403,
+            'M_FORBIDDEN',
+            `membership rejected (${res.rule})`,
+          );
+        }
+        return { roomId: room.id, eventId: res.eventId, created: true };
+      }),
     undefined,
     async (resident) => {
       await admitLocalJoin(room.store, room.id, userId);
+      admission = await prepareMembershipAdmission(
+        room.store,
+        room.id,
+        userId,
+        true,
+      );
       // This runs under the authoring lock, but outside the room transaction.
       // A retained result needs projection repair, not fresh signing authority.
       if (!resident && !prepareAbsent) return;
@@ -164,7 +177,14 @@ async function admitJoin(
         prepared = await prepareSigner(signer);
       }
     },
-    absent ? (tx) => absent(tx, prepared) : undefined,
+    absent
+      ? (tx) =>
+        withMembershipFence(
+          admission,
+          tx,
+          async () => await absent(tx, prepared),
+        )
+      : undefined,
   );
   if (result !== null) {
     await afterLocalCommit(room, result.eventId, signer.serverName);
@@ -193,43 +213,54 @@ export async function leave(
   reason?: string,
 ): Promise<MembershipOpResult> {
   const outcome = await withRoomLock(room.id, async () => {
+    const admission = await prepareMembershipAdmission(
+      room.store,
+      room.id,
+      userId,
+    );
     const current = await membershipOf(room, userId);
     if (current !== null && current.membership !== 'leave') {
       signer = await prepareSigner(signer);
     }
-    return await room.tx(async (tx) => {
-      const current = await membershipInTx(tx, userId);
-      if (current === null) {
-        throw new MatrixError(
-          403,
-          'M_FORBIDDEN',
-          'never a member of ' + room.id,
-        );
-      }
-      if (current.membership === 'leave') {
+    return await room.tx((tx) =>
+      withMembershipFence(admission, tx, async () => {
+        const current = await membershipInTx(tx, userId);
+        if (current === null) {
+          throw new MatrixError(
+            403,
+            'M_FORBIDDEN',
+            'never a member of ' + room.id,
+          );
+        }
+        if (current.membership === 'leave') {
+          return {
+            result: {
+              roomId: room.id,
+              eventId: current.eventId,
+              created: false,
+            },
+            rejection: null,
+          };
+        }
+        const content: Record<string, unknown> = { membership: 'leave' };
+        if (reason !== undefined) content.reason = reason;
+        const pdu = await buildInTx(tx, room.id, {
+          type: 'm.room.member',
+          sender: userId,
+          state_key: userId,
+          content,
+        }, signer);
+        const res = await ingestInTx(tx, room.id, pdu, {
+          self: signer.serverName,
+        });
         return {
-          result: { roomId: room.id, eventId: current.eventId, created: false },
-          rejection: null,
+          result: { roomId: room.id, eventId: res.eventId, created: true },
+          rejection: res.standing === 'rejected'
+            ? `membership rejected (${res.reason}, rule ${res.rule})`
+            : null,
         };
-      }
-      const content: Record<string, unknown> = { membership: 'leave' };
-      if (reason !== undefined) content.reason = reason;
-      const pdu = await buildInTx(tx, room.id, {
-        type: 'm.room.member',
-        sender: userId,
-        state_key: userId,
-        content,
-      }, signer);
-      const res = await ingestInTx(tx, room.id, pdu, {
-        self: signer.serverName,
-      });
-      return {
-        result: { roomId: room.id, eventId: res.eventId, created: true },
-        rejection: res.standing === 'rejected'
-          ? `membership rejected (${res.reason}, rule ${res.rule})`
-          : null,
-      };
-    });
+      })
+    );
   }).catch((error) => {
     if (
       String(error).includes('E_ROOM_ARCHIVED') ||

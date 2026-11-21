@@ -1,4 +1,8 @@
 import { assert, assertEquals } from '@std/assert';
+import {
+  createPrejoinJob,
+  prejoinWorkOf,
+} from '#engine/server/prejoin-jobs.ts';
 import { startAdmin } from '#root/api/admin/index.ts';
 import { startFederationServices } from '#engine/app.ts';
 import { config, setConfigForTests } from '#engine/config.ts';
@@ -251,6 +255,12 @@ Deno.test('admin federation operations cross the socket and affect their consume
         await app.server.execute(
           "INSERT INTO prejoin_memberships(room_id,user_id,event_id,room_version,event_json,invite_room_state,origin,received_ms,status,seq) VALUES('!invite|part:remote','@a:localhost','$invite','11','{}','[]','remote.test',1,'rejecting',1)",
         );
+        await app.server.tx(async (tx) => {
+          const [row] = await tx.query(
+            "SELECT * FROM prejoin_memberships WHERE room_id='!invite|part:remote'",
+          );
+          await createPrejoinJob(tx, prejoinWorkOf(row));
+        });
         const review = await call('federation-outbox/list', {
           destination: 'remote.test',
         });

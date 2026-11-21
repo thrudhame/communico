@@ -69,6 +69,16 @@ export class FederationHttpError extends UpstreamHttpError {
   }
 }
 
+/** Submission refusals may release exact prepared work. Proxy errors, timeouts
+ * and throttling keep the existing uncertain-delivery obligation. */
+export function isDefiniteFederationRefusal(
+  error: unknown,
+): error is FederationHttpError {
+  return error instanceof FederationHttpError && error.matrixBody &&
+    error.remoteStatus >= 400 && error.remoteStatus < 500 &&
+    error.remoteStatus !== 408 && error.remoteStatus !== 429;
+}
+
 // v2 -> v1 fallback requires a completed endpoint-unknown response, not a
 // client-facing mapped status or a local error with a coincidentally equal code.
 export function isEndpointUnknown(error: unknown): boolean {

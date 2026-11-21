@@ -38,6 +38,8 @@ import { randomSigner } from './fixtures/signer.ts';
 import { type FakeServer, startFakeServer } from './federation/fake-server.ts';
 import { latch, watchdog } from '#tests/support/ordering.ts';
 import { controlledTimeouts } from '#tests/support/timers.ts';
+import { keyStore } from '#engine/federation/keys.ts';
+import { directOnly, makeDoc, makeServer } from './federation/doc-helper.ts';
 
 async function withStore(
   fn: (store: Store) => Promise<void>,
@@ -62,6 +64,131 @@ async function withStore(
 }
 
 type Identity = { signer: Signer; doc: Record<string, unknown> };
+
+Deno.test('production witness fetcher sends one signed POST for every destination in its next batch', async () => {
+  await withStore(async (store) => {
+    const server = await store.server();
+    const identity = await makeIdentity('batch-origin.test');
+    const origins = await Promise.all(
+      ['anchor.test', 'batch-a.test', 'batch-b.test'].map((n) => makeServer(n)),
+    );
+    const docs = await Promise.all(origins.map((s) => makeDoc(s)));
+    const entered = latch(), release = latch(), enrolled = latch();
+    const answers = new Map<string, unknown>();
+    const requests: Record<
+      string,
+      Record<string, { minimum_valid_until_ts: number }>
+    >[] = [];
+    await withFake(identity, async (fake) => {
+      for (const doc of docs) {
+        answers.set(
+          doc.server_name,
+          await fake.sign(doc as unknown as Record<string, unknown>),
+        );
+      }
+      await keyStore(server, { deps: directOnly(await fake.keyDoc()) })
+        .acquireKeyDoc(fake.name, 0);
+      await addPeer(server, {
+        name: fake.name,
+        host: 'localhost',
+        port: fake.port,
+        trust: 'ca',
+        addedBy: 'operator',
+      });
+      const keys = keyStore(server, { signer: identity.signer });
+      const horizon = Date.now() + 1000;
+      const first = keys.getVerifyKey(
+        origins[0].name,
+        origins[0].keyId,
+        horizon,
+        'event',
+      );
+      const pending: Promise<unknown>[] = [first];
+      const query = server.query.bind(server);
+      try {
+        await watchdog(entered.wait, 'production anchor notary POST');
+        const policies = latch();
+        let reads = 0;
+        server.query = async (sql, values = []) => {
+          const rows = await query(sql, values);
+          if (sql.includes('SELECT DISTINCT server_name') && ++reads === 2) {
+            policies.release();
+          }
+          return rows;
+        };
+        let subscriptions = 0;
+        const wave = origins.slice(1).map((s) => {
+          const abort = new AbortController();
+          const add = abort.signal.addEventListener.bind(abort.signal);
+          abort.signal.addEventListener = (...args: Parameters<typeof add>) => {
+            add(...args);
+            if (args[0] === 'abort' && ++subscriptions === 2) {
+              enrolled.release();
+            }
+          };
+          return keyStore(server, { signer: identity.signer }).getVerifyKey(
+            s.name,
+            s.keyId,
+            horizon,
+            'event',
+            { signal: abort.signal },
+          );
+        });
+        pending.push(...wave);
+        await watchdog(enrolled.wait, 'production next-batch subscribers');
+        await watchdog(policies.wait, 'production next-batch policy reads');
+        await server.query('SELECT 1');
+        assertEquals(requests.length, 1);
+        release.release();
+        const results = await Promise.all([first, ...wave]);
+        for (let i = 0; i < origins.length; i++) {
+          assertEquals(
+            await exportPublicKeyRaw(results[i]),
+            await exportPublicKeyRaw(origins[i].kp.publicKey),
+          );
+        }
+        assertEquals(requests, [
+          {
+            'anchor.test': { 'ed25519:1': { minimum_valid_until_ts: horizon } },
+          },
+          {
+            'batch-a.test': {
+              'ed25519:1': { minimum_valid_until_ts: horizon },
+            },
+            'batch-b.test': {
+              'ed25519:1': { minimum_valid_until_ts: horizon },
+            },
+          },
+        ]);
+        assertEquals(fake.requests.map((r) => [r.method, r.path, r.verified]), [
+          ['POST', '/_matrix/key/v2/query', true],
+          ['POST', '/_matrix/key/v2/query', true],
+        ]);
+      } finally {
+        release.release();
+        await Promise.allSettled(pending);
+        server.query = query;
+      }
+    }, (request) => {
+      if (
+        request.method !== 'POST' || request.path !== '/_matrix/key/v2/query'
+      ) return null;
+      return (async () => {
+        const { server_keys } = request.json() as {
+          server_keys: typeof requests[number];
+        };
+        requests.push(server_keys);
+        if ('anchor.test' in server_keys) {
+          entered.release();
+          await release.wait;
+        }
+        return Response.json({
+          server_keys: Object.keys(server_keys).map((n) => answers.get(n)),
+        });
+      })();
+    });
+  });
+});
 
 async function makeIdentity(name: string): Promise<Identity> {
   const { signer, publicKey } = await randomSigner(name);

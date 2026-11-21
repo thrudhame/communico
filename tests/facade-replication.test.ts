@@ -8,6 +8,7 @@ import {
 import { setConfigForTests } from '#engine/config.ts';
 import { claimKeys, queryKeys } from '#engine/client/e2ee.ts';
 import { canSeeEvent } from '#engine/client/visibility.ts';
+import { join as clientJoin } from '#engine/client/membership.ts';
 import { versionOf } from '#engine/client/room.ts';
 import {
   createRoom as createClientRoom,
@@ -75,6 +76,7 @@ import { appendRecord, Journal } from '#engine/facade/journal.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
 import { LINK_CAPABILITIES, LINK_SUPPORTED } from '#engine/facade/protocol.ts';
 import { applyReplicaScope } from '#engine/facade/scopes.ts';
+import { replicationProgress } from '#engine/facade/progress.ts';
 import type { Database } from '#engine/store/db.ts';
 import {
   exportRoomReplica,
@@ -84,7 +86,7 @@ import {
 import { bounded } from './helpers/server-process.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
-import { setRoomHooks } from '#engine/room/hooks.ts';
+import { restrictedKnowledge, setRoomHooks } from '#engine/room/hooks.ts';
 import {
   importReplicaBoundary,
   importReplicaGenesis,
@@ -308,6 +310,83 @@ async function fixture(
     },
   };
 }
+
+Deno.test('operator replication progress distinguishes exact source, publication, receipt and application cuts without writing', async () => {
+  const f = await fixture();
+  const scope = 'room:' + f.room.id;
+  const readHome = () =>
+    replicationProgress(f.home, f.tenant.serverName, 'home', [scope]);
+  const readEdge = () =>
+    replicationProgress(f.edgeStore(), f.tenant.serverName, 'facade', [scope]);
+  try {
+    const original = await f.room.tx((tx) => tx.changes.head());
+    assertEquals((await readHome()).sources, [{ scope, cut: original }]);
+    const record = (await f.exports())!;
+    const published = (await readHome()).streams[0];
+    assertEquals(published.published, {
+      sequence: record.sequence,
+      hash: record.hash,
+      sourceCut: original,
+    });
+    assertEquals(published.received, {
+      sequence: 0,
+      hash: '',
+      sourceCut: null,
+    });
+    const journal = await f.journal();
+    await journal.receive('home', [record]);
+    const received = (await readEdge()).streams[0];
+    assertEquals(received.received, published.published);
+    assertEquals(received.applied, { sequence: 0, hash: '', sourceCut: null });
+    assertEquals(received.published, null);
+    assert(await (await f.replicas()).apply(journal, record));
+    const applied = (await readEdge()).streams[0];
+    assertEquals(applied.applied, published.published);
+    assertEquals(applied.published, published.published);
+    assertEquals(applied.ready, true);
+    assertEquals(applied.incarnation, f.bundle.id);
+    assertEquals(applied.source, 'home');
+    const next = await f.source.addEvent({
+      type: 'm.room.message',
+      content: { body: 'private-body-never-in-status' },
+    });
+    await f.ingest([next]);
+    const target = (await readHome()).sources[0].cut;
+    assert(target > original);
+    assertEquals((await readEdge()).streams[0].applied, applied.applied);
+    // Status does not mint snapshots or move any durable export/application cut.
+    const before = await (await f.home.server()).query(
+      'SELECT * FROM facade_exports',
+    );
+    const first = await readHome();
+    assertEquals(await readHome(), first);
+    assertEquals(
+      await (await f.home.server()).query('SELECT * FROM facade_exports'),
+      before,
+    );
+    assert(!JSON.stringify(first).includes('private-body-never-in-status'));
+    assertEquals(
+      (await replicationProgress(f.home, f.tenant.serverName, 'home', [
+        'room:!missing:logical.test',
+      ])).sources,
+      [],
+    );
+    const replica = await f.replica();
+    assertEquals((await readEdge()).sources, [{
+      scope,
+      cut: await replica.tx((tx) => tx.changes.head()),
+    }]);
+    assertEquals(
+      (await replicationProgress(f.edgeStore(), f.tenant.serverName, 'facade', [
+        'public:@alice:' + f.tenant.serverName,
+        'room:!missing:logical.test',
+      ])).sources,
+      [],
+    );
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('replica signature evidence replays hash-redacted non-create events without duplicate news', async () => {
   const f = await fixture();
@@ -1649,6 +1728,102 @@ Deno.test('room replication pins bootstrap, applies only durable semantic suffix
   }
 });
 
+Deno.test('operator reverse progress resolves the active enrollment after reenrolling the same node incarnation', async () => {
+  const f = await fixture();
+  try {
+    const initial = (await f.exports())!;
+    const edgeJournal = await f.journal();
+    await edgeJournal.receive('home', [initial]);
+    assert(await (await f.replicas()).apply(edgeJournal, initial));
+    const incoming = new Journal(await f.home.server(), LINK_SUPPORTED);
+    const owner = new RoomReplicas(
+      f.home,
+      f.homePairings,
+      f.tenant.serverName,
+      fakeKeyResolver(f.signing),
+    );
+    const oldReverse = (await exportRoomReplica(
+      f.edgeStore(),
+      await f.replica(),
+      f.tenant.serverName,
+      'home',
+      f.bundle.id,
+    ))!;
+    await incoming.receive(f.node.node, [oldReverse]);
+    assert(await owner.apply(incoming, oldReverse, f.bundle.id));
+    const edge = await f.edgePairings();
+    await edge.retire(await f.homePairings.revoke(f.bundle.id), 'a'.repeat(64));
+    const next = await f.homePairings.create({
+      node: f.node.node,
+      url: 'https://facade.test',
+      facadePin: 'b'.repeat(64),
+      expires: Date.now() + 60000,
+      required: [...LINK_CAPABILITIES],
+    });
+    await edge.accept(next);
+    const grant = await f.homePairings.grant(
+      next.id,
+      await edge.challenge(next.id, next.secret, 'a'.repeat(64)),
+    );
+    await f.homePairings.confirm(
+      next.id,
+      await edge.complete(next.id, grant, 'a'.repeat(64)),
+    );
+    assert(next.id !== f.bundle.id);
+    assertEquals(grant.body.transcript.body.incarnation, f.node.incarnation);
+    const pending = (await replicationProgress(
+      f.home,
+      f.tenant.serverName,
+      'home',
+      [oldReverse.stream],
+    )).streams.find((row) =>
+      row.direction === 'in' && row.source === f.node.node &&
+      row.incarnation === f.node.incarnation
+    )!;
+    assertEquals(pending.ready, false);
+    assertEquals(pending.published, null);
+    // The new enrollment owns its applied scope, while the source identity persists.
+    assert(
+      await exportRoomReplica(
+        f.home,
+        f.room,
+        f.tenant.serverName,
+        f.node.node,
+        next.id,
+      ),
+    );
+    const reverse = (await exportRoomReplica(
+      f.edgeStore(),
+      await f.replica(),
+      f.tenant.serverName,
+      'home',
+      next.id,
+    ))!;
+    await incoming.receive(f.node.node, [reverse]);
+    assert(await owner.apply(incoming, reverse, next.id));
+    const progress = await replicationProgress(
+      f.home,
+      f.tenant.serverName,
+      'home',
+      [reverse.stream],
+    );
+    const applied = progress.streams.find((row) =>
+      row.direction === 'in' && row.source === f.node.node &&
+      row.incarnation === f.node.incarnation
+    )!;
+    assertEquals(applied.ready, true);
+    assertEquals(applied.published, applied.applied);
+    assertEquals(
+      applied.applied.sourceCut,
+      (reverse.payload as {
+        manifest: { cut: number };
+      }).manifest.cut,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('room replication exports an enrolled facade suffix under its own source incarnation', async () => {
   const f = await fixture();
   try {
@@ -1690,6 +1865,49 @@ Deno.test('room replication exports an enrolled facade suffix under its own sour
     assert(await owner.apply(incoming, reverse, f.bundle.id));
     assertEquals(await owner.apply(incoming, reverse, f.bundle.id), false);
     assertEquals(await f.room.tx((tx) => tx.changes.head()), head);
+
+    // Journal identity is the node incarnation, but scope completion belongs
+    // to the enrollment. The read-only operator view must resolve that binding.
+    assert(f.bundle.id !== f.node.incarnation);
+    const progress = await replicationProgress(
+      f.home,
+      f.tenant.serverName,
+      'home',
+      [reverse.stream],
+    );
+    const applied = progress.streams.find((row) =>
+      row.direction === 'in' && row.source === f.node.node &&
+      row.incarnation === f.node.incarnation
+    )!;
+    assertEquals(applied.ready, true);
+    assertEquals(applied.published, applied.applied);
+    assertEquals(
+      applied.applied.sourceCut,
+      (reverse.payload as {
+        manifest: { cut: number };
+      }).manifest.cut,
+    );
+    assertEquals(applied.declaredCut, null);
+
+    const foreignJournal = new Journal(await f.edgeServer(), LINK_SUPPORTED);
+    const foreign = await foreignJournal.append('home', {
+      source: f.node.node,
+      incarnation: 'unbound-node-incarnation',
+      stream: reverse.stream,
+      type: reverse.type,
+      version: reverse.version,
+      operationId: 'foreign-progress-binding',
+      payload: reverse.payload,
+    });
+    await incoming.receive(f.node.node, [foreign]);
+    const unbound = (await replicationProgress(
+      f.home,
+      f.tenant.serverName,
+      'home',
+      [reverse.stream],
+    )).streams.find((row) => row.incarnation === foreign.incarnation)!;
+    assertEquals(unbound.ready, false);
+    assertEquals(unbound.published, null);
 
     const branch = f.source.tipId;
     const homeEvent = await f.source.addEvent({
@@ -3441,6 +3659,222 @@ Deno.test('replica device composition borrows the node service and binds its dis
   }
 });
 
+Deno.test('facade membership admission: every local owner refuses unavailable scope before a result or signature', async (t) => {
+  const f = await fixture();
+  const raw = f.node.signer();
+  let available = true, signatures = 0, revision = 0, retireOnSign = false;
+  const checkCurrent = () => {
+    if (!available) {
+      throw new MatrixError(503, 'M_UNAVAILABLE', 'replica scope closed');
+    }
+  };
+  const signer = {
+    ...raw,
+    sign: async (bytes: string) => {
+      signatures++;
+      const signature = await raw.sign(bytes);
+      if (retireOnSign) revision++;
+      return signature;
+    },
+  };
+  try {
+    setConfigForTests({
+      server: { name: 'logical.test', role: 'facade' },
+      facade: { phase: 'f2', nodeid: 'edge_a' },
+    });
+    const app = await openReplicaApp(f.edgeStore(), await f.edgeTenant(), {
+      requireScope: () => Promise.resolve(),
+      requireReadScope: () => Promise.resolve(),
+      prepareReadRoomScope: () => Promise.reject(new Error('unused')),
+      prepareRoomScope: async (_room, _absent, user) => {
+        // Preparation is allowed to read server authority; room callbacks are not.
+        await (await f.edgeServer()).query('SELECT 1');
+        assert(user === '@alice:logical.test' || user === '@bob:logical.test');
+        checkCurrent();
+        const captured = revision;
+        const current = () => {
+          checkCurrent();
+          if (captured !== revision) {
+            throw new MatrixError(
+              503,
+              'M_UNAVAILABLE',
+              'replica scope changed',
+            );
+          }
+        };
+        return {
+          check: () => Promise.resolve(current()),
+          checkCurrent: current,
+        };
+      },
+      keys: keyStore(await f.edgeServer(), { signer }),
+      signer,
+      keyDocument: () => Promise.reject(new Error('unused')),
+      publicRooms: () => Promise.resolve(false),
+    });
+    const user = '@alice:logical.test', target = '@bob:logical.test';
+    const created = await createClientRoom({
+      creator: user,
+      preset: 'public_chat',
+    });
+    const room = await openRoom(app.store, created.roomId);
+    await localMembership.invite(room, user, target, signer);
+    await localMembership.ban(room, user, '@carol:logical.test', signer);
+    let saved: PreparedSubmission | null = null;
+    const submission = {
+      lookup: () => Promise.resolve(saved),
+      prepare: (pdu: Pdu) =>
+        Promise.resolve(saved = { eventId: String(pdu.event_id), pdu }),
+      finish: () => Promise.resolve(),
+    };
+    const member = {
+      type: 'm.room.member',
+      sender: user,
+      state_key: user,
+      content: { membership: 'join', displayname: 'retained member' },
+    };
+    const committed = await sendLocal(room, member, signer, submission);
+    const committedHead = await room.tx((tx) => tx.changes.head());
+    available = false;
+    const before = signatures;
+    await t.step('exact committed member receipt', async () => {
+      const replay = await sendLocal(
+        room,
+        { ...member, content: { membership: 'leave' } },
+        signer,
+        submission,
+      );
+      assertEquals(replay.eventId, committed.eventId);
+      assertEquals(replay.receipt, true);
+      assertEquals(signatures, before);
+      assertEquals(await room.tx((tx) => tx.changes.head()), committedHead);
+    });
+    const operations = {
+      clientJoin: () => clientJoin(room.id, user),
+      join: () => localMembership.join(room, user, signer),
+      residentJoin: () => localMembership.joinResident(room, user, signer),
+      reopen: () => localMembership.reopen(room, user, signer, {}),
+      leave: () => localMembership.leave(room, user, signer),
+      invite: () =>
+        localMembership.invite(room, user, '@dave:logical.test', signer),
+      kick: () => localMembership.kick(room, user, target, signer),
+      ban: () => localMembership.ban(room, user, target, signer),
+      unban: () =>
+        localMembership.unban(room, user, '@carol:logical.test', signer),
+      knock: () => localMembership.knock(room, user, signer),
+    };
+    for (const [name, operation] of Object.entries(operations)) {
+      await t.step(name, async () => {
+        await assertRejects(operation, MatrixError, 'replica scope closed');
+        assertEquals(signatures, before);
+      });
+    }
+    assertEquals(
+      (await localMembership.membershipOf(room, user))?.membership,
+      'join',
+    );
+    assertEquals(
+      (await localMembership.membershipOf(room, target))?.membership,
+      'invite',
+    );
+    assertEquals(
+      (await localMembership.membershipOf(room, '@carol:logical.test'))
+        ?.membership,
+      'ban',
+    );
+    available = true;
+    retireOnSign = true;
+    for (
+      const [name, operation] of Object.entries({
+        join: () => localMembership.join(room, target, signer),
+        leave: () => localMembership.leave(room, user, signer),
+        authoredMember: () => localMembership.ban(room, user, target, signer),
+      })
+    ) {
+      await t.step('commit fence ' + name, async () => {
+        await assertRejects(operation, MatrixError, 'replica scope changed');
+        assertEquals(
+          (await localMembership.membershipOf(room, user))?.membership,
+          'join',
+        );
+        assertEquals(
+          (await localMembership.membershipOf(room, target))?.membership,
+          'invite',
+        );
+      });
+    }
+    retireOnSign = false;
+    await localMembership.leave(room, user, signer);
+    retireOnSign = true;
+    await assertRejects(
+      () => localMembership.reopen(room, user, signer, {}),
+      MatrixError,
+      'replica scope changed',
+    );
+    assertEquals(
+      (await localMembership.membershipOf(room, user))?.membership,
+      'leave',
+    );
+    assertEquals(await room.tx((tx) => tx.segments.openStay()), null);
+  } finally {
+    await closeApp();
+    await f.close();
+    setConfigForTests({});
+  }
+});
+
+Deno.test('facade membership admission: a client join cannot return a stale projected join after a committed departure', async () => {
+  const f = await fixture();
+  try {
+    setConfigForTests({
+      server: { name: 'logical.test', role: 'facade' },
+      facade: { phase: 'f2', nodeid: 'edge_a' },
+    });
+    const app = await openReplicaApp(f.edgeStore(), await f.edgeTenant(), {
+      requireScope: () => Promise.resolve(),
+      requireReadScope: () => Promise.resolve(),
+      prepareReadRoomScope: () => Promise.reject(new Error('unused')),
+      prepareRoomScope: () =>
+        Promise.resolve({ check: () => Promise.resolve(), checkCurrent() {} }),
+      keys: keyStore(await f.edgeServer(), { signer: f.node.signer() }),
+      signer: f.node.signer(),
+      keyDocument: () => Promise.reject(new Error('unused')),
+      publicRooms: () => Promise.resolve(false),
+    });
+    const user = '@alice:logical.test';
+    const created = await createClientRoom({
+      creator: user,
+      preset: 'public_chat',
+    });
+    const room = await openRoom(app.store, created.roomId);
+    const previous = await localMembership.membershipOf(room, user);
+    assert(previous);
+    setRoomHooks({ project: () => Promise.resolve(), register: registerRoom });
+    await localMembership.leave(room, user, app.tenant.signer());
+    assertEquals(
+      (await projectedMembershipOf(app.server, room.id, user))?.eventId,
+      previous.eventId,
+    );
+    installServerHooks();
+    const rejoined = await clientJoin(room.id, user);
+    assertEquals(rejoined.created, true);
+    assert(rejoined.eventId !== previous.eventId);
+    assertEquals(
+      (await localMembership.membershipOf(room, user))?.membership,
+      'join',
+    );
+    assertEquals(
+      (await projectedMembershipOf(app.server, room.id, user))?.eventId,
+      rejoined.eventId,
+    );
+  } finally {
+    installServerHooks();
+    await closeApp();
+    await f.close();
+    setConfigForTests({});
+  }
+});
+
 Deno.test('facade authorship captures room permits and never exposes the raw tenant signer', async () => {
   const f = await fixture();
   let allowed = true, preparations = 0, signatures = 0;
@@ -3484,7 +3918,10 @@ Deno.test('facade authorship captures room permits and never exposes the raw ten
     });
     const app = await openReplicaApp(f.edgeStore(), await f.edgeTenant(), {
       requireScope: () => Promise.resolve(),
-      prepareRoomScope: () => Promise.reject(new Error('unused')),
+      // This fixture isolates signer authority; membership now also prepares
+      // its independent scope capability, which remains available here.
+      prepareRoomScope: () =>
+        Promise.resolve({ check: () => Promise.resolve(), checkCurrent() {} }),
       requireReadScope: () => Promise.resolve(),
       prepareReadRoomScope: () => Promise.reject(new Error('unused')),
       keys: keyStore(await f.edgeServer(), { signer: guarded }),
@@ -3891,6 +4328,15 @@ Deno.test('enrolled replica app composes ordinary reads and recovery without cre
     });
     assertEquals(theApp(), app);
     assertEquals(app.tenant.keyId, f.node.keyId);
+    assertEquals(
+      await restrictedKnowledge(app.store, f.source.roomId),
+      'partial',
+    );
+    assertEquals(
+      await restrictedKnowledge(app.store, '!unselected:logical.test'),
+      'unavailable',
+      'a missing local allowed room on this replica is not complete nonmembership',
+    );
     assertEquals(app.sender, null);
     for (
       const service of [

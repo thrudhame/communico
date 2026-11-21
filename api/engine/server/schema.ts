@@ -17,6 +17,11 @@ import {
   PUBLICATION_DOMAIN_SQL,
 } from '#engine/facade/schema.ts';
 import { RECOVERY_SQL } from '#engine/server/recovery.ts';
+import { MEMBERSHIP_OPERATIONS_SQL } from '#engine/server/prejoin.ts';
+import {
+  migratePrejoinJobs,
+  PREJOIN_JOBS_SQL,
+} from '#engine/server/prejoin-jobs.ts';
 import {
   RECEIPT_ADMISSION_SQL,
   RECEIPT_GRAPH_SQL,
@@ -32,6 +37,11 @@ import {
   FACADE_SCOPES_SQL,
   RUNTIME_IDENTITY_SQL,
 } from './facade-schema.ts';
+
+const OUTBOUND_INVITES_SQL = `
+CREATE TABLE federation_invite_attempts(room_id TEXT NOT NULL,sender TEXT NOT NULL,target TEXT NOT NULL,event_id TEXT NOT NULL UNIQUE,destination TEXT NOT NULL,request_json TEXT NOT NULL,response_json TEXT,status TEXT NOT NULL,added_ms INTEGER NOT NULL,PRIMARY KEY(room_id,sender,target));
+CREATE INDEX federation_invite_attempts_destination ON federation_invite_attempts(destination,status,added_ms);
+`;
 
 const DEVICE_CHANGES_SQL = `
 CREATE TABLE device_changes(seq INTEGER PRIMARY KEY NOT NULL, source TEXT NOT NULL, source_pos INTEGER NOT NULL, subject TEXT NOT NULL, device_id TEXT NOT NULL, generation INTEGER NOT NULL, stream_id INTEGER NOT NULL, payload TEXT NOT NULL, UNIQUE(source,source_pos));
@@ -440,8 +450,11 @@ CREATE INDEX notification_own_events_event ON notification_own_events(event);
 CREATE INDEX notification_horizons_room ON notification_horizons(room);
 `;
 
+const JOIN_REFUSAL_SQL =
+  'ALTER TABLE federation_join_attempts ADD COLUMN remote_refused INTEGER NOT NULL DEFAULT 0 CHECK(remote_refused IN (0,1))';
+
 export const serverSchema: SchemaProvider = {
-  version: 47,
+  version: 53,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -491,6 +504,16 @@ export const serverSchema: SchemaProvider = {
     await db.exec(FACADE_INGRESS_PHASE_SQL);
     await db.exec(FACADE_INGRESS_POLICY_SQL);
     await db.exec(LOCAL_PARTICIPATION_SQL);
+    await db.exec(
+      'ALTER TABLE federation_join_attempts ADD COLUMN join_json TEXT',
+    );
+    await db.exec(OUTBOUND_INVITES_SQL);
+    await db.exec(MEMBERSHIP_OPERATIONS_SQL);
+    await db.exec(
+      'ALTER TABLE prejoin_memberships ADD COLUMN source_binding TEXT',
+    );
+    await db.exec(PREJOIN_JOBS_SQL);
+    await db.exec(JOIN_REFUSAL_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -560,5 +583,20 @@ INSERT INTO device_publication_predecessors SELECT DISTINCT p.subject,p.destinat
     44: (conn) => conn.exec(FACADE_INGRESS_PHASE_SQL),
     45: (conn) => conn.exec(FACADE_INGRESS_POLICY_SQL),
     46: (conn) => conn.exec(LOCAL_PARTICIPATION_SQL),
+    47: (conn) =>
+      conn.exec(
+        'ALTER TABLE federation_join_attempts ADD COLUMN join_json TEXT',
+      ),
+    48: (conn) => conn.exec(OUTBOUND_INVITES_SQL),
+    49: (conn) => conn.exec(MEMBERSHIP_OPERATIONS_SQL),
+    50: (conn) =>
+      conn.exec(
+        'ALTER TABLE prejoin_memberships ADD COLUMN source_binding TEXT',
+      ),
+    51: async (conn) => {
+      await conn.exec(PREJOIN_JOBS_SQL);
+      await migratePrejoinJobs(conn);
+    },
+    52: (conn) => conn.exec(JOIN_REFUSAL_SQL),
   },
 };

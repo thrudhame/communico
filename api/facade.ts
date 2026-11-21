@@ -151,6 +151,7 @@ export async function startFacade(lifetime: ServerLifetime) {
           pairings: runtime.pairings,
           initialize: runtime.initialize,
           status,
+          progress: runtime.progress,
           tenant: runtime.grantedTenant,
           changed: async () => {
             await runtime.changed();

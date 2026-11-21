@@ -43,7 +43,7 @@ import { publicDeviceValues } from '#engine/tenant/device-operations.ts';
 import { FacadeKeys } from '#engine/facade/control.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
 import { sendLocal } from '#engine/room/ingest.ts';
-import { projectThrough } from '#engine/server/project.ts';
+import { completeAccepted } from './complete-accepted.ts';
 
 Deno.test('cold roles expose only granted phase-honest Matrix replica routes without facade tenant genesis or home workers', async () => {
   setConfigForTests({ server: { name: 'logical.test' } });
@@ -907,7 +907,11 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
           .requestSigner(),
       );
       assert(authored.completion);
-      await projectThrough(offline, authored.completion);
+      await completeAccepted(
+        { store: offline, tenant },
+        roomId,
+        authored.eventId,
+      );
       edgeEventId = authored.eventId;
       assertEquals(
         (await (await offline.tenant('logical.test')).tx((conn) =>
@@ -1164,7 +1168,11 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
           },
         }, tenant.signer());
         assert(message.completion);
-        await projectThrough(isolated, message.completion);
+        await completeAccepted(
+          { store: isolated, tenant },
+          roomId,
+          message.eventId,
+        );
         const topic = await sendLocal(room, {
           type: 'm.room.topic',
           state_key: '',
@@ -1172,7 +1180,11 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
           content: { topic: 'home-concurrent-topic' },
         }, tenant.signer());
         assert(topic.completion);
-        await projectThrough(isolated, topic.completion);
+        await completeAccepted(
+          { store: isolated, tenant },
+          roomId,
+          topic.eventId,
+        );
         return { message: message.eventId, topic: topic.eventId };
       } finally {
         await isolated.close();

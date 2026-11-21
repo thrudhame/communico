@@ -30,7 +30,10 @@ import {
   DEVICE_STREAM_SQL,
 } from '#engine/tenant/device-stream.ts';
 import { SIGNING_OPERATIONS_SQL } from '#engine/tenant/signing-operations.ts';
-import { LINK_APPLICATIONS_SQL } from '#engine/tenant/link-applications.ts';
+import {
+  LINK_APPLICATION_PROJECTION_SQL,
+  LINK_APPLICATIONS_SQL,
+} from '#engine/tenant/link-applications.ts';
 import { SIGNATURE_OPERATIONS_SQL } from '#engine/tenant/signature-operations.ts';
 import {
   DEVICE_CREATION_HISTORY_SQL,
@@ -296,7 +299,7 @@ INSERT INTO deactivation_work SELECT localpart,EXISTS(SELECT 1 FROM erased_users
 `;
 
 export const tenantSchema: SchemaProvider = {
-  version: 41,
+  version: 42,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
     await db.exec(E2EE_SQL);
@@ -328,6 +331,7 @@ export const tenantSchema: SchemaProvider = {
     await db.exec(DEVICE_OPERATIONS_SQL);
     await db.exec(SIGNING_OPERATIONS_SQL);
     await db.exec(LINK_APPLICATIONS_SQL);
+    await db.exec(LINK_APPLICATION_PROJECTION_SQL);
     await db.exec(SIGNATURE_OPERATIONS_SQL);
     await db.exec(KEY_BOOTSTRAP_SQL);
     await db.exec(DEVICE_CREATION_HISTORY_SQL);
@@ -338,6 +342,7 @@ export const tenantSchema: SchemaProvider = {
     await db.exec(TO_DEVICE_ROUTE_LOOKUPS_SQL);
   },
   migrations: {
+    41: (conn) => conn.exec(LINK_APPLICATION_PROJECTION_SQL),
     40: (conn) => conn.exec(TO_DEVICE_ROUTE_LOOKUPS_SQL),
     39: (conn) => conn.exec(TO_DEVICE_ADMISSION_POLICY_SQL),
     38: (conn) => conn.exec(TO_DEVICE_ROUTING_SQL),

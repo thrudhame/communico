@@ -3,6 +3,7 @@ import type { Pdu } from '#engine/pdu.ts';
 import { fetchBoundaryEvents } from '#engine/room/boundary-fetch.ts';
 import { backfill } from '#engine/room/history.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
+import { serverSchema } from '#engine/server/schema.ts';
 import { joinRemote } from '#engine/room/join.ts';
 import { ingestRemote } from '#engine/room/remote.ts';
 import { openStore } from '#engine/store/index.ts';
@@ -33,7 +34,7 @@ for (const route of ['remote', 'history'] as const) {
         checkpointlogbytes: 65536,
         maxopenfiles: 8,
         idleseconds: 300,
-      }, { schemas: { room: roomSchema } });
+      }, { schemas: { room: roomSchema, server: serverSchema } });
       try {
         const fr = await makeFakeRoom({
           roomId: '!bulk-' + route + ':remote.test',

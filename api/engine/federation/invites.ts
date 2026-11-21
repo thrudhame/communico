@@ -16,7 +16,7 @@
 // per-destination loop performs on the ladder: the make_leave/send_leave
 // dance against the inviter first, then any server named in the
 // stripped state. No silent local-only fallback. The durable truth is
-// the invite row (the 4b outbox has no intent kind); the candidate
+// the local prejoin job, separate from display; the candidate
 // progress is in-memory — a restart resumes from the first candidate
 // (the inviter, always a correct first retry).
 //
@@ -24,14 +24,22 @@
 // federation_invites row, from the inviter, is a remote rejection
 // (tuwunel is the only prior art, handle_incoming_pdu.rs:125-133).
 import { canonicalJson } from '#engine/canonical.ts';
+import { createHash } from 'node:crypto';
 import { config } from '#engine/config.ts';
 import { eventIdFor, redact } from '#engine/eventid.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
-import { verify } from '#engine/room/verify.ts';
+import { eventMaterial, verify } from '#engine/room/verify.ts';
 import type { Pdu } from '#engine/pdu.ts';
-import { buildInTx, finalizeBuilt, roomVersionOf } from '#engine/room/build.ts';
+import {
+  buildInTx,
+  checkDeclaredAuth,
+  finalizeBuilt,
+  loadRulebookStore,
+  roomVersionOf,
+} from '#engine/room/build.ts';
 import type { KeyResolver } from '#engine/room/deps.ts';
 import { ingestLocal } from '#engine/room/ingest.ts';
+import { withMembershipFence } from '#engine/room/hooks.ts';
 import { openRoom, type Room } from '#engine/room/index.ts';
 import { prepareSigner, type Signer } from '#engine/room/signer.ts';
 import { getRulebook, supportedRoomVersions } from '#engine/rulebook/index.ts';
@@ -47,6 +55,7 @@ import {
 import {
   FederationHttpError,
   federationRequest,
+  isDefiniteFederationRefusal,
   isEndpointUnknown,
 } from './client.ts';
 import {
@@ -64,8 +73,30 @@ import { withRoomLock } from '#engine/room/lock.ts';
 import { admit } from './gate.ts';
 import { domainOf, toWire } from './pdu.ts';
 import { prejoinState, validatePrejoin } from './prejoin.ts';
-import { beginPrejoinLeave, visiblePrejoin } from '#engine/server/prejoin.ts';
+import {
+  beginPrejoinLeave,
+  prejoinLeaveActive,
+  prejoinResult,
+  savePrejoinResult,
+  settleSupersededPrejoin,
+  visiblePrejoin,
+} from '#engine/server/prejoin.ts';
 import { performKnockAttempt } from './knocks.ts';
+import { recordMembershipOperation } from '#engine/server/membership-operations.ts';
+import {
+  beginPrejoinJob,
+  createPrejoinJob,
+  type PrejoinJob,
+  prejoinJob,
+  prejoinJobActive,
+  prejoinJobId,
+  prejoinJobs,
+  type PrejoinWork,
+  prejoinWorkOf,
+  retractPrejoinKnock,
+  supersedePrejoinKnocks,
+  updatePrejoinJob,
+} from '#engine/server/prejoin-jobs.ts';
 import type {
   IntentJob,
   ReviewableIntentProvider,
@@ -83,6 +114,16 @@ export type InviteDeps = {
   self: string;
   // the sender's public wake (the reject intent queues on the loop)
   wake: (destination: string) => void;
+  // Replica composition supplies new-work admission. Durable checks belong to
+  // the server file; room callbacks use only the synchronous receive fence.
+  prepareRoomScope?: (
+    roomId: string,
+    allowAbsent?: boolean,
+    localUser?: string,
+  ) => Promise<{
+    check(conn: Conn): Promise<void>;
+    checkCurrent(): void;
+  }>;
 };
 
 // OOB invite transitions share projection's lifecycle lane. A removal captures
@@ -129,6 +170,41 @@ export async function countersign(
 
 // --- INVITER ---------------------------------------------------------------
 
+type OutboundInvite = {
+  roomId: string;
+  sender: string;
+  target: string;
+  eventId: string;
+  destination: string;
+  request: {
+    room_version: string;
+    event: Record<string, unknown>;
+    invite_room_state: unknown[];
+  };
+  response: Pdu | null;
+};
+function outboundInvite(row: Record<string, unknown>): OutboundInvite {
+  return {
+    roomId: String(row.room_id),
+    sender: String(row.sender),
+    target: String(row.target),
+    eventId: String(row.event_id),
+    destination: String(row.destination),
+    request: JSON.parse(String(row.request_json)),
+    response: row.response_json === null
+      ? null
+      : JSON.parse(String(row.response_json)),
+  };
+}
+// The existing sender owns cold recovery; a live synchronous caller is merely
+// another performer of that same durable operation, never a second attempt.
+const activeInvites = new WeakMap<Store, Set<string>>();
+function invitePerformers(store: Store): Set<string> {
+  let active = activeInvites.get(store);
+  if (!active) activeInvites.set(store, active = new Set());
+  return active;
+}
+
 export async function inviteRemote(
   roomId: string,
   sender: string,
@@ -149,158 +225,310 @@ export async function inviteRemote(
     user: sender,
     what: 'invite',
   });
-  // author the invite event (our signature), outside the room lock —
-  // a stale prev is harmless (the resolver orders forks)
   const content: Record<string, unknown> = { membership: 'invite' };
   if (reason !== undefined) content.reason = reason;
   if (opts?.isDirect === true) content.is_direct = true;
-  const version = await room.tx(async (tx) => {
-    const stay = await tx.segments.openStay();
-    if (stay === null) throw new MatrixError(404, 'M_NOT_FOUND', roomId);
-    return await roomVersionOf(tx, stay.id);
-  });
-  const permit = await prepareSigner(deps.signer);
-  const pdu = await room.tx((tx) =>
-    buildInTx(tx, roomId, {
-      type: 'm.room.member',
-      state_key: target,
-      sender,
-      content,
-      origin_server_ts: Date.now(),
-    }, permit)
+  // Capture authority before the lock/room transaction, but do not require a new
+  // signing permit when continuing previously prepared work.
+  const existing = await deps.server.query(
+    'SELECT * FROM federation_invite_attempts WHERE room_id=? AND sender=? AND target=?',
+    [roomId, sender, target],
   );
-  const eventId = String(pdu.event_id);
-  const inviteRoomState = await prejoinState(room, sender);
-  let merged: Pdu;
+  const replacing = existing.length > 0 && existing[0].status === 'refused' &&
+    canonicalJson(outboundInvite(existing[0]).request.event.content) !==
+      canonicalJson(content);
+  const continuing = existing.length > 0 && !replacing;
+  const admission = continuing
+    ? undefined
+    : await deps.prepareRoomScope?.(roomId, false, sender);
+  const permit = continuing ? null : await prepareSigner(deps.signer);
+  const attempt = await withRoomLock(roomId, async () => {
+    if (await deps.store.roomRetired(roomId)) {
+      throw new MatrixError(404, 'M_NOT_FOUND', 'room removal is pending');
+    }
+    const rows = await deps.server.query(
+      'SELECT * FROM federation_invite_attempts WHERE room_id=? AND sender=? AND target=?',
+      [roomId, sender, target],
+    );
+    let saved: OutboundInvite;
+    const replace = rows.length > 0 && rows[0].status === 'refused' &&
+      canonicalJson(outboundInvite(rows[0]).request.event.content) !==
+        canonicalJson(content);
+    if (
+      rows.length && invitePerformers(deps.store).has(String(rows[0].event_id))
+    ) {
+      throw new MatrixError(409, 'M_BAD_STATE', 'Remote invite is active');
+    }
+    if (rows.length && !replace) {
+      saved = outboundInvite(rows[0]);
+      if (
+        canonicalJson(saved.request.event.content) !== canonicalJson(content)
+      ) {
+        throw new MatrixError(
+          409,
+          'M_BAD_STATE',
+          'A different remote invite is pending',
+        );
+      }
+    } else {
+      if (permit === null) {
+        throw new MatrixError(
+          409,
+          'M_BAD_STATE',
+          'Remote invite completed concurrently',
+        );
+      }
+      const { version, pdu } = await room.tx((tx) =>
+        withMembershipFence(admission, tx, async () => {
+          await assertAcl(tx, remote);
+          await assertAcl(tx, deps.self);
+          const stay = await tx.segments.openStay();
+          if (stay === null) throw new MatrixError(404, 'M_NOT_FOUND', roomId);
+          const version = await roomVersionOf(tx, stay.id);
+          const pdu = await buildInTx(tx, roomId, {
+            type: 'm.room.member',
+            state_key: target,
+            sender,
+            content,
+            origin_server_ts: Date.now(),
+          }, permit);
+          // Local authorization precedes the remote side effect. The builder
+          // signs bytes; it does not by itself authorize their membership change.
+          const group = await tx.state.current(stay.id);
+          const current = group === null
+            ? new Map<string, string>()
+            : await tx.state.groupMap(group);
+          const evidence = await loadRulebookStore(tx, [...current.values()], [
+            pdu,
+          ]);
+          const rulebook = getRulebook(version);
+          const createId = current.get('m.room.create\0');
+          if (
+            !checkDeclaredAuth(
+              pdu,
+              rulebook,
+              evidence,
+              createId == null ? null : createId,
+            ).ok || !rulebook.checkAuthAgainstState(pdu, current, evidence).ok
+          ) {
+            throw new MatrixError(
+              403,
+              'M_FORBIDDEN',
+              'Remote invite is not authorized locally',
+            );
+          }
+          return { version, pdu };
+        })
+      );
+      const request = {
+        room_version: version,
+        event: toWire(pdu, version),
+        invite_room_state: await prejoinState(room, sender),
+      };
+      saved = {
+        roomId,
+        sender,
+        target,
+        eventId: String(pdu.event_id),
+        destination: remote,
+        request,
+        response: null,
+      };
+      await deps.server.tx(async (tx) => {
+        await admission?.check(tx);
+        await withMembershipFence(admission, tx, async () => {
+          if (replace) {
+            const removed = await tx.execute(
+              "DELETE FROM federation_invite_attempts WHERE event_id=? AND status='refused'",
+              [String(rows[0].event_id)],
+            );
+            if (removed !== 1) {
+              throw new MatrixError(
+                409,
+                'M_BAD_STATE',
+                'Remote invite refusal changed',
+              );
+            }
+          }
+          await tx.execute(
+            "INSERT INTO federation_invite_attempts(room_id,sender,target,event_id,destination,request_json,status,added_ms) VALUES(?,?,?,?,?,?,'pending',?)",
+            [
+              roomId,
+              sender,
+              target,
+              saved.eventId,
+              remote,
+              JSON.stringify(request),
+              Date.now(),
+            ],
+          );
+        });
+      });
+    }
+    if (invitePerformers(deps.store).has(saved.eventId)) {
+      throw new MatrixError(409, 'M_BAD_STATE', 'Remote invite is active');
+    }
+    await deps.server.execute(
+      "UPDATE federation_invite_attempts SET status='pending' WHERE event_id=? AND status IN ('failed','refused')",
+      [saved.eventId],
+    );
+    invitePerformers(deps.store).add(saved.eventId);
+    return saved;
+  });
   try {
-    const res = await federationRequest(deps.server, deps.signer, {
-      room: { store: deps.store, id: roomId, participation: true },
-      destination: remote,
-      method: 'PUT',
-      path: `/_matrix/federation/v2/invite/${encodeURIComponent(roomId)}/${
-        encodeURIComponent(eventId)
-      }`,
-      body: new TextEncoder().encode(
-        JSON.stringify({
-          room_version: version,
-          event: toWire(pdu, version),
-          invite_room_state: inviteRoomState,
-        }),
-      ),
+    return await performOutboundInvite(attempt, deps);
+  } finally {
+    invitePerformers(deps.store).delete(attempt.eventId);
+    deps.wake(attempt.destination);
+  }
+}
+
+async function performOutboundInvite(
+  attempt: OutboundInvite,
+  deps: InviteDeps,
+): Promise<{ eventId: string }> {
+  const { roomId, eventId, destination: remote, request } = attempt;
+  const version = request.room_version;
+  const pdu = { ...request.event, event_id: eventId } as unknown as Pdu;
+  const room = await openRoom(deps.store, roomId);
+  // A crash after ingest but before settlement never re-authors or re-publishes.
+  const committed = await room.tx((tx) => tx.events.getStatus(eventId));
+  if (
+    committed?.standing === 'accepted' && committed.grounding === 'grounded'
+  ) {
+    await deps.server.execute(
+      'DELETE FROM federation_invite_attempts WHERE event_id=?',
+      [eventId],
+    );
+    return { eventId };
+  }
+  let refused = false;
+  try {
+    let merged = attempt.response;
+    if (merged === null) {
+      const res = await federationRequest(deps.server, deps.signer, {
+        room: { store: deps.store, id: roomId, participation: true },
+        destination: remote,
+        method: 'PUT',
+        path: `/_matrix/federation/v2/invite/${encodeURIComponent(roomId)}/${
+          encodeURIComponent(eventId)
+        }`,
+        body: new TextEncoder().encode(JSON.stringify(request)),
+      }).catch((error: unknown) => {
+        // Only a refusal of this submission proves non-acceptance. Key lookup
+        // failures or invalid evidence after a response remain ambiguous.
+        refused = isDefiniteFederationRefusal(error);
+        throw error;
+      });
+      merged = inviteResponse(res.json);
+    }
+    // the invitee's signature: our id unchanged, their signature verifies
+    const returnedId = await eventIdFor(
+      merged as unknown as Record<string, unknown>,
+      version,
+    );
+    merged.event_id = eventId;
+    if (
+      returnedId !== eventId || eventMaterial(merged) !== eventMaterial(pdu)
+    ) {
+      throw new UpstreamError('validation', {
+        phase: 'invite',
+        reason: 'the invitee changed the event',
+      });
+    }
+    let theirSigOk = false;
+    const mergedSigs = merged.signatures == null ? {} : merged.signatures;
+    const remoteKids = mergedSigs[remote] == null ? {} : mergedSigs[remote];
+    for (const kid of Object.keys(remoteKids)) {
+      if (
+        await deps.keys.verifyEventSignature({
+          server: remote,
+          keyId: kid,
+          pdu: merged,
+          roomVersion: version,
+          minValidUntilMs: 0,
+        })
+      ) {
+        theirSigOk = true;
+        break;
+      }
+    }
+    if (!theirSigOk) {
+      throw new UpstreamError('validation', {
+        phase: 'invite',
+        reason: 'bad invitee signature',
+      });
+    }
+    (merged as unknown as Record<string, unknown>).event_id = eventId;
+    // merge signatures (ours is already on the event — author signed it)
+    const ours = pdu.signatures == null ? {} : pdu.signatures;
+    for (const [server, signatures] of Object.entries(ours)) {
+      merged.signatures[server] = {
+        ...merged.signatures[server],
+        ...signatures,
+      };
+    }
+    const retained = await deps.server.execute(
+      'UPDATE federation_invite_attempts SET response_json=? WHERE event_id=?',
+      [JSON.stringify(merged), eventId],
+    );
+    if (retained !== 1) {
+      throw new MatrixError(
+        409,
+        'M_BAD_STATE',
+        'Remote invite was removed during dispatch',
+      );
+    }
+    // ingest as our own (we authored it — the strict local checks apply),
+    // so outbox rows go to the room's servers as for any local event; the
+    // invitee's server receives it only if it already has joined members
+    // (invites-v2.yaml:40-42)
+    const ingested = await ingestLocal(room, merged, deps.self, async (tx) => {
+      await assertAcl(tx, remote);
+      await assertAcl(tx, deps.self);
     });
-    merged = inviteResponse(res.json);
+    if (ingested.standing !== 'accepted') {
+      await deps.server.execute(
+        "UPDATE federation_invite_attempts SET status='failed' WHERE event_id=?",
+        [eventId],
+      );
+      throw new MatrixError(
+        403,
+        'M_FORBIDDEN',
+        'Remote invite no longer authorized locally',
+      );
+    }
+    await deps.server.execute(
+      'DELETE FROM federation_invite_attempts WHERE event_id=?',
+      [eventId],
+    );
+    return { eventId };
   } catch (e) {
-    // only 400 M_MISSING_PARAM becomes a 5xx to our client
-    // (invites-v2.yaml:171-173). Typed peer errors and local failures keep
-    // their provenance; public rendering owns the eventual HTTP mapping.
+    // Both outcomes remain inspectable without autonomous retry. Only an exact
+    // submission refusal allows a fresh, newly authorized event with new content.
+    if (
+      (e instanceof FederationHttpError && e.remoteStatus < 500) ||
+      (e instanceof UpstreamError && e.category === 'validation')
+    ) {
+      await deps.server.execute(
+        'UPDATE federation_invite_attempts SET status=? WHERE event_id=?',
+        [refused ? 'refused' : 'failed', eventId],
+      );
+    }
     if (
       e instanceof FederationHttpError && e.remoteStatus === 400 &&
       e.matrixBody && e.errcode === 'M_MISSING_PARAM'
     ) {
-      throw new MatrixError(
-        502,
-        'M_UNKNOWN',
-        String(e.responseBody().error),
-      );
+      throw new MatrixError(502, 'M_UNKNOWN', String(e.responseBody().error));
     }
-    throw e; // 403 M_FORBIDDEN and 400 M_INCOMPATIBLE_ROOM_VERSION pass through
+    throw e;
   }
-  // the invitee's signature: our id unchanged, their signature verifies
-  const returnedId = await eventIdFor(
-    merged as unknown as Record<string, unknown>,
-    version,
-  );
-  if (returnedId !== eventId) {
-    throw new UpstreamError('validation', {
-      phase: 'invite',
-      reason: 'the invitee changed the event',
-    });
-  }
-  let theirSigOk = false;
-  const mergedSigs = merged.signatures == null ? {} : merged.signatures;
-  const remoteKids = mergedSigs[remote] == null ? {} : mergedSigs[remote];
-  for (const kid of Object.keys(remoteKids)) {
-    if (
-      await deps.keys.verifyEventSignature({
-        server: remote,
-        keyId: kid,
-        pdu: merged,
-        roomVersion: version,
-        minValidUntilMs: 0,
-      })
-    ) {
-      theirSigOk = true;
-      break;
-    }
-  }
-  if (!theirSigOk) {
-    throw new UpstreamError('validation', {
-      phase: 'invite',
-      reason: 'bad invitee signature',
-    });
-  }
-  (merged as unknown as Record<string, unknown>).event_id = eventId;
-  // merge signatures (ours is already on the event — author signed it)
-  const ours = pdu.signatures == null ? {} : pdu.signatures;
-  merged.signatures = {
-    ...(merged.signatures == null ? {} : merged.signatures),
-    ...ours,
-  };
-  // ingest as our own (we authored it — the strict local checks apply),
-  // so outbox rows go to the room's servers as for any local event; the
-  // invitee's server receives it only if it already has joined members
-  // (invites-v2.yaml:40-42)
-  await ingestLocal(room, merged, deps.self, async (tx) => {
-    await assertAcl(tx, remote);
-    await assertAcl(tx, deps.self);
-  });
-  return { eventId };
 }
 
 // --- INVITEE ---------------------------------------------------------------
 
-export type StoredInvite = {
-  kind: 'invite' | 'knock';
-  revision: number;
-  candidates: string[];
-  expiresMs: number | null;
-  leaveJson: string | null;
-  localLeaveJson: string | null;
-  roomId: string;
-  userId: string;
-  eventId: string;
-  roomVersion: string;
-  eventJson: string;
-  inviteRoomState: string;
-  origin: string;
-  receivedMs: number;
-  status: string;
-  seq: number;
-};
-
-// deno-lint-ignore no-explicit-any
-export function inviteOf(row: any): StoredInvite {
-  return {
-    kind: row.kind,
-    revision: Number(row.revision),
-    candidates: JSON.parse(String(row.candidates)),
-    expiresMs: row.expires_ms === null ? null : Number(row.expires_ms),
-    leaveJson: row.leave_json === null ? null : String(row.leave_json),
-    localLeaveJson: row.local_leave_json == null
-      ? null
-      : String(row.local_leave_json),
-    roomId: String(row.room_id),
-    userId: String(row.user_id),
-    eventId: String(row.event_id),
-    roomVersion: String(row.room_version),
-    eventJson: String(row.event_json),
-    inviteRoomState: String(row.invite_room_state),
-    origin: String(row.origin),
-    receivedMs: Number(row.received_ms),
-    status: String(row.status),
-    seq: Number(row.seq),
-  };
-}
+export type StoredInvite = PrejoinWork;
+export const inviteOf = prejoinWorkOf;
 
 export async function inviteFor(
   roomId: string,
@@ -345,13 +573,23 @@ export async function invitesOf(
 }
 
 // Do we participate in the room (a room file with an open stay)?
-async function participating(store: Store, roomId: string): Promise<boolean> {
+async function participating(
+  deps: InviteDeps,
+  roomId: string,
+): Promise<boolean> {
   let room: Room;
   try {
-    room = await openRoom(store, roomId);
+    room = await openRoom(deps.store, roomId);
   } catch (e) {
-    if (e instanceof Deno.errors.NotFound) return false;
-    throw e;
+    if (!(e instanceof Deno.errors.NotFound)) throw e;
+    if (!deps.prepareRoomScope) return false;
+    try {
+      await deps.prepareRoomScope(roomId);
+    } catch (error) {
+      if (error instanceof MatrixError && error.status === 404) return false;
+      throw error;
+    }
+    throw new MatrixError(503, 'M_UNAVAILABLE', 'room replica unavailable');
   }
   return await room.tx(async (tx) => (await tx.segments.openStay()) !== null);
 }
@@ -364,7 +602,17 @@ export async function receiveInvite(
   origin: string,
   deps: InviteDeps,
 ): Promise<Record<string, unknown>> {
-  await assertRoomAcl(deps.store, roomId, origin);
+  const operation = canonicalJson([origin, 'invite', roomId, eventId]);
+  // Keep new-work ACL ordering, but completed authenticated work remains
+  // replayable after a later ACL change, departure or room removal.
+  const completed = (await deps.server.query(
+    'SELECT 1 FROM membership_operations WHERE operation=?',
+    [operation],
+  )).length !== 0;
+  let admission = completed
+    ? undefined
+    : await deps.prepareRoomScope?.(roomId, true);
+  if (!completed) await assertRoomAcl(deps.store, roomId, origin);
   const body = (raw == null ? {} : raw) as {
     room_version?: unknown;
     event?: unknown;
@@ -404,6 +652,9 @@ export async function receiveInvite(
   const target = String(pdu.state_key == null ? '' : pdu.state_key);
   if (!target.endsWith(':' + deps.self)) {
     throw new MatrixError(400, 'M_BAD_JSON', 'state_key is not a local user');
+  }
+  if (!completed) {
+    admission = await deps.prepareRoomScope?.(roomId, true, target);
   }
   if (domainOf(String(pdu.sender)) !== origin) {
     throw new MatrixError(400, 'M_BAD_JSON', 'sender is not the origin');
@@ -445,6 +696,16 @@ export async function receiveInvite(
     throw new MatrixError(403, 'M_FORBIDDEN', 'bad signature');
   }
   (pdu as unknown as Record<string, unknown>).event_id = eventId;
+  const inputHash = createHash('sha256').update(canonicalJson([
+    roomVersion,
+    eventMaterial(pdu),
+  ])).digest('hex');
+  const retained = await prejoinResult(deps.server, operation, inputHash);
+  if (retained !== null) return retained;
+  if (admission === undefined) {
+    admission = await deps.prepareRoomScope?.(roomId, true, target);
+  }
+  if (admission) await deps.server.tx(admission.check);
   // Full create validation is shared with knocks. Legacy malformed hints are
   // filtered; v12 identity is strict. TODO Admin UI: compatibility warning.
   const stripped = await validatePrejoin(
@@ -454,36 +715,75 @@ export async function receiveInvite(
     deps.keys,
   );
   // countersign and answer
-  await verify(pdu, roomVersion, deps.keys, { roomId }).catch((error) => {
-    if (!recoverableUpstream(error)) throw error;
-    throw new MatrixError(403, 'M_FORBIDDEN', String(error));
-  });
-  await countersign(pdu, roomVersion, deps.signer);
+  const prepared = await verify(pdu, roomVersion, deps.keys, { roomId }).catch(
+    (error) => {
+      if (!recoverableUpstream(error)) throw error;
+      throw new MatrixError(403, 'M_FORBIDDEN', String(error));
+    },
+  );
+  const signed = prepared.pdu;
+  const permit = await prepareSigner(deps.signer);
+  await countersign(signed, roomVersion, permit);
+  admission?.checkCurrent();
+  const response = { event: toWire(signed, roomVersion) };
   // store: a room we HOLD does nothing else (the event arrives by /send
   // too, invites-v2.yaml:40-42); otherwise the out-of-band row so the
   // invitee sees it
-  await withRoomLock(roomId, () =>
+  return await withRoomLock(roomId, () =>
     withProjectionLock(async () => {
+      const retained = await prejoinResult(deps.server, operation, inputHash);
+      if (retained !== null) return retained;
+      if (admission) await deps.server.tx(admission.check);
       await assertRoomAcl(deps.store, roomId, origin);
       if (await deps.store.roomRetired(roomId)) {
         throw new MatrixError(404, 'M_NOT_FOUND', 'room removal is pending');
       }
-      if (await participating(deps.store, roomId)) return;
-      const publication = await prepareInvitePush(deps.store, deps.self, pdu);
+      if (await participating(deps, roomId)) {
+        return await deps.server.tx(async (tx) => {
+          await admission?.check(tx);
+          const result = await savePrejoinResult(
+            tx,
+            operation,
+            roomId,
+            inputHash,
+            response,
+          );
+          admission?.checkCurrent();
+          return result;
+        });
+      }
+      const publication = await prepareInvitePush(
+        deps.store,
+        deps.self,
+        signed,
+      );
       const now = Date.now();
-      await eventStreamTx(deps.server, async (tx) => {
+      return await eventStreamTx(deps.server, async (tx) => {
+        await admission?.check(tx);
+        const finish = async () => {
+          const result = await savePrejoinResult(
+            tx,
+            operation,
+            roomId,
+            inputHash,
+            response,
+          );
+          admission?.checkCurrent();
+          return result;
+        };
         const evaluated = await tx.query(
           'SELECT 1 FROM push_evaluations WHERE tenant=? AND user=? AND event=?',
           [deps.self, target, eventId],
         );
-        if (evaluated.length) return;
+        if (evaluated.length) return await finish();
         const previous = await tx.query(
           'SELECT event_id FROM prejoin_memberships WHERE room_id=? AND user_id=?',
           [roomId, target],
         );
         // Redelivery is not a new invitation, including after local rejection.
-        if (previous[0]?.event_id === eventId) return;
-        if (deps.signer.admit) tx.admit(deps.signer.admit);
+        if (previous[0]?.event_id === eventId) return await finish();
+        if (permit.admit) tx.admit(permit.admit);
+        await recordMembershipOperation(tx, roomId, target);
         if (previous.length) {
           await withdrawInvitePush(
             tx,
@@ -506,7 +806,7 @@ export async function receiveInvite(
             target,
             eventId,
             roomVersion,
-            JSON.stringify(pdu),
+            JSON.stringify(signed),
             JSON.stringify(stripped),
             origin,
             now,
@@ -514,9 +814,11 @@ export async function receiveInvite(
           ],
         );
         await applyInvitePush(tx, roomId, eventId, seq, publication, now);
+        await recordMembershipOperation(tx, roomId, target);
+        await supersedePrejoinKnocks(tx, roomId, target);
+        return await finish();
       });
     }));
-  return { event: toWire(pdu, roomVersion) };
 }
 
 // --- REJECT (ruling F) -----------------------------------------------------
@@ -540,52 +842,92 @@ export function candidatesOf(invite: StoredInvite, self: string): string[] {
 }
 
 // POST /rooms/#roomId/leave on a federation_invites room: local effect
-// at once (the row goes 'rejecting') — the intent itself is durable in
-// the row; the sender's loop performs the dance.
+// at once (the display goes 'rejecting'). The same transaction retains the
+// exact independent local job; the sender's loop performs the dance.
 export async function rejectInviteRemote(
   roomId: string,
   userId: string,
-  deps: Pick<InviteDeps, 'store' | 'server' | 'signer' | 'self' | 'wake'>,
+  deps: Pick<
+    InviteDeps,
+    'store' | 'server' | 'signer' | 'self' | 'wake' | 'prepareRoomScope'
+  >,
   reason?: string,
 ): Promise<void> {
-  const candidates = await inviteTransition(deps.server, async (tx) => {
+  const candidates = await withProjectionLock(async () => {
+    // The request signer reads durable server authority. Capture it before the
+    // server transaction, only when this lifecycle still needs a new departure.
+    // Prepared departures remain replayable without renewing signing authority.
     if (await deps.store.roomRetired(roomId)) {
       throw new MatrixError(404, 'M_NOT_FOUND', 'room removal is pending');
     }
-    const rows = await tx.query(
-      'SELECT * FROM prejoin_memberships WHERE room_id=? AND user_id=?',
+    const snapshot = await deps.server.query(
+      'SELECT status FROM prejoin_memberships WHERE room_id=? AND user_id=?',
       [roomId, userId],
     );
-    const invite = rows.length === 0 ? null : inviteOf(rows[0]);
-    if (invite === null || invite.status === 'joined') {
-      throw new MatrixError(404, 'M_NOT_FOUND', 'no invite to reject');
-    }
-    // Client retries and durable account cleanup share this transition owner.
-    // Never replace a prepared departure or restart its remote intent/revision.
-    if (['rejecting', 'rejected', 'failed-retract'].includes(invite.status)) {
-      return invite.status === 'rejecting'
-        ? candidatesOf(invite, deps.self)
-        : [];
-    }
-    if (deps.signer.admit) tx.admit(deps.signer.admit);
-    await withdrawInvitePush(tx, userId, roomId, invite.eventId);
-    const localLeave = await buildLocalPrejoinLeave(
-      invite,
-      deps.signer,
-      reason,
-    );
-    const seq = await nextEventSeq(tx);
-    await tx.execute(
-      "UPDATE prejoin_memberships SET status = 'rejecting', revision=revision+1, leave_json=NULL, local_leave_json=?, seq = ?, expires_ms=CASE WHEN kind='knock' THEN ? ELSE NULL END WHERE room_id = ? AND user_id = ?",
-      [
-        JSON.stringify(localLeave),
-        seq,
-        Date.now() + config().federation.refusedmillihours * 3600,
-        roomId,
-        userId,
-      ],
-    );
-    return candidatesOf(invite, deps.self);
+    const fresh = snapshot.length &&
+      !['joined', 'rejecting', 'rejected', 'failed-retract'].includes(
+        String(snapshot[0].status),
+      );
+    const admission = fresh
+      ? await deps.prepareRoomScope?.(roomId, true, userId)
+      : undefined;
+    const prepared = fresh ? await prepareSigner(deps.signer) : null;
+    return await eventStreamTx(deps.server, async (tx) => {
+      if (await deps.store.roomRetired(roomId)) {
+        throw new MatrixError(404, 'M_NOT_FOUND', 'room removal is pending');
+      }
+      const rows = await tx.query(
+        'SELECT * FROM prejoin_memberships WHERE room_id=? AND user_id=?',
+        [roomId, userId],
+      );
+      const invite = rows.length === 0 ? null : inviteOf(rows[0]);
+      if (invite === null || invite.status === 'joined') {
+        throw new MatrixError(404, 'M_NOT_FOUND', 'no invite to reject');
+      }
+      // Client retries and durable account cleanup share this transition owner.
+      // Never replace a prepared departure or restart its remote intent/revision.
+      if (['rejecting', 'rejected', 'failed-retract'].includes(invite.status)) {
+        return invite.status === 'rejecting'
+          ? candidatesOf(invite, deps.self)
+          : [];
+      }
+      if (prepared === null) {
+        throw new MatrixError(
+          409,
+          'M_BAD_STATE',
+          'membership changed during rejection',
+        );
+      }
+      if (prepared.admit) tx.admit(prepared.admit);
+      await admission?.check(tx);
+      return await withMembershipFence(admission, tx, async () => {
+        await recordMembershipOperation(tx, roomId, userId);
+        await withdrawInvitePush(tx, userId, roomId, invite.eventId);
+        const localLeave = await buildLocalPrejoinLeave(
+          invite,
+          prepared,
+          reason,
+        );
+        const seq = await nextEventSeq(tx);
+        await tx.execute(
+          "UPDATE prejoin_memberships SET status = 'rejecting', revision=revision+1, leave_json=NULL, local_leave_json=?, seq = ?, expires_ms=CASE WHEN kind='knock' THEN ? ELSE NULL END WHERE room_id = ? AND user_id = ?",
+          [
+            JSON.stringify(localLeave),
+            seq,
+            Date.now() + config().federation.refusedmillihours * 3600,
+            roomId,
+            userId,
+          ],
+        );
+        await recordMembershipOperation(tx, roomId, userId);
+        const [pending] = await tx.query(
+          'SELECT * FROM prejoin_memberships WHERE room_id=? AND user_id=?',
+          [roomId, userId],
+        );
+        await createPrejoinJob(tx, inviteOf(pending));
+        return candidatesOf(invite, deps.self);
+      });
+    });
   });
   // nothing ingested an event — wake the first candidate's loop directly
   if (candidates.length) deps.wake(candidates[0]);
@@ -640,8 +982,17 @@ export async function prejoinDeparture(
   }
   // Existing installations may have a pending intent without a local event.
   // Materialize once under the same revision owner; never synthesize per read.
-  return await withProjectionLock(() =>
-    deps.server.tx(async (tx) => {
+  return await withProjectionLock(async () => {
+    const snapshot = await deps.server.query(
+      'SELECT local_leave_json FROM prejoin_memberships WHERE room_id=? AND user_id=? AND revision=? AND seq=?',
+      [invite.roomId, invite.userId, invite.revision, invite.seq],
+    );
+    if (snapshot.length === 0) return null;
+    if (snapshot[0].local_leave_json != null) {
+      return JSON.parse(String(snapshot[0].local_leave_json)) as Pdu;
+    }
+    const prepared = await prepareSigner(deps.signer);
+    return await deps.server.tx(async (tx) => {
       const rows = await tx.query(
         'SELECT local_leave_json FROM prejoin_memberships WHERE room_id=? AND user_id=? AND revision=? AND seq=?',
         [invite.roomId, invite.userId, invite.revision, invite.seq],
@@ -650,8 +1001,9 @@ export async function prejoinDeparture(
       if (rows[0]?.local_leave_json != null) {
         return JSON.parse(String(rows[0].local_leave_json)) as Pdu;
       }
-      if (deps.signer.admit) tx.admit(deps.signer.admit);
-      const signed = await buildLocalPrejoinLeave(invite, deps.signer);
+      await recordMembershipOperation(tx, invite.roomId, invite.userId);
+      if (prepared.admit) tx.admit(prepared.admit);
+      const signed = await buildLocalPrejoinLeave(invite, prepared);
       await tx.execute(
         'UPDATE prejoin_memberships SET local_leave_json=? WHERE room_id=? AND user_id=? AND revision=? AND seq=?',
         [
@@ -662,9 +1014,10 @@ export async function prejoinDeparture(
           invite.seq,
         ],
       );
+      await recordMembershipOperation(tx, invite.roomId, invite.userId);
       return signed;
-    })
-  );
+    });
+  });
 }
 
 // The reject-invite performer (ruling F): make_leave → fill → sign →
@@ -774,114 +1127,153 @@ export async function sendRemoteLeave(
 
 async function performRejectInvite(
   destination: string,
-  invite: StoredInvite,
+  job: PrejoinJob,
   deps: InviteDeps,
 ): Promise<void> {
+  const invite = job.work;
+  const releaseJob = beginPrejoinJob(deps.store, invite);
+  if (releaseJob === null) return;
   const release = beginPrejoinLeave(deps.store, invite.roomId, invite.userId);
   try {
+    const prepared = invite.leaveJson === null
+      ? await prepareSigner(deps.signer)
+      : null;
     const signed = invite.leaveJson === null
-      ? await prepareRemoteLeave(destination, invite, deps)
+      ? await prepareRemoteLeave(destination, invite, {
+        ...deps,
+        signer: prepared!,
+      })
       : JSON.parse(invite.leaveJson) as Pdu;
     const active = await inviteTransition(deps.server, async (tx) => {
-      const rows = await tx.query(
-        `SELECT 1 FROM prejoin_memberships p WHERE room_id=? AND user_id=? AND revision=? AND status='rejecting' AND ${
-          visiblePrejoin('p')
-        }`,
-        [invite.roomId, invite.userId, invite.revision],
-      );
-      if (!rows.length) return false;
-      if (invite.leaveJson === null && deps.signer.admit) {
-        tx.admit(deps.signer.admit);
-      }
-      await tx.execute(
-        'UPDATE prejoin_memberships SET leave_json=? WHERE room_id=? AND user_id=? AND revision=?',
-        [JSON.stringify(signed), invite.roomId, invite.userId, invite.revision],
-      );
-      return true;
+      if (prepared?.admit) tx.admit(prepared.admit);
+      return await updatePrejoinJob(tx, job, {
+        ...invite,
+        leaveJson: JSON.stringify(signed),
+      }, false);
     });
     if (!active) return;
     await sendRemoteLeave(destination, signed, invite.roomVersion, deps);
-    const { roomId, userId } = invite;
     // delivered: the row becomes 'rejected', and the SIGNED LEAVE becomes
     // the rendered event — the out-of-band leave section of /sync carries
     // it in state.events (stage 5; SyncLeftFrom wants a leave event there)
     await inviteTransition(deps.server, async (tx) => {
-      const pending = await tx.query(
-        `SELECT (${
-          visiblePrejoin('p')
-        }) AS visible FROM prejoin_memberships p WHERE room_id=? AND user_id=? AND event_id=? AND revision=? AND status='rejecting'`,
-        [roomId, userId, invite.eventId, invite.revision],
-      );
-      if (pending.length === 0) return;
-      if (Number(pending[0].visible) !== 1) {
-        await tx.execute(
-          "UPDATE prejoin_memberships SET status='rejected' WHERE room_id=? AND user_id=?",
-          [roomId, userId],
-        );
-        return;
-      }
-      const seq = await nextEventSeq(tx);
-      await tx.execute(
-        "UPDATE prejoin_memberships SET status = 'rejected', event_json = ?, seq = ? WHERE room_id = ? AND user_id = ?",
-        [
-          JSON.stringify(signed as unknown as Record<string, unknown>),
-          seq,
-          roomId,
-          userId,
-        ],
-      );
+      await updatePrejoinJob(tx, active, {
+        ...active.work,
+        status: 'rejected',
+        eventJson: JSON.stringify(signed),
+      }, true);
     });
   } finally {
     release();
+    releaseJob();
   }
 }
 
-// The sender's intent provider: 'rejecting' invites are the durable
-// intents; the current candidate index is in-memory (a restart resumes
+// The sender's intent provider reads local jobs, never imported display rows.
+// The current candidate index is in-memory (a restart resumes
 // from the inviter). One job per destination per wake.
 export function inviteIntentProvider(
   deps: InviteDeps,
 ): ReviewableIntentProvider {
   const progress: InviteProgress = new Map();
   const provider = async (server: Db, destination: string) => {
-    const rows = await server.query(
-      `SELECT * FROM prejoin_memberships p WHERE status IN ('rejecting','attempting') AND ${
-        visiblePrejoin('p')
-      } ORDER BY received_ms`,
-      [],
+    const outgoing = await server.query(
+      "SELECT * FROM federation_invite_attempts WHERE destination=? AND status='pending' ORDER BY added_ms,event_id",
+      [destination],
     );
-    for (const raw of rows) {
-      const invite = inviteOf(raw);
+    for (const row of outgoing) {
+      const attempt = outboundInvite(row);
+      if (
+        invitePerformers(deps.store).has(attempt.eventId) ||
+        await deps.store.roomRetired(attempt.roomId)
+      ) continue;
+      return {
+        id: 'invite:' + attempt.eventId,
+        run: async () => {
+          const claimed = await withRoomLock(attempt.roomId, async () => {
+            if (
+              await deps.store.roomRetired(attempt.roomId) ||
+              invitePerformers(deps.store).has(attempt.eventId)
+            ) return null;
+            const [current] = await server.query(
+              "SELECT * FROM federation_invite_attempts WHERE event_id=? AND status='pending'",
+              [attempt.eventId],
+            );
+            if (!current) return null;
+            invitePerformers(deps.store).add(attempt.eventId);
+            return outboundInvite(current);
+          });
+          if (!claimed) return;
+          try {
+            await admit(server, destination, {
+              kind: 'outbound',
+              user: claimed.sender,
+              what: 'intent:invite',
+            });
+            await performOutboundInvite(claimed, deps);
+          } finally {
+            invitePerformers(deps.store).delete(attempt.eventId);
+          }
+        },
+        failed: async () => {},
+      } satisfies IntentJob;
+    }
+    for (const pending of await prejoinJobs(server)) {
+      if (prejoinJobActive(deps.store, pending.work)) continue;
+      if (
+        !prejoinLeaveActive(
+          deps.store,
+          pending.work.roomId,
+          pending.work.userId,
+        )
+      ) {
+        await inviteTransition(
+          server,
+          (tx) =>
+            settleSupersededPrejoin(
+              tx,
+              pending.work.roomId,
+              pending.work.userId,
+            ),
+        );
+      }
+      const job = await prejoinJob(server, pending.id);
+      if (!job || !['rejecting', 'attempting'].includes(job.work.status)) {
+        continue;
+      }
+      const invite = job.work;
       if (await deps.store.roomRetired(invite.roomId)) continue;
       if (invite.expiresMs !== null && Date.now() >= invite.expiresMs) {
         await inviteTransition(
           server,
-          (tx) =>
-            tx.execute(
-              'UPDATE prejoin_memberships SET status=? WHERE room_id=? AND user_id=? AND revision=? AND status=?',
-              [
-                invite.status === 'attempting'
+          async (tx) => {
+            return await updatePrejoinJob(
+              tx,
+              job,
+              {
+                ...invite,
+                status: invite.status === 'attempting'
                   ? 'failed-attempt'
                   : 'failed-retract',
-                invite.roomId,
-                invite.userId,
-                invite.revision,
-                invite.status,
-              ],
-            ),
+              },
+              true,
+              false,
+            );
+          },
         );
         continue;
       }
       if (invite.status === 'attempting') {
         if (invite.origin !== destination) continue;
         return {
-          id: 'knock-attempt:' +
-            JSON.stringify([invite.roomId, invite.userId, invite.revision]),
-          run: () => performKnockAttempt(invite, deps),
+          id: 'knock-attempt:' + job.id,
+          run: async () => {
+            await performKnockAttempt(invite, deps);
+          },
           failed: async () => {},
         } satisfies IntentJob;
       }
-      const key = JSON.stringify([invite.roomId, invite.userId]);
+      const key = job.id;
       const candidates = candidatesOf(invite, deps.self);
       const at = candidateIndex(invite, progress);
       if (candidates[at] !== destination) continue;
@@ -890,11 +1282,10 @@ export function inviteIntentProvider(
         run: async () => {
           const active = await withProjectionLock(async () => {
             if (await deps.store.roomRetired(invite.roomId)) return false;
-            const current = await inviteFor(invite.roomId, invite.userId, deps);
-            return current?.eventId === invite.eventId &&
-              current.revision === invite.revision &&
-              current.status === 'rejecting' &&
-              candidateIndex(current, progress) === at;
+            const current = await prejoinJob(server, job.id);
+            return current?.work.revision === invite.revision &&
+              current.work.status === 'rejecting' &&
+              candidateIndex(current.work, progress) === at;
           });
           if (!active) return;
           await admit(server, destination, {
@@ -902,18 +1293,13 @@ export function inviteIntentProvider(
             user: invite.userId,
             what: 'intent:reject-invite',
           });
-          await performRejectInvite(destination, invite, deps);
-          await withProjectionLock(async () => {
-            const current = await inviteFor(invite.roomId, invite.userId, deps);
-            if (current === null || current.eventId === invite.eventId) {
-              progress.delete(key);
-            }
-          });
+          await performRejectInvite(destination, job, deps);
+          progress.delete(key);
         },
         failed: () =>
           withProjectionLock(async () => {
             if (await deps.store.roomRetired(invite.roomId)) return;
-            const current = await inviteFor(invite.roomId, invite.userId, deps);
+            const current = (await prejoinJob(server, job.id))?.work;
             if (
               current?.eventId !== invite.eventId ||
               current.revision !== invite.revision ||
@@ -948,7 +1334,7 @@ function candidateIndex(
   invite: StoredInvite,
   progress: InviteProgress,
 ): number {
-  const entry = progress.get(JSON.stringify([invite.roomId, invite.userId]));
+  const entry = progress.get(prejoinJobId(invite));
   return entry?.eventId === invite.eventId ? entry.at : 0;
 }
 
@@ -958,37 +1344,54 @@ export async function listRejectIntents(
   self: string,
   progress: InviteProgress = new Map(),
 ): Promise<ReviewIntent[]> {
-  const rows = await server.query(
-    `SELECT * FROM prejoin_memberships p WHERE status IN ('rejecting','failed-retract','attempting','failed-attempt') AND ${
-      visiblePrejoin('p')
-    } ORDER BY received_ms, room_id, user_id`,
+  const jobs = await prejoinJobs(server);
+  const outgoing = await server.query(
+    'SELECT * FROM federation_invite_attempts ORDER BY added_ms,event_id',
   );
-  return rows.map((raw) => {
-    const invite = inviteOf(raw);
-    const key = JSON.stringify([invite.roomId, invite.userId]);
-    const candidates = candidatesOf(invite, self);
-    const at = candidateIndex(invite, progress);
-    return {
-      id: (invite.status === 'attempting' || invite.status === 'failed-attempt'
-        ? 'knock-attempt:'
-        : 'reject-invite:') + key,
-      destination: candidates[at],
-      kind: 'intent',
-      eventId: null,
-      intent: {
-        what: invite.kind === 'invite'
-          ? 'reject-invite'
-          : invite.status.includes('attempt')
-          ? 'knock-attempt'
-          : 'retract-knock',
-        user_id: invite.userId,
-        candidates,
-      },
-      addedMs: invite.receivedMs,
-      expiresMs: invite.expiresMs,
-      inflightTxn: null,
-    };
-  });
+  const invites: ReviewIntent[] = outgoing.map((row) => ({
+    id: 'invite:' + String(row.event_id),
+    destination: String(row.destination),
+    kind: 'intent',
+    eventId: null,
+    intent: {
+      what: 'invite',
+      user_id: String(row.sender),
+      candidates: [String(row.destination)],
+    },
+    addedMs: Number(row.added_ms),
+    expiresMs: null,
+    inflightTxn: null,
+  }));
+  return [
+    ...invites,
+    ...jobs.map((job) => {
+      const invite = job.work;
+      const key = job.id;
+      const candidates = candidatesOf(invite, self);
+      const at = candidateIndex(invite, progress);
+      return {
+        id:
+          (invite.status === 'attempting' || invite.status === 'failed-attempt'
+            ? 'knock-attempt:'
+            : 'reject-invite:') + key,
+        destination: candidates[at],
+        kind: 'intent' as const,
+        eventId: null,
+        intent: {
+          what: invite.kind === 'invite'
+            ? 'reject-invite'
+            : invite.status.includes('attempt')
+            ? 'knock-attempt'
+            : 'retract-knock',
+          user_id: invite.userId,
+          candidates,
+        },
+        addedMs: invite.receivedMs,
+        expiresMs: invite.expiresMs,
+        inflightTxn: null,
+      };
+    }),
+  ];
 }
 
 export async function pruneRejectIntents(
@@ -1003,28 +1406,36 @@ export async function pruneRejectIntents(
     );
     let count = 0;
     for (const row of rows) {
+      if (row.id.startsWith('invite:')) {
+        count += await tx.execute(
+          'DELETE FROM federation_invite_attempts WHERE event_id=?',
+          [row.id.slice('invite:'.length)],
+        );
+        continue;
+      }
       if (row.id.startsWith('knock-attempt:')) {
-        const [roomId, userId] = JSON.parse(
-          row.id.slice('knock-attempt:'.length),
-        ) as [string, string];
+        const job = await prejoinJob(tx, row.id.slice('knock-attempt:'.length));
+        if (!job) continue;
         // An ambiguous remote side effect cannot be discarded by prune. Turn
         // it into explicit compensating leave work, visible locally at once.
-        count += await tx.execute(
-          "UPDATE prejoin_memberships SET status='rejecting',revision=revision+1,seq=?,expires_ms=? WHERE room_id=? AND user_id=? AND status IN ('attempting','failed-attempt')",
-          [
-            await nextEventSeq(tx),
+        count += Number(
+          await retractPrejoinKnock(
+            tx,
+            job,
             Date.now() + config().federation.refusedmillihours * 3600,
-            roomId,
-            userId,
-          ],
+          ),
         );
         continue;
       }
       const key = row.id.slice('reject-invite:'.length);
-      const [roomId, userId] = JSON.parse(key) as [string, string];
-      count += await tx.execute(
-        "UPDATE prejoin_memberships SET status = 'rejected', revision=revision+1, seq = ? WHERE room_id = ? AND user_id = ? AND status IN ('rejecting','failed-retract')",
-        [await nextEventSeq(tx), roomId, userId],
+      const job = await prejoinJob(tx, key);
+      if (!job) continue;
+      count += Number(
+        (await updatePrejoinJob(tx, job, {
+          ...job.work,
+          status: 'rejected',
+          revision: job.work.revision + 1,
+        }, true)) !== null,
       );
       progress.delete(key);
     }
@@ -1038,23 +1449,34 @@ export async function retryPrejoinIntents(
   destination: string,
 ): Promise<void> {
   await inviteTransition(server, async (tx) => {
+    await tx.execute(
+      "UPDATE federation_invite_attempts SET status='pending' WHERE destination=? AND status IN ('failed','refused')",
+      [destination],
+    );
     const rows = await listRejectIntents(tx, self);
     for (const row of rows) {
+      if (row.id.startsWith('invite:')) continue;
       if (!row.intent.candidates.includes(destination)) continue;
       const prefix = row.id.startsWith('knock-attempt:')
         ? 'knock-attempt:'
         : 'reject-invite:';
-      const [roomId, userId] = JSON.parse(row.id.slice(prefix.length)) as [
-        string,
-        string,
-      ];
-      await tx.execute(
-        "UPDATE prejoin_memberships SET status=CASE WHEN status='failed-attempt' THEN 'attempting' ELSE 'rejecting' END,revision=revision+1,expires_ms=? WHERE room_id=? AND user_id=? AND status IN ('failed-attempt','failed-retract')",
-        [
-          Date.now() + config().federation.refusedmillihours * 3600,
-          roomId,
-          userId,
-        ],
+      const job = await prejoinJob(tx, row.id.slice(prefix.length));
+      if (
+        !job || !['failed-attempt', 'failed-retract'].includes(job.work.status)
+      ) continue;
+      await updatePrejoinJob(
+        tx,
+        job,
+        {
+          ...job.work,
+          status: job.work.status === 'failed-attempt'
+            ? 'attempting'
+            : 'rejecting',
+          revision: job.work.revision + 1,
+          expiresMs: Date.now() + config().federation.refusedmillihours * 3600,
+        },
+        true,
+        false,
       );
     }
   });
@@ -1090,6 +1512,7 @@ export async function acceptRescind(
     const stored = JSON.parse(invite.eventJson) as Record<string, unknown>;
     const inviter = typeof stored.sender === 'string' ? stored.sender : null;
     if (inviter === null || sender !== inviter) return false;
+    await recordMembershipOperation(tx, roomId, target);
     await withdrawInvitePush(tx, target, roomId, invite.eventId);
     const seq = await nextEventSeq(tx);
     await tx.execute(
@@ -1101,6 +1524,7 @@ export async function acceptRescind(
         target,
       ],
     );
+    await recordMembershipOperation(tx, roomId, target);
     return true;
   });
 }
@@ -1135,11 +1559,13 @@ export async function markInviteJoined(
       [roomId, userId],
     );
     if (rows.length === 0) return;
+    await recordMembershipOperation(tx, roomId, userId);
     await withdrawInvitePush(tx, userId, roomId, String(rows[0].event_id));
     const seq = await nextEventSeq(tx);
     await tx.execute(
       "UPDATE prejoin_memberships SET status = 'joined', revision=revision+1, seq = ? WHERE room_id = ? AND user_id = ? AND status IN ('pending','attempting')",
       [seq, roomId, userId],
     );
+    await recordMembershipOperation(tx, roomId, userId);
   });
 }

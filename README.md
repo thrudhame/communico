@@ -435,6 +435,72 @@ retained until DELETE. Only display names and avatars enter room membership.
 Avatar and timezone values must be strings but are otherwise accepted verbatim,
 matching Synapse's permissive default. Use DELETE to remove an avatar field.
 
+## Facade replication progress
+
+Operators can inspect lag over the private admin Unix socket:
+
+```sh
+curl --unix-socket /path/to/admin.sock -H 'Content-Type: application/json' \
+  -d '{"scopes":["room:!room:example.org","public:@alice:example.org"]}' \
+  http://localhost/v1/facade/replication
+```
+
+Omit `scopes` to inspect every retained stream. This read-only operation never
+exports, wakes workers, allocates source positions or waits for another node.
+It returns identifiers and cuts only, not record bodies, credentials, keys or
+session data. It is not mounted on public Matrix listeners.
+
+`sources` reports either role's current local room change heads, current local
+OOB membership operation heads, and the home's public-account projection revisions.
+Membership sources include the current transport `source` and `incarnation`;
+retained foreign/history facts are not local authorship. Each capture is local to its owning database, not a
+cross-file atomic snapshot. Snapshot cuts allocated only during export (such
+as auth and directory) have no local mutation-head entry. A missing source or
+stream is unknown, not zero or ready.
+
+`streams` identifies each cut by `peer`, `direction`, `source`, `incarnation`
+and `scope`. Each stage contains the journal `sequence`, `hash` and semantic
+`sourceCut` (null when that record type has no scalar source watermark).
+On outgoing streams, `published` is the locally journaled export, while
+`received` and `applied` are the peer's durable acknowledgments. On incoming
+streams, they are local receipt, completed scope publication and journal
+application respectively. `published` is null while scope publication is not
+ready; `ready` never establishes coverage of a later source mutation.
+`declaredCut` is the scope watermark in the incoming applied directory, or null
+when not declared. Status retains old incarnations for diagnosis; never compare
+cuts across identities or confuse a journal sequence with a semantic source cut.
+
+For `membership:@user:server`, semantic cuts cover current-source operations
+through the contiguous journal prefix. Interleaved history never advances that
+source counter. Readiness uses the actual journal completion under the active
+enrollment, not a room scope or a displayed prejoin row. On a facade, membership
+`published` additionally covers only the prefix declared by its applied directory;
+the directory's `declaredCut` remains a journal position. Pending membership may
+refuse new admission with HTTP 503 and the Matrix `errcode`/`error` JSON object;
+receipt is not application. Inspection never changes this admission contract.
+
+To observe a home room mutation on a facade, capture its home `sources` cut
+after acceptance, then inspect that exact pairing/source/scope until the
+incoming ready publication and application source cuts cover it (and the
+directory declaration covers it for directory-gated reads). Later work cannot
+enlarge the captured target. Home client acknowledgments do not depend on this
+inspection or on an online facade.
+
+For a facade room mutation, capture that facade's local `sources` cut and
+observe its exact outgoing source/incarnation/scope at home's incoming applied
+cut. Reverse room streams have no home directory declaration. A facade S2S
+acknowledgment does not wait for an online home; home-client causality follows
+observation through home sync, not the timing of another ingress's response.
+
+The private facade status reports `keyRoster.lastHome` as diagnostic contact
+time, not authentication, signing authority or a replication acknowledgment.
+Authenticated requests never wait for this diagnostic write. Pending times
+coalesce by maximum and drain before orderly shutdown closes storage; a
+successful drain persists the exact maximum accepted time. An abrupt crash
+can lose queued or uncommitted contact observations, with no fixed count
+bound. Persistence failures are reported and make shutdown fail; a failed
+writer retains its facts but does not restart on later contacts.
+
 ## Facade signing-key retirement
 
 A facade signing key is trusted as a key of the whole Matrix server, not as a

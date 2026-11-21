@@ -29,7 +29,12 @@ import {
   type KeyResolver,
   SendJoinRefused,
 } from '#engine/room/deps.ts';
-import { admitLocalJoin, registerCreatedRoom } from '#engine/room/hooks.ts';
+import {
+  admitLocalJoin,
+  prepareMembershipAdmission,
+  registerCreatedRoom,
+  withMembershipFence,
+} from '#engine/room/hooks.ts';
 import { afterRoomCommit } from '#engine/room/ingest.ts';
 import { openRoom } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
@@ -58,6 +63,7 @@ import {
   clearJoinAttempt,
   type JoinAttempt,
   joinAttemptCommitted,
+  refuseJoinAttempt,
   releaseJoinAttempt,
 } from '#engine/server/join-attempts.ts';
 
@@ -137,6 +143,12 @@ async function joinVia(
   candidate: string,
 ): Promise<JoinResult> {
   const { deps } = args;
+  const admission = await prepareMembershipAdmission(
+    store,
+    args.roomId,
+    args.user,
+    true,
+  );
 
   // 1. make_join — the resident's template names the room's version
   const mk = await deps.fetcher.makeJoin(
@@ -202,23 +214,23 @@ async function joinVia(
   };
   const signed = await finalizeBuilt(pdu, rulebook, args.signer);
   const eventId = String(signed.event_id);
+  admission?.checkCurrent();
 
-  // Outstanding compensation fences every new membership side effect, even
-  // after policy changes. Durable recording below remains strict-policy only.
+  // Outstanding compensation fences every new membership side effect. Policy
+  // never changes whether an uncertain remote join requires durable recovery.
   await withRoomLock(
     args.roomId,
     () => admitLocalJoin(store, args.roomId, args.user),
   );
-  const attempt: JoinAttempt | null =
-    config().encryption.allowunencryptedjoining ? null : {
-      roomId: args.roomId,
-      userId: args.user,
-      eventId,
-      roomVersion: mk.roomVersion,
-      destination: candidate,
-      addedMs: Date.now(),
-    };
-  if (attempt !== null) await beginJoinAttempt(store, attempt);
+  const attempt: JoinAttempt = {
+    roomId: args.roomId,
+    userId: args.user,
+    eventId,
+    roomVersion: mk.roomVersion,
+    destination: candidate,
+    addedMs: Date.now(),
+  };
+  await beginJoinAttempt(store, attempt, signed, admission);
   let refused = false;
   try {
     // 3. send_join — the answer is untrusted input
@@ -316,6 +328,12 @@ async function joinVia(
       encryptionId === undefined ? undefined : pack.get(encryptionId)?.content,
     );
 
+    const commitAdmission = await prepareMembershipAdmission(
+      store,
+      args.roomId,
+      args.user,
+      true,
+    );
     let held = null;
     try {
       held = await openRoom(store, args.roomId);
@@ -359,66 +377,73 @@ async function joinVia(
     //    discovery's window).
     const room = await openRoom(store, args.roomId, { create: true });
     await registerCreatedRoom(store, args.roomId);
-    await withRoomLock(args.roomId, () =>
-      room.tx(async (tx) => {
-        // revalidation (G8): a live stay means the room is already joined
-        if ((await tx.segments.openStay()) !== null) {
-          // /send may publish the same join while the dance is in flight.
-          // Reconcile its original receipt, not the returned snapshot.
-          const existing = await tx.events.getStatus(eventId);
-          if (
-            existing?.standing === 'accepted' &&
-            existing.grounding === 'grounded'
-          ) {
-            await tx.changes.localParticipation(eventId, args.user);
-            return;
-          }
-          throw new MatrixError(
-            400,
-            'M_BAD_STATE',
-            'room became resident during join',
-          );
-        }
-        const prevStay = (await tx.segments.list())
-          .filter((segment) => segment.kind === 'stay')
-          .pop() ?? null;
-        if (
-          prevStay !== null &&
-          await roomCreateId(tx, prevStay.id) !== createId
-        ) {
-          throw badResponse('snapshot replaces the room create');
-        }
+    await withRoomLock(
+      args.roomId,
+      () =>
+        room.tx((tx) =>
+          withMembershipFence(commitAdmission, tx, async () => {
+            // revalidation (G8): a live stay means the room is already joined
+            if ((await tx.segments.openStay()) !== null) {
+              // /send may publish the same join while the dance is in flight.
+              // Reconcile its original receipt, not the returned snapshot.
+              const existing = await tx.events.getStatus(eventId);
+              if (
+                existing?.standing === 'accepted' &&
+                existing.grounding === 'grounded'
+              ) {
+                await tx.changes.localParticipation(eventId, args.user);
+                return;
+              }
+              throw new MatrixError(
+                400,
+                'M_BAD_STATE',
+                'room became resident during join',
+              );
+            }
+            const prevStay = (await tx.segments.list())
+              .filter((segment) => segment.kind === 'stay')
+              .pop() ?? null;
+            if (
+              prevStay !== null &&
+              await roomCreateId(tx, prevStay.id) !== createId
+            ) {
+              throw badResponse('snapshot replaces the room create');
+            }
 
-        await installSnapshotBoundary(tx, {
-          roomId: args.roomId,
-          roomVersion: mk.roomVersion,
-          event: join,
-          verified,
-          resident: candidate,
-          self: deps.self,
-          previousStay: prevStay?.id ?? null,
-          localInitiator: args.user,
-        });
-      }));
+            await installSnapshotBoundary(tx, {
+              roomId: args.roomId,
+              roomVersion: mk.roomVersion,
+              event: join,
+              verified,
+              resident: candidate,
+              self: deps.self,
+              previousStay: prevStay?.id ?? null,
+              localInitiator: args.user,
+            });
+          })
+        ),
+    );
     await afterRoomCommit(room, deps.self);
     return { roomId: args.roomId, eventId };
   } finally {
-    if (attempt !== null) {
-      try {
-        if (refused || await joinAttemptCommitted(store, attempt)) {
-          await clearJoinAttempt(await store.server(), attempt);
-        } else if (deps.leave !== undefined) {
-          await deps.leave(attempt);
-          await clearJoinAttempt(await store.server(), attempt);
-        }
-      } catch (error) {
-        // The durable intent survives failed cleanup or acknowledgment. Never
-        // replace the original join refusal with a misleading cleanup success.
-        console.warn('join cleanup remains pending:', String(error));
-      } finally {
-        releaseJoinAttempt(store, attempt);
-        deps.wake?.(candidate);
+    try {
+      if (refused) {
+        const server = await store.server();
+        await refuseJoinAttempt(server, attempt);
+        await clearJoinAttempt(server, attempt);
+      } else if (await joinAttemptCommitted(store, attempt)) {
+        await clearJoinAttempt(await store.server(), attempt);
+      } else if (deps.leave !== undefined) {
+        await deps.leave(attempt);
+        await clearJoinAttempt(await store.server(), attempt);
       }
+    } catch (error) {
+      // The durable intent survives failed cleanup or acknowledgment. Never
+      // replace the original join refusal with a misleading cleanup success.
+      console.warn('join cleanup remains pending:', String(error));
+    } finally {
+      releaseJoinAttempt(store, attempt);
+      deps.wake?.(candidate);
     }
   }
 }

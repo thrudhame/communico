@@ -6,8 +6,10 @@
 // without the server schema) the writes stand alone — a later startup
 // roll-forward catches up.
 import type { Store } from '#engine/store/index.ts';
+import type { Conn } from '#engine/store/db.ts';
 import type { CompletionCut, CompletionTarget } from './completion.ts';
 import type { Room } from './index.ts';
+import type { CommitCheck } from '#engine/store/commit.ts';
 
 export type RoomHooks = {
   project: (store: Store, roomId: string) => Promise<void>;
@@ -28,12 +30,98 @@ export type RoomHooks = {
 let hooks: RoomHooks | null = null;
 const joinAdmissions = new WeakMap<
   Store,
-  (roomId: string, userId: string) => Promise<void>
+  (roomId: string, userId: string, eventId?: string) => Promise<void>
 >();
+
+export type MembershipAdmission = {
+  check?(conn: Conn): Promise<void>;
+  checkCurrent: CommitCheck;
+};
+const membershipAdmissions = new WeakMap<
+  Store,
+  (
+    roomId: string,
+    userId: string,
+    allowAbsent: boolean,
+  ) => Promise<MembershipAdmission>
+>();
+
+// Preparation may read the composition's authority files. A room transaction
+// receives only its synchronous fence, never a server/tenant lookup callback.
+export function setMembershipAdmission(
+  store: Store,
+  admission: (
+    roomId: string,
+    userId: string,
+    allowAbsent: boolean,
+  ) => Promise<MembershipAdmission>,
+): void {
+  membershipAdmissions.set(store, admission);
+}
+
+export async function prepareMembershipAdmission(
+  store: Store,
+  roomId: string,
+  userId: string,
+  allowAbsent = false,
+): Promise<MembershipAdmission | undefined> {
+  return await membershipAdmissions.get(store)?.(roomId, userId, allowAbsent);
+}
+
+export async function withMembershipFence<T>(
+  admission: MembershipAdmission | undefined,
+  transaction: { admit(check: CommitCheck): void },
+  operation: () => Promise<T>,
+): Promise<T> {
+  if (admission) transaction.admit(admission.checkCurrent);
+  return await operation();
+}
+
+export type RestrictedKnowledge = 'complete' | 'partial' | 'unavailable';
+export type PreparedRestrictedKnowledge = {
+  knowledge: RestrictedKnowledge;
+  checkCurrent?: CommitCheck;
+};
+const restrictedViews = new WeakMap<
+  Store,
+  (roomId: string) => Promise<RestrictedKnowledge | PreparedRestrictedKnowledge>
+>();
+
+// The composition owner knows whether this store covers the whole logical
+// server. Room admission never reaches into an app or a replica coordinator.
+export function setRestrictedKnowledge(
+  store: Store,
+  view: (
+    roomId: string,
+  ) => Promise<RestrictedKnowledge | PreparedRestrictedKnowledge>,
+): void {
+  restrictedViews.set(store, view);
+}
+
+export async function restrictedKnowledge(
+  store: Store,
+  roomId: string,
+): Promise<RestrictedKnowledge> {
+  return (await prepareRestrictedKnowledge(store, roomId)).knowledge;
+}
+
+// Discovery projects the knowledge label; a vouching write may also carry the
+// prepared allowed-scope authority into its own native commit boundary.
+export async function prepareRestrictedKnowledge(
+  store: Store,
+  roomId: string,
+): Promise<PreparedRestrictedKnowledge> {
+  const value = await restrictedViews.get(store)?.(roomId) ?? 'complete';
+  return typeof value === 'string' ? { knowledge: value } : value;
+}
 
 export function setJoinAdmission(
   store: Store,
-  admission: (roomId: string, userId: string) => Promise<void>,
+  admission: (
+    roomId: string,
+    userId: string,
+    eventId?: string,
+  ) => Promise<void>,
 ): void {
   joinAdmissions.set(store, admission);
 }
@@ -43,8 +131,9 @@ export async function admitLocalJoin(
   store: Store,
   roomId: string,
   userId: string,
+  eventId?: string,
 ): Promise<void> {
-  await joinAdmissions.get(store)?.(roomId, userId);
+  await joinAdmissions.get(store)?.(roomId, userId, eventId);
 }
 
 export function setRoomHooks(next: RoomHooks): void {
