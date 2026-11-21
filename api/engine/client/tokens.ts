@@ -1,5 +1,7 @@
 // Storage-neutral wire grammar. Sync recovery is applied by its consumer, never
 // by room pagination, which reads only its own event/room cursor boundary.
+import { Buffer } from 'node:buffer';
+
 export type StreamToken = {
   eSeq: number;
   pSeq: number;
@@ -11,9 +13,13 @@ export type StreamToken = {
   kSeq: number;
   nSeq?: number;
   epoch?: string;
+  domain?: string;
 };
 
-export type DurableStreamHeads = Omit<Required<StreamToken>, 'epoch' | 'tSeq'>;
+export type DurableStreamHeads = Omit<
+  Required<StreamToken>,
+  'epoch' | 'domain' | 'tSeq'
+>;
 
 /** Synapse's future-token recovery: clamp durable streams to allocated maxima.
  * Typing is intentionally excluded because its process-local stream may reset.
@@ -36,6 +42,35 @@ export function boundFutureToken(
 
 export function parseStreamToken(raw: string | null): StreamToken | null {
   if (raw === null) return null;
+  if (raw.startsWith('v1.')) {
+    if (!/^v1\.[A-Za-z0-9_-]+$/.test(raw)) return null;
+    let envelope: unknown;
+    try {
+      envelope = JSON.parse(Buffer.from(raw.slice(3), 'base64url').toString());
+    } catch {
+      return null;
+    }
+    if (
+      !Array.isArray(envelope) || envelope.length !== 2 ||
+      typeof envelope[0] !== 'string' || !validDomain(envelope[0]) ||
+      typeof envelope[1] !== 'string'
+    ) return null;
+    // Only the existing numeric grammar can inhabit an envelope. Requiring the
+    // issued spelling prevents padding, JSON and shorthand aliases from hashing
+    // into another token's inbox receipt. Domain validation is the consumer's job.
+    const cuts = parseLegacyToken(envelope[1]);
+    if (cuts === null || encodeStreamToken(cuts) !== envelope[1]) return null;
+    const token = { ...cuts, domain: envelope[0] };
+    return encodeStreamToken(token) === raw ? token : null;
+  }
+  return parseLegacyToken(raw);
+}
+
+function validDomain(domain: string): boolean {
+  return /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(domain);
+}
+
+function parseLegacyToken(raw: string): StreamToken | null {
   const m =
     /^s(\d+)(?:_p(\d+))?(?:_t(\d+))?(?:_r(\d+))?(?:_a(\d+))?(?:_d(\d+))?(?:_m(\d+))?(?:_k(\d+))?(?:_n(\d+))?(?:_z([a-f0-9]{32}))?$/
       .exec(
@@ -79,7 +114,7 @@ export function formatStreamToken(
 }
 
 export function encodeStreamToken(t: StreamToken): string {
-  return formatStreamToken(
+  const cuts = formatStreamToken(
     t.eSeq,
     t.pSeq,
     t.tSeq,
@@ -90,5 +125,10 @@ export function encodeStreamToken(t: StreamToken): string {
     t.kSeq,
     t.nSeq,
     t.epoch,
+  );
+  if (t.domain === undefined) return cuts;
+  if (!validDomain(t.domain)) throw new TypeError('invalid publication domain');
+  return 'v1.' + Buffer.from(JSON.stringify([t.domain, cuts])).toString(
+    'base64url',
   );
 }
