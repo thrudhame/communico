@@ -35,6 +35,7 @@ import { federationRequest } from './client.ts';
 import { upstreamCategory, UpstreamError } from '#engine/net/upstream-error.ts';
 import { keyDocument, oldKeysOf } from './key-document.ts';
 import { federationPolicy } from './policy.ts';
+import { keyFetchers } from './key-fetchers.ts';
 import {
   type DemandedWork,
   demandedWork,
@@ -67,11 +68,10 @@ export type KeysDeps = {
     minimumValidUntilTs: number,
     signal?: AbortSignal,
   ) => Promise<unknown>;
-  // one witness's notary answer for serverName (client.ts)
+  // One witness's batched notary answer, covering all requested servers.
   witnessQuery: (
     peer: string,
-    serverName: string,
-    minimumValidUntilTs: number,
+    demands: Record<string, Record<string, { minimum_valid_until_ts: number }>>,
     signal?: AbortSignal,
   ) => Promise<unknown>;
   // roster witnesses by seniority (peers.ts), then the event's room's
@@ -137,14 +137,14 @@ function productionDeps(server: Db, signer: Signer): KeysDeps {
       });
       return res.json;
     },
-    witnessQuery: async (peer, name, minimumValidUntilTs, signal) => {
+    witnessQuery: async (peer, demands, signal) => {
       const res = await federationRequest(server, signer, {
         destination: peer,
-        method: 'GET',
-        path: `/_matrix/key/v2/query/${
-          encodeURIComponent(name)
-        }?minimum_valid_until_ts=${minimumValidUntilTs}`,
-        body: null,
+        method: 'POST',
+        path: '/_matrix/key/v2/query',
+        body: new TextEncoder().encode(
+          JSON.stringify({ server_keys: demands }),
+        ),
         signal,
       });
       return res.json;
@@ -156,6 +156,7 @@ function productionDeps(server: Db, signer: Signer): KeysDeps {
 type AcquisitionEpoch = { current: boolean; users: number };
 
 type AcquisitionState = {
+  fetchers: ReturnType<typeof keyFetchers>;
   inFlight: Map<string, DemandedWork<KeyDoc>>;
   failureMemory: Map<string, { until: number; error: unknown }>;
   refusalMemory: Map<string, { until: number; error: KeyChangeRefused }>;
@@ -170,6 +171,7 @@ function stateOf(server: Db): AcquisitionState {
   let state = acquisitionStates.get(server);
   if (state === undefined) {
     state = {
+      fetchers: keyFetchers(),
       inFlight: new Map(),
       failureMemory: new Map(),
       refusalMemory: new Map(),
@@ -521,7 +523,13 @@ export function keyStore(
       const shared = work !== undefined;
       if (work === undefined) {
         work = demandedWork((signal) =>
-          doAcquire(name, minimumValidUntilTs, epoch, { ...ctx, signal })
+          doAcquire(
+            name,
+            minimumValidUntilTs,
+            epoch,
+            { ...ctx, signal },
+            wantKeyId,
+          )
         );
         inFlight.set(name, work);
         const owned = work;
@@ -554,6 +562,7 @@ export function keyStore(
     minimumValidUntilTs: number,
     epoch: AcquisitionEpoch,
     ctx?: { roomId?: string; signal?: AbortSignal },
+    wantKeyId?: string,
   ): Promise<KeyDoc> {
     const signal = ctx?.signal;
     try {
@@ -577,7 +586,13 @@ export function keyStore(
           peers,
           query: async (peer, name, horizon) => {
             signal?.throwIfAborted();
-            const answer = await deps.witnessQuery(peer, name, horizon, signal);
+            const answer = await state.fetchers.witness({
+              peer,
+              name,
+              horizon,
+              deps,
+              keyId: wantKeyId,
+            }, signal);
             signal?.throwIfAborted();
             return answer;
           },
@@ -613,7 +628,11 @@ export function keyStore(
       // closed mode only roster peers reach here — a consented address)
       if (candidate === null) {
         signal?.throwIfAborted();
-        const raw = await deps.directGet(name, minimumValidUntilTs, signal);
+        const raw = await state.fetchers.direct({
+          name,
+          horizon: minimumValidUntilTs,
+          deps,
+        }, signal);
         signal?.throwIfAborted();
         const doc = await validatedKeyDocument(name, raw);
         candidate = { doc, via: 'direct' };

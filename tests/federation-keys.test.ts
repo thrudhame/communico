@@ -89,6 +89,144 @@ function stubDeps(over: Partial<KeysDeps>): KeysDeps {
   };
 }
 
+Deno.test('review keys: fetcher batches share discovery across destinations', async (t) => {
+  for (const mode of ['witness', 'direct'] as const) {
+    await t.step(mode, async () => {
+      await withStore(async (store) => {
+        const server = await store.server();
+        const origins = await Promise.all(
+          ['anchor', 'next-a', 'next-b', 'cancelled'].map((n) =>
+            makeServer(mode + '-' + n + '.test')
+          ),
+        );
+        const docs = new Map(
+          await Promise.all(
+            origins.map(async (s) => [s.name, await makeDoc(s)] as const),
+          ),
+        );
+        const witness = await makeServer('batch-witness.test');
+        await seedServer(server, witness);
+        for (const doc of docs.values()) await notaryAnswer(doc, witness);
+        const entered = latch(), release = latch();
+        const enrolled = latch();
+        let subscriptions = 0;
+        const signal = () => {
+          const abort = new AbortController();
+          const add = abort.signal.addEventListener.bind(abort.signal);
+          abort.signal.addEventListener = (...args: Parameters<typeof add>) => {
+            add(...args);
+            if (args[0] === 'abort' && ++subscriptions === 4) {
+              enrolled.release();
+            }
+          };
+          return abort;
+        };
+        const witnessCalls: string[][] = [], directCalls: string[] = [];
+        const deps = stubDeps({
+          listWitnesses: () =>
+            Promise.resolve(mode === 'witness' ? [witness.name] : []),
+          witnessQuery: async (_peer, request) => {
+            // The old per-server transport deliberately fails the batch proof.
+            const names = typeof request === 'string'
+              ? [request]
+              : Object.keys(request);
+            witnessCalls.push(names);
+            if (names.includes(origins[0].name)) {
+              entered.release();
+              await release.wait;
+            }
+            return { server_keys: names.map((n) => docs.get(n)) };
+          },
+          directGet: async (name) => {
+            directCalls.push(name);
+            if (name === origins[0].name) {
+              entered.release();
+              await release.wait;
+            }
+            return docs.get(name);
+          },
+        });
+        const firstOwner = keyStore(server, { deps });
+        const otherOwner = keyStore(server, { deps });
+        const first = firstOwner.acquireKeyDoc(origins[0].name, 0);
+        const pending: Promise<unknown>[] = [first];
+        const query = server.query.bind(server);
+        try {
+          await watchdog(entered.wait, 'anchor fetcher batch');
+          const policies = latch();
+          let reads = 0;
+          server.query = async (sql, values = []) => {
+            const rows = await query(sql, values);
+            if (sql.includes('SELECT DISTINCT server_name') && ++reads === 3) {
+              policies.release();
+            }
+            return rows;
+          };
+          const controllers = Array.from({ length: 4 }, signal);
+          const wave = [1, 2, 1, 3].map((index, n) =>
+            otherOwner.acquireKeyDoc(origins[index].name, 0, {
+              signal: controllers[n].signal,
+            })
+          );
+          // Attach handlers before cancelling; the real owner still drains.
+          const settled = Promise.allSettled(wave);
+          pending.push(settled);
+          await watchdog(enrolled.wait, 'all destination subscribers');
+          await watchdog(policies.wait, 'all destination policy reads');
+          // Drain prior native policy reads before inspecting dispatch ownership.
+          await server.query('SELECT 1');
+          controllers[3].abort();
+          assertEquals(
+            mode === 'witness' ? witnessCalls : directCalls,
+            mode === 'witness' ? [[origins[0].name]] : [origins[0].name],
+            'only one batch is in flight',
+          );
+          release.release();
+          await first;
+          const results = await settled;
+          assertEquals(results.map((r) => r.status), [
+            'fulfilled',
+            'fulfilled',
+            'fulfilled',
+            'rejected',
+          ]);
+          if (mode === 'witness') {
+            assertEquals(witnessCalls.map((names) => names.slice().sort()), [[
+              origins[0].name,
+            ], [origins[1].name, origins[2].name].sort()]);
+            assertEquals(directCalls, []);
+          } else {
+            assertEquals(
+              directCalls.slice().sort(),
+              origins.slice(0, 3).map((s) => s.name).sort(),
+            );
+          }
+          for (const s of origins.slice(0, 3)) {
+            const pub = await firstOwner.getVerifyKey(
+              s.name,
+              s.keyId,
+              0,
+              'event',
+            );
+            assertEquals(
+              await exportPublicKeyRaw(pub),
+              await exportPublicKeyRaw(s.kp.publicKey),
+            );
+          }
+          assertEquals(await firstOwner.listServerKeys(origins[3].name), [{
+            rows: [],
+            doc: null,
+          }]);
+        } finally {
+          release.release();
+          await Promise.allSettled(pending);
+          server.query = query;
+        }
+      });
+    });
+  }
+});
+
 Deno.test('event evidence: optional signer domains cannot start key discovery', async () => {
   await withStore(async (store) => {
     const server = await store.server();
@@ -566,9 +704,9 @@ Deno.test('witnesses-first: the stranger document comes from a roster peer; via 
           directCalls++;
           return Promise.reject(new Error('direct should not fire'));
         },
-        witnessQuery: (peer, name) => {
+        witnessQuery: (peer, demands) => {
           assertEquals(peer, 'w1.test');
-          assertEquals(name, 'stranger1.test');
+          assertEquals(demands, { 'stranger1.test': {} });
           return Promise.resolve(answer);
         },
         listWitnesses: () => Promise.resolve(['w1.test']),
@@ -974,15 +1112,31 @@ for (const outcome of ['success', 'failure']) {
           await oldEntered;
           await keyStore(await store.server(), { deps: directOnly(freshDoc) })
             .forgetServerKeys(origin.name);
-          fresh = ks.acquireKeyDoc(origin.name, 0);
-          // A post-forget lookup must start first contact, never join the held
-          // pre-forget request, which stays held until fresh entry is observed.
+          const enrolled = latch();
+          const freshDemand = new AbortController();
+          const add = freshDemand.signal.addEventListener.bind(
+            freshDemand.signal,
+          );
+          freshDemand.signal.addEventListener = (
+            ...args: Parameters<typeof add>
+          ) => {
+            add(...args);
+            if (args[0] === 'abort') enrolled.release();
+          };
+          fresh = ks.acquireKeyDoc(origin.name, 0, {
+            signal: freshDemand.signal,
+          });
+          // The fresh owner enrolls while the obsolete fetch is held, but its
+          // network work belongs to the next batch. It must not consume the
+          // obsolete result or inherit that owner's negative publication.
+          await watchdog(enrolled.wait, 'post-forget subscriber');
+          assertEquals(calls, 1);
+          assertEquals(obsoleteOwner.released, false);
+          releaseOld();
           await watchdog(
             freshEntered,
             'post-forget lookup joined obsolete acquisition',
           );
-          assertEquals(obsoleteOwner.released, false);
-          releaseOld();
           const obsolete = await oldResult;
           if (outcome === 'failure') assertStrictEquals(obsolete.error, fault);
           else {assert(
