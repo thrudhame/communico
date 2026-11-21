@@ -3,7 +3,7 @@ import { serverSchema } from '#engine/server/schema.ts';
 import { openStore } from '#engine/store/index.ts';
 import { historicalServerSchema } from './fixtures/server-schema-history.ts';
 
-Deno.test('room upgrade intent migration appends to v54 with fresh-schema equivalence', async () => {
+Deno.test('room upgrade intent migration crosses v54 to v55 before current-schema equivalence', async () => {
   const root = await Deno.makeTempDir({ prefix: 'upgrade-schema-' });
   const settings = (name: string) => ({
     dir: root + '/' + name,
@@ -26,6 +26,27 @@ Deno.test('room upgrade intent migration appends to v54 with fresh-schema equiva
       [],
     );
     await old.close();
+    // Pin the historical boundary separately: later append-only migrations must
+    // not change what the room-upgrade migration installed at v55.
+    old = await openStore(settings('old'), {
+      schemas: {
+        server: {
+          ...historicalServerSchema(55),
+          migrations: serverSchema.migrations,
+        },
+      },
+    });
+    assertEquals(
+      await (await old.server()).query(
+        "SELECT v FROM meta WHERE k='schema_version'",
+      ),
+      [{ v: '55' }],
+    );
+    assertEquals(
+      await (await old.server()).query('SELECT * FROM room_upgrades'),
+      [],
+    );
+    await old.close();
     old = await openStore(settings('old'), {
       schemas: { server: serverSchema },
     });
@@ -43,7 +64,7 @@ Deno.test('room upgrade intent migration appends to v54 with fresh-schema equiva
       await (await old.server()).query(
         "SELECT v FROM meta WHERE k='schema_version'",
       ),
-      [{ v: '55' }],
+      [{ v: String(serverSchema.version) }],
     );
   } finally {
     await old.close();
