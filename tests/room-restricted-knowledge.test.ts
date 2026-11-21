@@ -11,6 +11,124 @@ import {
 import { openStore } from '#engine/store/index.ts';
 import { testSigner } from './fixtures/signer.ts';
 
+Deno.test('restricted vouch fences allowed scope at native commit but not later ordinary membership departure', async (t) => {
+  const dir = await Deno.makeTempDir({ prefix: 'restricted-scope-fence-' });
+  const store = await openStore({
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  }, { schemas: { room: roomSchema } });
+  try {
+    const signer = await testSigner();
+    const creator = '@owner:test', user = '@guest:test';
+    const allowed = await openRoom(
+      store,
+      (await createRoom(store, { creator, preset: 'public_chat' }, signer))
+        .roomId,
+    );
+    await join(allowed, user, signer);
+    const room = await openRoom(
+      store,
+      (await createRoom(store, {
+        creator,
+        initial_state: [{
+          type: 'm.room.join_rules',
+          state_key: '',
+          content: {
+            join_rule: 'restricted',
+            allow: [{ type: 'm.room_membership', room_id: allowed.id }],
+          },
+        }],
+      }, signer)).roomId,
+    );
+    const original = room.tx.bind(room);
+    let scopeReady = true;
+    const checkCurrent = () => {
+      if (!scopeReady) {
+        throw new MatrixError(503, 'M_UNAVAILABLE', 'allowed scope withdrawn');
+      }
+    };
+    setRestrictedKnowledge(
+      store,
+      () => Promise.resolve({ knowledge: 'partial', checkCurrent }),
+    );
+    for (const change of ['scope', 'departure']) {
+      await t.step(change, async () => {
+        const entered = Promise.withResolvers<void>(),
+          release = Promise.withResolvers<void>();
+        let applying: Promise<unknown> | undefined;
+        let held = false;
+        const operation = 'restricted-native-' + change;
+        room.tx = (fn) =>
+          original(async (tx) => {
+            const result = await fn(tx);
+            if (!held && await tx.membershipReceipts.has(operation)) {
+              held = true;
+              entered.resolve();
+              await release.promise;
+            }
+            return result;
+          });
+        try {
+          applying = withRestrictedAdmission(
+            room,
+            user,
+            signer.serverName,
+            async (tx, authorizer) => {
+              assertEquals(authorizer, creator);
+              return await tx.membershipReceipts.save(operation, 'same-input', {
+                vouched: true,
+              });
+            },
+          ).then(() => null, (error) => error);
+          await Promise.race([
+            entered.promise,
+            applying.then((result) => {
+              throw new Error(
+                'settled before native barrier: ' + String(result),
+              );
+            }),
+          ]);
+          if (change === 'scope') scopeReady = false;
+          else await leave(allowed, user, signer);
+          release.resolve();
+          const outcome = await applying;
+          room.tx = original;
+          const receipt = await room.tx((tx) =>
+            tx.membershipReceipts.get(operation, 'same-input')
+          );
+          if (change === 'scope') {
+            assertEquals(
+              receipt,
+              null,
+              'withdrawn allowed scope must roll back the actual target write',
+            );
+            assertEquals(outcome instanceof MatrixError, true);
+            scopeReady = true;
+          } else {
+            assertEquals(
+              outcome,
+              null,
+              'ordinary departure follows the qualifying-read cut',
+            );
+            assertEquals(receipt, { vouched: true });
+          }
+        } finally {
+          release.resolve();
+          await applying;
+          room.tx = original;
+          scopeReady = true;
+        }
+      });
+    }
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test('restricted allowed-room knowledge distinguishes partial local absence from complete nonmembership', async (t) => {
   const dir = await Deno.makeTempDir({ prefix: 'restricted-knowledge-' });
   const store = await openStore({

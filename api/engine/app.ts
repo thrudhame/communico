@@ -277,8 +277,13 @@ export async function openReplicaApp(
   );
   setRestrictedKnowledge(store, async (roomId) => {
     try {
-      await replica.requireScope('room:' + roomId);
-      return 'partial';
+      // Allowed-room knowledge is scope authority, not authority over the
+      // joining account: remote users can qualify through this evidence too.
+      const scope = await replica.prepareRoomScope(roomId);
+      return {
+        knowledge: 'partial' as const,
+        checkCurrent: scope.checkCurrent,
+      };
     } catch (error) {
       if (
         error instanceof MatrixError &&
