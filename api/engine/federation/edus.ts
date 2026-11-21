@@ -382,6 +382,7 @@ export function eduState(server: Db, self: string, store: Store): EduState {
         {
           lastActiveAgo: p.lastActiveAgo,
           currentlyActive: p.currentlyActive,
+          remote: true,
         },
       );
     }

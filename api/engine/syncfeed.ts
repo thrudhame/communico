@@ -59,7 +59,9 @@ import {
 import { filterEvents, type RoomFilter } from '#engine/tenant/filters.ts';
 import { waitForSync } from '#engine/sync-wait.ts';
 import {
+  capturePresence,
   getPresence,
+  publishPresence,
   receiptRoomsSince,
   receiptSnapshot,
   setPresenceValue,
@@ -381,6 +383,7 @@ async function assembleSync(
   // One server transaction selects events, receipts, memberships and counts.
   // Rendering afterward may be slow, but cannot mix a later count/receipt cut.
   const snapshot = await app.server.tx(async (tx) => {
+    const presence = await capturePresence(tx, i.userId);
     const counters = new Map(
       (await tx.query('SELECT name,value FROM counters')).map((
         r,
@@ -423,8 +426,9 @@ async function assembleSync(
       } ORDER BY seq`,
       [i.userId],
     );
-    return { counters, memberships, notifications, rooms, oob };
+    return { counters, memberships, notifications, rooms, oob, presence };
   });
+  publishPresence(app.server, snapshot.presence);
   const accountSnapshot = await app.tenant.tx((tx) =>
     captureAccountData(tx, lp, app.tenant.serverName, i.since?.aSeq ?? null)
   );
@@ -621,9 +625,10 @@ async function assembleSync(
     for (const u of result.joiners) allJoiners.add(u);
   }
   const presenceEvents = new Map<string, Record<string, unknown>>();
-  const shared = await sharedUsers(app.server, i.userId);
-  const includePresence = async (u: string) => {
-    const row = await getPresence(app.server, u);
+  const shared = snapshot.presence.rows.keys();
+  const includePresence = (u: string) => {
+    const row = snapshot.presence.rows.get(u);
+    if (!row) return;
     const content: Record<string, unknown> = { presence: row.presence };
     if (row.statusMsg !== null) content.status_msg = row.statusMsg;
     if (row.presence !== 'offline' && row.lastActiveMs > 0) {
@@ -634,13 +639,13 @@ async function assembleSync(
   for (const u of shared) {
     if (
       i.since === null ||
-      (await getPresence(app.server, u)).seq > i.since.pSeq ||
+      snapshot.presence.rows.get(u)!.seq > i.since.pSeq ||
       allJoiners.has(i.userId)
-    ) await includePresence(u);
+    ) includePresence(u);
   }
   if (i.since !== null) {
     for (const u of allJoiners) {
-      await includePresence(u);
+      includePresence(u);
     }
   }
   const deviceLists = recoveryReset

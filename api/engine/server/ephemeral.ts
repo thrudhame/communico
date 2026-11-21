@@ -2,6 +2,7 @@
 // Counters and rows commit together; notifications only follow a commit.
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Conn, Database as Db } from '#engine/store/db.ts';
+import type { Row } from '#engine/store/ffi.ts';
 import { eventStreamTx } from '#engine/server/stream.ts';
 import { isJoined, receiptTargetInThread } from '#engine/server/read.ts';
 import { advanceNotificationRead } from '#engine/server/notifications.ts';
@@ -18,6 +19,9 @@ import {
 } from '#engine/server/receipt-operations.ts';
 
 const MAX_UNKNOWN_THREADS = 100;
+// Synapse's FEDERATION_TIMEOUT: remote liveness expires from authenticated
+// receipt, never from the independently reported age of the user's activity.
+const REMOTE_PRESENCE_FRESHNESS_MS = 30 * 60 * 1000;
 /** Protocol identifiers, not arbitrary durable keys. Adapters must not coerce
  * malformed metadata into the distinct unthreaded identity. */
 export function receiptThreadId(value: unknown): string | null {
@@ -97,7 +101,11 @@ export async function setPresence(
   userId: string,
   presence: string,
   statusMsg?: string,
-  opts: { lastActiveAgo?: number; currentlyActive?: boolean } = {},
+  opts: {
+    lastActiveAgo?: number;
+    currentlyActive?: boolean;
+    remote?: boolean;
+  } = {},
 ): Promise<void> {
   await writePresence(server, userId, presence, statusMsg ?? null, opts, false);
 }
@@ -117,13 +125,14 @@ async function writePresence(
   userId: string,
   presence: string,
   statusMsg: string | null | undefined,
-  opts: { lastActiveAgo?: number; currentlyActive?: boolean },
+  opts: { lastActiveAgo?: number; currentlyActive?: boolean; remote?: boolean },
   skipUnchanged: boolean,
 ): Promise<void> {
   if (!['online', 'offline', 'unavailable'].includes(presence)) {
     throw new MatrixError(400, 'M_INVALID_PARAM', 'bad presence: ' + presence);
   }
-  const lastActiveMs = Date.now() - (opts.lastActiveAgo ?? 0);
+  const receivedMs = Date.now();
+  const lastActiveMs = receivedMs - (opts.lastActiveAgo ?? 0);
   const row = await eventStreamTx(server, async (tx) => {
     let status = statusMsg;
     if (skipUnchanged) {
@@ -136,9 +145,16 @@ async function writePresence(
     }
     const seq = await next(tx, 'presence');
     await tx.execute(
-      `INSERT INTO presence(user_id,presence,status_msg,last_active_ms,seq) VALUES(?,?,?,?,?)
-      ON CONFLICT(user_id) DO UPDATE SET presence=excluded.presence,status_msg=excluded.status_msg,last_active_ms=excluded.last_active_ms,seq=excluded.seq`,
-      [userId, presence, status ?? null, lastActiveMs, seq],
+      `INSERT INTO presence(user_id,presence,status_msg,last_active_ms,seq,remote_received_ms) VALUES(?,?,?,?,?,?)
+      ON CONFLICT(user_id) DO UPDATE SET presence=excluded.presence,status_msg=excluded.status_msg,last_active_ms=excluded.last_active_ms,seq=excluded.seq,remote_received_ms=excluded.remote_received_ms`,
+      [
+        userId,
+        presence,
+        status ?? null,
+        lastActiveMs,
+        seq,
+        opts.remote ? receivedMs : null,
+      ],
     );
     return { presence, statusMsg: status ?? null, lastActiveMs, seq };
   });
@@ -161,14 +177,15 @@ export async function ensurePresenceRow(
     );
   });
 }
-export async function getPresence(
-  server: Db,
-  userId: string,
-): Promise<PresenceRow> {
-  const rows = await server.query('SELECT * FROM presence WHERE user_id=?', [
-    userId,
-  ]);
-  const r = rows[0];
+function presenceExpired(r: Row | undefined): boolean {
+  return r !== undefined && r.presence !== 'offline' &&
+    r.remote_received_ms !== null &&
+    (Number(r.remote_received_ms) === 0 ||
+      Date.now() - Number(r.remote_received_ms) >=
+        REMOTE_PRESENCE_FRESHNESS_MS);
+}
+
+function presenceRow(r: Row | undefined): PresenceRow {
   return r === undefined
     ? { presence: 'offline', statusMsg: null, lastActiveMs: 0, seq: 0 }
     : {
@@ -178,8 +195,72 @@ export async function getPresence(
       seq: Number(r.seq),
     };
 }
-export async function sharedUsers(
+
+async function normalizePresence(tx: Conn, userId: string) {
+  const [current] = await tx.query('SELECT * FROM presence WHERE user_id=?', [
+    userId,
+  ]);
+  if (!presenceExpired(current)) {
+    return { row: presenceRow(current), changed: false };
+  }
+  const seq = await next(tx, 'presence');
+  await tx.execute(
+    "UPDATE presence SET presence='offline',seq=? WHERE user_id=?",
+    [seq, userId],
+  );
+  return {
+    row: presenceRow({ ...current, presence: 'offline', seq }),
+    changed: true,
+  };
+}
+
+export async function getPresence(
   server: Db,
+  userId: string,
+): Promise<PresenceRow> {
+  const [current] = await server.query(
+    'SELECT * FROM presence WHERE user_id=?',
+    [userId],
+  );
+  if (!presenceExpired(current)) return presenceRow(current);
+  // A concurrent authenticated observation wins over a stale reader's expiry.
+  const value = await eventStreamTx(
+    server,
+    (tx) => normalizePresence(tx, userId),
+  );
+  if (value.changed) {
+    notify(server, { kind: 'presence', userId, row: value.row });
+  }
+  return value.row;
+}
+
+/** Capture the exact presence view in the sync owner's existing server
+ * transaction, BEFORE it captures counters. Rendering cannot publish a lazy
+ * expiry after next_batch or mix a newer presence row into an older cut. */
+export async function capturePresence(tx: Conn, userId: string) {
+  const rows = new Map<string, PresenceRow>();
+  const changes: { userId: string; row: PresenceRow }[] = [];
+  for (const user of await sharedUsers(tx, userId)) {
+    const value = await normalizePresence(tx, user);
+    rows.set(user, value.row);
+    if (value.changed) changes.push({ userId: user, row: value.row });
+  }
+  return { rows, changes };
+}
+
+/** Call only after the capturing transaction commits. A rollback publishes no
+ * expiry, stream position or wakeup. The presence owner retains notification. */
+export function publishPresence(
+  server: Db,
+  capture: Awaited<ReturnType<typeof capturePresence>>,
+): void {
+  for (const change of capture.changes) {
+    notify(server, { kind: 'presence', ...change });
+  }
+}
+
+export async function sharedUsers(
+  server: Pick<Conn, 'query'>,
   userId: string,
 ): Promise<string[]> {
   const rows = await server.query(

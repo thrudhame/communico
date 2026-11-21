@@ -684,6 +684,93 @@ suite.test('inbound EDU rows reach HTTP sync; local producers reach the sender, 
         e.sender === remoteUser && (e.content as Json).status_msg === 'remote'
       ),
     );
+    const [freshPresence] = await app.server.query(
+      'SELECT * FROM presence WHERE user_id=?',
+      [remoteUser],
+    );
+    assert(Number(freshPresence.remote_received_ms) > 0);
+    await app.server.execute(
+      'UPDATE presence SET remote_received_ms=? WHERE user_id=?',
+      [Date.now() - 31 * 60 * 1000, remoteUser],
+    );
+    const expiredPresence = await call(
+      '/_matrix/client/v3/presence/' + encodeURIComponent(remoteUser) +
+        '/status',
+      user.access_token!,
+    );
+    assertEquals(expiredPresence.status, 200);
+    assertEquals(expiredPresence.body.presence, 'offline');
+    assertEquals(expiredPresence.body.status_msg, 'remote');
+    const expiredSync = await sync(
+      user.access_token!,
+      '&since=' + inbound.next_batch,
+    );
+    const expiredEvent = ((expiredSync.presence as Json).events as Json[]).find(
+      (e) => e.sender === remoteUser,
+    );
+    assertEquals((expiredEvent?.content as Json)?.presence, 'offline');
+    assertEquals((expiredEvent?.content as Json)?.status_msg, 'remote');
+    assertEquals(
+      Number(
+        (await app.server.query('SELECT seq FROM presence WHERE user_id=?', [
+          remoteUser,
+        ]))[0].seq,
+      ),
+      Number(freshPresence.seq) + 1,
+    );
+    assertEquals(
+      await fed('PUT', '/_matrix/federation/v1/send/refreshed-presence', {
+        origin: fake.name,
+        origin_server_ts: Date.now(),
+        pdus: [],
+        edus: [{
+          edu_type: 'm.presence',
+          content: {
+            push: [{
+              user_id: remoteUser,
+              presence: 'online',
+              status_msg: 'renewed remote',
+              last_active_ago: 90 * 60 * 1000,
+            }],
+          },
+        }],
+      }),
+      { status: 200, body: { pdus: {} } },
+    );
+    const renewed = await sync(
+      user.access_token!,
+      '&since=' + expiredSync.next_batch,
+    );
+    assert(
+      ((renewed.presence as Json).events as Json[]).some((e) =>
+        e.sender === remoteUser && (e.content as Json).presence === 'online'
+      ),
+    );
+    await app.server.execute(
+      'UPDATE presence SET remote_received_ms=? WHERE user_id=?',
+      [Date.now() - 31 * 60 * 1000, remoteUser],
+    );
+    // No HTTP GET normalizes this observation first: sync owns expiry and its
+    // returned cut must cover that transition exactly once, including timeout=0.
+    const lazyExpiry = await sync(
+      user.access_token!,
+      '&since=' + renewed.next_batch,
+    );
+    assert(
+      ((lazyExpiry.presence as Json).events as Json[]).some((e) =>
+        e.sender === remoteUser && (e.content as Json).presence === 'offline'
+      ),
+    );
+    const afterLazyExpiry = await sync(
+      user.access_token!,
+      '&since=' + lazyExpiry.next_batch,
+    );
+    assertEquals(
+      ((afterLazyExpiry.presence as Json).events as Json[]).some((e) =>
+        e.sender === remoteUser
+      ),
+      false,
+    );
     const base = '/_matrix/client/v3/rooms/' + encodeURIComponent(fr.roomId);
     await call(
       base + '/typing/' + encodeURIComponent(user.user_id),

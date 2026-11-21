@@ -120,6 +120,22 @@ Deno.test('backup audit: actual pending upgrade identity and private restored-wo
   }
 });
 
+Deno.test('backup audit: presence receipt evidence is retained and invalid timestamps are refused', async () => {
+  const f = await fixture();
+  try {
+    await f.app.server.execute(
+      "INSERT INTO presence(user_id,presence,status_msg,last_active_ms,seq,remote_received_ms) VALUES('@remote:test','online','retained',1,0,1)",
+    );
+    await f.audit();
+    await f.app.server.execute(
+      "UPDATE presence SET remote_received_ms=0.5 WHERE user_id='@remote:test'",
+    );
+    await assertRejects(f.audit, Error, 'remote presence receipt');
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('backup audit: report distributed identity cannot lose its retained source fact', async () => {
   const f = await fixture();
   try {

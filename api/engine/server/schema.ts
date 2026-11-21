@@ -466,8 +466,15 @@ const ROOM_UPGRADES_SQL = `
 CREATE TABLE room_upgrades(old_room_id TEXT PRIMARY KEY NOT NULL,user_id TEXT NOT NULL,replacement_room TEXT NOT NULL,plan_json TEXT NOT NULL,phase INTEGER NOT NULL DEFAULT 0 CHECK(phase BETWEEN 0 AND 4));
 `;
 
+// Historical rows have no receipt evidence: do not mint fresh remote liveness
+// at upgrade. New local writes explicitly store NULL; remote writes store the
+// authenticated receipt time, retained across backup and cold reopen.
+const PRESENCE_FRESHNESS_SQL = `
+ALTER TABLE presence ADD COLUMN remote_received_ms INTEGER DEFAULT 0 CHECK(remote_received_ms IS NULL OR remote_received_ms>=0);
+`;
+
 export const serverSchema: SchemaProvider = {
-  version: 55,
+  version: 56,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -529,6 +536,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(PREJOIN_JOBS_SQL);
     await db.exec(NOTIFICATION_CONTEXT_SQL);
     await db.exec(ROOM_UPGRADES_SQL);
+    await db.exec(PRESENCE_FRESHNESS_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -615,5 +623,6 @@ INSERT INTO device_publication_predecessors SELECT DISTINCT p.subject,p.destinat
     52: (conn) => conn.exec(REPORT_IDENTITY_SQL),
     53: (conn) => conn.exec(NOTIFICATION_CONTEXT_SQL),
     54: (conn) => conn.exec(ROOM_UPGRADES_SQL),
+    55: (conn) => conn.exec(PRESENCE_FRESHNESS_SQL),
   },
 };
