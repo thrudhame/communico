@@ -74,3 +74,58 @@ Deno.test('F2 complete-list routes share the client room scope', () => {
     );
   }
 });
+
+Deno.test('F2 directory reads and home-only writes keep their method boundaries', () => {
+  const f2 = capabilities('facade', 'f2');
+  for (
+    const [method, path] of [
+      ['GET', 'directory/list/room/room'],
+      ['GET', 'directory/room/alias'],
+      ['GET', 'rooms/room/aliases'],
+      ['GET', 'publicRooms'],
+      ['POST', 'publicRooms'],
+    ]
+  ) {
+    const request = new Request(
+      'https://facade.test/_matrix/client/v3/' + path,
+      {
+        method,
+      },
+    );
+    let required: string | undefined;
+    assertEquals(
+      f2.gate(request, (scope) => {
+        required = scope;
+        return true;
+      }),
+      null,
+      path,
+    );
+    assertEquals(required, 'clientrooms', path);
+    assertEquals(f2.gate(request, () => false)?.status, 503, path);
+    assertEquals(
+      capabilities('facade', 'f1').gate(request, () => true)?.status,
+      path === 'directory/room/alias' ? 405 : 404,
+      path,
+    );
+    assertEquals(
+      f2.gate(new Request(request.url, { method: 'PATCH' }), () => true)
+        ?.status,
+      405,
+      path,
+    );
+  }
+  for (
+    const [method, path] of [
+      ['PUT', 'directory/list/room/room'],
+      ['PUT', 'directory/room/alias'],
+      ['DELETE', 'directory/room/alias'],
+    ]
+  ) {
+    const response = f2.gate(
+      new Request('https://facade.test/_matrix/client/v3/' + path, { method }),
+      () => true,
+    );
+    assertEquals(response?.status, 503, method + ' ' + path);
+  }
+});

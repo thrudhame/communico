@@ -185,6 +185,24 @@ const F2_SYNC: readonly Rule[] = [
 // B6's client room owners enforce their exact room/account cuts. This is not
 // the federation rooms scope: local clients still work with federation off.
 const F2_ROOMS: readonly Rule[] = [
+  ...['GET', 'POST'].map((method) =>
+    route(method, literal('/_matrix/client/v3/publicRooms'), 'clientrooms')
+  ),
+  route(
+    'GET',
+    /^\/_matrix\/client\/v3\/directory\/list\/room\/[^/]+$/,
+    'clientrooms',
+  ),
+  route(
+    'GET',
+    /^\/_matrix\/client\/v3\/directory\/room\/[^/]+$/,
+    'clientrooms',
+  ),
+  route('GET', /^\/_matrix\/client\/v3\/rooms\/[^/]+\/aliases$/, 'clientrooms'),
+  ...[
+    /^\/_matrix\/client\/v3\/directory\/list\/room\/[^/]+$/,
+    /^\/_matrix\/client\/v3\/directory\/room\/[^/]+$/,
+  ].map((path) => route('PUT', path, 'clientrooms', 'home')),
   route('GET', literal('/_matrix/client/v3/joined_rooms'), 'clientrooms'),
   route(
     'POST',

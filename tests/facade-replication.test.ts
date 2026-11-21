@@ -9,7 +9,13 @@ import { setConfigForTests } from '#engine/config.ts';
 import { claimKeys, queryKeys } from '#engine/client/e2ee.ts';
 import { canSeeEvent } from '#engine/client/visibility.ts';
 import { join as clientJoin, joinedRooms } from '#engine/client/membership.ts';
-import { searchUsers } from '#engine/client/directory.ts';
+import {
+  getVisibility,
+  listLocalPublishedRooms,
+  resolveAlias,
+  roomAliases,
+  searchUsers,
+} from '#engine/client/directory.ts';
 import { versionOf } from '#engine/client/room.ts';
 import {
   createRoom as createClientRoom,
@@ -3703,6 +3709,96 @@ Deno.test('enrolled complete-list reads refuse missing inventory and missing roo
       results: [],
       limited: false,
     });
+  } finally {
+    await closeApp();
+    await f.close();
+    setConfigForTests({});
+  }
+});
+
+Deno.test('client directory readers retain required-cut and known-absence distinctions', async (t) => {
+  const f = await fixture();
+  const alias = '#linked:logical.test';
+  try {
+    setConfigForTests({ server: { name: 'logical.test', role: 'facade' } });
+    await registerAlias(
+      await f.home.server(),
+      alias,
+      f.source.roomId,
+      f.source.creator,
+    );
+    await setVisibility(await f.home.server(), f.source.roomId, 'public');
+    const directory = await f.directoryOwner();
+    await openReplicaApp(f.edgeStore(), await f.edgeTenant(), {
+      requireScope: (scope, allowAbsent) =>
+        directory.requireScope(scope, allowAbsent),
+      prepareRoomScope: (roomId, allowAbsent) =>
+        directory.prepareRoomScope(roomId, allowAbsent),
+      keys: keyStore(await f.edgeServer(), { signer: f.node.signer() }),
+      signer: f.node.signer(),
+      keyDocument: () => Promise.reject(new Error('unused')),
+      publicRooms: () => Promise.resolve(true),
+    });
+    const reads = [
+      ['visibility', () => getVisibility(f.source.roomId)],
+      ['alias', () => resolveAlias(alias)],
+      ['room aliases', () => roomAliases(f.source.roomId, f.source.creator)],
+      [
+        'public rooms',
+        () => listLocalPublishedRooms({ network: { kind: 'native' } }),
+      ],
+    ] as const;
+    for (const [name, read] of reads) {
+      await t.step(name + ' refuses absent directory', async () => {
+        await assertRejects(read, MatrixError, 'replica unavailable');
+      });
+    }
+    const inventory = await f.directoryExport();
+    assert(inventory);
+    const journal = await f.journal();
+    await journal.receive('home', [inventory]);
+    assert(await directory.apply(journal, inventory));
+    for (const [name, read] of reads) {
+      await t.step(name + ' refuses missing required room', async () => {
+        await assertRejects(read, MatrixError, 'replica unavailable');
+      });
+    }
+    const absent = await assertRejects(
+      () => resolveAlias('#absent:logical.test'),
+      MatrixError,
+    );
+    assertEquals(absent.status, 404);
+    const room = await f.exports();
+    assert(room);
+    await journal.receive('home', [room]);
+    assert(await (await f.replicas()).apply(journal, room));
+    assertEquals(await getVisibility(f.source.roomId), {
+      visibility: 'public',
+    });
+    assertEquals(await resolveAlias(alias), {
+      room_id: f.source.roomId,
+      servers: ['logical.test'],
+    });
+    assertEquals(await roomAliases(f.source.roomId, f.source.creator), [alias]);
+    assertEquals(
+      (await listLocalPublishedRooms({ network: { kind: 'native' } })).chunk
+        .map((room) => room.room_id),
+      [f.source.roomId],
+    );
+    await setVisibility(await f.home.server(), f.source.roomId, 'private');
+    const next = await f.directoryExport();
+    assert(next);
+    await journal.receive('home', [next]);
+    for (const [name, read] of reads) {
+      await t.step(
+        name + ' refuses unapplied successor directory',
+        async () => {
+          await assertRejects(read, MatrixError, 'replica unavailable');
+        },
+      );
+    }
+    assert(await directory.apply(journal, next));
+    assertEquals(await roomAliases(f.source.roomId, f.source.creator), [alias]);
   } finally {
     await closeApp();
     await f.close();

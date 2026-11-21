@@ -1546,8 +1546,107 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       (await edgeApi(roomPath + '/state/m.room.tombstone')).status,
       404,
     );
-    // The remaining B8 inventory still owes these client directory read routes.
-    // Assert their retained owner state at the next stopped cut below instead.
+    const aliasPath = 'directory/room/' +
+      encodeURIComponent('#upgrade-home-boundary:logical.test');
+    assertEquals(
+      await edgeApi('directory/list/room/' + encodeURIComponent(roomId)),
+      {
+        status: 200,
+        body: { visibility: 'public' },
+      },
+    );
+    assertEquals(await edgeApi(aliasPath), {
+      status: 200,
+      body: { room_id: roomId, servers: ['logical.test'] },
+    });
+    assertEquals(await edgeApi(roomPath + '/aliases'), {
+      status: 200,
+      body: { aliases: ['#upgrade-home-boundary:logical.test'] },
+    });
+    assertEquals(await edgeApi(freshRoomPath + '/aliases'), {
+      status: 200,
+      body: { aliases: [] },
+    });
+    assertEquals(
+      (await api(
+        roomPath + '/aliases',
+        undefined,
+        undefined,
+        'GET',
+        facadePort,
+      )).status,
+      401,
+    );
+    assertEquals(
+      (await api(
+        roomPath + '/aliases',
+        undefined,
+        registered.body.access_token,
+        'GET',
+        facadePort,
+      )).status,
+      503,
+    );
+    for (const method of ['GET', 'POST']) {
+      const result = await edgeApi(
+        'publicRooms',
+        method === 'POST' ? {} : undefined,
+        method,
+      );
+      assertEquals(result.status, 200, JSON.stringify(result));
+      assert(
+        result.body.chunk.some((room: { room_id: string }) =>
+          room.room_id === roomId
+        ),
+      );
+      assert(
+        !result.body.chunk.some((room: { room_id: string }) =>
+          room.room_id === fresh.body.room_id
+        ),
+      );
+    }
+    const anonymousAlias = await fetch(
+      `http://127.0.0.1:${facadePort}/_matrix/client/v3/` + aliasPath,
+    );
+    assertEquals(anonymousAlias.status, 200);
+    assertEquals(await anonymousAlias.json(), {
+      room_id: roomId,
+      servers: ['logical.test'],
+    });
+    for (
+      const [path, method, body] of [
+        [aliasPath, 'DELETE', undefined],
+        [
+          'directory/room/' +
+          encodeURIComponent('#must-stay-home:logical.test'),
+          'PUT',
+          { room_id: fresh.body.room_id },
+        ],
+        ['directory/list/room/' + encodeURIComponent(roomId), 'PUT', {
+          visibility: 'private',
+        }],
+      ] as const
+    ) {
+      assertEquals(await edgeApi(path, body, method), {
+        status: 503,
+        body: {
+          errcode: 'M_UNAVAILABLE',
+          error: 'operation requires home ingress',
+        },
+      });
+    }
+    assertEquals((await edgeApi(aliasPath)).body.room_id, roomId);
+    assertEquals(
+      (await edgeApi('directory/list/room/' + encodeURIComponent(roomId))).body
+        .visibility,
+      'public',
+    );
+    assertEquals(
+      (await edgeApi(
+        'directory/room/' + encodeURIComponent('#must-stay-home:logical.test'),
+      )).status,
+      404,
+    );
     const upgradeSeed = await edgeApi('createRoom', {
       room_version: '11',
       initial_state: [{
