@@ -38,7 +38,12 @@ export const tableContracts = {
       'publication_keys',
     ],
     // Accepted recovery obligations and immutable saved remote results.
-    retained: ['waits', 'remote_batches', 'membership_receipts'],
+    retained: [
+      'waits',
+      'remote_batches',
+      'membership_receipts',
+      'membership_receipt_wires',
+    ],
     // Room identity/exact acceptance cuts: auditRoom; completed progress is also
     // checked against server publication by auditServer.
     completion: ['completion_state', 'completion_receipts'],
