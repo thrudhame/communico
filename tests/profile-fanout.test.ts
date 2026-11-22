@@ -13,6 +13,7 @@ import type { Tenant } from '#engine/tenant/index.ts';
 import { buildInTx } from '#engine/room/build.ts';
 import { join, leave } from '#engine/room/membership.ts';
 import { type PreparedSubmission, sendLocal } from '#engine/room/ingest.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
 
 Deno.test('profile fanout: winning membership fields retain durable work in the profile transaction', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'profile-fanout-' });
@@ -164,6 +165,57 @@ async function member(
     return { id, content: JSON.parse(row.pdu).content };
   });
 }
+
+Deno.test('profile workers isolate discovery admission failure and retain the blocked user', async () => {
+  const f = await workerFixture();
+  try {
+    const bob =
+      (await registerUser(f.tenant, { localpart: 'bob', password: 'pw' }))
+        .user_id;
+    const room = await createRoom(
+      f.store,
+      { creator: bob, version: '11' },
+      f.tenant.signer(),
+    );
+    await setProfileField(f.tenant, 'alice', 'displayname', 'Alice updated');
+    await setProfileField(f.tenant, 'bob', 'displayname', 'Bob updated');
+    const server = await f.store.server(), query = server.query;
+    const blocked = new MatrixError(
+      503,
+      'M_UNAVAILABLE',
+      'fixture discovery admission',
+    );
+    server.query = function (...args) {
+      if (args[1]?.includes(f.user)) return Promise.reject(blocked);
+      return query.apply(this, args);
+    };
+    let failures;
+    try {
+      failures = await f.worker.drain();
+    } finally {
+      server.query = query;
+    }
+    assertEquals(failures.length, 1);
+    assertEquals(failures[0].error, blocked);
+    assertEquals(
+      (await member(f.store, room.roomId, bob)).content.displayname,
+      'Bob updated',
+    );
+    assertEquals(
+      (await f.tenant.tx((tx) => tx.profiles.fanout.list('alice'))).length,
+      1,
+    );
+    assertEquals(await f.worker.drain(), []);
+    for (const room of f.rooms) {
+      assertEquals(
+        (await member(f.store, room, f.user)).content.displayname,
+        'Alice updated',
+      );
+    }
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('profile fanout: partial failures survive cold reopen and successful rooms are not reauthored', async () => {
   const f = await workerFixture();
