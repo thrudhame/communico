@@ -23,6 +23,28 @@ export async function get(db: Db, source: string): Promise<number> {
   return position;
 }
 
+/** Read related source cuts in one snapshot, preserving request order. */
+export async function getAll(
+  db: Db,
+  sources: readonly string[],
+): Promise<number[]> {
+  if (!sources.length) return [];
+  const rows = await db.query(
+    `SELECT COALESCE(watermarks.position,0) AS position
+    FROM json_each(?) AS requested LEFT JOIN watermarks ON watermarks.source=requested.value
+    ORDER BY CAST(requested.key AS INTEGER)`,
+    [JSON.stringify(sources)],
+  );
+  return rows.map((row) => {
+    if (typeof row.position !== 'number') {
+      throw new Error(
+        `watermark position is not numeric: ${String(row.position)}`,
+      );
+    }
+    return row.position;
+  });
+}
+
 export async function advance(
   tx: Conn,
   source: string,
