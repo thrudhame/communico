@@ -43,7 +43,67 @@ Deno.test('room upgrade intent migration appends to v56 with fresh-schema equiva
       await (await old.server()).query(
         "SELECT v FROM meta WHERE k='schema_version'",
       ),
-      [{ v: '57' }],
+      [{ v: String(serverSchema.version) }],
+    );
+  } finally {
+    await old.close();
+    await fresh.close();
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test('notification room retirement appends to v57 with fresh-schema equivalence', async () => {
+  const root = await Deno.makeTempDir({
+    prefix: 'notification-retirement-schema-',
+  });
+  const settings = (name: string) => ({
+    dir: root + '/' + name,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  });
+  let old = await openStore(settings('old'), {
+    schemas: { server: historicalServerSchema(57) },
+  });
+  const fresh = await openStore(settings('fresh'), {
+    schemas: { server: serverSchema },
+  });
+  try {
+    assertEquals(
+      await (await old.server()).query(
+        "SELECT name FROM sqlite_master WHERE name='notification_retired_rooms'",
+      ),
+      [],
+    );
+    await (await old.server()).execute(
+      "INSERT INTO room_upgrades VALUES('!old:test','@alice:test','!new:test','{}',0)",
+    );
+    await old.close();
+    old = await openStore(settings('old'), {
+      schemas: { server: serverSchema },
+    });
+    const db = await old.server();
+    const sql =
+      "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso%' ORDER BY type,name";
+    assertEquals(await db.query(sql), await (await fresh.server()).query(sql));
+    assertEquals(
+      await db.query('SELECT * FROM notification_retired_rooms'),
+      [],
+    );
+    assertEquals((await db.query('SELECT * FROM room_upgrades')).length, 1);
+    await db.execute(
+      "INSERT INTO notification_retired_rooms VALUES('!removed:test')",
+    );
+    await old.close();
+    old = await openStore(settings('old'), {
+      schemas: { server: serverSchema },
+    });
+    assertEquals(
+      await (await old.server()).query(
+        'SELECT * FROM notification_retired_rooms',
+      ),
+      [{ room: '!removed:test' }],
     );
   } finally {
     await old.close();

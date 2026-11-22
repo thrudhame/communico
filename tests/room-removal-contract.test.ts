@@ -43,9 +43,12 @@ const cleared = [
 // cancelled by the notification owner, not erased with the room projection.
 // Membership protocol receipts retain exact authenticated retry responses after
 // removal; disposable sender attempts/jobs are cleared with the room instead.
+// Notification retirement markers keep late facts from rebuilding a dropped
+// projection or blocking unrelated history after the room file is gone.
 const retained = [
   'federation_join_attempts',
   'membership_operations',
+  'notification_retired_rooms',
   'push_delivery',
   'reports',
 ];

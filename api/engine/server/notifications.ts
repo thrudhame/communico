@@ -62,6 +62,11 @@ export async function removeNotificationFacts(
       'INSERT INTO notification_retired_users(user) VALUES(?) ON CONFLICT DO NOTHING',
       [scope.user],
     );
+  } else {
+    await tx.execute(
+      'INSERT INTO notification_retired_rooms(room) VALUES(?) ON CONFLICT DO NOTHING',
+      [scope.room],
+    );
   }
   await tx.execute(
     `UPDATE domain_operations SET applied=-1 WHERE kind='notification' AND json_extract(payload_json,'$.${column}')=?`,
@@ -646,7 +651,6 @@ export async function reconcileNotificationEvent(
   event: string,
   now: number,
 ): Promise<void> {
-  await projectImportedNotificationEvent(tx, room, event, now);
   const affected = new Set([event]);
   let frontier = [event];
   for (let hop = 0; hop < 3 && frontier.length; hop++) {
@@ -702,6 +706,9 @@ export async function reconcileNotificationEvent(
         now,
       );
     }
+    // Read markers and local own-event reads are authoritative before a saved
+    // imported decision is materialized. No transient unread row may dispatch.
+    await projectImportedNotificationEvent(tx, room, target, now);
     const redacted = (await tx.query(
       'SELECT 1 FROM redactions WHERE room=? AND target=?',
       [room, target],
@@ -1050,7 +1057,7 @@ export async function importNotificationOperation(
   history?: DomainHistoryProof,
 ) {
   const value = await acceptNotificationOperation(tx, operation, history);
-  await projectImportedNotificationEvent(tx, value.room, value.event, now);
+  await reconcileNotificationEvent(tx, value.room, value.event, now);
 }
 
 /** The existing server stream owns post-commit consumer wakes, as for imported

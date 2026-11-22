@@ -476,8 +476,11 @@ CREATE TABLE room_upgrades(old_room_id TEXT PRIMARY KEY NOT NULL,user_id TEXT NO
 const JOIN_REFUSAL_SQL =
   'ALTER TABLE federation_join_attempts ADD COLUMN remote_refused INTEGER NOT NULL DEFAULT 0 CHECK(remote_refused IN (0,1))';
 
+const NOTIFICATION_ROOM_RETIREMENT_SQL =
+  'CREATE TABLE notification_retired_rooms(room TEXT PRIMARY KEY NOT NULL)';
+
 export const serverSchema: SchemaProvider = {
-  version: 57,
+  version: 58,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -541,6 +544,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(INVITE_DISPATCH_SQL);
     await db.exec(NOTIFICATION_CONTEXT_SQL);
     await db.exec(ROOM_UPGRADES_SQL);
+    await db.exec(NOTIFICATION_ROOM_RETIREMENT_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -629,5 +633,6 @@ INSERT INTO device_publication_predecessors SELECT DISTINCT p.subject,p.destinat
     54: (conn) => conn.exec(REPORT_IDENTITY_SQL),
     55: (conn) => conn.exec(NOTIFICATION_CONTEXT_SQL),
     56: (conn) => conn.exec(ROOM_UPGRADES_SQL),
+    57: (conn) => conn.exec(NOTIFICATION_ROOM_RETIREMENT_SQL),
   },
 };

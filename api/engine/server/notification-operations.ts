@@ -187,6 +187,24 @@ export async function acceptNotificationOperation(
     throw new Error('saved notification changed');
   }
   await importRegisterOperation(conn, operation);
+  // Keep authenticated history, but never turn missing evidence for a dropped
+  // room into a permanent history-admission dependency. A newly registered
+  // room or current OOB invite has its own live evidence lifecycle.
+  await conn.execute(
+    `UPDATE domain_operations SET applied=-1 WHERE operation_id=?
+    AND EXISTS (SELECT 1 FROM notification_retired_rooms WHERE room=?)
+    AND NOT EXISTS (SELECT 1 FROM rooms WHERE room_id=?)
+    AND NOT EXISTS (SELECT 1 FROM prejoin_memberships WHERE room_id=?
+      AND user_id=? AND event_id=? AND kind='invite' AND status='pending')`,
+    [
+      operation.operationId,
+      value.room,
+      value.room,
+      value.room,
+      value.user,
+      value.event,
+    ],
+  );
   return value;
 }
 
