@@ -124,7 +124,10 @@ async function writePresence(
     throw new MatrixError(400, 'M_INVALID_PARAM', 'bad presence: ' + presence);
   }
   const lastActiveMs = Date.now() - (opts.lastActiveAgo ?? 0);
-  const row = await eventStreamTx(server, async (tx) => {
+  // Presence owns its counter, not the event allocator. MVCC retries serialize
+  // competing presence writes; publication cannot hold a reader's presence
+  // intent (including a no-op) behind an unrelated event-stream writer.
+  const row = await server.tx(async (tx) => {
     let status = statusMsg;
     if (skipUnchanged) {
       const current = (await tx.query(
@@ -149,17 +152,20 @@ export async function ensurePresenceRow(
   server: Db,
   userId: string,
 ): Promise<void> {
-  await eventStreamTx(server, async (tx) => {
+  const row = await server.tx(async (tx) => {
     if (
       (await tx.query('SELECT 1 FROM presence WHERE user_id=?', [userId]))
         .length
-    ) return;
+    ) return null;
     const seq = await next(tx, 'presence');
+    const lastActiveMs = Date.now();
     await tx.execute(
       "INSERT INTO presence(user_id,presence,status_msg,last_active_ms,seq) VALUES(?,'offline',NULL,?,?)",
-      [userId, Date.now(), seq],
+      [userId, lastActiveMs, seq],
     );
+    return { presence: 'offline', statusMsg: null, lastActiveMs, seq };
   });
+  if (row !== null) notify(server, { kind: 'presence', userId, row });
 }
 export async function getPresence(
   server: Pick<Db, 'query'>,

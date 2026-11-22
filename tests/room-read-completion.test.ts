@@ -17,7 +17,7 @@ function guard<T>(task: Promise<T>): Promise<T> {
   ]).finally(() => clearTimeout(timer));
 }
 
-Deno.test('room read completion: foreign accepted send precedes every scoped consumer, not unrelated rooms', async () => {
+Deno.test('room read completion: own accepted send precedes every scoped consumer, not unrelated rooms', async () => {
   const http = await startHttp(), { app } = http;
   const entered = Promise.withResolvers<void>(),
     release = Promise.withResolvers<void>();
@@ -142,13 +142,13 @@ Deno.test('room read completion: foreign accepted send precedes every scoped con
         ['v3/rooms/' + path + '/initialSync', undefined],
         ['v3/rooms/' + path + '/receipt/m.read/' + event, {}],
       ] as const
-    ) jobs.push(request(bob.access_token!, route, body));
+    ) jobs.push(request(alice.access_token!, route, body));
     await guard(Promise.race([
       captured.promise,
       ...jobs.map((job) =>
         job.then(() => {
           throw new Error(
-            'foreign room read returned before accepted publication',
+            'own room read returned before accepted publication',
           );
         })
       ),
@@ -179,7 +179,7 @@ Deno.test('room read completion: foreign accepted send precedes every scoped con
       };
       const abort = new AbortController();
       const job = request(
-        bob.access_token!,
+        alice.access_token!,
         route,
         body,
         undefined,
@@ -232,11 +232,8 @@ Deno.test('room read completion: foreign accepted send precedes every scoped con
         hit: { result: { event_id: string } },
       ) => hit.result.event_id === eventId),
     );
-    assert(
-      bodies[4].notifications.some((notice: { event: { event_id: string } }) =>
-        notice.event.event_id === eventId
-      ),
-    );
+    // Own sends are causal read obligations but do not notify their sender.
+    assertEquals(bodies[4].notifications, []);
     assert(
       bodies[5].rooms.join[created.roomId].timeline.events.some((
         event: { event_id: string },
