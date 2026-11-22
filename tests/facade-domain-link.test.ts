@@ -1685,6 +1685,133 @@ Deno.test('facade forget: actual local join retains admission context across col
   }
 });
 
+Deno.test('facade forget: a stale rejoin observation is inert evidence and never blocks the room cursor', async (t) => {
+  const f = await fixture();
+  const user = '@alice:logical.test';
+  try {
+    installJoinAdmission(f.home);
+    const db = await f.home.server();
+    for (
+      const [name, stale] of [
+        ['superseded authority incarnation', 'authority'],
+        ['join no longer accepted and grounded', 'standing'],
+      ] as const
+    ) {
+      await t.step(name, async () => {
+        // Each case owns its room: one wedged cursor cannot fail the other.
+        const created = await createRoom(f.home, {
+          creator: '@bob:logical.test',
+          preset: 'public_chat',
+        }, f.ht.signer());
+        const room = await openRoom(f.home, created.roomId);
+        setJoinObservation(
+          f.home,
+          (roomId, userId) => prepareRejoin(db, roomId, userId),
+        );
+        await joinLocal(room, user, f.ht.signer());
+        await leaveLocal(room, user, f.ht.signer());
+        await project(f.home, room.id);
+        await forget(db, room.id, user, 'logical.test');
+        const count = (await db.tx((tx) => forgetOperations(tx, user))).length;
+        setJoinObservation(f.home, async (roomId, userId) => {
+          const captured = await prepareRejoin(db, roomId, userId);
+          return stale === 'authority'
+            ? { ...captured, incarnation: 'superseded-incarnation' }
+            : captured;
+        });
+        const joined = await joinLocal(room, user, f.ht.signer());
+        if (stale === 'standing') {
+          await room.tx((tx) =>
+            tx.events.setStatus(joined.eventId, {
+              standing: 'rejected',
+              grounding: 'grounded',
+              origin: null,
+              received_ts: Date.now(),
+            })
+          );
+        }
+        const later = await sendLocal(room, {
+          type: 'm.room.message',
+          sender: '@bob:logical.test',
+          content: { msgtype: 'm.text', body: 'after ' + stale },
+        }, f.ht.signer());
+        await project(f.home, room.id);
+        assertEquals(
+          await db.query('SELECT room FROM feed WHERE event=?', [
+            later.eventId,
+          ]),
+          [{ room: room.id }],
+          'stale observation blocked later room projection',
+        );
+        assertEquals(
+          (await db.tx((tx) => forgetOperations(tx, user))).length,
+          count,
+          'stale observation authored a rejoin',
+        );
+        assertEquals(
+          (await membershipOf(db, room.id, user))!.forgotten,
+          true,
+        );
+      });
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade forget: producers fence an in-flight receive of the account stream', async () => {
+  const f = await fixture();
+  const room = '!fenced:logical.test', user = '@alice:logical.test';
+  try {
+    const hd = await f.home.server(), ed = await f.edge.server();
+    for (const db of [hd, ed]) {
+      await db.execute(
+        "INSERT INTO memberships(user,room,membership,event,seq) VALUES(?,?,'leave',?,1)",
+        [user, room, '$leave'],
+      );
+    }
+    const bootstrap = await f.hs.bootstrap('alice', f.bundle.id);
+    await f.toEdge(bootstrap);
+    await forget(hd, room, user, 'logical.test');
+    const suffix = (await f.hs.export('alice', f.bundle.id)).filter((record) =>
+      record.sequence > bootstrap.at(-1)!.sequence
+    );
+    assert(suffix.length > 0);
+    const held = Promise.withResolvers<void>();
+    const receiver = new Journal({
+      ...ed,
+      tx: async (fn, options) => {
+        await held.promise;
+        return await ed.tx(fn, options);
+      },
+    }, LINK_SUPPORTED);
+    const receiving = receiver.receive('home', suffix);
+    try {
+      for (
+        const produce of [
+          () => prepareRejoin(ed, room, user),
+          () => forget(ed, room, user, 'logical.test'),
+        ]
+      ) {
+        await assertRejects(
+          produce,
+          MatrixError,
+          'forget snapshot unavailable',
+        );
+      }
+    } finally {
+      held.resolve();
+      await receiving;
+    }
+    assertEquals(
+      await ed.query('SELECT room FROM forgotten WHERE user=?', [user]),
+      [],
+    );
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('facade forget: prepared client membership retry retains its original observation before room commit', async () => {
   const f = await fixture();
   const user = '@alice:logical.test';

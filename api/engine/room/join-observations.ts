@@ -49,17 +49,16 @@ export async function completeJoinObservation(
   event: string,
   data?: LocalJoinObservation,
 ) {
-  const [old] = await conn.query(
-    "SELECT 1 FROM changes WHERE kind='rejoin-observation' AND event=?",
-    [event],
-  );
-  if (old) return;
+  // The retained-row key lookup comes first: every grounded event asks.
   const [retained] = await conn.query(
     'SELECT data FROM local_join_observations WHERE event=?',
     [event],
   );
   const observed = retained ? JSON.parse(String(retained.data)) : data;
-  if (observed !== undefined) {
-    await appendChange(conn, 'rejoin-observation', event, observed);
-  }
+  if (observed === undefined) return;
+  const [old] = await conn.query(
+    "SELECT 1 FROM changes WHERE kind='rejoin-observation' AND event=?",
+    [event],
+  );
+  if (!old) await appendChange(conn, 'rejoin-observation', event, observed);
 }

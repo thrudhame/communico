@@ -144,6 +144,11 @@ function bind(
       setStatus: async (event: string, status: events.Status) => {
         await events.setStatus(conn, event, status);
         await waits.readyFor(conn, event);
+        // Whichever path grounds a retained local join completes its exact
+        // admission context in that same transaction; it is idempotent.
+        if (status.standing === 'accepted' && status.grounding === 'grounded') {
+          await joinObservations.completeJoinObservation(conn, event);
+        }
       },
       statuses: (ids: readonly string[]) => events.statuses(conn, ids),
       missingCandidates: (
