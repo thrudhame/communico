@@ -39,6 +39,9 @@ export type FederationRequest = {
   // response cap; defaults to federation.maxbytes
   maxBytes?: number;
   signal?: AbortSignal;
+  // The side-effect owner can durably record uncertainty before any request
+  // bytes can leave. Discovery, signing and ACL refusal precede this boundary.
+  beforeDispatch?: () => void | Promise<void>;
   // Typed scope from the owner, never inferred from paths or mixed /send bodies.
   room?: { store: Store; id: string; participation?: boolean };
 };
@@ -67,6 +70,16 @@ export class FederationHttpError extends UpstreamHttpError {
   override responseBody(): Record<string, unknown> {
     return { errcode: this.errcode, error: this.#remoteMessage };
   }
+}
+
+/** Submission refusals may release exact prepared work. Proxy errors, timeouts
+ * and throttling keep the existing uncertain-delivery obligation. */
+export function isDefiniteFederationRefusal(
+  error: unknown,
+): error is FederationHttpError {
+  return error instanceof FederationHttpError && error.matrixBody &&
+    error.remoteStatus >= 400 && error.remoteStatus < 500 &&
+    error.remoteStatus !== 408 && error.remoteStatus !== 429;
 }
 
 // v2 -> v1 fallback requires a completed endpoint-unknown response, not a
@@ -148,7 +161,7 @@ export async function federationRequestRaw(
     }
     await assertRoomAcl(req.room.store, req.room.id, req.destination);
   }
-  const res = await dialNodeTls({
+  const dial: Parameters<typeof dialNodeTls>[0] = {
     connectIp: endpoint.connectIp,
     alternatives: endpoint.alternatives,
     port: endpoint.port,
@@ -169,7 +182,9 @@ export async function federationRequestRaw(
       status >= 200 && status < 300 && req.sink !== undefined
         ? req.sink(status, headers)
         : null,
-  });
+  };
+  await req.beforeDispatch?.();
+  const res = await dialNodeTls(dial);
   if (res.status >= 200 && res.status < 300) {
     return res;
   }

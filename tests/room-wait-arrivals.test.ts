@@ -2,6 +2,7 @@ import { assertEquals } from '@std/assert';
 import { buildInTx } from '#engine/room/build.ts';
 import { backfill } from '#engine/room/history.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
+import { serverSchema } from '#engine/server/schema.ts';
 import { redactEvent, sendLocal } from '#engine/room/ingest.ts';
 import { joinRemote } from '#engine/room/join.ts';
 import { importReplicaBoundary } from '#engine/room/replica.ts';
@@ -23,7 +24,7 @@ Deno.test('backfill completion drains dependency work made ready by historical a
     checkpointlogbytes: 65536,
     maxopenfiles: 8,
     idleseconds: 300,
-  }, { schemas: { room: roomSchema } });
+  }, { schemas: { room: roomSchema, server: serverSchema } });
   try {
     const g = await genesis(store, { roomId: '!wait-backfill:test' });
     const target = await g.room.tx((tx) =>
@@ -73,7 +74,7 @@ for (const composition of ['rejoin', 'replica']) {
       checkpointlogbytes: 65536,
       maxopenfiles: 8,
       idleseconds: 300,
-    }, { schemas: { room: roomSchema } });
+    }, { schemas: { room: roomSchema, server: serverSchema } });
     try {
       const fr = await makeFakeRoom({ roomId: '!wait-rejoin:remote.test' });
       const user = '@anna:test', signer = await testSigner();

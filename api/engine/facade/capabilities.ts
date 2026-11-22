@@ -186,6 +186,36 @@ const F2_ROOMS: readonly Rule[] = [
   ),
 ];
 
+// B7 reuses the membership owners and their durable admission/receipt gates.
+// Forget and the remaining private read surfaces belong to B8; sync to B9.
+const F2_MEMBERSHIP: readonly Rule[] = [
+  ...['make_join', 'make_knock', 'make_leave'].map((name) =>
+    route('GET', new RegExp('^' + f + name + '/[^/]+/[^/]+$'), 'rooms')
+  ),
+  ...['send_join', 'send_knock', 'send_leave'].map((name) =>
+    route('PUT', new RegExp('^' + f + name + '/[^/]+/[^/]+$'), 'rooms')
+  ),
+  ...['send_join', 'send_leave', 'invite'].map((name) =>
+    route(
+      'PUT',
+      new RegExp('^/_matrix/federation/v2/' + name + '/[^/]+/[^/]+$'),
+      'rooms',
+    )
+  ),
+  ...['join', 'knock'].map((name) =>
+    route(
+      'POST',
+      new RegExp('^/_matrix/client/v3/' + name + '/[^/]+$'),
+      'clientrooms',
+    )
+  ),
+  route(
+    'POST',
+    /^\/_matrix\/client\/v3\/rooms\/[^/]+\/(?:join|invite|leave|kick|ban|unban)$/,
+    'clientrooms',
+  ),
+];
+
 const HOME_SERVICES = new Set([
   'recovery',
   'link-client',
@@ -231,6 +261,7 @@ export function capabilities(role: string, phase = 'f1') {
           ...F2_DEVICES,
           ...F2_TODEVICE,
           ...F2_ROOMS,
+          ...F2_MEMBERSHIP,
         ]
         : F1_PUBLIC)
         .filter((rule) => rule.path.test(path));

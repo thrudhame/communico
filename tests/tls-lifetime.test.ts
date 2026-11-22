@@ -151,10 +151,9 @@ for (const caller of ['http1', 'federation'] as const) {
   }
 
   Deno.test(`${caller}: initial TCP failure retains its transport phase`, async () => {
-    const listener = Deno.listen({ hostname: '127.0.0.1', port: 0 });
-    const port = (listener.addr as Deno.NetAddr).port;
-    listener.close();
-    const result = await request(port).then(() => null, (error) => error);
+    // TCP destination zero has no listener; unlike a released ephemeral port,
+    // it cannot be claimed by another fixture between selection and connect.
+    const result = await request(0).then(() => null, (error) => error);
     assert(result instanceof UpstreamError);
     assertEquals(result.context.phase, caller === 'http1' ? 'connect' : 'tls');
   });

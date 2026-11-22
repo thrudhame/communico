@@ -317,12 +317,12 @@ Deno.test('E6 pending remote cleanup blocks every local join authoring boundary 
     const attempt: JoinAttempt = {
       roomId: room.id,
       userId: partial.sender,
-      eventId: '$uncommitted',
+      eventId: String(pdu.event_id),
       roomVersion: '11',
       destination: 'remote.test',
       addedMs: Date.now(),
     };
-    await beginJoinAttempt(store, attempt);
+    await beginJoinAttempt(store, attempt, pdu);
     releaseJoinAttempt(store, attempt);
     for (
       const author of [
@@ -357,7 +357,7 @@ Deno.test('E6 pending remote cleanup blocks every local join authoring boundary 
       true,
     );
     await assertRejects(
-      () => beginJoinAttempt(store, attempt),
+      () => beginJoinAttempt(store, attempt, pdu),
       MatrixError,
       'Already joined locally',
     );

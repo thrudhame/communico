@@ -9,7 +9,6 @@ import { roomEdges } from '#engine/room/edges.ts';
 import { advance } from '#engine/store/watermark.ts';
 import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
 import { removeNotificationFacts } from '#engine/server/notifications.ts';
-import { visiblePrejoin } from './prejoin.ts';
 import { openRoom } from '#engine/room/index.ts';
 import { get } from '#engine/store/watermark.ts';
 import { reconcileRoomCompletions } from '#engine/tenant/completion.ts';
@@ -78,10 +77,19 @@ export async function finishRoomRemoval(
     const byDestination = new Map(
       rows.map((r) => [String(r.destination), Number(r.n)]),
     );
+    const invites = await tx.query(
+      'SELECT destination,count(*) AS n FROM federation_invite_attempts WHERE room_id=? GROUP BY destination',
+      [roomId],
+    );
+    for (const row of invites) {
+      const destination = String(row.destination);
+      byDestination.set(
+        destination,
+        (byDestination.get(destination) ?? 0) + Number(row.n),
+      );
+    }
     const pending = await tx.query(
-      `SELECT room_id,user_id,status FROM prejoin_memberships p WHERE room_id=? AND status IN ('rejecting','attempting','failed-attempt','failed-retract') AND ${
-        visiblePrejoin('p')
-      }`,
+      "SELECT job_id,status FROM prejoin_jobs WHERE room_id=? AND status IN ('rejecting','attempting','failed-attempt','failed-retract')",
       [roomId],
     );
     for (const row of pending) {
@@ -90,7 +98,7 @@ export async function finishRoomRemoval(
           (String(row.status).includes('attempt')
               ? 'knock-attempt:'
               : 'reject-invite:') +
-            JSON.stringify([String(row.room_id), String(row.user_id)])
+            String(row.job_id)
       );
       if (intent === undefined) {
         throw new Error('room removal missing prejoin delivery owner');
@@ -134,6 +142,8 @@ export async function finishRoomRemoval(
         'directory',
         'visibility',
         'prejoin_memberships',
+        'prejoin_jobs',
+        'federation_invite_attempts',
         'rooms',
       ]
     ) {

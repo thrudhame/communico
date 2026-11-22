@@ -7,6 +7,7 @@ import {
   type JoinAttempt,
   joinAttemptActive,
   joinAttemptCommitted,
+  joinAttemptRefused,
   joinLeave,
   pendingJoinAttempts,
   saveJoinLeave,
@@ -16,6 +17,7 @@ export async function performJoinCleanup(
   deps: Pick<InviteDeps, 'server' | 'signer' | 'store'>,
   attempt: JoinAttempt,
 ): Promise<void> {
+  if (await joinAttemptRefused(deps.server, attempt)) return;
   let signed = await joinLeave(deps.server, attempt);
   if (signed === null) {
     signed = await prepareRemoteLeave(attempt.destination, attempt, deps);
@@ -46,7 +48,10 @@ export function joinCleanupProvider(
               a.eventId === attempt.eventId
             )
           ) return;
-          if (!await joinAttemptCommitted(deps.store, attempt)) {
+          if (
+            !await joinAttemptRefused(server, attempt) &&
+            !await joinAttemptCommitted(deps.store, attempt)
+          ) {
             await admit(server, destination, {
               kind: 'outbound',
               user: attempt.userId,

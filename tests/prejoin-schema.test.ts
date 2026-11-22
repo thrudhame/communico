@@ -2,6 +2,7 @@ import { assertEquals } from '@std/assert';
 import { openStore } from '#engine/store/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { SERVER_V13 } from '#tests/fixtures/server-v13.ts';
+import { prejoinJobs } from '#engine/server/prejoin-jobs.ts';
 
 Deno.test('prejoin v20 upgrade preserves v19 invite events, sequences and unbounded rejection work', async () => {
   const dir = await Deno.makeTempDir();
@@ -39,10 +40,30 @@ Deno.test('prejoin v20 upgrade preserves v19 invite events, sequences and unboun
       schemas: { server: { ...serverSchema, version: 22 } },
     });
     await v22.close();
+    const v50 = await openStore(config, {
+      schemas: { server: { ...serverSchema, version: 50 } },
+    });
+    await v50.close();
     const current = await openStore(config, {
       schemas: { server: serverSchema },
     });
     const db = await current.server();
+    const jobs = await prejoinJobs(db);
+    assertEquals(jobs.length, 1);
+    assertEquals(jobs[0].work.userId, '@b:test');
+    assertEquals(jobs[0].work.seq, 42);
+    assertEquals(jobs[0].work.expiresMs, null);
+    assertEquals(jobs[0].source, null);
+    assertEquals(
+      await db.query(
+        'SELECT source_binding FROM prejoin_memberships ORDER BY seq',
+      ),
+      [
+        { source_binding: null },
+        { source_binding: null },
+        { source_binding: null },
+      ],
+    );
     assertEquals(
       await db.query(
         'SELECT local_leave_json FROM prejoin_memberships ORDER BY seq',
@@ -99,6 +120,7 @@ Deno.test('prejoin v20 upgrade preserves v19 invite events, sequences and unboun
     const reopened = await openStore(config, {
       schemas: { server: serverSchema },
     });
+    assertEquals(await prejoinJobs(await reopened.server()), jobs);
     assertEquals(
       (await (await reopened.server()).query(
         'SELECT * FROM prejoin_memberships',

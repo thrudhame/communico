@@ -327,8 +327,6 @@ Deno.test('F2 room authoring and reads use client scope, not federation availabi
   }
   for (
     const [method, path] of [
-      ['POST', 'rooms/room/join'],
-      ['POST', 'rooms/room/invite'],
       ['GET', 'sync'],
     ]
   ) {
@@ -340,6 +338,89 @@ Deno.test('F2 room authoring and reads use client scope, not federation availabi
         () => true,
       )?.status,
       404,
+    );
+  }
+});
+
+Deno.test('F2 membership activates only delivered methods and their independent client/federation scopes', () => {
+  const facade = capabilities('facade', 'f2');
+  const f1 = capabilities('facade', 'f1');
+  const routes: [string, string, string][] = [];
+  for (const name of ['make_join', 'make_knock', 'make_leave']) {
+    routes.push([
+      'GET',
+      '/_matrix/federation/v1/' + name + '/room/user',
+      'rooms',
+    ]);
+  }
+  for (const name of ['send_join', 'send_knock', 'send_leave']) {
+    routes.push([
+      'PUT',
+      '/_matrix/federation/v1/' + name + '/room/event',
+      'rooms',
+    ]);
+  }
+  for (const name of ['send_join', 'send_leave', 'invite']) {
+    routes.push([
+      'PUT',
+      '/_matrix/federation/v2/' + name + '/room/event',
+      'rooms',
+    ]);
+  }
+  for (const name of ['join', 'knock']) {
+    routes.push([
+      'POST',
+      '/_matrix/client/v3/' + name + '/room',
+      'clientrooms',
+    ]);
+  }
+  for (const name of ['join', 'invite', 'leave', 'kick', 'ban', 'unban']) {
+    routes.push([
+      'POST',
+      '/_matrix/client/v3/rooms/room/' + name,
+      'clientrooms',
+    ]);
+  }
+  for (const [method, path, scope] of routes) {
+    const request = new Request('https://logical.test' + path, { method });
+    const scopes: string[] = [];
+    assertEquals(
+      facade.gate(request, (required) => {
+        scopes.push(required);
+        return true;
+      }),
+      null,
+      path,
+    );
+    assertEquals(scopes, [scope]);
+    assertEquals(facade.gate(request, () => false)?.status, 503);
+    assertEquals(f1.gate(request, () => true)?.status, 404);
+    assertEquals(
+      facade.gate(new Request(request.url, { method: 'DELETE' }), () => true)
+        ?.status,
+      405,
+    );
+  }
+  for (
+    const [method, path] of [
+      ['PUT', '/_matrix/federation/v1/invite/room/event'],
+      ['PUT', '/_matrix/federation/v2/send_knock/room/event'],
+      ['PUT', '/_matrix/federation/v1/exchange_third_party_invite/room'],
+      ['PUT', '/_matrix/federation/v1/3pid/onbind'],
+      ['GET', '/_matrix/federation/v1/make_join/room'],
+      ['POST', '/_matrix/client/v3/join/room/extra'],
+      ['POST', '/_matrix/client/v3/rooms/room/forget'],
+      ['GET', '/_matrix/client/v3/joined_rooms'],
+      ['GET', '/_matrix/client/v3/sync'],
+    ]
+  ) {
+    assertEquals(
+      facade.gate(
+        new Request('https://logical.test' + path, { method }),
+        () => true,
+      )?.status,
+      404,
+      path,
     );
   }
 });

@@ -68,6 +68,8 @@ import {
 } from '#engine/server/e2ee.ts';
 import {
   pendingTenantProjection,
+  recordTenantProjection,
+  setTenantProjector,
   tenantChangesCommitted,
   tenantProjectionPending,
 } from '#engine/tenant/hooks.ts';
@@ -1525,6 +1527,81 @@ Deno.test('imported key news: signing and signature imports retain durable disco
     await f.close();
   }
 });
+
+for (const phase of ['new application', 'cold replay']) {
+  Deno.test(`device projection obligation: ${phase} does not adopt unrelated work`, async () => {
+    const f = await fixture();
+    let cold: Store | undefined;
+    try {
+      const [record] = await f.hs.export('alice', f.bundle.id);
+      await f.ej.receive('home', [record]);
+      const db = await f.edge.tenant('logical.test');
+      const operation = (record.payload as { body: DeviceView }).body.operation;
+      // The semantic fact can precede this new journal application, e.g. through
+      // history. It must not adopt unrelated work when installation is unchanged.
+      await db.tx((conn) => importDeviceOperation(conn, operation, operation));
+      await projectTenant(f.edge, 'logical.test');
+      const unrelated = phase === 'new application'
+        ? await db.tx(recordTenantProjection)
+        : 0;
+      let projections = 0;
+      setTenantProjector(() => {
+        projections++;
+        return Promise.resolve();
+      });
+      f.ej.complete = () => Promise.reject(new Error('projection ACK loss'));
+      await assertRejects(
+        () => f.es.apply(f.ej, record),
+        Error,
+        'projection ACK loss',
+      );
+      if (phase === 'new application') {
+        assertEquals(
+          projections,
+          0,
+          'device application owns no pre-existing projection',
+        );
+        assertEquals(await pendingTenantProjection(db), unrelated);
+        return;
+      }
+      await f.edge.close();
+      cold = await f.open('edge');
+      const pairings = new Pairings(
+        await cold.server(),
+        f.node.signer(),
+        f.node.publicKey,
+        'b'.repeat(64),
+        f.node,
+      );
+      const tenant = await enrolledTenant(
+        cold,
+        pairings,
+        'logical.test',
+        'edge_a',
+      );
+      const later = await (await cold.tenant('logical.test')).tx(
+        recordTenantProjection,
+      );
+      const journal = new Journal(await cold.server(), LINK_SUPPORTED);
+      assertEquals(
+        await new DeviceOperations(cold, tenant, pairings, f.node).apply(
+          journal,
+          record,
+        ),
+        true,
+      );
+      assertEquals(projections, 0, 'cold replay owns no later projection');
+      assertEquals(
+        await pendingTenantProjection(await cold.tenant('logical.test')),
+        later,
+      );
+    } finally {
+      setTenantProjector(undefined);
+      await cold?.close();
+      await f.close();
+    }
+  });
+}
 
 Deno.test('imported key news: rollback has no intent or wake; committed ACK loss cold-replays one consumer publication', async () => {
   const f = await fixture();
@@ -3659,7 +3736,10 @@ Deno.test('signature link: revocation before or during overlay admission rolls b
         const db = await store.tenant('logical.test');
         assertEquals(await db.query('SELECT * FROM signature_operations'), []);
         assertEquals(
-          await db.query('SELECT * FROM facade_link_applications'),
+          await db.query(
+            'SELECT * FROM facade_link_applications WHERE hash=?',
+            [records[0].hash],
+          ),
           [],
         );
         assertEquals(
@@ -4093,7 +4173,10 @@ Deno.test('signing link: revocation before or during identity admission rolls ba
       const tenant = await f.edge.tenant('logical.test');
       assertEquals(await tenant.query('SELECT * FROM signing_operations'), []);
       assertEquals(
-        await tenant.query('SELECT * FROM facade_link_applications'),
+        await tenant.query(
+          'SELECT * FROM facade_link_applications WHERE hash=?',
+          [record.hash],
+        ),
         [],
       );
       assertEquals((await f.ej.next('home', record))?.hash, record.hash);

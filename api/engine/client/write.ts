@@ -2,7 +2,7 @@
 import { theApp } from '#engine/app.ts';
 import { assertCanonicalNumbers, canonicalJson } from '#engine/canonical.ts';
 import { serverName } from '#engine/config.ts';
-import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
+import { inviteDependencies } from '#engine/federation/dependencies.ts';
 import { inviteRemote } from '#engine/federation/invites.ts';
 import { domainOf } from '#engine/federation/pdu.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
@@ -28,16 +28,7 @@ import { requireRoomForAdmission, stateAtSeq, versionOf } from './room.ts';
 export type { CreateRoomOptions };
 
 export function inviteDeps() {
-  const app = theApp();
-  const signer = app.tenant.signer();
-  return {
-    store: app.store,
-    server: app.server,
-    signer,
-    keys: productionKeyResolver(app.federationKeys),
-    self: serverName(),
-    wake: (destination: string) => app.sender?.wake(destination),
-  };
+  return inviteDependencies(theApp());
 }
 
 export async function createRoom(opts: CreateRoomOptions) {

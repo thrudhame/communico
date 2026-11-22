@@ -4,22 +4,24 @@ import { DiagnosticCommand } from '#tests/helpers/child-diagnostics.ts';
 // is opened by a tool while the server owns the real file lock.
 import { assert, assertEquals } from '@std/assert';
 import metadata from '#root/deno.json' with { type: 'json' };
+import { fixtureListeners } from './helpers/fixture-listeners.ts';
 
 Deno.test('operator task clients preserve CLI contracts through the running server', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'operator-' });
   const socket = `${dir}/operator socket`;
   const config = `${dir}/communico.toml`;
-  const probe = Deno.listen({ hostname: '127.0.0.1', port: 0 });
-  const port = probe.addr.port;
-  probe.close();
   await Deno.writeTextFile(
     config,
-    `[server]\nport=${port}\n[store]\ndir="${dir}/store"\n[media]\nroot="${dir}/media"\n[admin]\nsocket="${socket}"\n[federation]\nenabled=false\ncert="${dir}/fed.crt"\nkey="${dir}/fed.key"\n`,
+    `[server]\nport=0\n[store]\ndir="${dir}/store"\n[media]\nroot="${dir}/media"\n[admin]\nsocket="${socket}"\n[federation]\nenabled=false\ncert="${dir}/fed.crt"\nkey="${dir}/fed.key"\n`,
   );
   const env = { COMMUNICO_CONFIG: config, DENO_NO_PROMPT: '1' };
+  const listeners = await fixtureListeners(config);
   const child = new DiagnosticCommand(Deno.execPath(), {
-    args: metadata.tasks.start.split(' ').slice(1),
-    env,
+    args: [
+      ...metadata.tasks.start.split(' ').slice(1, -1),
+      'tests/fixtures/listener-child.ts',
+    ],
+    env: { ...env, ...listeners.env },
     stdout: 'piped',
     stderr: 'piped',
   }).spawn();
@@ -28,6 +30,7 @@ Deno.test('operator task clients preserve CLI contracts through the running serv
     ended = true;
     return out;
   });
+  const port = await listeners.port('client');
   const base = `http://127.0.0.1:${port}/_matrix/client/`;
   const cli = async (
     task: string,

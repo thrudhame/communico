@@ -74,7 +74,7 @@ export async function listOutbox(
 // Destinations with undelivered rows (the startSender / projection rescan).
 async function destinationsWithPending(server: Db): Promise<string[]> {
   const rows = await server.query(
-    "SELECT destination FROM outbox WHERE state='pending' UNION SELECT destination FROM edu_outbox WHERE state='pending' UNION SELECT destination FROM federation_batches",
+    "SELECT destination FROM outbox WHERE state='pending' UNION SELECT destination FROM edu_outbox WHERE state='pending' UNION SELECT destination FROM federation_batches UNION SELECT destination FROM federation_invite_attempts WHERE status='pending'",
     [],
   );
   return rows.map((row) => String(row.destination));

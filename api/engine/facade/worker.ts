@@ -44,9 +44,33 @@ function advance(held: Cut, remote: Cut) {
   }
 }
 
+/** Local domains can depend on another stream's application, not its receipt.
+ * Keep one current retry per incomplete stream, including while it is running.
+ * Empty streams are not dependencies and never amplify a completion wake. */
+class ApplicationDependencies {
+  private readonly pending = new Map<string, () => void>();
+
+  track(stream: Stream, heads: Heads, retry: () => void) {
+    const id = key(stream);
+    if (heads.received.sequence > heads.applied.sequence) {
+      this.pending.set(id, retry);
+    } else {
+      this.pending.delete(id);
+    }
+  }
+
+  progressed(stream: Stream) {
+    const id = key(stream);
+    for (const [other, retry] of this.pending) {
+      if (other !== id) retry();
+    }
+  }
+}
+
 export class JournalReconciler {
   private readonly running = new Map<string, Promise<void>>();
   private readonly rerun = new Set<string>();
+  private readonly dependencies = new ApplicationDependencies();
   constructor(private readonly options: Options) {}
 
   async reconcile(signal?: AbortSignal): Promise<Hello> {
@@ -133,7 +157,8 @@ export class JournalReconciler {
   }
 
   async drain(): Promise<void> {
-    await Promise.all(this.running.values());
+    // Completing one admitted domain may admit a dependent stream's retry.
+    while (this.running.size) await Promise.all(this.running.values());
   }
 
   private async push(stream: Heads, hello: Hello, signal?: AbortSignal) {
@@ -172,10 +197,13 @@ export class JournalReconciler {
       const progressed = !sameCut(ack.received, next.received) ||
         !sameCut(ack.applied, next.applied);
       ack = next;
+      // Receipt can advance before the receiver's application commits. Drain
+      // toward this page's source head, not the old hello's applied cut; a
+      // no-progress response still yields rather than spinning on blocked work.
       if (
         !progressed ||
         (ack.received.sequence >= page.head.sequence &&
-          ack.applied.sequence >= (remote?.applied.sequence ?? 0))
+          ack.applied.sequence >= page.head.sequence)
       ) break;
     }
   }
@@ -204,6 +232,13 @@ export class JournalReconciler {
     let remoteApplied = remote?.applied ?? EMPTY_CUT;
     advance(remote?.received ?? EMPTY_CUT, held.received);
     advance(remoteApplied, held.applied);
+    const track = () =>
+      this.dependencies.track(
+        stream,
+        held,
+        () => this.start('in', stream, signal),
+      );
+    track();
     const acknowledge = async () => {
       for (;;) {
         const ack = await journal.acknowledgement(
@@ -234,6 +269,8 @@ export class JournalReconciler {
         );
       }
       held = next;
+      track();
+      this.dependencies.progressed(stream);
       await acknowledge();
     }
     signal?.throwIfAborted();
@@ -317,7 +354,7 @@ export function startHomeLinkWorker(
 /** Facade application is local and independent of the home socket. The same
  * explicit domain completion contract is used by both runtime roles. */
 type InboxOptions = {
-  journal: Journal;
+  journal: Pick<Journal, 'streams' | 'heads'>;
   peer: string;
   pollseconds: number;
   apply(stream: Stream): Promise<boolean>;
@@ -348,7 +385,55 @@ export class InboxWorker {
     let scanning: Promise<void> | undefined;
     const running = new Map<string, Promise<void>>();
     const rerun = new Set<string>();
+    const dependencies = new ApplicationDependencies();
     let dirty = false;
+    const start = (stream: Stream) => {
+      if (stopped) return;
+      const id = key(stream);
+      if (running.has(id)) {
+        rerun.add(id);
+        return;
+      }
+      const work = (async () => {
+        try {
+          do {
+            rerun.delete(id);
+            let applied: number | undefined;
+            try {
+              const heads = await options.journal.heads(
+                options.peer,
+                'in',
+                stream,
+              );
+              applied = heads.applied.sequence;
+              dependencies.track(stream, heads, () => start(stream));
+              while (!stopped && await options.apply(stream)) {
+                const next = await options.journal.heads(
+                  options.peer,
+                  'in',
+                  stream,
+                );
+                if (next.applied.sequence <= applied) {
+                  throw new LinkError(
+                    'LINK_DIVERGED',
+                    'domain reported application without durable completion',
+                  );
+                }
+                applied = next.applied.sequence;
+                dependencies.track(stream, next, () => start(stream));
+                dependencies.progressed(stream);
+                options.changed();
+              }
+            } catch (error) {
+              this.failed(error, stream, applied);
+            }
+          } while (!stopped && rerun.delete(id));
+        } finally {
+          running.delete(id);
+        }
+      })();
+      running.set(id, work);
+    };
     const scan = () => {
       dirty = true;
       return scanning ??= (async () => {
@@ -362,48 +447,8 @@ export class InboxWorker {
                   'in',
                 )
               ) {
-                const id = key(stream);
                 if (stopped) break;
-                if (running.has(id)) {
-                  rerun.add(id);
-                  continue;
-                }
-                const work = (async () => {
-                  try {
-                    do {
-                      rerun.delete(id);
-                      let applied: number | undefined;
-                      try {
-                        applied = (await options.journal.heads(
-                          options.peer,
-                          'in',
-                          stream,
-                        ))
-                          .applied.sequence;
-                        while (!stopped && await options.apply(stream)) {
-                          const next = await options.journal.heads(
-                            options.peer,
-                            'in',
-                            stream,
-                          );
-                          if (next.applied.sequence <= applied) {
-                            throw new LinkError(
-                              'LINK_DIVERGED',
-                              'domain reported application without durable completion',
-                            );
-                          }
-                          applied = next.applied.sequence;
-                          options.changed();
-                        }
-                      } catch (error) {
-                        this.failed(error, stream, applied);
-                      }
-                    } while (!stopped && rerun.delete(id));
-                  } finally {
-                    running.delete(id);
-                  }
-                })();
-                running.set(id, work);
+                start(stream);
               }
             } catch (error) {
               this.failed(error);

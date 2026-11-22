@@ -1,6 +1,7 @@
 import { assert, assertEquals } from '@std/assert';
 import metadata from '#root/deno.json' with { type: 'json' };
 import { childDiagnostics } from './child-diagnostics.ts';
+import { fixtureListeners } from './fixture-listeners.ts';
 
 export const pause = (ms: number) =>
   new Promise<void>((r) => setTimeout(r, ms));
@@ -40,28 +41,30 @@ export async function serverProcess(
   } = {},
 ) {
   const dir = options.dir ?? await Deno.makeTempDir({ prefix: 'life-' });
-  const probe = Deno.listen({ hostname: '127.0.0.1', port: 0 });
-  const port = probe.addr.port;
-  probe.close();
   const socket = `${dir}/admin.sock`;
   const config = `${dir}/config.toml`;
   await Deno.writeTextFile(
     config,
-    `[server]\nport=${port}\nshutdowngraceseconds=${
+    `[server]\nport=0\nshutdowngraceseconds=${
       options.grace ?? 10
     }\n[store]\ndir="${dir}/store"\n[media]\nroot="${dir}/media"\n[admin]\nsocket="${socket}"\n[federation]\nenabled=false\n`,
   );
   const diagnostics = await childDiagnostics();
+  const listeners = await fixtureListeners(config);
   const child = new Deno.Command(Deno.execPath(), {
     args: options.exitBarrier || options.fatal
       ? [
         ...metadata.tasks.start.split(' ').slice(1, -1),
         'tests/fixtures/lifecycle-child.ts',
       ]
-      : metadata.tasks.start.split(' ').slice(1),
+      : [
+        ...metadata.tasks.start.split(' ').slice(1, -1),
+        'tests/fixtures/listener-child.ts',
+      ],
     env: {
       COMMUNICO_CONFIG: config,
       DENO_NO_PROMPT: '1',
+      ...listeners.env,
       ...(options.exitBarrier
         ? { DENO_COMMUNICO_TEST_EXIT_BARRIER: options.exitBarrier }
         : {}),
@@ -102,9 +105,10 @@ export async function serverProcess(
     diagnostics.status(status);
     return { ...status, stdout, stderr };
   });
-  const base = `http://127.0.0.1:${port}`;
+  let port = 0;
+  const base = () => `http://127.0.0.1:${port}`;
   const api = async (path: string, body?: unknown, token?: string) => {
-    const response = await fetch(base + '/_matrix/client/' + path, {
+    const response = await fetch(base() + '/_matrix/client/' + path, {
       method: body === undefined ? 'GET' : 'POST',
       headers: token ? { authorization: `Bearer ${token}` } : {},
       body: body === undefined ? undefined : JSON.stringify(body),
@@ -126,6 +130,12 @@ export async function serverProcess(
     if (!options.dir) await Deno.remove(dir, { recursive: true });
   };
   try {
+    port = await Promise.race([
+      listeners.port('client'),
+      output.then((result) => {
+        throw new Error(result.stdout + '\n' + result.stderr);
+      }),
+    ]);
     const end = Date.now() + 15000;
     for (;;) {
       try {

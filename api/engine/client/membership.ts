@@ -66,10 +66,6 @@ export async function join(
 ) {
   const app = theApp();
   const signer = app.tenant.signer();
-  const current = await membershipOf(app.server, roomId, userId);
-  if (current?.membership === 'join') {
-    return { roomId, eventId: current.eventId, created: false };
-  }
   const profile = await getProfile(
     app.tenant,
     localpartOf(userId),

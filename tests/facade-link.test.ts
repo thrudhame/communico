@@ -669,6 +669,76 @@ Deno.test('durable result is ACKed before a later operation blocks in the same s
   }
 });
 
+Deno.test('home application completion wakes another blocked incoming stream without another reconciliation', async () => {
+  const f = await fixture();
+  const blocked = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const completed = Promise.withResolvers<void>();
+  const failures: unknown[] = [];
+  let reconciler: JournalReconciler | undefined;
+  try {
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+    const client = await openJournalClient(f.hp, bundle.id, f.tls.home);
+    const base = {
+      source: 'edge_a',
+      incarnation: client.peer.incarnation,
+      type: 'control',
+      version: 1,
+    };
+    const dependency = await f.fj.append('home', {
+      ...base,
+      stream: 'room:z-dependency',
+      operationId: 'dependency',
+      payload: 1,
+    });
+    const dependent = await f.fj.append('home', {
+      ...base,
+      stream: 'room:a-dependent',
+      operationId: 'dependent',
+      payload: 2,
+    });
+    reconciler = new JournalReconciler({
+      client,
+      journal: f.hj,
+      limits: { maxItems: 100, maxBytes: 10000 },
+      failed: (error) => failures.push(error),
+      async apply(stream) {
+        const next = await f.hj.next('edge_a', stream);
+        if (!next) return false;
+        if (next.operationId === dependency.operationId) await release.promise;
+        if (
+          next.operationId === dependent.operationId &&
+          await f.hj.result('edge_a', 'in', dependency, dependency) === null
+        ) {
+          blocked.resolve();
+          throw new LinkError(
+            'LINK_UNAVAILABLE',
+            'dependent domain awaits application',
+          );
+        }
+        await f.hj.complete('edge_a', stream, next, { applied: next.payload });
+        if (next.operationId === dependent.operationId) completed.resolve();
+        return true;
+      },
+    });
+    await reconciler.reconcile();
+    await testDeadline(blocked.promise);
+    release.resolve();
+    await testDeadline(completed.promise);
+    await reconciler.drain();
+    assertEquals(failures.length, 1);
+    assertEquals(await f.fj.result('home', 'out', dependent, dependent), {
+      result: { applied: 2 },
+    });
+  } finally {
+    release.resolve();
+    await reconciler?.drain();
+    await f.close();
+  }
+});
+
 Deno.test('durable outgoing ACK progress wakes its consumer without waiting for a fault retry timer', async () => {
   const f = await fixture();
   const notifications: string[] = [];
@@ -715,6 +785,60 @@ Deno.test('durable outgoing ACK progress wakes its consumer without waiting for 
       'an unchanged ACK is not progress',
     );
     assertEquals(failures, []);
+  } finally {
+    await reconciler?.drain();
+    await f.close();
+  }
+});
+
+Deno.test('outgoing progress drains an application completed after the receipt snapshot without a new hello or notice', async () => {
+  const f = await fixture();
+  const notifications: string[] = [];
+  const failures: unknown[] = [];
+  let reconciler: JournalReconciler | undefined;
+  try {
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+    const client = await openJournalClient(f.hp, bundle.id, f.tls.home);
+    const record = await f.hj.append('edge_a', {
+      source: 'home',
+      incarnation: bundle.id,
+      stream: 'egress:remote.test',
+      type: 'control',
+      version: 1,
+      operationId: 'receipt-then-result',
+      payload: {},
+    });
+    const push = client.push.bind(client);
+    const pages: number[] = [];
+    client.push = async (...args) => {
+      const response = await push(...args);
+      pages.push(args[1].length);
+      if (args[1].length) {
+        assertEquals(response.applied, EMPTY_CUT);
+        // The receipt response has its own read cut. Application can commit
+        // immediately afterwards, without a fresh source mutation or notice.
+        await f.fj.complete('home', record, record, { fence: 'ready' });
+      }
+      return response;
+    };
+    reconciler = new JournalReconciler({
+      client,
+      journal: f.hj,
+      limits: { maxItems: 100, maxBytes: 10000 },
+      apply: () => Promise.resolve(false),
+      failed: (error) => failures.push(error),
+      acknowledged: (stream) => notifications.push(stream.stream),
+    });
+    await reconciler.reconcile();
+    await reconciler.drain();
+    assertEquals(failures, []);
+    assertEquals(await f.hj.result('edge_a', 'out', record, record), {
+      result: { fence: 'ready' },
+    });
+    assertEquals(pages, [1, 0]);
+    assertEquals(notifications, ['egress:remote.test']);
   } finally {
     await reconciler?.drain();
     await f.close();

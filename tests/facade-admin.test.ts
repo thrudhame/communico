@@ -9,6 +9,34 @@ import { serverSchema } from '#engine/server/schema.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 
+Deno.test('replication inspection validates selection on the private operation surface', async () => {
+  let calls = 0;
+  const handler = operationHandler(facadeOperations({
+    role: 'facade',
+    pairings: () => Promise.reject(new Error('inspection must not enroll')),
+    progress: (scopes) => {
+      calls++;
+      return Promise.resolve({ sources: [], streams: [], selected: scopes });
+    },
+  }));
+  const request = (body: unknown) =>
+    handler(
+      new Request('http://localhost/v1/facade/replication', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }),
+    );
+  const selected = await request({ scopes: ['room:!one:example.org'] });
+  assertEquals(selected.status, 200);
+  assertEquals((await selected.json()).result.selected, [
+    'room:!one:example.org',
+  ]);
+  for (const scopes of ['room:!one:example.org', [null], [''], {}]) {
+    assertEquals((await request({ scopes })).status, 400);
+  }
+  assertEquals(calls, 1);
+});
+
 Deno.test('pair/initialize/accept/status/revoke stay on protected local sockets without an edge tenant', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'facade-admin-' });
   const cfg = (name: string) => ({

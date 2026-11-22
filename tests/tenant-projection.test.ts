@@ -3,7 +3,14 @@ import { openStore, type Store } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { issueToken, revokeToken } from '#engine/tenant/auth.ts';
 import { setPusher } from '#engine/tenant/pushers.ts';
-import { setTenantProjector } from '#engine/tenant/hooks.ts';
+import {
+  completedTenantProjection,
+  completeTenantProjection,
+  pendingTenantProjection,
+  recordTenantProjection,
+  setTenantProjector,
+  tenantChangesCommitted,
+} from '#engine/tenant/hooks.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { roomSchema } from '#engine/room/index.ts';
 import { projectTenant } from '#engine/server/project-tenant.ts';
@@ -55,9 +62,9 @@ async function fixture() {
       (await store.tenant('test')).query(
         "SELECT value FROM counters WHERE name='projection_pending'",
       ),
-    reopen: async () => {
+    reopen: async (beforeStartup?: (store: Store) => Promise<unknown>) => {
       await store.close();
-      store = await openStore(options, { schemas });
+      store = await openStore(options, { schemas, beforeStartup });
       tenant = await openTenant(store, 'test');
     },
     close: async () => {
@@ -67,6 +74,69 @@ async function fixture() {
     },
   };
 }
+
+Deno.test('review projection: completed progress survives cold reopen and preserves newer recovery debt', async () => {
+  const f = await fixture();
+  try {
+    let db = await f.store.tenant('test');
+    const old = await db.tx(recordTenantProjection);
+    await projectTenant(f.store, 'test');
+    const later = await db.tx(recordTenantProjection);
+    await completeTenantProjection(f.store, 'test', db, old);
+    assertEquals(await pendingTenantProjection(db), later);
+    let projections = 0;
+    setTenantProjector((...args: Parameters<typeof projectTenant>) => {
+      projections++;
+      return projectTenant(...args);
+    });
+    // Inspect the actual reopened file before normal startup roll-forward;
+    // startup must then remain free to recover the independently newer debt.
+    await f.reopen(async (cold) => {
+      const reopened = await cold.tenant('test');
+      assertEquals(await completedTenantProjection(reopened), old);
+      await tenantChangesCommitted(cold, 'test', old);
+      assertEquals(projections, 0);
+      assertEquals(await pendingTenantProjection(reopened), later);
+    });
+    db = await f.store.tenant('test');
+    assertEquals(await completedTenantProjection(db), later);
+    assertEquals(await pendingTenantProjection(db), 0);
+    const newest = await db.tx(recordTenantProjection);
+    await tenantChangesCommitted(f.store, 'test', newest);
+    assertEquals(projections, 1);
+    assertEquals(await completedTenantProjection(db), newest);
+    assertEquals(await pendingTenantProjection(db), 0);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('review projection: post-commit progress lookup failure leaves successful mutation recoverable', async () => {
+  const f = await fixture();
+  const original = f.store.tenant.bind(f.store);
+  try {
+    setTenantProjector(projectTenant);
+    f.store.tenant = () =>
+      Promise.reject(new Error('projection metadata unavailable'));
+    await f.register();
+    f.store.tenant = original;
+    assert(Number((await f.pending())[0].value) > 0);
+    assertEquals(
+      await (await f.store.server()).query('SELECT * FROM push_targets'),
+      [],
+    );
+    await projectTenant(f.store, 'test');
+    assertEquals(await f.pending(), []);
+    assertEquals(
+      (await (await f.store.server()).query('SELECT * FROM push_targets'))
+        .length,
+      1,
+    );
+  } finally {
+    f.store.tenant = original;
+    await f.close();
+  }
+});
 
 Deno.test('tenant projection: unchanged mutations and same-device login create no projection work or notices', async () => {
   const f = await fixture();
@@ -233,16 +303,22 @@ Deno.test('tenant projection: failed recovery retains pending work and an older 
     f.store.tenant = original;
     const first = Number((await f.pending())[0].value);
     let interleaved = false;
+    const wrapped = new WeakSet<object>();
     f.store.tenant = async (...args: Parameters<Store['tenant']>) => {
       const db = await original(...args);
-      const execute = db.execute;
-      db.execute = async (sql, values) => {
-        if (!interleaved && sql.startsWith('DELETE FROM counters')) {
-          interleaved = true;
-          await f.register();
-        }
-        return execute(sql, values);
-      };
+      if (!wrapped.has(db)) {
+        wrapped.add(db);
+        const tx = db.tx.bind(db);
+        // Completion now records durable progress and clears pending debt in
+        // one transaction. Interleave before that transaction, not inside it.
+        db.tx = async (fn, options) => {
+          if (!interleaved) {
+            interleaved = true;
+            await f.register();
+          }
+          return await tx(fn, options);
+        };
+      }
       return db;
     };
     await sender.tick();

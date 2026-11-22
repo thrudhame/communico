@@ -38,7 +38,12 @@ export const tableContracts = {
       'publication_keys',
     ],
     // Accepted recovery obligations and immutable saved remote results.
-    retained: ['waits', 'remote_batches'],
+    retained: [
+      'waits',
+      'remote_batches',
+      'membership_receipts',
+      'membership_receipt_wires',
+    ],
     // Room identity/exact acceptance cuts: auditRoom; completed progress is also
     // checked against server publication by auditServer.
     completion: ['completion_state', 'completion_receipts'],
@@ -103,6 +108,8 @@ export const tableContracts = {
       'device_operations',
       'signing_operations',
       'signature_operations',
+      // Includes nullable per-receipt projection_revision, semantic result and
+      // publication hints. counters also retains the legacy projection cut.
       'facade_link_applications',
       'key_bootstrap_publications',
       'device_creation_history',
@@ -177,7 +184,10 @@ export const tableContracts = {
       'federation_blocks',
       'federation_pending',
       'prejoin_memberships',
+      'prejoin_jobs',
       'federation_join_attempts',
+      'federation_invite_attempts',
+      'membership_operations',
       'server_keys',
       'server_key_docs',
       'server_key_changes',

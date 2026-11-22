@@ -6,6 +6,8 @@ import { startFakeServer } from './federation/fake-server.ts';
 import { type FakeRoom, makeFakeRoom } from './fixtures/remote-room.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { openRoom } from '#engine/room/index.ts';
+import { finalizeBuilt } from '#engine/room/build.ts';
+import { getRulebook } from '#engine/rulebook/index.ts';
 import { receiveInvite } from '#engine/federation/invites.ts';
 import { inviteDeps } from '#engine/client/write.ts';
 import {
@@ -344,15 +346,32 @@ Deno.test('E6 production federation startup discovers interrupted join cleanup a
     },
   });
   try {
+    const signed = await finalizeBuilt(
+      {
+        type: 'm.room.member',
+        room_id: '!abandoned:' + fake.name,
+        sender: '@a:test',
+        state_key: '@a:test',
+        content: { membership: 'join' },
+        prev_events: [],
+        auth_events: [],
+        depth: 1,
+        origin_server_ts: Date.now(),
+        hashes: { sha256: '' },
+        signatures: {},
+      },
+      getRulebook('11'),
+      app.tenant.signer(),
+    );
     const attempt = {
       roomId: '!abandoned:' + fake.name,
       userId: '@a:test',
-      eventId: '$uncommitted',
+      eventId: String(signed.event_id),
       roomVersion: '11',
       destination: fake.name,
       addedMs: Date.now(),
     };
-    await beginJoinAttempt(app.store, attempt);
+    await beginJoinAttempt(app.store, attempt, signed);
     releaseJoinAttempt(app.store, attempt);
     await closeApp();
     app = await openApp(settings);
