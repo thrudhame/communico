@@ -48,7 +48,16 @@ export async function withdrawCompletedMembershipDisplay(
   if (
     canonicalJson(binding.state) !==
       canonicalJson(membershipStateOf(previous)) ||
-    !joined.some((state) => state.eventId === previous.event_id)
+    !Array.isArray(binding.operations) || !binding.operations.length ||
+    !binding.operations.every((id: string) => {
+      const retained = selection.ready.find((operation) =>
+        operation.operationId === id
+      );
+      if (!retained) return false;
+      const state = JSON.parse(retained.payload) as MembershipState;
+      return selection.suppressed.has(state.eventId) ||
+        !selection.frontier.some((operation) => operation.operationId === id);
+    })
   ) return;
   await withdrawInvitePush(conn, userId, roomId, String(previous.event_id));
   await conn.execute(

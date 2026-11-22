@@ -2266,6 +2266,102 @@ Deno.test('membership terminal authority: missing departure evidence cannot eras
   }
 });
 
+Deno.test('review membership: a concurrent same-event copy suppressed by a ready join completes its journal head', async () => {
+  const f = await fixture();
+  try {
+    const { record, state, keys } = await incoming(f);
+    const db = await f.home.server();
+    const copy = await source(f, 1, 'home', state.roomId);
+    copy.payload = canonicalJson(state);
+    copy.payloadHash = createHash('sha256').update(copy.payload).digest('hex');
+    await db.execute(
+      'UPDATE domain_operations SET payload_json=?,payload_hash=? WHERE operation_id=?',
+      [copy.payload, copy.payloadHash, copy.operationId],
+    );
+    // This completion observes only the local copy, not the concurrent link
+    // record. The latter remains on the frontier, but cannot display invite A.
+    await db.tx((conn) =>
+      appendMembershipSuccessor(conn, copy, { ...state, status: 'joined' })
+    );
+    const journal = new Journal(db, LINK_SUPPORTED);
+    await journal.receive(record.source, [record]);
+    assertEquals(
+      await lifecycleApplication(f.hs)(journal, record, keys, f.bundle.id),
+      true,
+    );
+    assertEquals(
+      (await journal.heads(record.source, 'in', record)).applied.sequence,
+      record.sequence,
+    );
+    assertEquals(await invitesOf(state.userId, { server: db }), []);
+  } finally {
+    await f.close();
+  }
+});
+
+for (const localReplacement of [false, true]) {
+  Deno.test(`review membership: completed successor withdraws only the obsolete bound import ${localReplacement}`, async () => {
+    const f = await fixture();
+    try {
+      const { record, state, keys, operation } = await incoming(f);
+      const db = await f.home.server();
+      const journal = new Journal(db, LINK_SUPPORTED);
+      await journal.receive(record.source, [record]);
+      await lifecycleApplication(f.hs)(journal, record, keys, f.bundle.id);
+      if (localReplacement) {
+        await db.execute(
+          'UPDATE prejoin_memberships SET source_binding=NULL WHERE room_id=?',
+          [state.roomId],
+        );
+      }
+      const successor = await remoteEvent(
+        state.roomId,
+        await testRemoteServer('remote.test'),
+        '11',
+        {
+          type: 'm.room.member',
+          sender: '@inviter:remote.test',
+          state_key: state.userId,
+          content: { membership: 'invite', reason: 'successor B' },
+          prev_events: [],
+        },
+      );
+      const nextState = {
+        ...state,
+        eventId: String(successor.event_id),
+        eventJson: canonicalJson(successor),
+      };
+      const next = await exportSuccessor(f, operation, nextState);
+      const joined = await exportSuccessor(f, next.operation, {
+        ...nextState,
+        status: 'joined',
+      });
+      await journal.receive(record.source, [next.record, joined.record]);
+      await f.hs.retain(next.record, keys, f.bundle.id);
+      await f.hs.retain(joined.record, keys, f.bundle.id);
+      for (const item of [next.record, joined.record]) {
+        assertEquals(
+          await lifecycleApplication(f.hs)(journal, item, keys, f.bundle.id),
+          true,
+        );
+      }
+      const invites = await invitesOf(state.userId, { server: db });
+      assertEquals(
+        invites.map((invite) => invite.eventId),
+        localReplacement ? [state.eventId] : [],
+      );
+      assertEquals(
+        await db.query('SELECT withdrawn FROM notifications WHERE event=?', [
+          state.eventId,
+        ]),
+        [{ withdrawn: localReplacement ? 0 : 1 }],
+      );
+    } finally {
+      await f.close();
+    }
+  });
+}
+
 Deno.test('membership terminal application: superseded source facts and an unheld join complete the account prefix without display authority', async () => {
   const f = await fixture();
   try {

@@ -556,6 +556,7 @@ export class MembershipOperations {
       (state.localLeaveJson === null &&
         ['rejecting', 'failed-retract'].includes(state.status));
     const sourceOnly = state.status === 'joined' ||
+      (state.status === 'pending' && selection.suppressed.has(state.eventId)) ||
       !selection.frontier.some((op) =>
         op.operationId === view.operation.operationId
       );
