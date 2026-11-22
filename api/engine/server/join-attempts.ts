@@ -55,7 +55,7 @@ async function assertNoJoinCleanup(
     return eventStreamTx(server, async (tx) => {
       if (!inflight) await settleSupersededPrejoin(tx, roomId, userId);
       const rows = await tx.query(
-        "SELECT 1 FROM federation_join_attempts WHERE room_id=? AND user_id=? AND (? IS NULL OR event_id<>? OR join_json IS NULL OR leave_json IS NOT NULL) UNION ALL SELECT 1 FROM prejoin_jobs WHERE room_id=? AND user_id=? AND status IN ('rejecting','failed-retract')",
+        "SELECT 1 FROM federation_join_attempts WHERE room_id=? AND user_id=? AND remote_refused=0 AND (? IS NULL OR event_id<>? OR join_json IS NULL OR leave_json IS NOT NULL) UNION ALL SELECT 1 FROM prejoin_jobs WHERE room_id=? AND user_id=? AND status IN ('rejecting','failed-retract')",
         [roomId, userId, continuing, continuing, roomId, userId],
       );
       return { inflight, rows };
@@ -134,7 +134,7 @@ export async function beginJoinAttempt(
           await admission?.check?.(tx);
           if (
             (await tx.query(
-              'SELECT 1 FROM federation_join_attempts WHERE room_id=? AND user_id=?',
+              'SELECT 1 FROM federation_join_attempts WHERE room_id=? AND user_id=? AND remote_refused=0',
               [a.roomId, a.userId],
             )).length
           ) {
@@ -145,7 +145,7 @@ export async function beginJoinAttempt(
             );
           }
           await tx.execute(
-            'INSERT INTO federation_join_attempts(room_id,user_id,event_id,room_version,destination,added_ms,join_json) VALUES(?,?,?,?,?,?,?)',
+            'INSERT INTO federation_join_attempts(room_id,user_id,event_id,room_version,destination,added_ms,join_json) VALUES(?,?,?,?,?,?,?) ON CONFLICT(room_id,user_id) DO UPDATE SET event_id=excluded.event_id,room_version=excluded.room_version,destination=excluded.destination,added_ms=excluded.added_ms,join_json=excluded.join_json,leave_json=NULL,remote_refused=0 WHERE federation_join_attempts.remote_refused=1',
             [
               a.roomId,
               a.userId,
@@ -178,6 +178,26 @@ export async function clearJoinAttempt(
     'DELETE FROM federation_join_attempts WHERE room_id=? AND user_id=? AND event_id=?',
     [a.roomId, a.userId, a.eventId],
   );
+}
+// Only the typed send_join refusal establishes that no remote membership was
+// committed. Persist it before deletion; old/uncertain attempts still owe leave.
+export async function refuseJoinAttempt(
+  server: Database,
+  a: JoinAttempt,
+): Promise<void> {
+  await server.execute(
+    'UPDATE federation_join_attempts SET remote_refused=1 WHERE room_id=? AND user_id=? AND event_id=?',
+    [a.roomId, a.userId, a.eventId],
+  );
+}
+export async function joinAttemptRefused(
+  server: Database,
+  a: JoinAttempt,
+): Promise<boolean> {
+  return (await server.query(
+    'SELECT 1 FROM federation_join_attempts WHERE room_id=? AND user_id=? AND event_id=? AND remote_refused=1',
+    [a.roomId, a.userId, a.eventId],
+  )).length !== 0;
 }
 export async function joinLeave(
   server: Database,

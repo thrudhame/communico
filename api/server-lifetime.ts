@@ -1,5 +1,6 @@
 // One admission and transport lifetime, owned by main for every listener.
 // Never call HttpServer.shutdown while an admitted request may read its body.
+import { requestFailure } from '#engine/request-diagnostics.ts';
 export class ServerLifetime {
   readonly controller = new AbortController();
   #operations = new AbortController();
@@ -79,6 +80,9 @@ export class ServerLifetime {
         return new Response(output.readable, response);
       } catch (error) {
         if (this.#cancelled && signal.aborted) return this.#unavailable(name);
+        // A router/materializer failure can escape its own outcome renderer.
+        // Preserve correlation before Deno's final fallback turns it into 500.
+        requestFailure(operation, error);
         throw error;
       } finally {
         handled = true;

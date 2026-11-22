@@ -297,18 +297,16 @@ Deno.test('facade observations bind fact completion to the peer and source incar
 
 Deno.test('facade observation child reports real listener binding and services its private control pipe', async () => {
   const tls = await facadeTls();
-  const probe = Deno.listen({ hostname: '127.0.0.1', port: 0 });
-  const port = probe.addr.port;
-  probe.close();
   const config = tls.dir + '/observation.toml';
   await Deno.writeTextFile(
     config,
-    `[server]\nname="observation.test"\nport=${port}\n[store]\ndir="${tls.dir}/store"\n[media]\nroot="${tls.dir}/media"\n[admin]\nsocket="${tls.dir}/admin.sock"\n[federation]\nenabled=false\n`,
+    `[server]\nname="observation.test"\nport=0\n[store]\ndir="${tls.dir}/store"\n[media]\nroot="${tls.dir}/media"\n[admin]\nsocket="${tls.dir}/admin.sock"\n[federation]\nenabled=false\n`,
   );
   const child = await facadeProcess(config, 'federation: disabled', [
     'contract',
   ]);
   try {
+    const port = await child.port('client');
     await child.listening(port);
     await child.fence();
     const response = await fetch(

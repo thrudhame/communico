@@ -3,7 +3,7 @@ import { serverSchema } from '#engine/server/schema.ts';
 import { openStore } from '#engine/store/index.ts';
 import { historicalServerSchema } from './fixtures/server-schema-history.ts';
 
-Deno.test('room upgrade intent migration appends to v54 with fresh-schema equivalence', async () => {
+Deno.test('room upgrade intent migration appends to v56 with fresh-schema equivalence', async () => {
   const root = await Deno.makeTempDir({ prefix: 'upgrade-schema-' });
   const settings = (name: string) => ({
     dir: root + '/' + name,
@@ -13,7 +13,7 @@ Deno.test('room upgrade intent migration appends to v54 with fresh-schema equiva
     idleseconds: 300,
   });
   let old = await openStore(settings('old'), {
-    schemas: { server: historicalServerSchema(54) },
+    schemas: { server: historicalServerSchema(56) },
   });
   const fresh = await openStore(settings('fresh'), {
     schemas: { server: serverSchema },
@@ -43,7 +43,7 @@ Deno.test('room upgrade intent migration appends to v54 with fresh-schema equiva
       await (await old.server()).query(
         "SELECT v FROM meta WHERE k='schema_version'",
       ),
-      [{ v: '55' }],
+      [{ v: '57' }],
     );
   } finally {
     await old.close();

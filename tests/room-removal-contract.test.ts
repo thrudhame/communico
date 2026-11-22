@@ -94,7 +94,12 @@ Deno.test('operator unlink clears every registered per-room server table', async
         for (const [i, g] of [gone, kept].entries()) {
           // Seed even owners not exercised by genesis. Values obey the schema;
           // the test checks retirement, not admission of synthetic domain facts.
-          const values = columns.map((c) => {
+          // Let the schema initialize defaulted columns, including constrained
+          // flags; type-based synthetic values need not satisfy their CHECKs.
+          const seeded = columns.filter((c) =>
+            c.name === key || c.dflt_value === null
+          );
+          const values = seeded.map((c) => {
             if (c.name === key) return g.roomId;
             if (c.name === 'kind') {
               return table === 'reports' ? 'room' : 'invite';
@@ -109,7 +114,7 @@ Deno.test('operator unlink clears every registered per-room server table', async
           // Counts have relational CHECK constraints; equal values satisfy them.
           await tx.execute(
             `INSERT OR IGNORE INTO "${table}" (${
-              columns.map((c) => `"${c.name}"`).join(',')
+              seeded.map((c) => `"${c.name}"`).join(',')
             }) VALUES(${values.map(() => '?').join(',')})`,
             values,
           );

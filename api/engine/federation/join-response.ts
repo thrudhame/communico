@@ -68,9 +68,12 @@ export async function joinResponse(
   }
   const stateIds = new Set(partialState.map((p) => ids.get(p)!));
   const required = new Set<string>();
-  const pending = partialState.flatMap((p) =>
-    p.auth_events == null ? [] : p.auth_events
-  );
+  // The submitted join can require an omitted authorizer that no returned
+  // state event references. Both auth closures belong to this pinned result.
+  const pending = [
+    ...partialState.flatMap((p) => p.auth_events == null ? [] : p.auth_events),
+    ...(joining.auth_events == null ? [] : joining.auth_events),
+  ];
   while (pending.length) {
     const id = pending.pop()!;
     if (required.has(id)) continue;

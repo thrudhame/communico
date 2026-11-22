@@ -55,6 +55,7 @@ import {
 import {
   FederationHttpError,
   federationRequest,
+  isDefiniteFederationRefusal,
   isEndpointUnknown,
 } from './client.ts';
 import {
@@ -87,6 +88,7 @@ import {
   createPrejoinJob,
   type PrejoinJob,
   prejoinJob,
+  prejoinJobActive,
   prejoinJobId,
   prejoinJobs,
   type PrejoinWork,
@@ -180,6 +182,7 @@ type OutboundInvite = {
     invite_room_state: unknown[];
   };
   response: Pdu | null;
+  mayHaveApplied: boolean;
 };
 function outboundInvite(row: Record<string, unknown>): OutboundInvite {
   return {
@@ -188,6 +191,7 @@ function outboundInvite(row: Record<string, unknown>): OutboundInvite {
     target: String(row.target),
     eventId: String(row.event_id),
     destination: String(row.destination),
+    mayHaveApplied: Boolean(row.may_have_applied),
     request: JSON.parse(String(row.request_json)),
     response: row.response_json === null
       ? null
@@ -232,10 +236,15 @@ export async function inviteRemote(
     'SELECT * FROM federation_invite_attempts WHERE room_id=? AND sender=? AND target=?',
     [roomId, sender, target],
   );
-  const admission = existing.length
+  const replacing = existing.length > 0 && existing[0].status === 'refused' &&
+    !outboundInvite(existing[0]).mayHaveApplied &&
+    canonicalJson(outboundInvite(existing[0]).request.event.content) !==
+      canonicalJson(content);
+  const continuing = existing.length > 0 && !replacing;
+  const admission = continuing
     ? undefined
     : await deps.prepareRoomScope?.(roomId, false, sender);
-  const permit = existing.length ? null : await prepareSigner(deps.signer);
+  const permit = continuing ? null : await prepareSigner(deps.signer);
   const attempt = await withRoomLock(roomId, async () => {
     if (await deps.store.roomRetired(roomId)) {
       throw new MatrixError(404, 'M_NOT_FOUND', 'room removal is pending');
@@ -245,7 +254,16 @@ export async function inviteRemote(
       [roomId, sender, target],
     );
     let saved: OutboundInvite;
-    if (rows.length) {
+    const replace = rows.length > 0 && rows[0].status === 'refused' &&
+      !outboundInvite(rows[0]).mayHaveApplied &&
+      canonicalJson(outboundInvite(rows[0]).request.event.content) !==
+        canonicalJson(content);
+    if (
+      rows.length && invitePerformers(deps.store).has(String(rows[0].event_id))
+    ) {
+      throw new MatrixError(409, 'M_BAD_STATE', 'Remote invite is active');
+    }
+    if (rows.length && !replace) {
       saved = outboundInvite(rows[0]);
       if (
         canonicalJson(saved.request.event.content) !== canonicalJson(content)
@@ -319,11 +337,25 @@ export async function inviteRemote(
         destination: remote,
         request,
         response: null,
+        mayHaveApplied: false,
       };
       await deps.server.tx(async (tx) => {
         await admission?.check(tx);
-        await withMembershipFence(admission, tx, () =>
-          tx.execute(
+        await withMembershipFence(admission, tx, async () => {
+          if (replace) {
+            const removed = await tx.execute(
+              "DELETE FROM federation_invite_attempts WHERE event_id=? AND status='refused' AND may_have_applied=0",
+              [String(rows[0].event_id)],
+            );
+            if (removed !== 1) {
+              throw new MatrixError(
+                409,
+                'M_BAD_STATE',
+                'Remote invite refusal changed',
+              );
+            }
+          }
+          await tx.execute(
             "INSERT INTO federation_invite_attempts(room_id,sender,target,event_id,destination,request_json,status,added_ms) VALUES(?,?,?,?,?,?,'pending',?)",
             [
               roomId,
@@ -334,14 +366,15 @@ export async function inviteRemote(
               JSON.stringify(request),
               Date.now(),
             ],
-          ));
+          );
+        });
       });
     }
     if (invitePerformers(deps.store).has(saved.eventId)) {
       throw new MatrixError(409, 'M_BAD_STATE', 'Remote invite is active');
     }
     await deps.server.execute(
-      "UPDATE federation_invite_attempts SET status='pending' WHERE event_id=? AND status='failed'",
+      "UPDATE federation_invite_attempts SET status='pending' WHERE event_id=? AND status IN ('failed','refused')",
       [saved.eventId],
     );
     invitePerformers(deps.store).add(saved.eventId);
@@ -374,6 +407,8 @@ async function performOutboundInvite(
     );
     return { eventId };
   }
+  let refused = false;
+  let priorUncertainty = true;
   try {
     let merged = attempt.response;
     if (merged === null) {
@@ -385,6 +420,31 @@ async function performOutboundInvite(
           encodeURIComponent(eventId)
         }`,
         body: new TextEncoder().encode(JSON.stringify(request)),
+        beforeDispatch: async () => {
+          await deps.server.tx(async (conn) => {
+            const [row] = await conn.query(
+              'SELECT may_have_applied FROM federation_invite_attempts WHERE event_id=?',
+              [eventId],
+            );
+            if (!row) {
+              throw new MatrixError(
+                409,
+                'M_BAD_STATE',
+                'Remote invite was removed before dispatch',
+              );
+            }
+            priorUncertainty = Boolean(row.may_have_applied);
+            await conn.execute(
+              'UPDATE federation_invite_attempts SET may_have_applied=1 WHERE event_id=?',
+              [eventId],
+            );
+          });
+        },
+      }).catch((error: unknown) => {
+        // Only a refusal of this submission proves non-acceptance. Key lookup
+        // failures or invalid evidence after a response remain ambiguous.
+        refused = isDefiniteFederationRefusal(error) && !priorUncertainty;
+        throw error;
       });
       merged = inviteResponse(res.json);
     }
@@ -470,22 +530,28 @@ async function performOutboundInvite(
     );
     return { eventId };
   } catch (e) {
-    // Definite refusal/bad evidence remains inspectable, but does not make an
-    // autonomous retry loop. Explicit retry continues the same prepared PDU.
+    // Both outcomes remain inspectable without autonomous retry. Only an exact
+    // submission refusal allows a fresh, newly authorized event with new content.
     if (
       (e instanceof FederationHttpError && e.remoteStatus < 500) ||
       (e instanceof UpstreamError && e.category === 'validation')
     ) {
       await deps.server.execute(
-        "UPDATE federation_invite_attempts SET status='failed' WHERE event_id=?",
-        [eventId],
+        'UPDATE federation_invite_attempts SET status=?,may_have_applied=CASE WHEN ?=1 THEN 0 ELSE may_have_applied END WHERE event_id=?',
+        [refused ? 'refused' : 'failed', refused ? 1 : 0, eventId],
       );
     }
     if (
       e instanceof FederationHttpError && e.remoteStatus === 400 &&
       e.matrixBody && e.errcode === 'M_MISSING_PARAM'
     ) {
-      throw new MatrixError(502, 'M_UNKNOWN', String(e.responseBody().error));
+      const failure = new MatrixError(
+        502,
+        'M_UNKNOWN',
+        String(e.responseBody().error),
+      );
+      failure.cause = e;
+      throw failure;
     }
     throw e;
   }
@@ -1160,24 +1226,23 @@ export function inviteIntentProvider(
             if (
               await deps.store.roomRetired(attempt.roomId) ||
               invitePerformers(deps.store).has(attempt.eventId)
-            ) return false;
-            if (
-              !(await server.query(
-                "SELECT 1 FROM federation_invite_attempts WHERE event_id=? AND status='pending'",
-                [attempt.eventId],
-              )).length
-            ) return false;
+            ) return null;
+            const [current] = await server.query(
+              "SELECT * FROM federation_invite_attempts WHERE event_id=? AND status='pending'",
+              [attempt.eventId],
+            );
+            if (!current) return null;
             invitePerformers(deps.store).add(attempt.eventId);
-            return true;
+            return outboundInvite(current);
           });
           if (!claimed) return;
           try {
             await admit(server, destination, {
               kind: 'outbound',
-              user: attempt.sender,
+              user: claimed.sender,
               what: 'intent:invite',
             });
-            await performOutboundInvite(attempt, deps);
+            await performOutboundInvite(claimed, deps);
           } finally {
             invitePerformers(deps.store).delete(attempt.eventId);
           }
@@ -1186,6 +1251,7 @@ export function inviteIntentProvider(
       } satisfies IntentJob;
     }
     for (const pending of await prejoinJobs(server)) {
+      if (prejoinJobActive(deps.store, pending.work)) continue;
       if (
         !prejoinLeaveActive(
           deps.store,
@@ -1416,7 +1482,7 @@ export async function retryPrejoinIntents(
 ): Promise<void> {
   await inviteTransition(server, async (tx) => {
     await tx.execute(
-      "UPDATE federation_invite_attempts SET status='pending' WHERE destination=? AND status='failed'",
+      "UPDATE federation_invite_attempts SET status='pending' WHERE destination=? AND status IN ('failed','refused')",
       [destination],
     );
     const rows = await listRejectIntents(tx, self);

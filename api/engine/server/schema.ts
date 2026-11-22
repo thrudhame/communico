@@ -48,6 +48,13 @@ ALTER TABLE reports ADD COLUMN report_id TEXT;
 CREATE UNIQUE INDEX reports_identity ON reports(report_id);
 `;
 
+const INVITE_DISPATCH_SQL = `
+ALTER TABLE federation_invite_attempts ADD COLUMN may_have_applied INTEGER NOT NULL DEFAULT 0 CHECK(may_have_applied IN (0,1));
+-- Older outstanding attempts did not retain dispatch certainty. Preserve their
+-- exact replay obligation rather than treating a later refusal as proof.
+UPDATE federation_invite_attempts SET may_have_applied=1;
+`;
+
 const DEVICE_CHANGES_SQL = `
 CREATE TABLE device_changes(seq INTEGER PRIMARY KEY NOT NULL, source TEXT NOT NULL, source_pos INTEGER NOT NULL, subject TEXT NOT NULL, device_id TEXT NOT NULL, generation INTEGER NOT NULL, stream_id INTEGER NOT NULL, payload TEXT NOT NULL, UNIQUE(source,source_pos));
 CREATE INDEX device_changes_subject ON device_changes(subject,seq);
@@ -466,8 +473,11 @@ const ROOM_UPGRADES_SQL = `
 CREATE TABLE room_upgrades(old_room_id TEXT PRIMARY KEY NOT NULL,user_id TEXT NOT NULL,replacement_room TEXT NOT NULL,plan_json TEXT NOT NULL,phase INTEGER NOT NULL DEFAULT 0 CHECK(phase BETWEEN 0 AND 4));
 `;
 
+const JOIN_REFUSAL_SQL =
+  'ALTER TABLE federation_join_attempts ADD COLUMN remote_refused INTEGER NOT NULL DEFAULT 0 CHECK(remote_refused IN (0,1))';
+
 export const serverSchema: SchemaProvider = {
-  version: 55,
+  version: 57,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -527,6 +537,8 @@ export const serverSchema: SchemaProvider = {
       'ALTER TABLE prejoin_memberships ADD COLUMN source_binding TEXT',
     );
     await db.exec(PREJOIN_JOBS_SQL);
+    await db.exec(JOIN_REFUSAL_SQL);
+    await db.exec(INVITE_DISPATCH_SQL);
     await db.exec(NOTIFICATION_CONTEXT_SQL);
     await db.exec(ROOM_UPGRADES_SQL);
   },
@@ -612,8 +624,10 @@ INSERT INTO device_publication_predecessors SELECT DISTINCT p.subject,p.destinat
       await conn.exec(PREJOIN_JOBS_SQL);
       await migratePrejoinJobs(conn);
     },
-    52: (conn) => conn.exec(REPORT_IDENTITY_SQL),
-    53: (conn) => conn.exec(NOTIFICATION_CONTEXT_SQL),
-    54: (conn) => conn.exec(ROOM_UPGRADES_SQL),
+    52: (conn) => conn.exec(JOIN_REFUSAL_SQL),
+    53: (conn) => conn.exec(INVITE_DISPATCH_SQL),
+    54: (conn) => conn.exec(REPORT_IDENTITY_SQL),
+    55: (conn) => conn.exec(NOTIFICATION_CONTEXT_SQL),
+    56: (conn) => conn.exec(ROOM_UPGRADES_SQL),
   },
 };

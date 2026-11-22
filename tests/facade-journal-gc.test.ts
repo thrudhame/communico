@@ -1,3 +1,4 @@
+import { DiagnosticCommand } from '#tests/helpers/child-diagnostics.ts';
 import { assertEquals } from '@std/assert';
 
 Deno.test('pending journal receive retains its shared fence when no admission predicate is retained', async () => {
@@ -31,7 +32,7 @@ Deno.test('pending journal receive retains its shared fence when no admission pr
     assertEquals(check('home', stream), false, 'rollback invalidates the pending cut');
     assertEquals(receivedFence(db)('home', stream), true);
   `;
-  const result = await new Deno.Command(Deno.execPath(), {
+  const result = await new DiagnosticCommand(Deno.execPath(), {
     args: ['eval', '--v8-flags=--expose-gc', script],
     stdout: 'piped',
     stderr: 'piped',

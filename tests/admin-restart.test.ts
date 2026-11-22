@@ -1,3 +1,4 @@
+import { DiagnosticCommand } from '#tests/helpers/child-diagnostics.ts';
 import { assert, assertEquals, assertRejects, assertThrows } from '@std/assert';
 import {
   adminSocket,
@@ -17,7 +18,7 @@ import {
 
 const decode = (out: Uint8Array) => new TextDecoder().decode(out);
 async function tool(config: string) {
-  const out = await new Deno.Command(Deno.execPath(), {
+  const out = await new DiagnosticCommand(Deno.execPath(), {
     args: ['task', 'federation-block', '--', 'list'],
     env: { COMMUNICO_CONFIG: config },
   }).output();
@@ -55,7 +56,7 @@ Deno.test('admin socket limit is absolute UTF-8 bytes, shared by config, bind an
         message,
       );
       await assertRejects(() => startAdmin(http.app, path), Error, message);
-      const out = await new Deno.Command(Deno.execPath(), {
+      const out = await new DiagnosticCommand(Deno.execPath(), {
         args: ['task', 'federation-block', '--', 'list'],
         env: { COMMUNICO_ADMIN_SOCKET: path },
       }).output();
@@ -96,7 +97,7 @@ Deno.test('restart cannot acquire store until old admin listener is gone; old ex
     old.child.kill('SIGTERM');
     await old.waitLog('shutdown: draining');
     // A second real main cannot open the store while the old listener drains.
-    const contender = await bounded(new Deno.Command(Deno.execPath(), {
+    const contender = await bounded(new DiagnosticCommand(Deno.execPath(), {
       args: metadata.tasks.start.split(' ').slice(1),
       env: { COMMUNICO_CONFIG: old.config },
     }).output());

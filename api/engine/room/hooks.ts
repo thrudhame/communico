@@ -96,16 +96,22 @@ export async function withMembershipFence<T>(
 }
 
 export type RestrictedKnowledge = 'complete' | 'partial' | 'unavailable';
+export type PreparedRestrictedKnowledge = {
+  knowledge: RestrictedKnowledge;
+  checkCurrent?: CommitCheck;
+};
 const restrictedViews = new WeakMap<
   Store,
-  (roomId: string) => Promise<RestrictedKnowledge>
+  (roomId: string) => Promise<RestrictedKnowledge | PreparedRestrictedKnowledge>
 >();
 
 // The composition owner knows whether this store covers the whole logical
 // server. Room admission never reaches into an app or a replica coordinator.
 export function setRestrictedKnowledge(
   store: Store,
-  view: (roomId: string) => Promise<RestrictedKnowledge>,
+  view: (
+    roomId: string,
+  ) => Promise<RestrictedKnowledge | PreparedRestrictedKnowledge>,
 ): void {
   restrictedViews.set(store, view);
 }
@@ -114,7 +120,17 @@ export async function restrictedKnowledge(
   store: Store,
   roomId: string,
 ): Promise<RestrictedKnowledge> {
-  return await restrictedViews.get(store)?.(roomId) ?? 'complete';
+  return (await prepareRestrictedKnowledge(store, roomId)).knowledge;
+}
+
+// Discovery projects the knowledge label; a vouching write may also carry the
+// prepared allowed-scope authority into its own native commit boundary.
+export async function prepareRestrictedKnowledge(
+  store: Store,
+  roomId: string,
+): Promise<PreparedRestrictedKnowledge> {
+  const value = await restrictedViews.get(store)?.(roomId) ?? 'complete';
+  return typeof value === 'string' ? { knowledge: value } : value;
 }
 
 export function setJoinAdmission(

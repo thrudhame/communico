@@ -16,7 +16,11 @@ import {
 } from './build.ts';
 import { openRoom, type Room, type RoomTx } from './index.ts';
 import { withRoomLock } from './lock.ts';
-import { restrictedKnowledge } from './hooks.ts';
+import {
+  type PreparedRestrictedKnowledge,
+  prepareRestrictedKnowledge,
+  restrictedKnowledge,
+} from './hooks.ts';
 
 async function current(tx: RoomTx) {
   const stay = await tx.segments.openStay();
@@ -164,14 +168,17 @@ export async function withRestrictedAdmission<T>(
       }
     }
     const result = await withRoomLock(room.id, async () => {
+      let allowedScope: PreparedRestrictedKnowledge | undefined;
       if (before) {
         const { stay, group } = await room.tx(current);
         await before(stay !== null && group !== null);
       }
       if (proof !== null) {
-        if (
-          await restrictedKnowledge(room.store, proof.room.id) === 'unavailable'
-        ) return changed;
+        allowedScope = await prepareRestrictedKnowledge(
+          room.store,
+          proof.room.id,
+        );
+        if (allowedScope.knowledge === 'unavailable') return changed;
         const now = await witness(proof.room, user);
         if (
           now === null || now.stay !== proof.stay || now.group !== proof.group
@@ -200,6 +207,10 @@ export async function withRestrictedAdmission<T>(
               'restricted join eligibility not established',
             );
           }
+          // Scope/control retirement is not an ordinary later DAG departure.
+          // Carry its prepared authority to the target's actual native commit,
+          // without reading another authority file inside this transaction.
+          if (allowedScope?.checkCurrent) tx.admit(allowedScope.checkCurrent);
           let candidates = now.authorizers.filter((u) => domainOf(u) === self);
           if (nominated === undefined) {
             // Both local joins and federation templates author from the selected

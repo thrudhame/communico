@@ -1,3 +1,4 @@
+import { DiagnosticCommand } from '#tests/helpers/child-diagnostics.ts';
 // tests/env-precedence.test.ts — Deno's env > .env pin (ruling 3) plus
 // config merge order via a main.ts-like probe: defaults < config < env.
 // Deno flip-flopped on env vs .env across releases (2.6.10 env-wins →
@@ -49,7 +50,7 @@ async function runProbe(
     args.push(envFlag === '' ? '--env' : envFlag);
   }
   args.push('probe.ts');
-  const cmd = new Deno.Command(DENO, {
+  const cmd = new DiagnosticCommand(DENO, {
     args,
     cwd: dir,
     env: { PATH: pathEnv, ...extraEnv },
@@ -88,7 +89,7 @@ async function runConfigProbe(
   extraEnv: Record<string, string>,
 ): Promise<{ stdout: string; code: number; stderr: string }> {
   await Deno.writeTextFile(`${dir}/probe-config.ts`, CONFIG_PROBE);
-  const cmd = new Deno.Command(DENO, {
+  const cmd = new DiagnosticCommand(DENO, {
     args: [
       'run',
       `--config=${REPO}/deno.json`,

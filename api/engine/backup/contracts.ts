@@ -43,6 +43,7 @@ export const tableContracts = {
       'remote_batches',
       'membership_receipts',
       'local_join_observations',
+      'membership_receipt_wires',
     ],
     // Room identity/exact acceptance cuts: auditRoom; completed progress is also
     // checked against server publication by auditServer.

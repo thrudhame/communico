@@ -1,8 +1,9 @@
+import { DiagnosticCommand } from '#tests/helpers/child-diagnostics.ts';
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { runCrashChild } from './crash-child.ts';
 
 function command(source: string) {
-  return new Deno.Command(Deno.execPath(), {
+  return new DiagnosticCommand(Deno.execPath(), {
     args: ['eval', source],
     stdout: 'piped',
     stderr: 'piped',
