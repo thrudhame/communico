@@ -12,6 +12,7 @@ import {
 } from '#engine/tenant/backup-accounting.ts';
 import {
   importRegisterOperation,
+  readRegister,
   registerJson,
   type RegisterOperation,
   registerOperations,
@@ -319,6 +320,14 @@ export async function backupKeys(
           payload,
           previous.length ? String(previous[0].payload) : undefined,
         );
+        await recordBackupSession(
+          conn,
+          user,
+          row.version_no,
+          entry.room,
+          entry.session,
+          entry.data,
+        );
         changed = true;
       }
     }
@@ -329,6 +338,12 @@ export async function backupKeys(
     limitEntries(Number(total[0].n), limits.maxbackupsessions);
     await assertRestoreCapacity(conn, user, row.version_no, limits);
   } else if (action === 'delete') {
+    const removed = await tenantAuthority(conn)
+      ? await conn.query(
+        'SELECT room_id,session_id FROM backup_sessions WHERE ' + where,
+        args,
+      )
+      : [];
     changed = await forgetBackupEntries(
       conn,
       user,
@@ -336,6 +351,16 @@ export async function backupKeys(
       room,
       session,
     );
+    for (const entry of removed) {
+      await recordBackupSession(
+        conn,
+        user,
+        row.version_no,
+        String(entry.room_id),
+        String(entry.session_id),
+        null,
+      );
+    }
   } else {
     const rows = await conn.query(
       'SELECT room_id,session_id,payload FROM backup_sessions WHERE ' + where +
@@ -420,7 +445,7 @@ type BackupRevision = {
   auth_data: Json;
   etag: string;
   deleted: boolean;
-  rooms: Record<string, { sessions: Record<string, Session> }>;
+  count: number;
 };
 
 async function heldRevision(
@@ -429,27 +454,43 @@ async function heldRevision(
   version: number,
 ): Promise<BackupRevision> {
   const row = await versionRow(conn, user, String(version));
-  const rooms: BackupRevision['rooms'] = Object.create(null);
-  for (
-    const session of await conn.query(
-      'SELECT room_id,session_id,payload FROM backup_sessions WHERE localpart=? AND version_no=? ORDER BY room_id,session_id',
-      [user, version],
-    )
-  ) {
-    const room = String(session.room_id);
-    (rooms[room] ??= { sessions: Object.create(null) })
-      .sessions[String(session.session_id)] = JSON.parse(
-        String(session.payload),
-      );
-  }
   return {
     version: String(version),
     algorithm: row.algorithm,
     auth_data: JSON.parse(row.auth_data),
     etag: String(row.etag),
     deleted: row.deleted === 1,
-    rooms,
+    count: (await stats(conn, user, row)).count,
   };
+}
+
+function sessionKey(
+  user: string,
+  version: number,
+  room: string,
+  session: string,
+) {
+  return JSON.stringify(['backup', user, String(version), room, session]);
+}
+
+async function recordBackupSession(
+  conn: Conn,
+  user: string,
+  version: number,
+  room: string,
+  session: string,
+  data: Session | null,
+) {
+  const authority = await tenantAuthority(conn);
+  if (!authority) return;
+  if (authority.node !== 'home') throw new Error('backup source is not home');
+  await writeRegister(
+    conn,
+    { source: authority.node, incarnation: authority.incarnation },
+    sessionKey(user, version, room, session),
+    'backup',
+    JSON.stringify({ data }),
+  );
 }
 
 async function recordBackupVersion(conn: Conn, user: string, version: number) {
@@ -501,6 +542,29 @@ export async function captureBackupOperations(conn: Conn, user: string) {
     ) {
       await recordBackupVersion(conn, user, version);
     }
+    for (
+      const entry of await conn.query(
+        'SELECT room_id,session_id,payload FROM backup_sessions WHERE localpart=? AND version_no=? ORDER BY room_id,session_id',
+        [user, version],
+      )
+    ) {
+      const room = String(entry.room_id), session = String(entry.session_id);
+      if (
+        !(await registerOperations(
+          conn,
+          sessionKey(user, version, room, session),
+        )).length
+      ) {
+        await recordBackupSession(
+          conn,
+          user,
+          version,
+          room,
+          session,
+          JSON.parse(String(entry.payload)),
+        );
+      }
+    }
   }
   return await backupOperations(conn, user);
 }
@@ -508,7 +572,14 @@ export async function captureBackupOperations(conn: Conn, user: string) {
 function revisionOf(
   operation: RegisterOperation,
   limits: Limits,
-): { user: string; revision: BackupRevision } {
+): {
+  user: string;
+  version: number;
+  room?: string;
+  session?: string;
+  data?: Session | null;
+  revision?: BackupRevision;
+} {
   let key: unknown, raw: unknown;
   try {
     key = JSON.parse(operation.semanticKey);
@@ -519,52 +590,56 @@ function revisionOf(
   }
   const body = object(raw, 'backup revision');
   if (
-    !Array.isArray(key) || key.length !== 3 || key[0] !== 'backup' ||
+    !Array.isArray(key) || ![3, 5].includes(key.length) ||
+    key[0] !== 'backup' ||
     typeof key[1] !== 'string' || !key[1] || typeof key[2] !== 'string' ||
-    operation.semanticKey !== semanticKey(key[1], key[2]) ||
-    operation.kind !== 'backup' || operation.source !== 'home' ||
-    body.version !== key[2] ||
-    Object.keys(body).sort().join(',') !==
-      'algorithm,auth_data,deleted,etag,rooms,version'
+    operation.semanticKey !== JSON.stringify(key) ||
+    operation.kind !== 'backup' || operation.source !== 'home'
   ) {
     throw new Error('invalid backup revision');
   }
-  versionNumber(key[2]);
+  const version = versionNumber(key[2]);
+  if (key.length === 5) {
+    if (
+      typeof key[3] !== 'string' || !key[3] || typeof key[4] !== 'string' ||
+      !key[4] ||
+      Object.keys(body).join(',') !== 'data' ||
+      (body.data !== null &&
+        registerJson(JSON.stringify(sessionData(body.data, limits))) !==
+          registerJson(JSON.stringify(body.data)))
+    ) {
+      throw new Error('invalid backup session');
+    }
+    return {
+      user: key[1],
+      version,
+      room: key[3],
+      session: key[4],
+      data: body.data as Session | null,
+    };
+  }
   if (
+    body.version !== key[2] ||
+    Object.keys(body).sort().join(',') !==
+      'algorithm,auth_data,count,deleted,etag,version' ||
     typeof body.algorithm !== 'string' || !body.algorithm ||
     typeof body.etag !== 'string' || !/^(0|[1-9][0-9]*)$/.test(body.etag) ||
     !Number.isSafeInteger(Number(body.etag)) ||
-    typeof body.deleted !== 'boolean'
+    typeof body.deleted !== 'boolean' || !Number.isSafeInteger(body.count) ||
+    Number(body.count) < 0
   ) {
     throw new Error('invalid backup metadata');
   }
   object(body.auth_data, 'auth_data');
-  const rooms = object(body.rooms, 'rooms');
-  for (const [room, raw] of Object.entries(rooms)) {
-    if (!room) throw new Error('invalid backup room');
-    const row = object(raw, 'room');
-    if (Object.keys(row).join(',') !== 'sessions') {
-      throw new Error('invalid backup room');
-    }
-    for (
-      const [id, value] of Object.entries(object(row.sessions, 'sessions'))
-    ) {
-      if (
-        !id ||
-        registerJson(JSON.stringify(sessionData(value, limits))) !==
-          registerJson(JSON.stringify(value))
-      ) throw new Error('invalid backup session');
-    }
-  }
   if (
     body.deleted &&
-    (Object.keys(rooms).length || Object.keys(body.auth_data as Json).length)
+    (body.count !== 0 || Object.keys(body.auth_data as Json).length)
   ) throw new Error('deleted backup has private data');
-  return { user: key[1], revision: body as unknown as BackupRevision };
+  return { user: key[1], version, revision: body as unknown as BackupRevision };
 }
 
-/** A complete home-authored revision is a read projection, not a second backup
- * writer: no quality comparison, version allocation or independent etag bump. */
+/** Home facts project their own key only. Metadata never rehydrates a version
+ * after its first materialization; a late session cannot revive a deleted version. */
 export async function importBackup(
   conn: Conn,
   operation: RegisterOperation,
@@ -580,15 +655,21 @@ export async function importBackup(
   );
   if (!account) throw new Error('backup account unavailable');
   if (account.deactivated === 1 || !result.changed || !result.winner) return;
-  const { revision } = revisionOf(result.winner, limits);
-  const version = Number(revision.version);
+  const winner = revisionOf(result.winner, limits);
+  const { version, revision } = winner;
+  if (!revision) {
+    await projectBackupSession(conn, user, winner);
+    return;
+  }
   const [previous] = await conn.query(
     'SELECT 1 FROM backup_versions WHERE localpart=? AND version_no=?',
     [user, version],
   );
-  if (previous) await forgetBackupEntries(conn, user, version);
+  if (previous && revision.deleted) {
+    await forgetBackupEntries(conn, user, version);
+  }
   await conn.execute(
-    'INSERT INTO backup_versions(localpart,version_no,algorithm,auth_data,etag,deleted,session_count,restore_bytes) VALUES(?,?,?,?,?,?,0,?) ON CONFLICT(localpart,version_no) DO UPDATE SET algorithm=excluded.algorithm,auth_data=excluded.auth_data,etag=excluded.etag,deleted=excluded.deleted,session_count=0,restore_bytes=excluded.restore_bytes',
+    'INSERT INTO backup_versions(localpart,version_no,algorithm,auth_data,etag,deleted,session_count,restore_bytes) VALUES(?,?,?,?,?,?,0,?) ON CONFLICT(localpart,version_no) DO UPDATE SET algorithm=excluded.algorithm,auth_data=excluded.auth_data,etag=excluded.etag,deleted=excluded.deleted',
     [
       user,
       version,
@@ -599,14 +680,60 @@ export async function importBackup(
       EMPTY_BACKUP_BYTES,
     ],
   );
-  for (const [room, row] of Object.entries(revision.rooms)) {
-    for (const [id, data] of Object.entries(row.sessions)) {
-      const payload = JSON.stringify(data);
-      await conn.execute(
-        'INSERT INTO backup_sessions(localpart,version_no,room_id,session_id,payload) VALUES(?,?,?,?,?)',
-        [user, version, room, id, payload],
-      );
-      await accountSession(conn, user, version, room, id, payload);
+  if (!previous && !revision.deleted) {
+    for (
+      const row of await conn.query(
+        "SELECT DISTINCT semantic_key FROM domain_operations WHERE kind='backup' AND json_array_length(semantic_key)=5 AND json_extract(semantic_key,'$[1]')=? AND json_extract(semantic_key,'$[2]')=?",
+        [user, String(version)],
+      )
+    ) {
+      const held = await readRegister(conn, String(row.semantic_key));
+      if (held.winner) {
+        await projectBackupSession(conn, user, revisionOf(held.winner, limits));
+      }
     }
   }
+}
+
+async function projectBackupSession(
+  conn: Conn,
+  user: string,
+  fact: ReturnType<typeof revisionOf>,
+) {
+  const { version, room, session, data } = fact;
+  if (room === undefined || session === undefined || data === undefined) {
+    throw new Error('invalid backup session');
+  }
+  const [metadata] = await conn.query(
+    'SELECT deleted FROM backup_versions WHERE localpart=? AND version_no=?',
+    [user, version],
+  );
+  // Authentic session facts may precede their metadata in transport. First
+  // metadata import projects retained winners once; later updates are O(change).
+  if (!metadata || metadata.deleted === 1) return;
+  if (data === null) {
+    await forgetBackupEntries(conn, user, version, room, session);
+    return;
+  }
+  const [previous] = await conn.query(
+    'SELECT payload FROM backup_sessions WHERE localpart=? AND version_no=? AND room_id=? AND session_id=?',
+    [user, version, room, session],
+  );
+  const payload = JSON.stringify(data);
+  if (
+    previous && registerJson(String(previous.payload)) === registerJson(payload)
+  ) return;
+  await conn.execute(
+    'INSERT INTO backup_sessions(localpart,version_no,room_id,session_id,payload) VALUES(?,?,?,?,?) ON CONFLICT(localpart,version_no,room_id,session_id) DO UPDATE SET payload=excluded.payload',
+    [user, version, room, session, payload],
+  );
+  await accountSession(
+    conn,
+    user,
+    version,
+    room,
+    session,
+    payload,
+    previous ? String(previous.payload) : undefined,
+  );
 }
