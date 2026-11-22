@@ -3,6 +3,48 @@
 // batch; there is no numeric admission limit or dropped demand.
 import { demandedWork, joinDemand, settleAll } from '#engine/net/demand.ts';
 import type { KeysDeps } from './keys.ts';
+import { UpstreamError } from '#engine/net/upstream-error.ts';
+
+type Answer = { value: unknown } | { error: unknown };
+type Demands = Parameters<KeysDeps['witnessQuery']>[1];
+
+async function witnessAnswers(
+  deps: KeysDeps,
+  peer: string,
+  demands: Demands,
+  signal: AbortSignal,
+): Promise<Map<string, Answer>> {
+  const names = Object.keys(demands);
+  try {
+    signal.throwIfAborted();
+    const value = await deps.witnessQuery(peer, demands, signal);
+    return new Map(names.map((name) => [name, { value }]));
+  } catch (error) {
+    if (
+      names.length > 1 && error instanceof UpstreamError &&
+      error.context.resourceLimit &&
+      ['http-body', 'http-representation'].includes(error.context.phase)
+    ) {
+      // The existing per-response limit is not a limit on the number of
+      // requested origins. Retry smaller answers, serially within this batch.
+      const middle = Math.ceil(names.length / 2);
+      const answers = new Map<string, Answer>();
+      for (const part of [names.slice(0, middle), names.slice(middle)]) {
+        const result = await witnessAnswers(
+          deps,
+          peer,
+          Object.fromEntries(part.map((name) => [name, demands[name]])),
+          signal,
+        );
+        for (const [name, answer] of result) answers.set(name, answer);
+      }
+      return answers;
+    }
+    // A single origin's oversized answer remains a failure for that origin,
+    // without erasing usable answers from the other half of a split batch.
+    return new Map(names.map((name) => [name, { error }]));
+  }
+}
 
 type Fetch = {
   name: string;
@@ -65,14 +107,22 @@ function fetcher(witness: boolean) {
           }
           const work = demandedWork(async (signal) =>
             witness
-              ? await deps.witnessQuery(key, serverKeys, signal)
-              : await deps.directGet(key, demands[key], signal)
+              ? await witnessAnswers(deps, key, serverKeys, signal)
+              : new Map<string, Answer>([[key, {
+                value: await deps.directGet(key, demands[key], signal),
+              }]])
           );
           // One cancelled origin cannot abort a shared notary POST. The last
           // live origin owns cancellation, and the batch retains callback drain.
           await Promise.all(group.map(async (item) => {
             try {
-              item.resolve(await joinDemand(work, item.signal));
+              const answers = await joinDemand(work, item.signal);
+              const answer = answers.get(item.value.name);
+              if (!answer) {
+                throw new Error('key fetcher omitted a demanded origin');
+              }
+              if ('error' in answer) throw answer.error;
+              item.resolve(answer.value);
             } catch (error) {
               item.reject(error);
             }
