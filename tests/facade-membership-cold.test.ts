@@ -15,16 +15,11 @@ import { fakeKeyResolver, remoteEvent } from './fixtures/remote.ts';
 import { testRemoteServer } from './fixtures/signer.ts';
 import { facadeProcess } from './helpers/facade-process.ts';
 import { facadeTls } from './support/facade-tls.ts';
+import { fixtureLink } from './helpers/fixture-listeners.ts';
 
 Deno.test('membership cold composition: empty bootstrap and independent local invites cross the real home-initiated link in both directions', async () => {
   const tls = await facadeTls();
-  const ports: number[] = [];
-  for (let i = 0; i < 3; i++) {
-    const probe = Deno.listen({ hostname: '127.0.0.1', port: 0 });
-    ports.push(probe.addr.port);
-    probe.close();
-  }
-  const [homePort, edgePort, linkPort] = ports;
+  let homePort = 0, edgePort = 0, linkPort = 0;
   const file = (side: string) => tls.dir + '/' + side + '.toml';
   const socket = (side: string) => tls.dir + '/' + side + '.sock';
   const bundlefile = tls.dir + '/bundle.json';
@@ -83,11 +78,14 @@ Deno.test('membership cold composition: empty bootstrap and independent local in
       file('facade'),
       'facade: link/local admin ready',
     );
+    linkPort = await edge.port('link');
+    await fixtureLink(file('home'), linkPort);
     assertEquals(
       (await adminCall(socket('facade'), 'facade/initialize')).status,
       200,
     );
     home = await facadeProcess(file('home'), 'federation: disabled');
+    homePort = await home.port('client');
     await home.listening(homePort);
     let homeToken = '';
     for (const username of ['empty', 'pending']) {
@@ -138,6 +136,7 @@ Deno.test('membership cold composition: empty bootstrap and independent local in
       await homeFact(edge, 'auth:@' + localpart + ':logical.test');
       await homeFact(edge, 'domain:@' + localpart + ':logical.test');
     }
+    edgePort = await edge.port('client');
     await edge.listening(edgePort);
     await home.stop();
     await edge.stop();

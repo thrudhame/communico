@@ -15,7 +15,10 @@ import { pathfinder } from '@pathfinder/pathfinder';
 import type { Scope } from '#engine/facade/capabilities.ts';
 import { federationPolicy } from '#engine/federation/policy.ts';
 
-export async function startFacade(lifetime: ServerLifetime) {
+export async function startFacade(
+  lifetime: ServerLifetime,
+  fail: (error: unknown) => void,
+) {
   prepareAppRecovery();
   const runtime = await openFacadeRuntime();
   let link: Awaited<ReturnType<typeof startLinkTransport>> | undefined;
@@ -23,6 +26,7 @@ export async function startFacade(lifetime: ServerLifetime) {
   let composed = false;
   let appBound = false;
   let composing: Promise<void> | undefined;
+  let compositionFailed = false;
   const status = async () => {
     const state = await runtime.status();
     return { ...state, matrix: composed && state.enrolled };
@@ -124,12 +128,19 @@ export async function startFacade(lifetime: ServerLifetime) {
       }
       composed = true;
     })().catch(async (error) => {
-      await Promise.all(
-        servers.splice(0).map((server) => server.shutdown()),
-      );
+      // Composition is startup, even when enrollment triggers it later. A
+      // configured listener failure must not become retryable link traffic.
+      compositionFailed = true;
+      if (link) {
+        // The process owner aborts and closes the whole running facade. Do not
+        // close a partial listener here first and leave its abort hook dangling.
+        fail(error);
+      } else {
+        await Promise.all(servers.splice(0).map((server) => server.shutdown()));
+      }
       throw error;
     }).finally(() => {
-      composing = undefined;
+      if (!compositionFailed) composing = undefined;
     });
   try {
     await compose();

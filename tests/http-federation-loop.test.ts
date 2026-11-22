@@ -2,6 +2,7 @@
 // route tree. TLS is verified against the existing fixture CA, with no fake
 // federation transport, engine seeding or private diagnostic endpoints.
 import { assert, assertEquals } from '@std/assert';
+import { fixtureListeners } from './helpers/fixture-listeners.ts';
 
 type Json = Record<string, unknown>;
 const fixture = Deno.cwd() + '/tests/fixtures/tls/';
@@ -16,34 +17,28 @@ async function waitFor(probe: () => Promise<boolean>, label: string) {
 }
 
 async function start(dir: string) {
-  const httpReservation = Deno.listen({ hostname: '127.0.0.1', port: 0 });
-  const tlsReservation = Deno.listen({ hostname: '127.0.0.1', port: 0 });
-  const httpPort = (httpReservation.addr as Deno.NetAddr).port;
-  const tlsPort = (tlsReservation.addr as Deno.NetAddr).port;
-  const name = 'localhost:' + tlsPort;
   await Deno.mkdir(dir);
   const overlay = dir + '/communico.toml';
   await Deno.writeTextFile(
     overlay,
     `[server]
-name="${name}"
-port=${httpPort}
+name="localhost:0"
+port=0
 [store]
 dir="${dir}/store"
 [federation]
 enabled=true
-port=${tlsPort}
+port=0
 cert="${fixture}localhost.crt"
 key="${fixture}localhost.key"
 cacerts=["${fixture}ca.crt"]
 backfillbatch=2
 `,
   );
-  httpReservation.close();
-  tlsReservation.close();
+  const listeners = await fixtureListeners(overlay);
   const child = new Deno.Command(Deno.execPath(), {
-    args: ['run', '--allow-all', 'main.ts'],
-    env: { COMMUNICO_CONFIG: overlay },
+    args: ['run', '--allow-all', 'tests/fixtures/listener-child.ts'],
+    env: { COMMUNICO_CONFIG: overlay, ...listeners.env },
     stdout: 'piped',
     stderr: 'piped',
   }).spawn();
@@ -61,6 +56,8 @@ backfillbatch=2
     exited = true;
     return result;
   });
+  const httpPort = await listeners.port('client');
+  const name = 'localhost:' + await listeners.port('federation');
   const tls = Deno.createHttpClient({
     caCerts: [await Deno.readTextFile(fixture + 'ca.crt')],
   });

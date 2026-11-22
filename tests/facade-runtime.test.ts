@@ -44,6 +44,7 @@ import { FacadeKeys } from '#engine/facade/control.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
 import { sendLocal } from '#engine/room/ingest.ts';
 import { completeAccepted } from './complete-accepted.ts';
+import { fixtureLink } from './helpers/fixture-listeners.ts';
 
 Deno.test('cold roles expose only granted phase-honest Matrix replica routes without facade tenant genesis or home workers', async () => {
   setConfigForTests({ server: { name: 'logical.test' } });
@@ -71,14 +72,8 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
     return Response.json({ pdus: {} });
   });
   const destination = `127.0.0.1:${receiver.addr.port}`;
-  const ports = [];
-  for (let i = 0; i < 5; i++) {
-    const probe = Deno.listen({ hostname: '127.0.0.1', port: 0 });
-    ports.push(probe.addr.port);
-    probe.close();
-  }
-  const [facadePort, homePort, linkPort, federationPort, homeFederationPort] =
-    ports;
+  let facadePort = 0, homePort = 0, linkPort = 0, federationPort = 0;
+  const homeFederationPort = 0;
   const facadeConfig = `${tls.dir}/facade.toml`;
   const homeConfig = `${tls.dir}/home.toml`;
   const bundlefile = `${tls.dir}/bundle.json`;
@@ -86,11 +81,11 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
     `[server]\nname="logical.test"\nrole="${role}"\nport=${port}\n[store]\ndir="${tls.dir}/${side}-store"\n[media]\nroot="${tls.dir}/${side}-media"\n[admin]\nsocket="${tls.dir}/${side}.sock"\n`;
   const link = (side: string) =>
     `[facade]\nnodeid="edge_a"\nurl="https://127.0.0.1:${linkPort}"\nlinkport=${linkPort}\nlinkcert="${tls.dir}/${side}.crt"\nlinkkey="${tls.dir}/${side}.key"\nlinkcacerts=["${tls.dir}/ca.crt"]\npollseconds=1\nreconnectmaxseconds=1\n`;
-  const facadeFederation =
+  const facadeFederation = () =>
     `[federation]\nenabled=true\nport=${federationPort}\ncert="${tls.dir}/facade.crt"\nkey="${tls.dir}/facade.key"\ncacerts=["${tls.dir}/ca.crt"]\n`;
   await Deno.writeTextFile(
     facadeConfig,
-    common('facade', facadePort, 'facade') + facadeFederation +
+    common('facade', facadePort, 'facade') + facadeFederation() +
       link('facade'),
   );
   await Deno.writeTextFile(
@@ -115,6 +110,8 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
   await seed.close();
   try {
     facade = await process(facadeConfig, 'facade: link/local admin ready');
+    linkPort = await facade.port('link');
+    await fixtureLink(homeConfig, linkPort);
     const status = async () => {
       const response = await adminCall(
         tls.dir + '/facade.sock',
@@ -146,6 +143,8 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
       null,
     );
     home = await process(homeConfig, 'federation: enabled');
+    homePort = await home.port('client');
+    await home.port('federation');
     await home.listening(homePort);
     const api = async (
       path: string,
@@ -216,6 +215,8 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
     const roster = (await status()).body.result.keyRoster;
     assert(roster.revision > 0);
     assert(roster.lastHome > 0);
+    facadePort = await facade.port('client');
+    federationPort = await facade.port('federation');
     await facade.listening(facadePort);
     assertEquals((await status()).body.result.matrix, true);
     const sendOutbound = async (marker: string) => {
@@ -428,7 +429,7 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
     await Deno.remove(bundlefile);
     await Deno.writeTextFile(
       facadeConfig,
-      common('facade', facadePort, 'facade') + facadeFederation +
+      common('facade', facadePort, 'facade') + facadeFederation() +
         link('facade') + `pairfile="${bundlefile}"\n`,
     );
     await facade.stop();
@@ -657,13 +658,7 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
 
 Deno.test('cold F2 link workers export account cuts and recover facade authority before home ACK', async () => {
   const tls = await facadeTls();
-  const ports: number[] = [];
-  for (let i = 0; i < 3; i++) {
-    const listener = Deno.listen({ hostname: '127.0.0.1', port: 0 });
-    ports.push(listener.addr.port);
-    listener.close();
-  }
-  const [homePort, facadePort, linkPort] = ports;
+  let homePort = 0, facadePort = 0, linkPort = 0;
   const bundlefile = tls.dir + '/auth-bundle.json';
   const file = (side: string) => tls.dir + '/' + side + '-auth.toml';
   for (const side of ['home', 'facade']) {
@@ -708,8 +703,11 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     });
   try {
     edge = await process(file('facade'), 'facade: link/local admin ready');
+    linkPort = await edge.port('link');
+    await fixtureLink(file('home'), linkPort);
     await adminCall(tls.dir + '/facade-auth.sock', 'facade/initialize');
     home = await process(file('home'), 'federation: disabled');
+    homePort = await home.port('client');
     await home.listening(homePort);
     assertEquals((await api('login')).status, 200);
     const registration = { username: 'outside', password: 'offline-password' };
@@ -855,6 +853,7 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
           item.signature === homeSignature
         );
     });
+    facadePort = await edge.port('client');
     await home.stop();
     await edge.stop();
     // Join every admitted receive before selecting the offline key-stream cut.
@@ -1025,6 +1024,7 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
         ),
       );
     }
+    facadePort = await edge.port('client');
     await edge.listening(facadePort);
     // Real public authoring while home is absent and federation is disabled.
     // This room has never existed at home or in its exported inventory.
@@ -1789,13 +1789,7 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
   const timings = new ColdAuthTimings();
   timings.phase('configure and enroll');
   const tls = await facadeTls();
-  const ports: number[] = [];
-  for (let i = 0; i < 3; i++) {
-    const listener = Deno.listen({ hostname: '127.0.0.1', port: 0 });
-    ports.push(listener.addr.port);
-    listener.close();
-  }
-  const [homePort, facadePort, linkPort] = ports;
+  let homePort = 0, facadePort = 0, linkPort = 0;
   const bundlefile = tls.dir + '/public-auth-bundle.json';
   const file = (side: string) => tls.dir + '/' + side + '-public-auth.toml';
   const configure = async (side: string, extra = '') => {
@@ -1860,8 +1854,11 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
   };
   try {
     edge = await process(file('facade'), 'facade: link/local admin ready');
+    linkPort = await edge.port('link');
+    await fixtureLink(file('home'), linkPort);
     await adminCall(tls.dir + '/facade-public-auth.sock', 'facade/initialize');
     home = await process(file('home'), 'federation: disabled');
+    homePort = await home.port('client');
     await home.listening(homePort);
     assertEquals((await api('home', 'login')).status, 200);
     const registration = {
@@ -1930,6 +1927,7 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       'room:' + departureRoom.body.room_id,
       (record) => roomView(record).roomId === departureRoom.body.room_id,
     );
+    facadePort = await edge.port('client');
     await home.stop();
     // Shutdown stops between records; it does not drain the received tail.
     // With home stopped, restart and observe the actual finite auth apply cut
