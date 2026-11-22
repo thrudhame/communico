@@ -723,6 +723,52 @@ Deno.test('witnesses-first: the stranger document comes from a roster peer; via 
   });
 });
 
+Deno.test('review keys: malformed foreign notary documents cannot hide a usable origin', async () => {
+  await withStore(async (store) => {
+    const server = await store.server();
+    const origin = await makeServer('isolated-origin.test');
+    const witness = await makeServer('isolated-witness.test');
+    await seedServer(server, witness);
+    const doc = await makeDoc(origin);
+    await notaryAnswer(doc, witness);
+    const malformed = { server_name: 'malformed-other.test' };
+    let directCalls = 0;
+    const ks = keyStore(server, {
+      deps: stubDeps({
+        witnessQuery: () => Promise.resolve({ server_keys: [malformed, doc] }),
+        listWitnesses: () => Promise.resolve([witness.name]),
+        directGet: () => {
+          directCalls++;
+          throw new Error('the usable witness must prevent direct fallback');
+        },
+      }),
+    });
+    const key = await ks.getVerifyKey(origin.name, origin.keyId, 0, 'event');
+    assertEquals(
+      new Uint8Array(await crypto.subtle.exportKey('raw', key)),
+      await exportPublicKeyRaw(origin.kp.publicKey),
+    );
+    assertEquals(directCalls, 0);
+    assertEquals(
+      (await server.query(
+        'SELECT via FROM server_key_docs WHERE server_name=?',
+        [origin.name],
+      ))[0].via,
+      'witness:' + witness.name,
+    );
+    await assertRejects(
+      () =>
+        Promise.resolve().then(() =>
+          documentsFromAnswer(
+            { server_keys: [malformed] },
+            malformed.server_name,
+          )
+        ),
+      UpstreamError,
+    );
+  });
+});
+
 Deno.test('seniority: the senior usable answer wins; a differing junior is recorded as disagreement', async () => {
   await withStore(async (store) => {
     const server = await store.server();
