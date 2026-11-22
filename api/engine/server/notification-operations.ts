@@ -16,6 +16,7 @@ import {
   requireDomainSources,
 } from '#engine/facade/domain-control.ts';
 import { PUSH_KINDS } from '#engine/push/defaults.ts';
+import { validRoomId } from '#engine/room/identity.ts';
 
 export type SavedNotification = {
   tenant: string;
@@ -68,7 +69,7 @@ export function savedNotification(
     !value || typeof value.tenant !== 'string' ||
     typeof value.user !== 'string' || !/^@[^:]+:.+$/.test(value.user) ||
     value.user.slice(value.user.indexOf(':') + 1) !== value.tenant ||
-    typeof value.room !== 'string' || !/^!\S+:\S+$/.test(value.room) ||
+    !validRoomId(value.room) ||
     typeof value.event !== 'string' || !/^\$\S+$/.test(value.event) ||
     !['room', 'invite'].includes(value.source) ||
     !integer(value.ruleRevision) || !integer(value.ignoreRevision) ||

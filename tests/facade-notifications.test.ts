@@ -17,8 +17,10 @@ import {
 } from '#engine/server/notification-operations.ts';
 import { createHash } from 'node:crypto';
 import type { PushPublication } from '#engine/server/push-project.ts';
+import { buildCreate } from '#engine/room/build.ts';
+import { testSigner } from './fixtures/signer.ts';
 
-async function fixture() {
+async function fixture(room = '!room:test') {
   const dir = await Deno.makeTempDir({ prefix: 'facade-notifications-' });
   const stores: Awaited<ReturnType<typeof openStore>>[] = [];
   for (const side of ['home', 'edge', 'recovered']) {
@@ -57,11 +59,12 @@ async function fixture() {
         'hash',
       ]);
       await conn.execute(
-        "INSERT INTO event_index(event,room,pos,standing,grounding,seq) VALUES('$event','!room:test',1,'accepted','grounded',?)",
-        [node === 'home' ? 5 : 71],
+        "INSERT INTO event_index(event,room,pos,standing,grounding,seq) VALUES('$event',?,1,'accepted','grounded',?)",
+        [room, node === 'home' ? 5 : 71],
       );
       await conn.execute(
-        "INSERT INTO receipt_dag_nodes(room,event) VALUES('!room:test','$event')",
+        "INSERT INTO receipt_dag_nodes(room,event) VALUES(?,'$event')",
+        [room],
       );
     });
   }
@@ -108,6 +111,61 @@ function publication(notify = true): PushPublication {
     }],
   };
 }
+
+Deno.test('facade notifications: both qualified and v12-derived room IDs publish and import', async (t) => {
+  const create = await buildCreate(
+    {
+      sender: '@alice:test',
+      content: { room_version: '12' },
+      origin_server_ts: Date.now(),
+    },
+    await testSigner(),
+    '12',
+  );
+  for (const room of ['!room:test', '!' + String(create.event_id).slice(1)]) {
+    await t.step(room, async () => {
+      const f = await fixture(room);
+      try {
+        await f.home.tx((conn) =>
+          applyPushPublication(conn, room, '$event', 5, 17, publication(), 1000)
+        );
+        const [fact] = await f.home.tx((conn) =>
+          notificationOperations(conn, '@bob:test')
+        );
+        assertEquals(JSON.parse(fact.payload).room, room);
+        await f.edge.tx((conn) =>
+          importNotificationOperation(conn, fact, 2000)
+        );
+        for (const db of [f.home, f.edge]) {
+          assertEquals(await db.query('SELECT room,event FROM notifications'), [
+            { room, event: '$event' },
+          ]);
+          assertEquals(
+            await db.tx(async (conn) =>
+              roomNotificationCounts(
+                (await notificationSnapshot(conn, '@bob:test', 0)).rooms.get(
+                  room,
+                ),
+              )
+            ),
+            { notification_count: 1, highlight_count: 0 },
+          );
+        }
+        assertEquals(await f.edge.query('SELECT * FROM push_delivery'), []);
+        assertEquals(await f.edge.query('SELECT * FROM push_badges'), []);
+        await f.edge.tx((conn) =>
+          importNotificationOperation(conn, fact, 3000)
+        );
+        assertEquals(
+          (await f.edge.query('SELECT * FROM notifications')).length,
+          1,
+        );
+      } finally {
+        await f.close();
+      }
+    });
+  }
+});
 
 Deno.test('facade notifications: native notify and suppress retain immutable source intent with their projection', async (t) => {
   for (const notify of [true, false]) {
