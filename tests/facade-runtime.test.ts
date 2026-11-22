@@ -2393,6 +2393,32 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       'PUT',
     );
     assertEquals(legacyNotice.status, 200);
+    // /send now returns acceptance, and ordinary reads serve applied state.
+    // Observe publication through the real child process's sync consumer.
+    const deliveryDeadline = AbortSignal.timeout(30000);
+    let notificationSince: string | undefined;
+    for (;;) {
+      const query = new URLSearchParams({ timeout: '30000' });
+      if (notificationSince !== undefined) {
+        query.set('since', notificationSince);
+      }
+      const response = await fetch(
+        `http://127.0.0.1:${homePort}/_matrix/client/v3/sync?${query}`,
+        {
+          headers: { authorization: 'Bearer ' + registered.body.access_token },
+          signal: deliveryDeadline,
+        },
+      );
+      assertEquals(response.status, 200, await response.clone().text());
+      const body = await response.json();
+      notificationSince = body.next_batch;
+      if (
+        body.rooms?.join?.[departureRoom.body.room_id]?.timeline?.events?.some(
+          (event: { event_id: string }) =>
+            event.event_id === legacyNotice.body.event_id,
+        )
+      ) break;
+    }
     const homeNotifications = await api(
       'home',
       'notifications',

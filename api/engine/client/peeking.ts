@@ -16,6 +16,7 @@ import { clientEventsForRows } from './state.ts';
 import { messages } from './timeline.ts';
 import { parseStreamToken } from './tokens.ts';
 import { roomCompletion } from './completion.ts';
+import type { DeviceIdentity } from '#engine/tenant/devices.ts';
 
 function forbidden(): never {
   throw new MatrixError(403, 'M_FORBIDDEN', 'no room preview available');
@@ -80,8 +81,9 @@ export async function roomInitialSync(
   device: string | null,
   limit: number,
   signal?: AbortSignal,
+  identity: DeviceIdentity | null = null,
 ) {
-  await roomCompletion(theApp(), [roomId], signal);
+  await roomCompletion(theApp(), [roomId], signal, identity);
   return await withRoomLock(roomId, async () => {
     const app = theApp(), snapshot = await previewCut(roomId, user);
     const page = await messages({
@@ -132,12 +134,13 @@ export async function roomEvents(
   rawFrom: string | null,
   timeout: number,
   signal: AbortSignal,
+  identity: DeviceIdentity | null = null,
 ) {
   if (!roomId.startsWith('!')) invalid('room_id is required');
   const parsed = parseStreamToken(rawFrom);
   if (rawFrom !== null && parsed === null) invalid('bad from token');
   const app = theApp();
-  await roomCompletion(app, [roomId], signal);
+  await roomCompletion(app, [roomId], signal, identity);
   // An omitted cursor begins now, not at room genesis.
   let from = parsed?.eSeq ?? await eventStreamMax(app.server);
   const start = rawFrom ?? 's' + from;

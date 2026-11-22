@@ -1,4 +1,5 @@
 import { getPresence } from '#engine/client/presence.ts';
+import { authenticatedDevice } from '#engine/auth-context.ts';
 
 export default async function (
   request: import('@pathfinder/pathfinder').PathfinderRequest,
@@ -8,6 +9,7 @@ export default async function (
     context.state.user as string,
     request.params.userId as string,
     request._raw.signal,
+    authenticatedDevice(context),
   );
   const out: Record<string, unknown> = { presence: row.presence };
   if (row.statusMsg !== null) out.status_msg = row.statusMsg;

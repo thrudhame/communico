@@ -1,6 +1,7 @@
 import { MatrixError } from '#engine/matrix-error.ts';
 import { search, type SearchRoomEvents } from '#engine/client/search.ts';
 import { parseJson } from '#engine/operation-body.ts';
+import { authenticatedDevice } from '#engine/auth-context.ts';
 export default async function (
   request: import('@pathfinder/pathfinder').PathfinderRequest,
   context: import('@pathfinder/pathfinder').Context,
@@ -55,6 +56,7 @@ export default async function (
         req,
         request.query.get('next_batch'),
         request._raw.signal,
+        authenticatedDevice(context),
       ),
     },
   };

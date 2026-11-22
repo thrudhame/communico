@@ -1,5 +1,6 @@
 import { assert, assertEquals } from '@std/assert';
 import { httpSuite } from '#tests/http-app.ts';
+import { deliveredBySync } from '#tests/support/sync-delivery.ts';
 
 const suite = httpSuite('HTTP search operation contracts');
 type Json = Record<string, unknown>;
@@ -57,20 +58,23 @@ suite.test('prepare distinct rooms, senders, keys and tied ranks', async () => {
       200,
     );
   }
-  for (let i = 0; i < 5; i++) {
-    const sent = await call(
-      'rooms/' + encodeURIComponent(i % 2 === 0 ? roomA : roomB) +
-        '/send/m.room.message/s' + i,
-      {
-        body: i === 0 ? 'needle other words' : 'needle',
-        msgtype: 'm.text',
-      },
-      'PUT',
-      i < 3 ? token : otherToken,
-    );
-    assertEquals(sent.status, 200);
-    ids.push(String(sent.body.event_id));
-  }
+  await deliveredBySync(suite.matrix, token, async () => {
+    for (let i = 0; i < 5; i++) {
+      const sent = await call(
+        'rooms/' + encodeURIComponent(i % 2 === 0 ? roomA : roomB) +
+          '/send/m.room.message/s' + i,
+        {
+          body: i === 0 ? 'needle other words' : 'needle',
+          msgtype: 'm.text',
+        },
+        'PUT',
+        i < 3 ? token : otherToken,
+      );
+      assertEquals(sent.status, 200);
+      ids.push(String(sent.body.event_id));
+    }
+    return { [roomA]: [ids[0], ids[2], ids[4]], [roomB]: [ids[1], ids[3]] };
+  });
 });
 for (const order_by of ['rank', 'recent']) {
   suite.test(
