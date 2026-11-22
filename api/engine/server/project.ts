@@ -619,9 +619,7 @@ async function publishGroup(group: PublicationTurn[]): Promise<void> {
     const server = await group[0].store.server();
     const now = Date.now();
     await eventStreamTx(server, async (tx) => {
-      if (
-        active.length > 1 && await applyIndependentPublications(tx, active, now)
-      ) return;
+      if (await applyIndependentPublications(tx, active, now)) return;
       for (const { work, ready } of active) {
         for (const item of ready) {
           await apply(tx, work.roomId, item, now, work.localServers);

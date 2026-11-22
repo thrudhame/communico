@@ -13,6 +13,7 @@ import { onProjected, publishThrough } from '#engine/server/project.ts';
 import { type Genesis, genesis } from '#tests/fixtures/genesis.ts';
 import { makeRemoteServer, remoteEvent } from '#tests/fixtures/remote.ts';
 import { finishRoomRemoval } from '#engine/server/removal.ts';
+import { observePublication } from '#tests/support/hold-publication.ts';
 
 installServerHooks();
 const config = (dir: string) => ({
@@ -374,23 +375,17 @@ Deno.test('completion owner: completed arrival includes its ready dependency tai
     await g.room.tx((tx) => ingestInTx(tx, g.roomId, parent, { remote }));
     const parentCut = await g.room.tx((tx) => tx.completion.capture());
     const server = await store.server();
-    const transaction = server.tx.bind(server);
     const entered = Promise.withResolvers<void>(),
       release = Promise.withResolvers<void>();
-    server.tx = (fn, options) =>
-      transaction(async (tx) => {
-        const execute = tx.execute.bind(tx);
-        tx.execute = async (sql, values = []) => {
-          if (
-            sql.startsWith('INSERT INTO feed(') && values[3] === child.event_id
-          ) {
-            entered.resolve();
-            await release.promise;
-          }
-          return await execute(sql, values);
-        };
-        return await fn(tx);
-      }, options);
+    const restore = observePublication({ server }, g.roomId, async (tx) => {
+      if (
+        (await tx.query('SELECT 1 FROM feed WHERE event=?', [child.event_id!]))
+          .length
+      ) {
+        entered.resolve();
+        await release.promise;
+      }
+    });
     let returned = false;
     const completed = afterRoomCommit(g.room, 'test', [parent.event_id!]).then(
       () => returned = true,
@@ -424,7 +419,7 @@ Deno.test('completion owner: completed arrival includes its ready dependency tai
     } finally {
       release.resolve();
       await completed;
-      server.tx = transaction;
+      restore();
     }
   });
 });

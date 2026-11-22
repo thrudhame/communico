@@ -13,6 +13,7 @@ import { finishRoomRemoval } from '#engine/server/removal.ts';
 import { projectTenant } from '#engine/server/project-tenant.ts';
 import { bobJoins, genesis } from '#tests/fixtures/genesis.ts';
 import { setTyping, typingIn } from '#engine/typing.ts';
+import { observePublication } from '#tests/support/hold-publication.ts';
 
 async function withStore(fn: (store: Store) => Promise<void>) {
   const dir = await Deno.makeTempDir();
@@ -327,23 +328,22 @@ Deno.test('projection work: failed application releases the room owner and rolls
       content: { body: 'retry', msgtype: 'm.text' },
     }, g.signer);
     const db = await store.server();
-    const original = db.tx.bind(db);
     let failed = false;
-    db.tx = (fn, options) =>
-      original((conn) => {
-        const execute = conn.execute.bind(conn);
-        conn.execute = (sql, values = []) => {
-          if (
-            !failed && sql.startsWith('INSERT INTO feed(') &&
-            values.includes(event.eventId)
-          ) {
-            failed = true;
-            throw new Error('injected projection failure');
-          }
-          return execute(sql, values);
-        };
-        return fn(conn);
-      }, options);
+    const restore = observePublication(
+      { server: db },
+      g.roomId,
+      async (conn) => {
+        if (
+          !failed &&
+          (await conn.query('SELECT 1 FROM feed WHERE event=?', [
+            event.eventId,
+          ])).length
+        ) {
+          failed = true;
+          throw new Error('injected projection failure');
+        }
+      },
+    );
     try {
       await assertRejects(
         () => project(store, g.roomId),
@@ -355,7 +355,7 @@ Deno.test('projection work: failed application releases the room owner and rolls
         [],
       );
     } finally {
-      db.tx = original;
+      restore();
     }
     await Promise.all([project(store, g.roomId), project(store, g.roomId)]);
     assertEquals(
@@ -616,44 +616,49 @@ Deno.test('projection work: a prepared prefix is not truncated by demand arrivin
       }, g.signer);
     const events: Awaited<ReturnType<typeof write>>[] = [];
     for (const body of ['one', 'two', 'three']) events.push(await write(body));
-    const db = await store.server(), original = db.tx.bind(db);
+    const db = await store.server();
     let queued = false;
     let between: Promise<void> = Promise.resolve();
-    db.tx = (fn, options) =>
-      original((conn) => {
-        const execute = conn.execute.bind(conn);
-        conn.execute = (sql, values = []) => {
-          if (
-            !queued && sql.startsWith('INSERT INTO feed(') &&
-            values.includes(events[0].eventId)
-          ) {
-            queued = true;
-            between = withProjectionLock(async () => {
-              assertEquals(
-                (await db.query(
-                  'SELECT event FROM feed WHERE room=? ORDER BY seq',
-                  [g.roomId],
-                ))
-                  .filter((row) =>
-                    events.some((event) => event.eventId === row.event)
-                  ).map((row) => row.event),
-                events.map((event) => event.eventId),
-                'new demand truncated the already prepared input prefix',
-              );
-              await tenant.tx((tx) => tx.users.markDeactivated('bob'));
-            });
-            void between.catch(() => {});
-          }
-          return execute(sql, values);
-        };
-        return fn(conn);
-      }, options);
+    const restore = observePublication(
+      { server: db },
+      g.roomId,
+      async (conn) => {
+        if (
+          !queued &&
+          (await conn.query('SELECT 1 FROM feed WHERE event=?', [
+            events[0].eventId,
+          ])).length
+        ) {
+          queued = true;
+          between = withProjectionLock(async () => {
+            assertEquals(
+              (await db.query(
+                'SELECT event FROM feed WHERE room=? ORDER BY seq',
+                [g.roomId],
+              ))
+                .filter((row) =>
+                  events.some((event) => event.eventId === row.event)
+                ).map((row) => row.event),
+              events.map((event) => event.eventId),
+              'new demand truncated the already prepared input prefix',
+            );
+            await tenant.tx((tx) => tx.users.markDeactivated('bob'));
+          });
+          void between.catch(() => {});
+        }
+      },
+    );
     try {
       await project(store, g.roomId);
       await between;
+      assertEquals(
+        queued,
+        true,
+        'the competing demand must actually be injected',
+      );
     } finally {
       await Promise.allSettled([between]);
-      db.tx = original;
+      restore();
     }
     const later = await write('new turn, fresh policy');
     await project(store, g.roomId);
@@ -689,7 +694,6 @@ Deno.test('projection work: a later change failure preserves earlier publication
       );
     }
     const db = await store.server();
-    const original = db.tx.bind(db);
     const originalTenant = store.tenant.bind(store);
     let between: Promise<void> = Promise.resolve();
     let queued = false;
@@ -706,18 +710,19 @@ Deno.test('projection work: a later change failure preserves earlier publication
         },
       };
     };
-    db.tx = (fn, options) =>
-      original((conn) => {
-        const execute = conn.execute.bind(conn);
-        conn.execute = (sql, values = []) => {
-          if (
-            sql.startsWith('INSERT INTO feed(') &&
-            values.includes(events[1].eventId)
-          ) throw new Error('later durable change failure');
-          return execute(sql, values);
-        };
-        return fn(conn);
-      }, options);
+    const restore = observePublication(
+      { server: db },
+      g.roomId,
+      async (conn) => {
+        if (
+          (await conn.query('SELECT 1 FROM feed WHERE event=?', [
+            events[1].eventId,
+          ])).length
+        ) {
+          throw new Error('later durable change failure');
+        }
+      },
+    );
     try {
       await assertRejects(
         () => project(store, g.roomId),
@@ -740,7 +745,7 @@ Deno.test('projection work: a later change failure preserves earlier publication
       );
     } finally {
       await between;
-      db.tx = original;
+      restore();
       store.tenant = originalTenant;
     }
     await Promise.all([project(store, g.roomId), project(store, g.roomId)]);
