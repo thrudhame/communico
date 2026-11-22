@@ -1,3 +1,4 @@
+import { DiagnosticCommand } from '#tests/helpers/child-diagnostics.ts';
 import { assert } from '@std/assert';
 
 /** Real HTTP over Unix sockets, independently of the production client. */
@@ -6,7 +7,7 @@ export async function adminCall(
   operation: string,
   body: unknown = {},
 ) {
-  const output = await new Deno.Command('curl', {
+  const output = await new DiagnosticCommand('curl', {
     args: [
       '--silent',
       '--show-error',

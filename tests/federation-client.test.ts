@@ -1,3 +1,4 @@
+import { DiagnosticCommand } from '#tests/helpers/child-diagnostics.ts';
 // tests/federation-client.test.ts — the signed outbound client against
 // the fake remote server (real TLS, fixture CA): header grammar,
 // destination sent, Content-Type on bodies, Matrix error passthrough,
@@ -594,7 +595,7 @@ Deno.test('dial: key-is-name peer → raw key equality round trips', async () =>
     const tmp = await Deno.makeTempFile();
     await Deno.writeTextFile(tmp, pem);
     const certPath = await Deno.makeTempFile();
-    const out = await new Deno.Command('openssl', {
+    const out = await new DiagnosticCommand('openssl', {
       args: [
         'req',
         '-x509',
@@ -768,7 +769,7 @@ Deno.test('client: CA transport verifies configured roots, IP SAN and server ide
   const valid = await Deno.readTextFile('tests/fixtures/tls/localhost.crt');
   const dir = await Deno.makeTempDir();
   const openssl = async (...args: string[]) => {
-    const output = await new Deno.Command('openssl', {
+    const output = await new DiagnosticCommand('openssl', {
       args,
       stdout: 'piped',
       stderr: 'piped',

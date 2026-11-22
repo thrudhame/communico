@@ -55,6 +55,8 @@ export default async function (
     if (msg.includes('E_CREATE_ROOM_REJECT')) {
       throw new MatrixError(400, 'M_INVALID_PARAM', msg);
     }
-    throw new MatrixError(500, 'M_UNKNOWN', msg);
+    // Unexpected failures belong to the shared request error owner. Replacing
+    // them here discarded their class, stack and nested causes before logging.
+    throw e;
   }
 }

@@ -271,16 +271,22 @@ Deno.test('completion owner: failure without a full waiter is observable and aut
     try {
       completionService(store).enroll(g.room, g.signer.serverName, target);
       await guard(retried.promise);
+      const line = logs.flat().find((arg) =>
+        typeof arg === 'string' && arg.startsWith('worker failure: ')
+      );
       assert(
-        logs.some((args) =>
-          args.some((arg) =>
-            arg instanceof CompletionFailure &&
-            arg.target.roomId === g.roomId &&
-            arg.target.through === target.through && arg.phase === 'completion'
-          )
-        ),
+        typeof line === 'string',
         'owner swallowed a failure without a full waiter',
       );
+      const record = JSON.parse(line.slice('worker failure: '.length));
+      assertEquals(record.owner, 'room completion');
+      assertEquals(record.server, g.signer.serverName);
+      assertEquals(record.scope, `${g.roomId}/${target.through} (completion)`);
+      assertEquals(record.error.status, 503);
+      assertEquals(record.error.cause.name, 'AggregateError');
+      const callback = record.error.cause.errors[0];
+      assertEquals(callback.message, 'unattended callback failure');
+      assert(callback.stack.includes('completion-recovery.test.ts'));
     } finally {
       console.error = original;
       dispose();

@@ -1,3 +1,4 @@
+import { DiagnosticCommand } from '#tests/helpers/child-diagnostics.ts';
 import { assertEquals } from '@std/assert';
 
 Deno.test('Complement harness records the canonical executed settings vector', async () => {
@@ -35,7 +36,7 @@ Deno.test('Complement harness records the canonical executed settings vector', a
       await Deno.writeTextFile(`${dir}/bin/${name}`, text);
       await Deno.chmod(`${dir}/bin/${name}`, 0o755);
     }
-    const out = await new Deno.Command('bash', {
+    const out = await new DiagnosticCommand('bash', {
       args: ['complement/run.sh'],
       cwd: dir,
       env: {

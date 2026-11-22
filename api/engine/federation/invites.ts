@@ -197,11 +197,13 @@ export async function inviteRemote(
       e instanceof FederationHttpError && e.remoteStatus === 400 &&
       e.matrixBody && e.errcode === 'M_MISSING_PARAM'
     ) {
-      throw new MatrixError(
+      const failure = new MatrixError(
         502,
         'M_UNKNOWN',
         String(e.responseBody().error),
       );
+      failure.cause = e;
+      throw failure;
     }
     throw e; // 403 M_FORBIDDEN and 400 M_INCOMPATIBLE_ROOM_VERSION pass through
   }

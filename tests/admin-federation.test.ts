@@ -1,3 +1,4 @@
+import { DiagnosticCommand } from '#tests/helpers/child-diagnostics.ts';
 import { assert, assertEquals } from '@std/assert';
 import { startAdmin } from '#root/api/admin/index.ts';
 import { startFederationServices } from '#engine/app.ts';
@@ -309,7 +310,7 @@ Deno.test('admin federation operations cross the socket and affect their consume
           "INSERT INTO outbox(room,pos,destination,event,state,added_ms) VALUES('!clock:test',1,'clock.test','$clock','pending',?)",
           [now - 125000 - config().federation.refusedmillihours * 3600],
         );
-        const out = await new Deno.Command(Deno.execPath(), {
+        const out = await new DiagnosticCommand(Deno.execPath(), {
           args: [
             'run',
             '--allow-env',

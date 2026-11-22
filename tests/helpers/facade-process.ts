@@ -402,6 +402,7 @@ export async function facadeProcess(
     }),
   ]).then(([status]) => {
     ended = true;
+    diagnostics.status(status);
     observations.close(
       new Error(`facade child exited (${status.code})\n${out}\n${err}`),
     );
