@@ -15,6 +15,8 @@ import {
   LinkError,
 } from '#engine/facade/protocol.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { VerificationUnavailable } from '#engine/facade/signing-authority.ts';
+import { bounded } from './helpers/server-process.ts';
 import { historicalServerSchema } from './fixtures/server-schema-history.ts';
 import { historicalTenantSchema } from './fixtures/tenant-schema-history.ts';
 import { serverSchema } from '#engine/server/schema.ts';
@@ -328,6 +330,88 @@ for (
         (await owner.ready()).revision,
         kind === 'regression' ? 2 : 1,
       );
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+Deno.test('AUTHFLAKE: ownership revision advance waits for the tenant install, not a terminal refusal', async () => {
+  const f = await fixture();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let installing: Promise<boolean> | undefined;
+  try {
+    const first = await f.receive();
+    const journal = await f.journal();
+    await (await f.owner()).apply(journal, first);
+    const body = { ...(await (await f.owner()).ready()), revision: 2 };
+    const record = await f.changed({
+      body,
+      signature: await f.tenant.signer().sign(canonicalJson(body)),
+    }, 'advance');
+    await journal.receive('home', [record]);
+    const tenant = await f.edge().tenant('logical.test');
+    const owner = new OwnerControls(
+      await f.edge().server(),
+      {
+        ...tenant,
+        tx: async (fn, options) => {
+          entered.resolve();
+          await release.promise;
+          return await tenant.tx(fn, options);
+        },
+      },
+      f.pairings(),
+      f.node,
+    );
+    installing = owner.apply(journal, record);
+    installing.catch(entered.reject);
+    await bounded(entered.promise);
+    await assertRejects(
+      () => (f.owner()).then((o) => o.ready()),
+      VerificationUnavailable,
+    );
+    assertEquals(
+      (await journal.heads('home', 'in', record)).applied.sequence,
+      first.sequence,
+    );
+    release.resolve();
+    assertEquals(await bounded(installing), true);
+    assertEquals((await (await f.owner()).ready()).revision, 2);
+  } finally {
+    release.resolve();
+    await installing?.catch(() => {});
+    await f.close();
+  }
+});
+
+for (const corruption of ['material', 'hash'] as const) {
+  Deno.test(`AUTHFLAKE: equal-revision ownership ${corruption} corruption stays terminal`, async () => {
+    const f = await fixture();
+    try {
+      const record = await f.receive();
+      await (await f.owner()).apply(await f.journal(), record);
+      const tenant = await f.edge().tenant('logical.test');
+      if (corruption === 'material') {
+        await tenant.execute('UPDATE facade_owner_controls SET signed_json=?', [
+          '{}',
+        ]);
+      } else {
+        for (const db of [await f.edge().server(), tenant]) {
+          await db.execute('UPDATE facade_owner_activation SET body_hash=?', [
+            'bad-hash',
+          ]);
+          await db.execute('UPDATE facade_owner_controls SET body_hash=?', [
+            'bad-hash',
+          ]);
+        }
+      }
+      const error = await assertRejects(
+        () => (f.owner()).then((o) => o.ready()),
+        MatrixError,
+      );
+      assertEquals(error instanceof VerificationUnavailable, false);
     } finally {
       await f.close();
     }

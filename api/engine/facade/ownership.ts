@@ -18,6 +18,7 @@ import {
   type RemoteSignatureCuts,
 } from '#engine/tenant/signature-bootstrap.ts';
 import type { NodeIdentity } from './identity.ts';
+import { VerificationUnavailable } from './signing-authority.ts';
 import { appendRecord, type Journal } from './journal.ts';
 import type { Grant, Pairings, Signed } from './pairing.ts';
 import {
@@ -413,7 +414,13 @@ export class OwnerControls {
     );
     const left = rows[0][0], right = rows[1][0];
     if (
-      !left || !right || left.revision !== right.revision ||
+      !left || !right || left.revision !== right.revision
+    ) {
+      // The independent control stream commits server, then tenant. Auth and
+      // reverse exports wait for that installation without a terminal refusal.
+      throw new VerificationUnavailable('ownership control unavailable');
+    }
+    if (
       left.body_hash !== right.body_hash ||
       left.signed_json !== right.signed_json
     ) unavailable();
