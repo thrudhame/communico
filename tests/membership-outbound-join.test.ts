@@ -1,4 +1,9 @@
-import { assert, assertEquals, assertRejects } from '@std/assert';
+import {
+  assert,
+  assertEquals,
+  assertRejects,
+  assertStrictEquals,
+} from '@std/assert';
 import { config, setConfigForTests } from '#engine/config.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { joinRemote } from '#engine/room/join.ts';
@@ -28,6 +33,98 @@ import {
   beginJoinAttempt,
   releaseJoinAttempt,
 } from '#engine/server/join-attempts.ts';
+
+for (const version of ['v2', 'v1']) {
+  Deno.test(`review join: ${version} request signing failure before dispatch leaves no compensation debt`, async () => {
+    const dir = await Deno.makeTempDir({ prefix: 'join-not-dispatched-' });
+    const store = await openStore({
+      dir,
+      library: './.native/libturso_ffi.so',
+      checkpointlogbytes: 65536,
+      maxopenfiles: 8,
+      idleseconds: 300,
+    }, { schemas: { room: roomSchema, server: serverSchema } });
+    const signer = await testSigner();
+    const local = await testRemoteServer();
+    const fault = new Error('send_join request signer unavailable');
+    const guarded = {
+      ...signer,
+      sign: (canonical: string) => {
+        const request = JSON.parse(canonical);
+        if (String(request.uri).includes('/' + version + '/send_join/')) {
+          return Promise.reject(
+            fault,
+          );
+        }
+        return signer.sign(canonical);
+      },
+    };
+    let fr: Awaited<ReturnType<typeof makeFakeRoom>>;
+    let compensations = 0;
+    const peer = await startFakeServer({
+      ourKeyDoc: async () => ({
+        server_name: signer.serverName,
+        verify_keys: {
+          [signer.keyId]: {
+            key: b64encodeStd(await exportPublicKeyRaw(local.kp.publicKey)),
+          },
+        },
+      }),
+      handlers: (req) =>
+        req.path.includes('/make_join/')
+          ? Response.json({
+            room_version: fr.version,
+            event: fr.makeJoinAnswer('@anna:test').event,
+          })
+          : req.path.includes('/v2/send_join/')
+          ? Response.json({ errcode: 'M_UNRECOGNIZED', error: 'use v1' }, {
+            status: 404,
+          })
+          : null,
+    });
+    const old = config();
+    setConfigForTests({
+      federation: { cacerts: ['tests/fixtures/tls/ca.crt'] },
+    });
+    try {
+      fr = await makeFakeRoom({
+        roomId: '!not-dispatched:' + peer.name,
+        server: peer,
+      });
+      const server = await store.server();
+      const error = await assertRejects(() =>
+        joinRemote(store, {
+          roomId: fr.roomId,
+          user: '@anna:test',
+          via: [peer.name],
+          signer: guarded,
+          deps: {
+            self: 'test',
+            fetcher: productionFetcher(server, guarded, store),
+            keys: fakeKeyResolver(peer, local),
+            leave: () => {
+              compensations++;
+              throw new Error('peer refuses make_leave');
+            },
+          },
+        })
+      );
+      assertStrictEquals(error, fault);
+      assertEquals(compensations, 0);
+      assertEquals(await pendingJoinAttempts(server), []);
+      assertEquals(
+        peer.requests.filter((request) => request.path.includes('/send_join/'))
+          .length,
+        version === 'v1' ? 1 : 0,
+      );
+    } finally {
+      setConfigForTests(old);
+      await peer.close();
+      await store.close();
+      await Deno.remove(dir, { recursive: true });
+    }
+  });
+}
 
 Deno.test('confirmed outbound join refusal survives failed deletion and cold cleanup without a leave', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'join-refused-' });

@@ -11,6 +11,12 @@ import { recoverableUpstream } from '#engine/net/upstream-error.ts';
 // All other throws, including locally constructed MatrixErrors, are uncertain.
 export class SendJoinRefused extends MatrixError {}
 
+export class SendJoinNotDispatched extends Error {
+  constructor(readonly error: unknown) {
+    super('send_join was not dispatched', { cause: error });
+  }
+}
+
 // KeyResolver: verify one signature entry of an event at a time. The
 // resolver owns key discovery (direct fetch, witnesses, caching — stage
 // 4) and answers whether `signatures[server][keyId]` of `pdu` verifies

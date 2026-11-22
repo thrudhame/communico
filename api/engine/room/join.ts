@@ -27,6 +27,7 @@ import { finalizeBuilt, roomCreateId } from '#engine/room/build.ts';
 import {
   type Fetcher,
   type KeyResolver,
+  SendJoinNotDispatched,
   SendJoinRefused,
 } from '#engine/room/deps.ts';
 import {
@@ -236,6 +237,12 @@ async function joinVia(
     // 3. send_join — the answer is untrusted input
     const resp = await deps.fetcher.sendJoin(args.roomId, signed, candidate)
       .catch((error: unknown) => {
+        if (error instanceof SendJoinNotDispatched) {
+          // Persist the same proof of no remote membership as a peer refusal,
+          // so even a failed deletion cannot create compensating leave debt.
+          refused = true;
+          throw error.error;
+        }
         refused = error instanceof SendJoinRefused;
         throw error;
       });
