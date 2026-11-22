@@ -182,6 +182,7 @@ type OutboundInvite = {
     invite_room_state: unknown[];
   };
   response: Pdu | null;
+  mayHaveApplied: boolean;
 };
 function outboundInvite(row: Record<string, unknown>): OutboundInvite {
   return {
@@ -190,6 +191,7 @@ function outboundInvite(row: Record<string, unknown>): OutboundInvite {
     target: String(row.target),
     eventId: String(row.event_id),
     destination: String(row.destination),
+    mayHaveApplied: Boolean(row.may_have_applied),
     request: JSON.parse(String(row.request_json)),
     response: row.response_json === null
       ? null
@@ -235,6 +237,7 @@ export async function inviteRemote(
     [roomId, sender, target],
   );
   const replacing = existing.length > 0 && existing[0].status === 'refused' &&
+    !outboundInvite(existing[0]).mayHaveApplied &&
     canonicalJson(outboundInvite(existing[0]).request.event.content) !==
       canonicalJson(content);
   const continuing = existing.length > 0 && !replacing;
@@ -252,6 +255,7 @@ export async function inviteRemote(
     );
     let saved: OutboundInvite;
     const replace = rows.length > 0 && rows[0].status === 'refused' &&
+      !outboundInvite(rows[0]).mayHaveApplied &&
       canonicalJson(outboundInvite(rows[0]).request.event.content) !==
         canonicalJson(content);
     if (
@@ -333,13 +337,14 @@ export async function inviteRemote(
         destination: remote,
         request,
         response: null,
+        mayHaveApplied: false,
       };
       await deps.server.tx(async (tx) => {
         await admission?.check(tx);
         await withMembershipFence(admission, tx, async () => {
           if (replace) {
             const removed = await tx.execute(
-              "DELETE FROM federation_invite_attempts WHERE event_id=? AND status='refused'",
+              "DELETE FROM federation_invite_attempts WHERE event_id=? AND status='refused' AND may_have_applied=0",
               [String(rows[0].event_id)],
             );
             if (removed !== 1) {
@@ -403,6 +408,7 @@ async function performOutboundInvite(
     return { eventId };
   }
   let refused = false;
+  let priorUncertainty = true;
   try {
     let merged = attempt.response;
     if (merged === null) {
@@ -414,10 +420,30 @@ async function performOutboundInvite(
           encodeURIComponent(eventId)
         }`,
         body: new TextEncoder().encode(JSON.stringify(request)),
+        beforeDispatch: async () => {
+          await deps.server.tx(async (conn) => {
+            const [row] = await conn.query(
+              'SELECT may_have_applied FROM federation_invite_attempts WHERE event_id=?',
+              [eventId],
+            );
+            if (!row) {
+              throw new MatrixError(
+                409,
+                'M_BAD_STATE',
+                'Remote invite was removed before dispatch',
+              );
+            }
+            priorUncertainty = Boolean(row.may_have_applied);
+            await conn.execute(
+              'UPDATE federation_invite_attempts SET may_have_applied=1 WHERE event_id=?',
+              [eventId],
+            );
+          });
+        },
       }).catch((error: unknown) => {
         // Only a refusal of this submission proves non-acceptance. Key lookup
         // failures or invalid evidence after a response remain ambiguous.
-        refused = isDefiniteFederationRefusal(error);
+        refused = isDefiniteFederationRefusal(error) && !priorUncertainty;
         throw error;
       });
       merged = inviteResponse(res.json);
@@ -511,8 +537,8 @@ async function performOutboundInvite(
       (e instanceof UpstreamError && e.category === 'validation')
     ) {
       await deps.server.execute(
-        'UPDATE federation_invite_attempts SET status=? WHERE event_id=?',
-        [refused ? 'refused' : 'failed', eventId],
+        'UPDATE federation_invite_attempts SET status=?,may_have_applied=CASE WHEN ?=1 THEN 0 ELSE may_have_applied END WHERE event_id=?',
+        [refused ? 'refused' : 'failed', refused ? 1 : 0, eventId],
       );
     }
     if (

@@ -55,6 +55,7 @@ import { testRemoteServer, testSigner } from './fixtures/signer.ts';
 import { assertAuthored } from './fixtures/authored.ts';
 import { sendLocal } from '#engine/room/ingest.ts';
 import { watchdog } from './support/ordering.ts';
+import { historicalServerSchema } from './fixtures/server-schema-history.ts';
 
 async function ourKeyDoc(name: string): Promise<Record<string, unknown>> {
   const us = await testRemoteServer(name);
@@ -922,6 +923,116 @@ Deno.test('inviter: new content replaces only a definitely refused attempt', asy
           );
         });
       }));
+  }
+});
+
+Deno.test('review inviter: upgrade preserves unknown dispatch certainty and fresh attempts start undispatched', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'invite-certainty-upgrade-' });
+  let store = await openStore(config(dir), {
+    schemas: { server: historicalServerSchema(53) },
+  });
+  try {
+    const old = await store.server();
+    for (const status of ['pending', 'refused']) {
+      await old.execute(
+        'INSERT INTO federation_invite_attempts(room_id,sender,target,event_id,destination,request_json,status,added_ms) VALUES(?,?,?,?,?,?,?,?)',
+        [
+          '!old:test',
+          '@sender:test',
+          '@' + status + ':remote.test',
+          '$' + status,
+          'remote.test',
+          '{"frozen":"intent"}',
+          status,
+          123,
+        ],
+      );
+    }
+    await store.close();
+    store = await openStore(config(dir), { schemas: { server: serverSchema } });
+    const current = await store.server();
+    assertEquals(
+      await current.query(
+        'SELECT request_json,may_have_applied FROM federation_invite_attempts ORDER BY event_id',
+      ),
+      [
+        { request_json: '{"frozen":"intent"}', may_have_applied: 1 },
+        { request_json: '{"frozen":"intent"}', may_have_applied: 1 },
+      ],
+    );
+    await current.execute(
+      "INSERT INTO federation_invite_attempts(room_id,sender,target,event_id,destination,request_json,status,added_ms) VALUES('!new:test','@sender:test','@new:remote.test','$new','remote.test','{}','pending',123)",
+    );
+    assertEquals(
+      await current.query(
+        "SELECT may_have_applied FROM federation_invite_attempts WHERE event_id='$new'",
+      ),
+      [{ may_have_applied: 0 }],
+    );
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('review inviter: a later refusal cannot erase an earlier uncertain dispatch across restart', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'invite-certainty-' });
+  const schemas = { room: roomSchema, server: serverSchema };
+  let store = await openStore(config(dir), { schemas });
+  try {
+    await withInviteHost(async (h) => {
+      const g = await genesis(store, { roomId: '!uncertain-refusal:test' });
+      const deps = async (): Promise<InviteDeps> => {
+        const server = await store.server();
+        return {
+          store,
+          server,
+          signer: g.signer,
+          keys: productionKeyResolver(keyStore(server, { signer: g.signer })),
+          self: 'test',
+          wake() {},
+        };
+      };
+      const invite = async (reason: string) =>
+        inviteRemote(
+          g.roomId,
+          '@dev:test',
+          `@zoe:${h.fake.name}`,
+          reason,
+          undefined,
+          await deps(),
+        );
+      h.response = () =>
+        Response.json({
+          errcode: 'M_UNKNOWN',
+          error: 'response lost after possible acceptance',
+        }, { status: 502 });
+      await assertRejects(() => invite('A'));
+      const original = canonicalJson(h.inviteRequests[0]);
+      await store.close();
+      store = await openStore(config(dir), { schemas });
+      h.response = () =>
+        Response.json({
+          errcode: 'M_NOT_FOUND',
+          error: 'federation temporarily disabled',
+        }, { status: 404 });
+      await assertRejects(() => invite('A'));
+      h.response = () => null;
+      const conflict = await assertRejects(() => invite('B'), MatrixError);
+      assertEquals(conflict.status, 409);
+      assertEquals(h.inviteRequests.length, 2);
+      await invite('A');
+      assertEquals(canonicalJson(h.inviteRequests[2]), original);
+      assertEquals(
+        await (await store.server()).query(
+          'SELECT * FROM federation_invite_attempts',
+        ),
+        [],
+      );
+    });
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
   }
 });
 
