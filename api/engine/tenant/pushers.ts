@@ -336,6 +336,30 @@ export async function capturePusherOperations(conn: Conn, localpart: string) {
   return await pusherOperations(conn, localpart);
 }
 
+/** Enrollment adopts only factless home registrations, including accounts not
+ * selected for replication. Retained choices/removals always outrank native
+ * recovery rows; reactivation cannot mint a replacement for either. */
+export async function captureLegacyPusherOperations(conn: Conn) {
+  const authority = await tenantAuthority(conn);
+  if (authority?.node !== 'home') return;
+  const rows = await conn.query(
+    `SELECT p.* FROM pushers p
+    JOIN users u ON u.localpart=p.localpart AND u.deactivated=0
+    JOIN access_tokens a ON a.token=p.access_token AND a.localpart=p.localpart
+    JOIN session_authority s ON s.hash=a.token AND s.localpart=p.localpart
+    WHERE s.node=? AND s.incarnation=? AND s.refresh=0 AND NOT EXISTS (
+      SELECT 1 FROM domain_operations o WHERE o.kind IN ('pusher','pusher-choice')
+      AND json_extract(o.semantic_key,'$[1]')=p.localpart
+      AND json_extract(o.semantic_key,'$[2]')=p.app_id
+      AND json_extract(o.semantic_key,'$[3]')=p.pushkey)`,
+    [authority.node, authority.incarnation],
+  );
+  for (const row of rows) {
+    await recordPusherOperation(conn, row, false);
+    await recordPusherChoice(conn, row);
+  }
+}
+
 function pusherOperation(operation: RegisterOperation) {
   let key: unknown, value: unknown;
   try {
@@ -853,8 +877,9 @@ export async function pusherIncarnations(
     [];
 }
 
-/** Publication and scalar readers share the pusher owner's admission contract.
- * Native candidates are selected as one set; facade choices remain authoritative. */
+/** Capture durable routing candidates, not permission to send. An incomplete
+ * choice retains work for final admission instead of blocking publication or
+ * discarding a notification. A resolved losing choice never gains a route. */
 export async function capturePusherIncarnations(
   conn: Conn,
   localparts: readonly string[],
@@ -866,16 +891,19 @@ export async function capturePusherIncarnations(
   if (!rows.length) return result;
   const enrolled = await tenantAuthority(conn);
   for (const row of rows) {
-    if (
-      !enrolled ||
-      await pusherIsCurrent(
+    if (enrolled) {
+      if (!await pusherSessionIsCurrent(conn, String(row.access_token))) {
+        continue;
+      }
+      const choice = await selectedPusher(
         conn,
         String(row.localpart),
         String(row.app_id),
         String(row.pushkey),
-        String(row.incarnation),
-      )
-    ) result.get(String(row.localpart))!.push(String(row.incarnation));
+      );
+      if (choice.ready && choice.incarnation !== row.incarnation) continue;
+    }
+    result.get(String(row.localpart))!.push(String(row.incarnation));
   }
   return result;
 }
@@ -902,6 +930,18 @@ function nativePusherCandidates(
   );
 }
 
+async function pusherSessionIsCurrent(conn: Conn, accessHash: string) {
+  try {
+    await requireSessionAuthority(conn, accessHash, false);
+    return true;
+  } catch (error) {
+    if (!(error instanceof MatrixError) || ![401, 503].includes(error.status)) {
+      throw error;
+    }
+    return false;
+  }
+}
+
 /** Send admission reads account, registration and its current token/device
  * generation in one tenant snapshot. Refresh moves ownership without changing
  * the incarnation; deletion/recreation cannot revive an old registration. */
@@ -919,12 +959,7 @@ export async function pusherIsCurrent(
   });
   if (!native) return false;
   if (await tenantAuthority(conn)) {
-    try {
-      await requireSessionAuthority(conn, String(native.access_token), false);
-    } catch (error) {
-      if (
-        !(error instanceof MatrixError) || ![401, 503].includes(error.status)
-      ) throw error;
+    if (!await pusherSessionIsCurrent(conn, String(native.access_token))) {
       return false;
     }
     const selected = await selectedPusher(conn, localpart, appId, pushkey);

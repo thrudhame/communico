@@ -7,7 +7,10 @@ import { nextCounter } from '#engine/tenant/accountdata.ts';
 import { deleteDevice } from '#engine/tenant/devices.ts';
 import { appendImportedKeyNotice } from '#engine/tenant/changes.ts';
 import { recordTenantProjection } from '#engine/tenant/hooks.ts';
-import { deletePushersForToken } from '#engine/tenant/pushers.ts';
+import {
+  captureLegacyPusherOperations,
+  deletePushersForToken,
+} from '#engine/tenant/pushers.ts';
 import { deactivateUserRows } from '#engine/tenant/users.ts';
 import type { ErasureCut } from '#engine/room/state.ts';
 import { authUnavailable } from '#engine/tenant/account-auth.ts';
@@ -159,6 +162,7 @@ export async function activateTenantAuthority(
     }
     await retainLegacySignatures(conn, signatures);
   }
+  if (identity.node === 'home') await captureLegacyPusherOperations(conn);
 }
 
 export async function accountBarriers(
