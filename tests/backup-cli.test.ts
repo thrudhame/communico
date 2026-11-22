@@ -1,3 +1,4 @@
+import { DiagnosticCommand } from '#tests/helpers/child-diagnostics.ts';
 import { assert, assertEquals } from '@std/assert';
 import { join } from '@std/path';
 import metadata from '#root/deno.json' with { type: 'json' };
@@ -62,7 +63,7 @@ for (
     };
     const start = async (configPath: string) => {
       const listeners = await fixtureListeners(configPath);
-      const child = new Deno.Command(Deno.execPath(), {
+      const child = new DiagnosticCommand(Deno.execPath(), {
         args: [
           ...metadata.tasks.start.split(' ').slice(1, -1),
           'tests/fixtures/listener-child.ts',
@@ -116,7 +117,7 @@ for (
       expected = 0,
       extra: Record<string, string> = {},
     ) => {
-      const result = await new Deno.Command(Deno.execPath(), {
+      const result = await new DiagnosticCommand(Deno.execPath(), {
         args: ['task', task, '--', ...args],
         env: { ...env, COMMUNICO_CONFIG: configPath, ...extra },
         stdout: 'piped',

@@ -23,7 +23,7 @@ import type { Conn } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
 import { roomSource } from '#engine/store/projection-sources.ts';
 import { queueBadge } from '#engine/server/push-queue.ts';
-import { advance, advanceAll, get } from '#engine/store/watermark.ts';
+import { advance, advanceAll, get, getAll } from '#engine/store/watermark.ts';
 import { changedColumns } from '#engine/store/changed.ts';
 import {
   eventStreamTx,
@@ -332,11 +332,17 @@ async function projectRoom(
       // A drop/recreate cannot publish an earlier incarnation's captured page.
       await room.tx(async (tx) => {
         if (target !== undefined) await tx.completion.validate(target);
-        return await tx.changes.head();
       });
-      return await get(server, sourceOf(roomId)) === mark &&
-        await get(server, roomSource('push-context', roomId)) === contextMark &&
-        await get(server, roomSource('receipt-graph', roomId)) === receiptMark;
+      const [currentMark, currentContext, currentReceipt] = await getAll(
+        server,
+        [
+          sourceOf(roomId),
+          roomSource('push-context', roomId),
+          roomSource('receipt-graph', roomId),
+        ],
+      );
+      return currentMark === mark && currentContext === contextMark &&
+        currentReceipt === receiptMark;
     };
     if (seed !== null) {
       // Context edges batch until another writer needs the owner. Publish only
@@ -619,9 +625,7 @@ async function publishGroup(group: PublicationTurn[]): Promise<void> {
     const server = await group[0].store.server();
     const now = Date.now();
     await eventStreamTx(server, async (tx) => {
-      if (
-        active.length > 1 && await applyIndependentPublications(tx, active, now)
-      ) return;
+      if (await applyIndependentPublications(tx, active, now)) return;
       for (const { work, ready } of active) {
         for (const item of ready) {
           await apply(tx, work.roomId, item, now, work.localServers);

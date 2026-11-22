@@ -102,6 +102,7 @@ export async function serverProcess(
     }),
   ]).then(([status]) => {
     ended = true;
+    diagnostics.status(status);
     return { ...status, stdout, stderr };
   });
   let port = 0;

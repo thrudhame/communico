@@ -545,7 +545,13 @@ async function performOutboundInvite(
       e instanceof FederationHttpError && e.remoteStatus === 400 &&
       e.matrixBody && e.errcode === 'M_MISSING_PARAM'
     ) {
-      throw new MatrixError(502, 'M_UNKNOWN', String(e.responseBody().error));
+      const failure = new MatrixError(
+        502,
+        'M_UNKNOWN',
+        String(e.responseBody().error),
+      );
+      failure.cause = e;
+      throw failure;
     }
     throw e;
   }

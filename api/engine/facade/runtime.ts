@@ -4,7 +4,7 @@ import { config, serverName } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { drainResources } from '#engine/lifetime.ts';
 import { ContactObservations } from '#engine/federation/pending-contacts.ts';
-import { inboxFailure } from '#engine/request-diagnostics.ts';
+import { inboxFailure, workerFailure } from '#engine/request-diagnostics.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
@@ -202,10 +202,11 @@ export async function openFacadeRuntime(
           notices.changed();
         },
         failed: (error) =>
-          console.error(
-            'facade deactivation pending:',
-            error instanceof LinkError ? error.code : 'M_UNAVAILABLE',
-          ),
+          workerFailure({
+            owner: 'facade deactivation',
+            server: identity.server,
+            node: identity.node,
+          }, error),
       });
     }
     if (settings.phase === 'f2' && !profileFanout) {
@@ -224,10 +225,11 @@ export async function openFacadeRuntime(
           return await (await keyOwner()).prepareSigner();
         },
         failed: (error) =>
-          console.error(
-            'facade profile fanout pending:',
-            error instanceof LinkError ? error.code : 'M_UNAVAILABLE',
-          ),
+          workerFailure({
+            owner: 'facade profile fanout',
+            server: identity.server,
+            node: identity.node,
+          }, error),
       });
     }
     if (settings.phase === 'f2' && !authExports) {
@@ -255,10 +257,12 @@ export async function openFacadeRuntime(
         },
         changed: () => notices.changed(),
         failed: (error) =>
-          console.error(
-            'facade auth export:',
-            error instanceof LinkError ? error.code : 'LINK_UNAVAILABLE',
-          ),
+          workerFailure({
+            owner: 'facade auth export',
+            server: identity.server,
+            node: identity.node,
+            peer: 'home',
+          }, error),
       });
     }
     if (settings.phase === 'f2' && !keyExports) {
@@ -275,10 +279,12 @@ export async function openFacadeRuntime(
             .exportChanges(localpart),
         changed: () => notices.changed(),
         failed: (error) =>
-          console.error(
-            'facade key export:',
-            error instanceof LinkError ? error.code : 'LINK_UNAVAILABLE',
-          ),
+          workerFailure({
+            owner: 'facade key export',
+            server: identity.server,
+            node: identity.node,
+            peer: 'home',
+          }, error),
       });
     }
     if (settings.phase === 'f2' && !toDeviceExports) {
@@ -295,10 +301,12 @@ export async function openFacadeRuntime(
             .export(localpart),
         changed: () => notices.changed(),
         failed: (error) =>
-          console.error(
-            'facade to-device export:',
-            error instanceof LinkError ? error.code : 'LINK_UNAVAILABLE',
-          ),
+          workerFailure({
+            owner: 'facade to-device export',
+            server: identity.server,
+            node: identity.node,
+            peer: 'home',
+          }, error),
       });
     }
     if (settings.phase === 'f2' && !membershipExports) {
@@ -339,10 +347,12 @@ export async function openFacadeRuntime(
           version: 2,
           changed: () => notices.changed(),
           failed: (error) =>
-            console.error(
-              'facade room export:',
-              error instanceof LinkError ? error.code : 'LINK_UNAVAILABLE',
-            ),
+            workerFailure({
+              owner: 'facade room export',
+              server: identity.server,
+              node: identity.node,
+              peer: 'home',
+            }, error),
         });
         roomBinding = binding;
       }

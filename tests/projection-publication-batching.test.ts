@@ -25,7 +25,7 @@ async function fixture(
     g: Awaited<ReturnType<typeof genesis>>;
     event: Awaited<ReturnType<typeof sendLocal>>;
   }[], dir: string) => Promise<void>,
-  variant: 'plain' | 'relation' | 'membership' | 'reference' = 'plain',
+  variant: 'plain' | 'relation' | 'membership' | 'reference' | 'many' = 'plain',
 ) {
   const dir = await Deno.makeTempDir();
   const store = await openStore({
@@ -42,6 +42,7 @@ async function fixture(
     await tenant.tx(async (tx) => {
       await tx.users.insert('dev', 'Dev');
       await tx.users.insert('bob', 'Bob');
+      if (variant === 'many') await tx.users.insert('charlie', 'Charlie');
     });
     const rooms = [];
     for (let n = 0; n < 2; n++) {
@@ -50,6 +51,7 @@ async function fixture(
       });
       await bobJoins(g);
       await bobJoins(g, '@charlie:remote.test', 2000);
+      if (variant === 'many') await bobJoins(g, '@charlie:test', 3000);
       await sendLocal(g.room, {
         type: 'm.room.message',
         sender: '@bob:test',
@@ -175,6 +177,120 @@ async function durableTables(store: Store) {
   }
   return result;
 }
+
+Deno.test('publication batching: a single ready unit uses set-wise notification work with identical durable facts', async () => {
+  await fixture(async (baseline, rooms, dir) => {
+    const tenant = await openTenant(baseline, 'test');
+    await tenant.tx(async (tx) => {
+      for (const user of ['dev', 'bob']) {
+        await tx.pushers.upsert(user, {
+          app_id: 'single-app',
+          pushkey: 'key-' + user,
+          kind: 'http',
+          app_display_name: 'Test',
+          device_display_name: 'Test',
+          lang: 'en',
+          data: { url: 'https://push.example/_matrix/push/v1/notify' },
+        }, 'test-access-hash');
+      }
+    });
+    await projectTenant(baseline, 'test');
+    await baseline.close();
+    const now = Date.now;
+    Date.now = () => 1800000000000;
+    const results = [];
+    const work = [];
+    try {
+      for (const ordered of [true, false]) {
+        const copy = dir + (ordered ? '-ordered-one' : '-set-one');
+        await cp(dir, copy, { recursive: true });
+        const store = await openStore({
+          dir: copy,
+          library: './.native/libturso_ffi.so',
+          checkpointlogbytes: 65536,
+          maxopenfiles: 16,
+          idleseconds: 300,
+        }, {
+          schemas: {
+            room: roomSchema,
+            server: serverSchema,
+            tenant: tenantSchema,
+          },
+        });
+        try {
+          const db = await store.server();
+          const original = db.tx.bind(db);
+          const statements: string[] = [];
+          db.tx = (fn, options) =>
+            original(async (tx) => {
+              const query = tx.query.bind(tx);
+              const execute = tx.execute.bind(tx);
+              tx.query = (sql, values) => {
+                statements.push(sql);
+                // Force only the existing dependency fallback, without changing
+                // any durable fact, to retain an independent ordered oracle.
+                if (
+                  ordered &&
+                  sql.startsWith(
+                    'SELECT 1 FROM json_each(?) j JOIN event_index i',
+                  )
+                ) {
+                  return Promise.resolve([{ '1': 1 }]);
+                }
+                return query(sql, values);
+              };
+              tx.execute = (sql, values) => {
+                statements.push(sql);
+                return execute(sql, values);
+              };
+              return await fn(tx);
+            }, options);
+          await projectThrough(store, rooms[0].event.completion!);
+          work.push(
+            statements.filter((sql) =>
+              sql.includes('INSERT INTO push_evaluations')
+            ).length,
+          );
+          results.push(await durableTables(store));
+          assertEquals(
+            (await db.query('SELECT event FROM feed WHERE event=?', [
+              rooms[0].event.eventId,
+            ])).length,
+            1,
+          );
+          const beforeReplay = statements.length;
+          await projectThrough(store, rooms[0].event.completion!);
+          assertEquals(
+            statements.slice(beforeReplay).filter((sql) =>
+              sql.includes('INSERT INTO push_evaluations')
+            ).length,
+            0,
+          );
+        } finally {
+          await store.close();
+          await Deno.remove(copy, { recursive: true });
+        }
+      }
+      assertEquals(
+        results[1],
+        results[0],
+        'all durable server tables match ordered application, including notification sequences and badges',
+      );
+      assertEquals(
+        work[1],
+        1,
+        'one notification evaluation statement per ready unit, not per recipient',
+      );
+      assertEquals(
+        work[0] > work[1],
+        true,
+        'the ordered control exercises recipient-proportional SQL',
+      );
+    } finally {
+      Date.now = now;
+    }
+  }, 'many');
+});
 
 for (
   const variant of ['plain', 'relation', 'membership', 'reference'] as const

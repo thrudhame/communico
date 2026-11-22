@@ -1,10 +1,11 @@
+import { DiagnosticCommand } from '#tests/helpers/child-diagnostics.ts';
 import { assert, assertEquals } from '@std/assert';
 import { bounded, serverProcess } from './helpers/server-process.ts';
 
 Deno.test('200 cross-process tool, request-abort and stale-probe closes preserve admin and CS', async () => {
   const server = await serverProcess();
   try {
-    const child = new Deno.Command(Deno.execPath(), {
+    const child = new DiagnosticCommand(Deno.execPath(), {
       args: [
         'run',
         '--allow-net',
@@ -26,7 +27,7 @@ Deno.test('200 cross-process tool, request-abort and stale-probe closes preserve
         '200 cross-process close/abort/probe iterations passed',
       ),
     );
-    const tool = await new Deno.Command(Deno.execPath(), {
+    const tool = await new DiagnosticCommand(Deno.execPath(), {
       args: ['task', 'federation-block', '--', 'list'],
       env: { COMMUNICO_CONFIG: server.config },
     }).output();

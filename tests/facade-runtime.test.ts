@@ -1,3 +1,4 @@
+import { DiagnosticCommand } from '#tests/helpers/child-diagnostics.ts';
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import metadata from '#root/deno.json' with { type: 'json' };
 import { adminCall } from './admin-client.ts';
@@ -493,7 +494,7 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
         'nodes=[]',
       ),
     );
-    const refusedOwner = await new Deno.Command(Deno.execPath(), {
+    const refusedOwner = await new DiagnosticCommand(Deno.execPath(), {
       args: metadata.tasks.start.split(' ').slice(1),
       env: { COMMUNICO_CONFIG: disabledOwner, DENO_NO_PROMPT: '1' },
       stdout: 'piped',
@@ -635,7 +636,7 @@ Deno.test('cold roles expose only granted phase-honest Matrix replica routes wit
       wrong,
       common('facade', facadePort, 'home') + '[federation]\nenabled=false\n',
     );
-    const rejected = await new Deno.Command(Deno.execPath(), {
+    const rejected = await new DiagnosticCommand(Deno.execPath(), {
       args: metadata.tasks.start.split(' ').slice(1),
       env: { COMMUNICO_CONFIG: wrong, DENO_NO_PROMPT: '1' },
       stdout: 'piped',

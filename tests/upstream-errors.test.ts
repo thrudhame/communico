@@ -1,3 +1,4 @@
+import { DiagnosticCommand } from '#tests/helpers/child-diagnostics.ts';
 import {
   assert,
   assertEquals,
@@ -167,7 +168,7 @@ Deno.test('JSON decoder causes cannot leak response snippets through normal diag
 
 Deno.test('upstream diagnostics: real console output is safe and completed HTTP keeps its response body', async () => {
   const source = import.meta.resolve('#engine/net/upstream-error.ts');
-  const child = new Deno.Command(Deno.execPath(), {
+  const child = new DiagnosticCommand(Deno.execPath(), {
     args: [
       'eval',
       `import { UpstreamError } from ${JSON.stringify(source)};

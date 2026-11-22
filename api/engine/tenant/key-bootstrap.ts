@@ -359,7 +359,13 @@ export async function semanticKeyReader(
     await requireDomainControl(conn, view);
   } catch (error) {
     if (!(error instanceof LinkError)) throw error;
-    throw new MatrixError(503, 'M_UNAVAILABLE', 'key bootstrap unavailable');
+    const failure = new MatrixError(
+      503,
+      'M_UNAVAILABLE',
+      'key bootstrap unavailable',
+    );
+    failure.cause = error;
+    throw failure;
   }
   return true;
 }

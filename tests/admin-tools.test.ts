@@ -1,3 +1,4 @@
+import { DiagnosticCommand } from '#tests/helpers/child-diagnostics.ts';
 // Real task clients against a separately started main.ts, with its normal
 // permission set. Bogus native-library config in every client proves no store
 // is opened by a tool while the server owns the real file lock.
@@ -15,7 +16,7 @@ Deno.test('operator task clients preserve CLI contracts through the running serv
   );
   const env = { COMMUNICO_CONFIG: config, DENO_NO_PROMPT: '1' };
   const listeners = await fixtureListeners(config);
-  const child = new Deno.Command(Deno.execPath(), {
+  const child = new DiagnosticCommand(Deno.execPath(), {
     args: [
       ...metadata.tasks.start.split(' ').slice(1, -1),
       'tests/fixtures/listener-child.ts',
@@ -37,7 +38,7 @@ Deno.test('operator task clients preserve CLI contracts through the running serv
     code = 0,
     extra: Record<string, string> = {},
   ) => {
-    const output = await new Deno.Command(Deno.execPath(), {
+    const output = await new DiagnosticCommand(Deno.execPath(), {
       args: ['task', task, '--', ...args],
       env: {
         ...env,

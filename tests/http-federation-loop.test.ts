@@ -1,3 +1,4 @@
+import { DiagnosticCommand } from '#tests/helpers/child-diagnostics.ts';
 // Production main.ts processes: every client and federation hop uses the real
 // route tree. TLS is verified against the existing fixture CA, with no fake
 // federation transport, engine seeding or private diagnostic endpoints.
@@ -36,7 +37,7 @@ backfillbatch=2
 `,
   );
   const listeners = await fixtureListeners(overlay);
-  const child = new Deno.Command(Deno.execPath(), {
+  const child = new DiagnosticCommand(Deno.execPath(), {
     args: ['run', '--allow-all', 'tests/fixtures/listener-child.ts'],
     env: { COMMUNICO_CONFIG: overlay, ...listeners.env },
     stdout: 'piped',
