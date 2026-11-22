@@ -1,3 +1,4 @@
+import { DiagnosticCommand } from '#tests/helpers/child-diagnostics.ts';
 // tests/server-crash.test.ts — SIGKILL during projection batches: ten
 // kills at random moments while the child writes and projects. After
 // every kill the reopened store's startup roll-forward must leave every
@@ -33,7 +34,7 @@ Deno.test('server crash: 10 SIGKILLs during projection — watermark at the last
     let reported = 0;
     let sampleTimer: ReturnType<typeof setTimeout> | undefined;
     const result = await runCrashChild<ChildEvent>(
-      new Deno.Command(Deno.execPath(), {
+      new DiagnosticCommand(Deno.execPath(), {
         args: [
           'run',
           '--allow-read',

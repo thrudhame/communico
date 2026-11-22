@@ -10,6 +10,7 @@ import { resumeWaits } from '#engine/room/ingest.ts';
 import { completePublished, publishThrough, sourceOf } from './project.ts';
 import { get } from '#engine/store/watermark.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { workerFailure } from '#engine/request-diagnostics.ts';
 
 type Target = CompletionCut | CompletionTarget;
 type Phase = 'publication' | 'completion';
@@ -193,9 +194,13 @@ export class RoomCompletion {
     // Log the transition, not every timer retry of the same failed cut/phase.
     if (
       demand.failure?.target.through !== target.through ||
-      demand.failure?.phase !== phase
+      demand.failure?.phase !== phase || demand.failure?.cause !== cause
     ) {
-      console.error('room completion owner failed:', failure);
+      workerFailure({
+        owner: 'room completion',
+        server: demand.self,
+        scope: `${target.roomId}/${target.through} (${phase})`,
+      }, failure);
     }
     demand.failure = failure;
     for (const waiter of [...demand.waiters]) {

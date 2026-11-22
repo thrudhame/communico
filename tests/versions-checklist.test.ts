@@ -1,3 +1,4 @@
+import { DiagnosticCommand } from '#tests/helpers/child-diagnostics.ts';
 import { assert, assertEquals } from '@std/assert';
 import versions from '#endpoints/matrix/_matrix/client/versions/get.ts';
 import {
@@ -90,7 +91,7 @@ Deno.test('advertised version behavioral checklist executes at the real consumer
   assert(files.length > 20, 'behavioral checklist must not become empty');
   const dir = await Deno.makeTempDir({ prefix: 'versions-contracts-' });
   try {
-    const output = await new Deno.Command(Deno.execPath(), {
+    const output = await new DiagnosticCommand(Deno.execPath(), {
       cwd: root,
       args: [
         'test',

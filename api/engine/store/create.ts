@@ -63,6 +63,7 @@ export async function checkSchema(
       `database has no schema meta table: ${
         error instanceof Error ? error.message : String(error)
       }`,
+      { cause: error },
     );
   }
   if (rows.length !== 1) {

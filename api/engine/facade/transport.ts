@@ -105,6 +105,12 @@ export async function startLinkTransport(options: {
     const work = (async () => {
       let response: Response | undefined;
       let ws: WebSocket | undefined;
+      let diagnosed = false;
+      const report = (error: unknown) => {
+        if (diagnosed) return;
+        diagnosed = true;
+        requestFailure(incoming, error);
+      };
       const interrupt = () => ws ? ws.terminate() : socket.destroy();
       controller.signal.addEventListener('abort', interrupt, { once: true });
       try {
@@ -149,7 +155,10 @@ export async function startLinkTransport(options: {
         // or processes any buffered application frames in head.
         upgrades.handleUpgrade(incoming, socket, head, (upgraded) => {
           ws = upgraded;
-          ws.on('error', abort);
+          ws.on('error', (error) => {
+            report(error);
+            abort();
+          });
           ws.on('close', abort);
           // The home never sends application messages on this channel.
           ws.on('message', () => ws!.terminate());
@@ -166,8 +175,8 @@ export async function startLinkTransport(options: {
           });
         }
       } catch (error) {
-        if (!ws && (!(error instanceof LinkError) || error.status >= 500)) {
-          requestFailure(incoming, error);
+        if (!(error instanceof LinkError) || error.status >= 500) {
+          report(error);
         }
         if (!ws && !socket.destroyed) {
           const status = error instanceof LinkError ? error.status : 500;

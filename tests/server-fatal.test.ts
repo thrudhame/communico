@@ -1,3 +1,4 @@
+import { DiagnosticCommand } from '#tests/helpers/child-diagnostics.ts';
 import { assert, assertEquals } from '@std/assert';
 import { bounded, serverProcess } from './helpers/server-process.ts';
 
@@ -32,7 +33,7 @@ for (const fatal of ['close', 'hang', 'second'] as const) {
           }
         }
       }
-      const tool = await new Deno.Command(Deno.execPath(), {
+      const tool = await new DiagnosticCommand(Deno.execPath(), {
         args: ['task', 'federation-block', '--', 'list'],
         env: { COMMUNICO_CONFIG: server.config },
       }).output();

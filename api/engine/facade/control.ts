@@ -809,12 +809,22 @@ export class FacadeKeys {
         JSON.parse(String(held.document_json)),
         roster,
       );
-    } catch {
-      throw new MatrixError(
+    } catch (cause) {
+      const failure = new MatrixError(
         503,
         'M_UNAVAILABLE',
         'co-signed key document not ready',
       );
+      // JSON parser text can contain document bytes. Keep that detail behind
+      // the established upstream disclosure boundary, not in the diagnostic.
+      failure.cause = cause instanceof SyntaxError
+        ? new UpstreamError('validation', {
+          phase: 'key-document',
+          reason: 'invalid retained key document JSON',
+          cause,
+        })
+        : cause;
+      throw failure;
     }
     if (now >= doc.valid_until_ts) {
       throw new MatrixError(

@@ -1,3 +1,4 @@
+import { DiagnosticCommand } from '#tests/helpers/child-diagnostics.ts';
 // tests/server-registry.test.ts — the room registry: registration on room
 // creation (room-first), startup discovery for the crash window between
 // create and registry, and the startup roll-forward for the window
@@ -45,7 +46,7 @@ async function withStore(
 }
 
 async function runChild(mode: string, dir: string): Promise<void> {
-  const child = new Deno.Command(Deno.execPath(), {
+  const child = new DiagnosticCommand(Deno.execPath(), {
     args: [
       'run',
       '--allow-read',
@@ -60,8 +61,8 @@ async function runChild(mode: string, dir: string): Promise<void> {
     stdout: 'piped',
     stderr: 'piped',
   }).spawn();
-  const status = await child.status;
-  const stderr = await new Response(child.stderr).text();
+  const status = await child.output();
+  const stderr = new TextDecoder().decode(status.stderr);
   assertEquals(status.code, 0, `child ${mode} failed: ${stderr}`);
 }
 

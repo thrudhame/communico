@@ -1,3 +1,4 @@
+import { DiagnosticCommand } from '#tests/helpers/child-diagnostics.ts';
 // tests/store-crash.test.ts — SIGKILL recovery. A child writes under barrier
 // pressure and is killed 30 times: 20 at random moments (at least five while
 // a barrier checkpoint runs) and ten aimed at 10%…100% of the measured
@@ -43,7 +44,7 @@ Deno.test('store crash: 30 SIGKILLs, reopen passes integrity and keeps every rep
     fraction = 0,
     killOnBarrierStart = false,
   ): Promise<void> {
-    const command = new Deno.Command(Deno.execPath(), {
+    const command = new DiagnosticCommand(Deno.execPath(), {
       args: [
         'run',
         '--allow-read',

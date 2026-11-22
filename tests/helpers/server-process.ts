@@ -99,6 +99,7 @@ export async function serverProcess(
     }),
   ]).then(([status]) => {
     ended = true;
+    diagnostics.status(status);
     return { ...status, stdout, stderr };
   });
   const base = `http://127.0.0.1:${port}`;

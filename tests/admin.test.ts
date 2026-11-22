@@ -1,10 +1,11 @@
+import { DiagnosticCommand } from '#tests/helpers/child-diagnostics.ts';
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { startAdmin } from '#root/api/admin/index.ts';
 import { startHttp } from '#tests/http-app.ts';
 import { adminSocket, loadConfig } from '#engine/config.ts';
 
 async function call(path: string, route = '/v1/status', body = '{}') {
-  const output = await new Deno.Command('curl', {
+  const output = await new DiagnosticCommand('curl', {
     args: [
       '--silent',
       '--show-error',
@@ -51,7 +52,7 @@ Deno.test('admin status, private socket, stale/live ownership and public isolati
       try {
         await Deno.lstat(path);
       } catch {
-        const child = new Deno.Command('python3', {
+        const child = new DiagnosticCommand('python3', {
           args: [
             '-c',
             'import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.close()',

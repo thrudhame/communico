@@ -1,3 +1,4 @@
+import { DiagnosticCommand } from '#tests/helpers/child-diagnostics.ts';
 // The error-path assertion from doltgres:tests/config-required.test.ts.
 // Its complete-tree /versions startup case is also run as the per-commit
 // main.ts smoke in CT 800 (isolated loopback namespace, workspace store).
@@ -20,7 +21,7 @@ Deno.test('incomplete defaults → exit 1, stderr lists every problem', async ()
       const value = Deno.env.get(name);
       if (value !== undefined) env[name] = value;
     }
-    const out = await new Deno.Command(Deno.execPath(), {
+    const out = await new DiagnosticCommand(Deno.execPath(), {
       args: [
         'run',
         `--config=${REPO}/deno.json`,

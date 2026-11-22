@@ -14,6 +14,7 @@ import { LinkError } from '#engine/facade/protocol.ts';
 import { pathfinder } from '@pathfinder/pathfinder';
 import type { Scope } from '#engine/facade/capabilities.ts';
 import { federationPolicy } from '#engine/federation/policy.ts';
+import { requestFailure } from '#engine/request-diagnostics.ts';
 
 export async function startFacade(lifetime: ServerLifetime) {
   prepareAppRecovery();
@@ -94,6 +95,9 @@ export async function startFacade(lifetime: ServerLifetime) {
           return await matrix(request, info);
         } catch (error) {
           if (error instanceof MatrixError || error instanceof LinkError) {
+            if (!(error instanceof MatrixError) || error.status >= 500) {
+              requestFailure(request, error);
+            }
             return Response.json(
               error instanceof MatrixError ? error.responseBody() : {
                 errcode: 'M_UNAVAILABLE',
