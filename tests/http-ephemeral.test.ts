@@ -1,5 +1,6 @@
 // doltgres typing, receipt/read-marker and presence-on-join contracts.
 import { assert, assertEquals } from '@std/assert';
+import { roomDeliveredBySync } from '#tests/support/sync-delivery.ts';
 import { theApp } from '#engine/app.ts';
 import { httpSuite } from '#tests/http-app.ts';
 import { observeSyncWait } from '#tests/support/sync-turn.ts';
@@ -222,13 +223,22 @@ for (const mode of ['selection', 'long poll']) {
         'pw',
       );
       const { roomId, base } = await roomFor(a, b);
-      const sent = await call(
-        base + '/send/m.room.message/private-target',
-        a.access_token!,
-        'PUT',
-        { body: 'target' },
+      let sent!: Awaited<ReturnType<typeof call>>;
+      await roomDeliveredBySync(
+        suite.matrix,
+        b.access_token!,
+        roomId,
+        async () => {
+          sent = await call(
+            base + '/send/m.room.message/private-target',
+            a.access_token!,
+            'PUT',
+            { body: 'target' },
+          );
+          assertEquals(sent.status, 200);
+          return [String(sent.body.event_id)];
+        },
       );
-      assertEquals(sent.status, 200);
       const target = encodeURIComponent(String(sent.body.event_id));
       const before = await sync(b.access_token!);
       const receipt = async (type: string) => {
@@ -803,13 +813,17 @@ suite.test('typing and receipt-only changes wake joined users without waking unr
   const b = await suite.registerTestUser('ep-wake-b', 'pw');
   const c = await suite.registerTestUser('ep-wake-c', 'pw');
   const { roomId, base } = await roomFor(a, b);
-  const sent = await call(
-    base + '/send/m.room.message/wake-target',
-    a.access_token!,
-    'PUT',
-    { msgtype: 'm.text', body: 'receipt target' },
-  );
-  assertEquals(sent.status, 200);
+  let sent!: Awaited<ReturnType<typeof call>>;
+  await roomDeliveredBySync(suite.matrix, b.access_token!, roomId, async () => {
+    sent = await call(
+      base + '/send/m.room.message/wake-target',
+      a.access_token!,
+      'PUT',
+      { msgtype: 'm.text', body: 'receipt target' },
+    );
+    assertEquals(sent.status, 200);
+    return [String(sent.body.event_id)];
+  });
   let before = await sync(b.access_token!);
   const turns = observeSyncWait();
   const wait = (since: unknown) =>

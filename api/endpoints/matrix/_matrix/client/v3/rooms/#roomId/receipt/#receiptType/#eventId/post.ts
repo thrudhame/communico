@@ -1,6 +1,7 @@
 import { MatrixError } from '#engine/matrix-error.ts';
 import { setReceipt } from '#engine/receipts.ts';
 import { parseJson } from '#engine/operation-body.ts';
+import { authenticatedDevice } from '#engine/auth-context.ts';
 
 export default async function (
   request: import('@pathfinder/pathfinder').PathfinderRequest,
@@ -26,6 +27,7 @@ export default async function (
     {
       threadId: (body as Record<string, unknown>).thread_id,
       signal: request._raw.signal,
+      device: authenticatedDevice(context),
     },
   );
   return {};

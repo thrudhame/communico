@@ -330,9 +330,10 @@ body/name/topic text without altering the PDU.
 
 ## Client reads and sync
 
-Both ordinary and sliding sync first capture the authenticated device generation's
-pending cuts and their room audience's accepted cuts, release the transactions and
-await those exact publications. This precedes ordinary stream-head clamping and sliding list/lease
+Both ordinary and sliding sync first capture only the authenticated device generation's
+exact pending send cuts, release the transactions and await those publications.
+Other accepted room work is not a read dependency: readers select applied state,
+and publication notifiers wake fresh captures. This precedes ordinary stream-head clamping and sliding list/lease
 selection, including timeout-zero, initial, full-state, list-only and encryption
 requests. Only successful rendering conditionally retires each captured revision;
 failed/cancelled consumers and concurrently higher revisions retain their markers.
@@ -341,10 +342,11 @@ room incarnation, not shared by independent sends across the tenant. It survives
 marker retirement to fence stale syncs and exact replay, and is removed with the
 device's receipts. Existing global revisions remain valid; first scoped use starts
 above the retained legacy ceiling without rewriting it.
-Shared effect-read admission captures the explicit room or the search/notification
-audience before event/relation/search/receipt/peek selection, regardless of sender,
-leaving client marker retirement to sync. A later acceptance cannot extend a
-captured target, and unrelated rooms or account reads acquire no global drain.
+Shared effect-read admission selects this same device's pending cuts in the
+explicit room or search/notification audience before event/relation/search/receipt/peek
+selection, leaving client marker retirement to sync. The authenticated generation
+is passed from the adapter, never replaced by a new lookup. A later acceptance
+cannot extend a captured target, and unrelated rooms or account reads acquire no global drain.
 Existing filters, visibility, limits and explicit historical tokens retain their
 meaning; completion does not inject an event into a filtered or trimmed response.
 (`api/engine/client/completion.ts`, `auth-context.ts`, `syncfeed.ts`, `sliding-sync/index.ts`)
@@ -685,6 +687,8 @@ event to return, not the next event's numeric slot.
 
 Typing is ephemeral; presence and receipts are server data, while
 account-data stream markers belong to the tenant.
+Presence mutations use their own counter in native transactions and publish
+post-commit ephemeral hints; they do not queue behind the event allocator.
 (`api/engine/client/tokens.ts:1-33`, `api/engine/server/stream.ts:1-52`,
 `api/engine/typing.ts:1-48`, `api/engine/server/schema.ts:115-132`,
 `api/engine/tenant/schema.ts:72-108`)

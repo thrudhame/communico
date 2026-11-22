@@ -1,6 +1,7 @@
 import type { Context, PathfinderRequest } from '@pathfinder/pathfinder';
 import { peekNumber, roomInitialSync } from '#engine/client/peeking.ts';
 import { config } from '#engine/config.ts';
+import { authenticatedDevice } from '#engine/auth-context.ts';
 export default async function (request: PathfinderRequest, context: Context) {
   return await roomInitialSync(
     request.params.roomId as string,
@@ -12,5 +13,6 @@ export default async function (request: PathfinderRequest, context: Context) {
       config().peeking.maxevents,
     ),
     request._raw.signal,
+    authenticatedDevice(context),
   );
 }
