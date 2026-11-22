@@ -849,24 +849,57 @@ export async function pusherIncarnations(
   conn: Conn,
   localpart: string,
 ): Promise<string[]> {
-  const result: string[] = [];
-  for (
-    const row of await conn.query(
-      "SELECT app_id,pushkey,incarnation FROM pushers WHERE localpart=? AND kind='http'",
-      [localpart],
-    )
-  ) {
+  return (await capturePusherIncarnations(conn, [localpart])).get(localpart) ??
+    [];
+}
+
+/** Publication and scalar readers share the pusher owner's admission contract.
+ * Native candidates are selected as one set; facade choices remain authoritative. */
+export async function capturePusherIncarnations(
+  conn: Conn,
+  localparts: readonly string[],
+): Promise<Map<string, string[]>> {
+  const selected = [...new Set(localparts)];
+  const result = new Map<string, string[]>(selected.map((lp) => [lp, []]));
+  if (!selected.length) return result;
+  const rows = await nativePusherCandidates(conn, selected);
+  if (!rows.length) return result;
+  const enrolled = await tenantAuthority(conn);
+  for (const row of rows) {
     if (
+      !enrolled ||
       await pusherIsCurrent(
         conn,
-        localpart,
+        String(row.localpart),
         String(row.app_id),
         String(row.pushkey),
         String(row.incarnation),
       )
-    ) result.push(String(row.incarnation));
+    ) result.get(String(row.localpart))!.push(String(row.incarnation));
   }
   return result;
+}
+
+/** The native token/device predicate is shared by send and publication admission. */
+function nativePusherCandidates(
+  conn: Conn,
+  localparts: readonly string[],
+  target?: { appId: string; pushkey: string; incarnation: string },
+) {
+  return conn.query(
+    `SELECT p.localpart,p.app_id,p.pushkey,p.incarnation,p.access_token
+    FROM json_each(?) selected JOIN pushers p ON p.localpart=CAST(selected.value AS TEXT)
+    JOIN users u ON u.localpart=p.localpart
+    JOIN access_tokens a ON a.token=p.access_token AND a.localpart=p.localpart
+    WHERE p.kind='http' AND u.deactivated=0 AND (a.device_id IS NULL OR EXISTS (
+      SELECT 1 FROM devices d WHERE d.localpart=a.localpart AND d.device_id=a.device_id AND d.generation=a.generation))` +
+      (target ? ' AND p.app_id=? AND p.pushkey=? AND p.incarnation=?' : '') +
+      ' ORDER BY p.localpart,p.app_id,p.pushkey',
+    [
+      JSON.stringify(localparts),
+      ...(target ? [target.appId, target.pushkey, target.incarnation] : []),
+    ],
+  );
 }
 
 /** Send admission reads account, registration and its current token/device
@@ -879,14 +912,11 @@ export async function pusherIsCurrent(
   pushkey: string,
   incarnation: string,
 ): Promise<boolean> {
-  const [native] = await conn.query(
-    `SELECT p.access_token FROM pushers p JOIN users u ON u.localpart=p.localpart
-    JOIN access_tokens a ON a.token=p.access_token AND a.localpart=p.localpart
-    WHERE p.localpart=? AND p.app_id=? AND p.pushkey=? AND p.incarnation=?
-    AND p.kind='http' AND u.deactivated=0 AND (a.device_id IS NULL OR EXISTS (
-      SELECT 1 FROM devices d WHERE d.localpart=a.localpart AND d.device_id=a.device_id AND d.generation=a.generation))`,
-    [localpart, appId, pushkey, incarnation],
-  );
+  const [native] = await nativePusherCandidates(conn, [localpart], {
+    appId,
+    pushkey,
+    incarnation,
+  });
   if (!native) return false;
   if (await tenantAuthority(conn)) {
     try {

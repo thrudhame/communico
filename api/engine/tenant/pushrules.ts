@@ -79,7 +79,7 @@ export type RuleRow = {
   is_default: boolean;
 };
 
-function ruleRow(row: Record<string, unknown>): RuleRow {
+export function ruleRow(row: Record<string, unknown>): RuleRow {
   return {
     rule_id: String(row.rule_id),
     priority: Number(row.priority),
@@ -609,9 +609,22 @@ export async function rulesetAt(
   localpart: string,
   serverName: string,
 ): Promise<Ruleset> {
+  return rulesetFromRows(
+    localpart,
+    serverName,
+    await tx.pushRules.rulesetRows(localpart),
+  );
+}
+
+/** Stored row conversion and default precedence are shared by every reader. */
+export function rulesetFromRows(
+  localpart: string,
+  serverName: string,
+  rows: readonly (RuleRow & { kind: string })[],
+): Ruleset {
   const stored = {} as Ruleset;
   for (const kind of PUSH_KINDS) stored[kind] = [];
-  for (const row of await tx.pushRules.rulesetRows(localpart)) {
+  for (const row of rows) {
     if ((PUSH_KINDS as readonly string[]).includes(row.kind)) {
       stored[row.kind as PushKind].push(rowToRule(row));
     }

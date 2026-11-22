@@ -157,6 +157,14 @@ Deno.test('pusher choice: concurrent registrations converge across public reads 
     );
     assertEquals(await f.et.tx((tx) => tx.pushers.incarnations('alice')), []);
     assertEquals(
+      await f.et.tx(async (tx) =>
+        (await tx.pushPolicy.capture(['alice'])).get('alice')
+          ?.pusherIncarnations
+      ),
+      [],
+      'publication policy must not route a losing local registration',
+    );
+    assertEquals(
       (await f.ed.query('SELECT * FROM pusher_changes WHERE payload IS NULL'))
         .length,
       1,
@@ -212,6 +220,11 @@ Deno.test('pusher choice: missing selected registration is unavailable, not empt
     const badges = await server.query('SELECT * FROM push_badges');
     await f.sync();
     await f.et.tx((tx) => tx.pushers.import(choice));
+    await assertRejects(
+      () => f.et.tx((tx) => tx.pushPolicy.capture(['alice'])),
+      Error,
+      'pusher selection unavailable',
+    );
     await assertRejects(
       () => listPushers(f.et, 'alice'),
       Error,
