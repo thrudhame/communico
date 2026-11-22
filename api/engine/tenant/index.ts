@@ -41,6 +41,7 @@ import * as filters from '#engine/tenant/filters.ts';
 import * as media from '#engine/tenant/media.ts';
 import * as pushers from '#engine/tenant/pushers.ts';
 import * as pushrules from '#engine/tenant/pushrules.ts';
+import { capturePublicationPolicies } from '#engine/tenant/push-policy.ts';
 import * as txns from '#engine/tenant/txns.ts';
 import * as completion from '#engine/tenant/completion.ts';
 import type { CompletionTarget } from '#engine/room/completion.ts';
@@ -733,6 +734,10 @@ function bind(
       user: (hash: string, now: number) => openid.openIdUser(conn, hash, now),
       clear: (localpart: string) => openid.clearOpenId(conn, localpart),
       expire: (now: number) => openid.expireOpenId(conn, now),
+    },
+    pushPolicy: {
+      capture: (localparts: readonly string[]) =>
+        capturePublicationPolicies(conn, serverName, localparts),
     },
     pushRules: {
       prepare: (localpart: string) =>
