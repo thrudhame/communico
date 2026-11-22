@@ -1,7 +1,7 @@
 // Connect local producers to the existing per-destination EDU queues.
 // Asynchronous destination lookup cannot overwrite a newer queued change.
 import type { Database as Db } from '#engine/store/db.ts';
-import { onEphemeral } from '#engine/server/ephemeral.ts';
+import { onEphemeral, sharedUsers } from '#engine/server/ephemeral.ts';
 import { onTypingChange, typingSeq } from '#engine/typing.ts';
 import type { EduQueues } from '#engine/federation/edus.ts';
 import { domainOf } from '#engine/federation/pdu.ts';
@@ -57,16 +57,11 @@ export function wireEphemeral(
     } else {
       if (domainOf(change.userId) !== self) return;
       run(async () => {
-        const rooms = await server.query(
-          "SELECT room FROM memberships WHERE user=? AND membership='join'",
-          [change.userId],
+        const targets = new Set(
+          (await sharedUsers(server, change.userId)).map(domainOf).filter((d) =>
+            d !== self
+          ),
         );
-        const targets = new Set<string>();
-        for (const room of rooms) {
-          for (const d of await destinations(String(room.room))) {
-            targets.add(d);
-          }
-        }
         for (const d of targets) {
           queues.queuePresence(d, {
             user_id: change.userId,

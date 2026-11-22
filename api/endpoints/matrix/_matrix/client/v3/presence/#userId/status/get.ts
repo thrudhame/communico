@@ -1,10 +1,14 @@
-import { getPresence } from '#engine/presence.ts';
+import { getPresence } from '#engine/client/presence.ts';
 
 export default async function (
   request: import('@pathfinder/pathfinder').PathfinderRequest,
-  _context: import('@pathfinder/pathfinder').Context,
+  context: import('@pathfinder/pathfinder').Context,
 ) {
-  const row = await getPresence(request.params.userId as string);
+  const row = await getPresence(
+    context.state.user as string,
+    request.params.userId as string,
+    request._raw.signal,
+  );
   const out: Record<string, unknown> = { presence: row.presence };
   if (row.statusMsg !== null) out.status_msg = row.statusMsg;
   if (row.presence !== 'offline' && row.lastActiveMs > 0) {

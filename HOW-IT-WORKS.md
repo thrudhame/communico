@@ -704,6 +704,14 @@ account-data stream markers belong to the tenant.
 `api/engine/typing.ts:1-48`, `api/engine/server/schema.ts:115-132`,
 `api/engine/tenant/schema.ts:72-108`)
 
+Presence disclosure requires self or a currently shared joined room, as in
+Synapse. Client GET and sync capture eligibility and presence values in one
+server transaction; invitations and departed memberships grant no access.
+Client GET first admits complete replica room scopes and accepted publication
+cuts. Federation audiences reuse the same shared-join owner; raw presence
+storage reads remain internal.
+(`api/engine/client/presence.ts`, `api/engine/server/ephemeral.ts`)
+
 Receipts are keyed by room, user, public/private type and thread. Sync exposes
 public receipts plus the viewer's private receipts; federation consumes only
 public receipts. Thread identity survives both sync and federation, with

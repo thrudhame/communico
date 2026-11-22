@@ -1,6 +1,40 @@
 import { assertEquals } from '@std/assert';
 import { capabilities } from '#engine/facade/capabilities.ts';
 
+Deno.test('F2 presence and typing expose only the original authenticated domain and room owners', () => {
+  for (
+    const [method, path, scope] of [
+      ['GET', 'presence/user/status', 'domain'],
+      ['PUT', 'presence/user/status', 'domain'],
+      ['PUT', 'rooms/room/typing/user', 'clientrooms'],
+    ]
+  ) {
+    const request = new Request(
+      'https://facade.test/_matrix/client/v3/' + path,
+      { method },
+    );
+    const f2 = capabilities('facade', 'f2');
+    let required: string | undefined;
+    assertEquals(
+      f2.gate(request, (value) => {
+        required = value;
+        return true;
+      }),
+      null,
+    );
+    assertEquals(required, scope);
+    assertEquals(f2.gate(request, () => false)?.status, 503);
+    assertEquals(
+      capabilities('facade', 'f1').gate(request, () => true)?.status,
+      404,
+    );
+    assertEquals(
+      f2.gate(new Request(request.url, { method: 'POST' }), () => true)?.status,
+      405,
+    );
+  }
+});
+
 Deno.test('F2 room read adapters and legacy aliases share local client admission', () => {
   const paths = [
     'v1/room_summary/room',

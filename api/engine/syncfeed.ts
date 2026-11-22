@@ -60,11 +60,10 @@ import { filterEvents, type RoomFilter } from '#engine/tenant/filters.ts';
 import { waitForSync } from '#engine/sync-wait.ts';
 import {
   capturePresence,
-  getPresence,
+  presenceFor,
   publishPresence,
   receiptRoomsSince,
   receiptSnapshot,
-  sharedUsers,
   withPresenceSync,
 } from '#engine/server/ephemeral.ts';
 import {
@@ -283,8 +282,8 @@ async function relevantChanged(
   if (
     (await receiptRoomsSince(app.server, i.userId, i.since.rSeq)).size > 0
   ) return true;
-  for (const u of await sharedUsers(app.server, i.userId)) {
-    if ((await getPresence(app.server, u)).seq > i.since.pSeq) return true;
+  for (const row of (await presenceFor(app.server, i.userId)).values()) {
+    if (row.seq > i.since.pSeq) return true;
   }
   return false;
 }
@@ -640,7 +639,6 @@ async function assembleSyncView(
     for (const u of result.joiners) allJoiners.add(u);
   }
   const presenceEvents = new Map<string, Record<string, unknown>>();
-  const shared = snapshot.presence.rows.keys();
   const includePresence = (u: string) => {
     const row = snapshot.presence.rows.get(u);
     if (!row) return;
@@ -651,10 +649,10 @@ async function assembleSyncView(
     }
     presenceEvents.set(u, { type: 'm.presence', sender: u, content });
   };
-  for (const u of shared) {
+  for (const [u, row] of snapshot.presence.rows) {
     if (
       i.since === null ||
-      snapshot.presence.rows.get(u)!.seq > i.since.pSeq ||
+      row.seq > i.since.pSeq ||
       allJoiners.has(i.userId)
     ) includePresence(u);
   }

@@ -626,10 +626,17 @@ export async function importPresenceStatus(
 /** Capture the exact presence view in the sync owner's existing server
  * transaction, BEFORE it captures counters. Rendering cannot publish a lazy
  * expiry after next_batch or mix a newer presence row into an older cut. */
-export async function capturePresence(tx: Conn, userId: string, server?: Db) {
+export async function capturePresence(
+  tx: Conn,
+  userId: string,
+  server?: Db,
+  subjects?: readonly string[],
+) {
   const rows = new Map<string, PresenceRow>();
   const changes: { userId: string; row: PresenceRow }[] = [];
-  for (const user of await sharedUsers(tx, userId)) {
+  const visible = new Set([userId, ...await sharedUsers(tx, userId)]);
+  for (const user of subjects ?? visible) {
+    if (!visible.has(user)) continue;
     await requirePresenceStatus(tx, user);
     const value = await normalizePresence(tx, user, server);
     rows.set(user, value.row);
@@ -659,6 +666,23 @@ export async function sharedUsers(
     [userId],
   );
   return rows.map((r) => String(r.user));
+}
+
+/** Presence disclosure is self or a current shared join, never an invitation
+ * or historical participation. Capture eligibility and values together so a
+ * departure cannot leave a stale audience paired with a later private status. */
+export async function presenceFor(
+  server: Db,
+  observer: string,
+  subjects?: readonly string[],
+  authorize?: (tx: Conn) => Promise<void>,
+): Promise<Map<string, PresenceRow>> {
+  const captured = await server.tx(async (tx) => {
+    await authorize?.(tx);
+    return await capturePresence(tx, observer, server, subjects);
+  });
+  publishPresence(server, captured);
+  return captured.rows;
 }
 export async function setReceipt(
   server: Db,

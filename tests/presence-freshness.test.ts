@@ -3,11 +3,12 @@ import {
   capturePresence,
   getPresence,
   onEphemeral,
+  presenceFor,
   publishPresence,
   setPresence,
 } from '#engine/server/ephemeral.ts';
 import { serverSchema } from '#engine/server/schema.ts';
-import { eventStreamTx } from '#engine/server/stream.ts';
+import { eventStreamTx, onEventStream } from '#engine/server/stream.ts';
 import { openStore } from '#engine/store/index.ts';
 import { historicalServerSchema } from '#tests/fixtures/server-schema-history.ts';
 
@@ -73,6 +74,76 @@ Deno.test('presence freshness expires an observation, not the remote activity ti
     assertEquals((await getPresence(server, user)).presence, 'online');
   } finally {
     Date.now = now;
+    await store.close();
+    await Deno.remove(f.dir, { recursive: true });
+  }
+});
+
+Deno.test('presence audience reads share freshness capture without waking their own event-stream wait', async () => {
+  const f = await fixture();
+  const store = await f.open();
+  const clock = Date.now;
+  let stopPresence = () => {}, stopStream = () => {};
+  try {
+    const server = await store.server();
+    const user = '@remote:origin.test', observer = '@viewer:local.test';
+    const received = clock();
+    Date.now = () => received;
+    await setPresence(server, user, 'online', 'audience status', {
+      remote: true,
+    });
+    for (const member of [user, observer]) {
+      await server.execute('INSERT INTO memberships VALUES(?,?,?,?,?)', [
+        member,
+        '!presence:origin.test',
+        'join',
+        '$join',
+        1,
+      ]);
+    }
+    const notices: number[] = [];
+    let streamWakes = 0;
+    stopPresence = onEphemeral((db, change) => {
+      if (db.path === server.path && change.kind === 'presence') {
+        notices.push(change.row.seq);
+      }
+    });
+    stopStream = onEventStream((path) => {
+      if (path === server.path) streamWakes++;
+    });
+    const fresh = await presenceFor(server, observer, [user, '@hidden:test']);
+    assertEquals([...fresh.keys()], [user]);
+    assertEquals(fresh.get(user)?.presence, 'online');
+    assertEquals(notices, []);
+    assertEquals(
+      streamWakes,
+      0,
+      'presence audience read must not publish an event-stream wake',
+    );
+    Date.now = () => received + 31 * 60 * 1000;
+    const expired = await presenceFor(server, observer, [user]);
+    assertEquals(expired.get(user)?.presence, 'offline');
+    assertEquals(expired.get(user)?.seq, fresh.get(user)!.seq + 1);
+    assertEquals(notices, [expired.get(user)!.seq]);
+    assertEquals(streamWakes, 0);
+    const self = await presenceFor(server, '@self:no-room');
+    assertEquals([...self.keys()], ['@self:no-room']);
+    assertEquals(self.get('@self:no-room')?.presence, 'offline');
+    const departed = await presenceFor(server, observer, [user], async (tx) => {
+      await tx.execute(
+        "UPDATE memberships SET membership='leave' WHERE user=?",
+        [
+          user,
+        ],
+      );
+    });
+    assertEquals([...departed.keys()], []);
+    assertEquals(notices, [expired.get(user)!.seq]);
+    assertEquals(streamWakes, 0);
+  } finally {
+    stopPresence();
+    stopStream();
+    Date.now = clock;
     await store.close();
     await Deno.remove(f.dir, { recursive: true });
   }

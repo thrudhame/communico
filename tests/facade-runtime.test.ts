@@ -1089,6 +1089,68 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     }
     await edge.listening(facadePort);
     // Real public authoring while home is absent and federation is disabled.
+    const offlinePresence = 'presence/' + encodeURIComponent(user) + '/status';
+    const offlineTyping = roomPath + '/typing/' + encodeURIComponent(user);
+    assertEquals(
+      await edgeApi(offlinePresence, {
+        presence: 'online',
+        status_msg: 'offline facade status',
+      }, 'PUT'),
+      { status: 200, body: {} },
+    );
+    const offlinePresenceRead = await edgeApi(offlinePresence);
+    assertEquals(offlinePresenceRead.status, 200);
+    assertEquals(offlinePresenceRead.body.presence, 'online');
+    assertEquals(offlinePresenceRead.body.status_msg, 'offline facade status');
+    assertEquals(
+      await edgeApi(offlineTyping, { typing: true, timeout: 30000 }, 'PUT'),
+      { status: 200, body: {} },
+    );
+    const offlineActivitySync = await edgeApi(
+      'sync?timeout=0&set_presence=online',
+    );
+    assertEquals(offlineActivitySync.status, 200);
+    assert(
+      offlineActivitySync.body.rooms.join[roomId].ephemeral.events.some((
+        event: { type: string; content: { user_ids?: string[] } },
+      ) => event.type === 'm.typing' && event.content.user_ids?.includes(user)),
+    );
+    for (
+      const [path, method, body] of [
+        [offlinePresence, 'GET', undefined],
+        [offlinePresence, 'PUT', { presence: 'offline' }],
+        [offlineTyping, 'PUT', { typing: false }],
+      ] as const
+    ) {
+      assertEquals(
+        (await api(path, body, undefined, method, facadePort)).status,
+        401,
+      );
+      assertEquals(
+        (await api(
+          path,
+          body,
+          registered.body.access_token,
+          method,
+          facadePort,
+        )).status,
+        503,
+      );
+    }
+    assertEquals(
+      (await edgeApi('presence/%40other%3Alogical.test/status', {
+        presence: 'online',
+      }, 'PUT')).status,
+      403,
+    );
+    assertEquals(await edgeApi(offlineTyping, { typing: false }, 'PUT'), {
+      status: 200,
+      body: {},
+    });
+    assertEquals(
+      await edgeApi(offlinePresence, { presence: 'offline' }, 'PUT'),
+      { status: 200, body: {} },
+    );
     const forgottenRoom = await edgeApi('createRoom', {
       preset: 'public_chat',
       initial_state: [{

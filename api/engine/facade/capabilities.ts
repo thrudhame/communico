@@ -109,6 +109,9 @@ const F2_AUTH: readonly Rule[] = [
 // additionally require their room cut. These client scopes do not depend on the
 // federation switch; the existing federation public/rooms rules still do.
 const F2_REGISTERS: readonly Rule[] = [
+  ...['GET', 'PUT'].map((method) =>
+    route(method, /^\/_matrix\/client\/v3\/presence\/[^/]+\/status$/, 'domain')
+  ),
   route('GET', /^\/_matrix\/client\/v3\/profile\/[^/]+(?:\/[^/]+)?$/, 'domain'),
   ...['PUT', 'DELETE'].map((method) =>
     route(method, /^\/_matrix\/client\/v3\/profile\/[^/]+\/[^/]+$/, 'domain')
@@ -215,6 +218,11 @@ const F2_ROOMS: readonly Rule[] = [
     /^\/_matrix\/client\/v3\/directory\/room\/[^/]+$/,
   ].map((path) => route('PUT', path, 'clientrooms', 'home')),
   route('GET', literal('/_matrix/client/v3/joined_rooms'), 'clientrooms'),
+  route(
+    'PUT',
+    /^\/_matrix\/client\/v3\/rooms\/[^/]+\/typing\/[^/]+$/,
+    'clientrooms',
+  ),
   route(
     'POST',
     literal('/_matrix/client/v3/user_directory/search'),

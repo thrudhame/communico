@@ -78,6 +78,8 @@ Deno.test('presence wire: producer storage to EDU to remote persistence preserve
       assertEquals(received.statusMsg, status ?? null);
       assert(received.seq > 0);
     }
+    await stop();
+    stop = undefined;
     // The actual authenticated inbound owner records receipt freshness, even
     // though the sender's local row has no remote expiry. The outbound reader
     // must not resurrect a stale remote observation after an outage.
@@ -93,6 +95,34 @@ Deno.test('presence wire: producer storage to EDU to remote persistence preserve
     // The sender's local device also expires, under its own shorter sync grace,
     // rather than acquiring the receiver's remote-observation lifetime.
     assertEquals((await getPresence(producer, local)).presence, 'offline');
+    Date.now = clock;
+    // Both federation directions use the same current shared-join audience.
+    // Once the resident user leaves, later local changes are not queued and
+    // inbound updates cannot refresh the old stored remote presence.
+    for (const server of [producer, consumer]) {
+      await server.execute(
+        "UPDATE memberships SET membership='leave' WHERE user=?",
+        [remote],
+      );
+    }
+    stop = wireEphemeral(producer, 'origin.test', queues);
+    await setPresence(producer, local, 'online', 'not shared');
+    await stop();
+    stop = undefined;
+    assertEquals(queues.drain('resident.test', 100), []);
+    const before = await getPresence(consumer, local);
+    await receiver.dispatch('origin.test', {
+      edu_type: 'm.presence',
+      content: {
+        push: [{
+          user_id: local,
+          presence: 'online',
+          status_msg: 'not shared',
+          last_active_ago: 0,
+        }],
+      },
+    });
+    assertEquals(await getPresence(consumer, local), before);
   } finally {
     Date.now = clock;
     await stop?.();
