@@ -5,6 +5,8 @@ import { upgradeRoom } from '#engine/client/upgrade.ts';
 import { registerUser } from '#engine/tenant/users.ts';
 import { stateAtSeq } from '#engine/client/room.ts';
 import { lookupAlias } from '#engine/server/aliases.ts';
+import { join, leave } from '#engine/client/membership.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
 
 for (const version of ['11', '12']) {
   for (const cut of ['before-publication', 'after-publication', 'push-rules']) {
@@ -304,3 +306,158 @@ Deno.test('upgrade reuses an existing tombstone and replacement without rewritin
     await Deno.remove(dir, { recursive: true });
   }
 });
+
+async function withUpgradeApp(
+  run: (app: Awaited<ReturnType<typeof openApp>>) => Promise<void>,
+) {
+  const dir = await Deno.makeTempDir({ prefix: 'upgrade-recovery-' });
+  const app = await openApp({
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  });
+  try {
+    await run(app);
+  } finally {
+    await closeApp();
+    await Deno.remove(dir, { recursive: true });
+  }
+}
+
+Deno.test('upgrade lockdown retry derives from current power, never a stale plan', () =>
+  withUpgradeApp(async (app) => {
+    const user = await registerUser(app.tenant, {
+      localpart: 'upgrader',
+      password: 'pw',
+    });
+    const moderator = '@moderator:' + user.user_id.split(':')[1];
+    const old = await createRoom({ creator: user.user_id, version: '11' });
+    const power = (await stateAtSeq(old.roomId, null, [[
+      'm.room.power_levels',
+      '',
+    ]]))[0].content as Record<string, unknown>;
+    await writeStateKey(old.roomId, user.user_id, 'm.room.power_levels', '', {
+      ...power,
+      users: { [user.user_id]: 100, [moderator]: 50 },
+    });
+    const room = app.store.room.bind(app.store);
+    const execute = app.server.execute.bind(app.server);
+    let cut = false;
+    app.server.execute = async (sql, values) => {
+      const result = await execute(sql, values);
+      if (
+        sql.startsWith('UPDATE room_upgrades SET phase=') && values?.[0] === 3
+      ) cut = true;
+      return result;
+    };
+    app.store.room = async (id, options) => {
+      const database = await room(id, options);
+      if (cut && id === old.roomId) {
+        database.tx = () => Promise.reject(new Error('upgrade-lockdown-cut'));
+      }
+      return database;
+    };
+    try {
+      await assertRejects(
+        () => upgradeRoom(old.roomId, user.user_id, '12'),
+        Error,
+        'upgrade-lockdown-cut',
+      );
+    } finally {
+      app.server.execute = execute;
+      app.store.room = room;
+    }
+    // The owner removes the moderator while lockdown is pending.
+    await writeStateKey(old.roomId, user.user_id, 'm.room.power_levels', '', {
+      ...power,
+      users: { [user.user_id]: 100 },
+      events_default: 0,
+      invite: 75,
+    });
+    await upgradeRoom(old.roomId, user.user_id, '12');
+    const locked = (await stateAtSeq(old.roomId, null, [[
+      'm.room.power_levels',
+      '',
+    ]]))[0].content as Record<string, unknown>;
+    assertEquals(locked.users, { [user.user_id]: 100 });
+    // Synapse raises only levels below max(users_default + 1, 50).
+    assertEquals([locked.events_default, locked.invite], [50, 75]);
+  }));
+
+Deno.test('upgrade requests with different parameters never share a retained result', () =>
+  withUpgradeApp(async (app) => {
+    const user = await registerUser(app.tenant, {
+      localpart: 'upgrader',
+      password: 'pw',
+    });
+    const old = await createRoom({ creator: user.user_id, version: '11' });
+    const raced = await Promise.allSettled([
+      upgradeRoom(old.roomId, user.user_id, '12'),
+      upgradeRoom(old.roomId, user.user_id, '11'),
+    ]);
+    const done = raced.flatMap((r) =>
+      r.status === 'fulfilled' ? [r.value] : []
+    );
+    const refused = raced.flatMap((r) =>
+      r.status === 'rejected' ? [r.reason] : []
+    );
+    assertEquals(done.length, 1);
+    assertEquals(refused.length, 1);
+    assertEquals(refused[0] instanceof MatrixError, true);
+    assertEquals([refused[0].status, refused[0].errcode], [400, 'M_BAD_STATE']);
+    const version = raced[0].status === 'fulfilled' ? '12' : '11';
+    const other = version === '12' ? '11' : '12';
+    const error = await assertRejects(
+      () => upgradeRoom(old.roomId, user.user_id, other),
+      MatrixError,
+    );
+    assertEquals([error.status, error.errcode], [400, 'M_BAD_STATE']);
+    assertEquals(await upgradeRoom(old.roomId, user.user_id, version), done[0]);
+    assertEquals((await app.store.rooms()).length, 2);
+  }));
+
+Deno.test('upgrade by a powered user who left starts no upgrade effects', () =>
+  withUpgradeApp(async (app) => {
+    const user = await registerUser(app.tenant, {
+      localpart: 'upgrader',
+      password: 'pw',
+    });
+    const former = await registerUser(app.tenant, {
+      localpart: 'former',
+      password: 'pw',
+    });
+    const old = await createRoom({
+      creator: user.user_id,
+      version: '11',
+      preset: 'public_chat',
+    });
+    const power = (await stateAtSeq(old.roomId, null, [[
+      'm.room.power_levels',
+      '',
+    ]]))[0].content as Record<string, unknown>;
+    await writeStateKey(old.roomId, user.user_id, 'm.room.power_levels', '', {
+      ...power,
+      users: { [user.user_id]: 100, [former.user_id]: 100 },
+    });
+    await join(old.roomId, former.user_id);
+    await leave(old.roomId, former.user_id);
+    const rooms = await app.store.rooms();
+    const error = await assertRejects(
+      () => upgradeRoom(old.roomId, former.user_id, '12'),
+      MatrixError,
+    );
+    assertEquals([error.status, error.errcode], [403, 'M_FORBIDDEN']);
+    assertEquals(
+      await app.server.query('SELECT * FROM room_upgrades'),
+      [],
+    );
+    assertEquals(await app.store.rooms(), rooms);
+    // The joined owner can still upgrade: nothing was retained for the leaver.
+    assertEquals(
+      typeof (await upgradeRoom(old.roomId, user.user_id, '12'))
+        .replacement_room,
+      'string',
+    );
+  }));
