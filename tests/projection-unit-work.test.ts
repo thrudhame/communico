@@ -98,8 +98,9 @@ Deno.test('publication unit: contended turns publish complete acceptance and rec
             conn.query = (sql, values) => {
               if (
                 !policy &&
-                sql ===
-                  'SELECT display_name, avatar_url, deactivated FROM users WHERE localpart = ?'
+                // Account admission identifies the policy attempt for scalar
+                // and selected-set readers, independent of their SQL shape.
+                /\b(?:FROM|JOIN)\s+users\b/i.test(sql)
               ) {
                 policy = true;
                 policySnapshots++;
