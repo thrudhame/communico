@@ -12,6 +12,7 @@ import type { Journal } from '#engine/facade/journal.ts';
 import { VerificationUnavailable } from '#engine/facade/signing-authority.ts';
 import { bounded, pause } from './server-process.ts';
 import { childDiagnostics } from './child-diagnostics.ts';
+import { fixtureListeners } from './fixture-listeners.ts';
 
 export const observationPrefix = 'facade-test: ';
 export type ObservationScope = Stream & { peer: string; after?: number };
@@ -351,6 +352,7 @@ export async function facadeProcess(
   const observations = new FacadeObservations();
   const initialHolds = new Set(heldPublications);
   const diagnostics = await childDiagnostics();
+  const listeners = await fixtureListeners(config);
   const child = new Deno.Command(Deno.execPath(), {
     args: [
       ...metadata.tasks.start.split(' ').slice(1, -1),
@@ -360,6 +362,7 @@ export async function facadeProcess(
       COMMUNICO_CONFIG: config,
       DENO_NO_PROMPT: '1',
       FACADE_TEST_HOLDS: JSON.stringify(heldPublications),
+      ...listeners.env,
     },
     stdin: 'piped',
     stdout: 'piped',
@@ -447,6 +450,18 @@ export async function facadeProcess(
   }
   return {
     diagnostics,
+    result: async () => ({
+      ...await bounded(output),
+      stdout: out,
+      stderr: err,
+    }),
+    port: (name: Parameters<typeof listeners.port>[0]) =>
+      Promise.race([
+        listeners.port(name),
+        output.then(() => {
+          throw new Error(out + '\n' + err);
+        }),
+      ]),
     observations,
     listening: (port: number) =>
       observations.wait((event) =>

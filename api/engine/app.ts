@@ -54,6 +54,10 @@ import { PendingContacts } from '#engine/federation/pending-contacts.ts';
 import type { Dispatch } from '#engine/server/delivery.ts';
 import type { ReplicaRoomAdmission } from '#engine/facade/directory.ts';
 import { roomSchema } from '#engine/room/index.ts';
+import {
+  setMembershipAdmission,
+  setRestrictedKnowledge,
+} from '#engine/room/hooks.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import {
   installServerHooks,
@@ -104,6 +108,7 @@ export type ReplicaAccess = {
   prepareRoomScope(
     roomId: string,
     allowAbsent?: boolean,
+    localUser?: string,
   ): Promise<ReplicaRoomAdmission>;
   keyDocument(): Promise<KeyDoc>;
   publicRooms(): Promise<boolean>;
@@ -262,6 +267,31 @@ export async function openReplicaApp(
       'replica signer does not match its node',
     );
   }
+  // A replica's missing local room is incomplete knowledge, not evidence that
+  // a logical-local user is not joined. Its directory owns readiness; the room
+  // core receives only the knowledge contract, never the application singleton.
+  setMembershipAdmission(
+    store,
+    (roomId, userId, allowAbsent) =>
+      replica.prepareRoomScope(roomId, allowAbsent, userId),
+  );
+  setRestrictedKnowledge(store, async (roomId) => {
+    try {
+      // Allowed-room knowledge is scope authority, not authority over the
+      // joining account: remote users can qualify through this evidence too.
+      const scope = await replica.prepareRoomScope(roomId);
+      return {
+        knowledge: 'partial' as const,
+        checkCurrent: scope.checkCurrent,
+      };
+    } catch (error) {
+      if (
+        error instanceof MatrixError &&
+        (error.status === 404 || error.status === 503)
+      ) return 'unavailable';
+      throw error;
+    }
+  });
   prepareAppRecovery();
   await recoverServer(store);
   const unavailable = (name: string): never => {

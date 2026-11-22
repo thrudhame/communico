@@ -8,7 +8,6 @@ import {
 } from '#engine/facade/protocol.ts';
 import type { LinkClient } from '#engine/facade/transport.ts';
 import { startInboxWorker } from '#engine/facade/worker.ts';
-import type { Journal } from '#engine/facade/journal.ts';
 
 Deno.test('typed client refuses forged response identity, stream ownership and malformed cuts', async () => {
   const peer = {
@@ -81,12 +80,21 @@ Deno.test('inbox reports the original pre-apply rejection without blocking anoth
     source: 'home',
     incarnation: 'pair',
     stream,
+    received: { sequence: 1, hash: 'a'.repeat(64) },
+    applied: EMPTY_CUT,
   }));
   const worker = startInboxWorker({
     journal: {
       streams: () => Promise.resolve(streams),
-      heads: () => Promise.resolve({ applied: { sequence: through } }),
-    } as unknown as Journal,
+      heads: (_peer, _direction, stream) =>
+        Promise.resolve({
+          ...stream,
+          received: { sequence: 1, hash: 'a'.repeat(64) },
+          applied: stream.stream === 'directory' || through === 0
+            ? EMPTY_CUT
+            : { sequence: through, hash: 'a'.repeat(64) },
+        }),
+    },
     peer: 'home',
     pollseconds: 3600,
     apply: (stream) => {

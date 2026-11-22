@@ -3,6 +3,7 @@
 import { assertEquals, assertRejects } from '@std/assert';
 import { roomSchema } from '#engine/room/schema.ts';
 import { openStore } from '#engine/store/index.ts';
+import { historicalRoomSchema } from '#tests/fixtures/room-schema-history.ts';
 
 const config = (dir: string) => ({
   dir,
@@ -32,6 +33,8 @@ const TABLES = [
   'remote_batches',
   'completion_state',
   'completion_receipts',
+  'membership_receipts',
+  'membership_receipt_wires',
 ];
 
 const INDEXES = [
@@ -53,19 +56,48 @@ const INDEXES = [
   'completion_receipts_through',
 ];
 
+Deno.test('room schema: v11 membership receipt upgrade preserves events and matches fresh creation', async () => {
+  const dir = await Deno.makeTempDir();
+  let store = await openStore(config(dir), {
+    schemas: { room: historicalRoomSchema(11) },
+  });
+  try {
+    const old = await store.room('!membership-upgrade:test', { create: true });
+    assertEquals(
+      await old.query(
+        "SELECT name FROM sqlite_master WHERE name='membership_receipts'",
+      ),
+      [],
+    );
+    await old.execute(
+      "INSERT INTO events(id,pdu,type,sender,depth,origin_ts) VALUES('$old','{}','test','@a:test',1,1)",
+    );
+    await store.close();
+    store = await openStore(config(dir), { schemas: { room: roomSchema } });
+    const upgraded = await store.room('!membership-upgrade:test');
+    const fresh = await store.room('!membership-fresh:test', { create: true });
+    const schema =
+      "SELECT name,sql FROM sqlite_master WHERE type IN ('table','index') AND name NOT LIKE '__turso%' ORDER BY name";
+    assertEquals(await upgraded.query(schema), await fresh.query(schema));
+    assertEquals(await upgraded.query('SELECT id,pdu FROM events'), [{
+      id: '$old',
+      pdu: '{}',
+    }]);
+    assertEquals(await upgraded.query('SELECT * FROM membership_receipts'), []);
+    assertEquals(await upgraded.query('SELECT v FROM meta'), [{
+      v: String(roomSchema.version),
+    }]);
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test('room schema: v8 signature overlay upgrade preserves base events and matches fresh creation', async () => {
   const dir = await Deno.makeTempDir();
   let store = await openStore(config(dir), {
     schemas: {
-      room: {
-        version: 8,
-        apply: async (db) => {
-          await roomSchema.apply(db);
-          await db.exec(
-            'DROP TABLE event_signatures; ALTER TABLE events DROP COLUMN hash_redacted',
-          );
-        },
-      },
+      room: historicalRoomSchema(8),
     },
   });
   try {
@@ -111,15 +143,7 @@ Deno.test('room schema: v9 receipt provenance upgrade preserves immutable events
   const dir = await Deno.makeTempDir();
   let store = await openStore(config(dir), {
     schemas: {
-      room: {
-        version: 9,
-        apply: async (db) => {
-          await roomSchema.apply(db);
-          await db.exec(
-            'ALTER TABLE events DROP COLUMN hash_redacted; ALTER TABLE event_signatures DROP COLUMN home_pdu',
-          );
-        },
-      },
+      room: historicalRoomSchema(9),
     },
   });
   try {
@@ -150,13 +174,7 @@ Deno.test('room schema: v10 upgrade retains base bytes and internal evidence wit
   const dir = await Deno.makeTempDir();
   let store = await openStore(config(dir), {
     schemas: {
-      room: {
-        version: 10,
-        apply: async (db) => {
-          await roomSchema.apply(db);
-          await db.exec('ALTER TABLE event_signatures DROP COLUMN home_pdu');
-        },
-      },
+      room: historicalRoomSchema(10),
     },
   });
   try {
@@ -249,15 +267,7 @@ Deno.test('room schema: v3 upgrade preserves old data and starts the future publ
   const dir = await Deno.makeTempDir();
   let store = await openStore(config(dir), {
     schemas: {
-      room: {
-        version: 3,
-        apply: async (db) => {
-          await roomSchema.apply(db);
-          await db.exec(
-            'DROP TABLE event_signatures; ALTER TABLE events DROP COLUMN hash_redacted; DROP TABLE publication_keys; DROP INDEX events_annotation_target; DROP TABLE remote_batches; DROP INDEX waits_ready; DROP TABLE completion_receipts; DROP TABLE completion_state',
-          );
-        },
-      },
+      room: historicalRoomSchema(3),
     },
   });
   try {
@@ -285,15 +295,7 @@ Deno.test('room schema: v4 annotation index upgrade preserves events and uses ta
   const dir = await Deno.makeTempDir();
   let store = await openStore(config(dir), {
     schemas: {
-      room: {
-        version: 4,
-        apply: async (db) => {
-          await roomSchema.apply(db);
-          await db.exec(
-            'DROP TABLE event_signatures; ALTER TABLE events DROP COLUMN hash_redacted; DROP INDEX events_annotation_target; DROP TABLE remote_batches; DROP INDEX waits_ready; DROP TABLE completion_receipts; DROP TABLE completion_state',
-          );
-        },
-      },
+      room: historicalRoomSchema(4),
     },
   });
   const pdu = JSON.stringify({
@@ -342,15 +344,7 @@ Deno.test('room schema: v5 adds durable remote batch receipts without changing e
   const dir = await Deno.makeTempDir();
   let store = await openStore(config(dir), {
     schemas: {
-      room: {
-        version: 5,
-        apply: async (db) => {
-          await roomSchema.apply(db);
-          await db.exec(
-            'DROP TABLE event_signatures; ALTER TABLE events DROP COLUMN hash_redacted; DROP TABLE remote_batches; DROP INDEX waits_ready; DROP TABLE completion_receipts; DROP TABLE completion_state',
-          );
-        },
-      },
+      room: historicalRoomSchema(5),
     },
   });
   try {
@@ -378,15 +372,7 @@ Deno.test('room schema: v6 admits eligible retained dependencies into the indexe
   const dir = await Deno.makeTempDir();
   let store = await openStore(config(dir), {
     schemas: {
-      room: {
-        version: 6,
-        apply: async (db) => {
-          await roomSchema.apply(db);
-          await db.exec(
-            'DROP TABLE event_signatures; ALTER TABLE events DROP COLUMN hash_redacted; DROP INDEX waits_ready; DROP TABLE completion_receipts; DROP TABLE completion_state',
-          );
-        },
-      },
+      room: historicalRoomSchema(6),
     },
   });
   try {

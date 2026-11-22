@@ -110,6 +110,14 @@ export const SYMMETRIC_ROOM_CAPABILITY: Capability = {
   type: 'room-replica',
   version: 2,
 };
+export const MEMBERSHIP_DIRECTORY_CAPABILITY: Capability = {
+  type: 'directory-replica',
+  version: 2,
+};
+export const MEMBERSHIP_OPERATION_CAPABILITY: Capability = {
+  type: 'membership-operation',
+  version: 1,
+};
 export const OWNER_INGRESS_CAPABILITY: Capability = {
   type: 'ingress',
   version: 2,
@@ -133,6 +141,8 @@ export const LINK_SUPPORTED: readonly Capability[] = [
   KEY_HISTORY_V2_CAPABILITY,
   TO_DEVICE_CAPABILITY,
   SYMMETRIC_ROOM_CAPABILITY,
+  MEMBERSHIP_DIRECTORY_CAPABILITY,
+  MEMBERSHIP_OPERATION_CAPABILITY,
   ROUTED_INGRESS_CAPABILITY,
   OWNER_INGRESS_CAPABILITY,
 ];

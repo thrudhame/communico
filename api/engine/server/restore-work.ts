@@ -27,14 +27,19 @@ export async function restoredServerWork(db: CapturedQuery) {
   }
   const prejoin = await inventoryRows(
     db,
-    'prejoin_memberships',
-    'room_id,user_id,event_id,origin,kind,status,revision,expires_ms',
+    'prejoin_jobs',
+    'job_id,room_id,user_id,event_id,action,status,revision,expires_ms',
     "status IN ('rejecting','failed-retract','attempting','failed-attempt')",
   );
   const joins = await inventoryRows(
     db,
     'federation_join_attempts',
     'room_id,user_id,event_id,destination,added_ms,(leave_json IS NOT NULL) AS prepared',
+  );
+  const invites = await inventoryRows(
+    db,
+    'federation_invite_attempts',
+    'room_id,sender,target,event_id,destination,status,added_ms,(response_json IS NOT NULL) AS prepared',
   );
   const deliveries = await inventoryRows(
     db,
@@ -49,7 +54,7 @@ export async function restoredServerWork(db: CapturedQuery) {
     'revision>MAX(sent_revision,expired_revision)',
   );
   return {
-    federation: { pdus, edus, frozen, prejoin, joins },
+    federation: { pdus, edus, frozen, prejoin, joins, invites },
     push: { deliveries, badges },
   };
 }

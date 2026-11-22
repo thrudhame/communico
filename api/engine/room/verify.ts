@@ -92,6 +92,22 @@ export function copyEventReceipt(pdu: Pdu): Pdu {
   return copy;
 }
 
+/** Independent receipt checks must not serialize key discovery, share mutable
+ * normalization, or outlive a failed pack. Consumers supply ordinary admission
+ * (including any signature-union checks), then fold results in input order. */
+export async function prepareReceiptPack<T>(
+  events: readonly Pdu[],
+  prepare: (pdu: Pdu) => Promise<T>,
+): Promise<T[]> {
+  const results = await Promise.allSettled(
+    events.map(async (pdu) => await prepare(copyEventReceipt(pdu))),
+  );
+  return results.map((result) => {
+    if (result.status === 'rejected') throw result.reason;
+    return result.value;
+  });
+}
+
 // Check 1: the wire bounds and the per-version format checks (old
 // federation/pdu.ts checkRemoteFormat). A hard failure throws; the
 // lenient size case is returned. The backfill count exemption

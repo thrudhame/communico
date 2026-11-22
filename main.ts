@@ -20,19 +20,14 @@ function closeStore(): Promise<void> {
   return closing ??= stopRuntime();
 }
 
-globalThis.addEventListener('unhandledrejection', (event) => {
+function fail(reason: unknown, context: string) {
   if (fatal) Deno.exit(1);
   fatal = true;
   // Defer Deno's immediate fatal default only for bounded cleanup. Continuing
   // to serve, recovering from the rejection or exiting successfully is forbidden.
-  event.preventDefault();
+  console.error('fatal: ' + context);
+  console.error(reason instanceof Error ? reason : new Error(String(reason)));
   lifetime.abort();
-  console.error('fatal: unhandled rejection');
-  console.error(
-    event.reason instanceof Error
-      ? event.reason.stack
-      : new Error(String(event.reason)).stack,
-  );
   const timer = setTimeout(() => Deno.exit(1), 2000);
   void lifetime.settled().then(closeStore).then(() => {
     console.error('fatal: store closed');
@@ -43,6 +38,11 @@ globalThis.addEventListener('unhandledrejection', (event) => {
     clearTimeout(timer);
     Deno.exit(1);
   });
+}
+
+globalThis.addEventListener('unhandledrejection', (event) => {
+  event.preventDefault();
+  fail(event.reason, 'unhandled rejection');
 });
 
 try {
@@ -92,7 +92,10 @@ try {
 let admin: { shutdown(): Promise<void> };
 const servers: Deno.HttpServer[] = [];
 if (config().server.role === 'facade') {
-  const facade = await startFacade(lifetime);
+  const facade = await startFacade(
+    lifetime,
+    (error) => fail(error, 'facade composition failed'),
+  );
   admin = facade.admin;
   stopRuntime = facade.close;
   console.log(

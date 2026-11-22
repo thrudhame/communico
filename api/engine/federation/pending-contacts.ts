@@ -1,9 +1,8 @@
 import type { Database } from '#engine/store/db.ts';
 import { lookupPeer, type PendingRow, recordPending } from './peers.ts';
 
-type Batch = { count: number; detail: string };
-type Writer = {
-  pending?: Batch;
+type Writer<T> = {
+  pending?: T;
   task: Promise<void>;
   error?: { cause: unknown };
 };
@@ -12,33 +11,32 @@ type Writer = {
  * An abrupt crash can lose every accepted contact still queued or in an
  * uncommitted flush (no fixed count bound). Orderly close drains them before
  * storage closes; failures remain owned and are reported by drain/close.
- * Business outcomes composed with a Conn must keep using recordPending directly.
+ * The injected merge preserves the caller's facts; only persistence queues.
+ * Business outcomes must keep their own durable transaction barriers.
  */
-export class PendingContacts {
-  private readonly writers = new Map<string, Writer>();
+export class ContactObservations<T> {
+  private readonly writers = new Map<string, Writer<T>>();
   private closing = false;
   private closed?: Promise<void>;
 
   constructor(
-    private readonly server: Database,
+    private readonly persist: (key: string, batch: T) => Promise<void>,
+    private readonly merge: (earlier: T, later: T) => T,
     private readonly failed: (error: unknown) => void = (error) =>
-      console.error('federation contact diagnostics:', error),
+      console.error('contact diagnostics:', error),
   ) {}
 
-  record(name: string, kind: PendingRow['kind'], detail: string): void {
-    if (this.closing) throw new Error('federation contact log is closing');
-    const key = JSON.stringify([name, kind]);
+  observe(key: string, observation: T): void {
+    if (this.closing) throw new Error('contact log is closing');
     const active = this.writers.get(key);
     if (active !== undefined) {
-      if (active.pending === undefined) active.pending = { count: 1, detail };
-      else {
-        active.pending.count++;
-        active.pending.detail = detail;
-      }
+      active.pending = active.pending === undefined
+        ? observation
+        : this.merge(active.pending, observation);
       return;
     }
-    const writer: Writer = {
-      pending: { count: 1, detail },
+    const writer: Writer<T> = {
+      pending: observation,
       task: Promise.resolve(),
     };
     this.writers.set(key, writer);
@@ -49,22 +47,7 @@ export class PendingContacts {
         const batch = writer.pending;
         writer.pending = undefined;
         try {
-          await this.server.tx(async (tx) => {
-            // An approval completed while this diagnostic was queued removes
-            // the knock. Do not recreate it from the earlier auth admission.
-            if (
-              (kind === 'inbound' || kind === 'outbound') &&
-              await lookupPeer(tx, name) !== null
-            ) return;
-            await recordPending(
-              tx,
-              name,
-              kind,
-              true,
-              batch.detail,
-              batch.count,
-            );
-          });
+          await this.persist(key, batch);
         } catch (cause) {
           this.retain(writer, batch);
           writer.error = { cause };
@@ -85,13 +68,12 @@ export class PendingContacts {
     });
   }
 
-  private retain(writer: Writer, batch: Batch): void {
+  private retain(writer: Writer<T>, batch: T): void {
     // Admission can append another batch while the failed flush awaits I/O.
     const following = writer.pending;
-    writer.pending = {
-      count: batch.count + (following === undefined ? 0 : following.count),
-      detail: following === undefined ? batch.detail : following.detail,
-    };
+    writer.pending = following === undefined
+      ? batch
+      : this.merge(batch, following);
   }
 
   async drain(): Promise<void> {
@@ -107,7 +89,7 @@ export class PendingContacts {
       if (errors.length > 1) {
         throw new AggregateError(
           errors,
-          'federation contact diagnostics failed',
+          'contact diagnostics failed',
         );
       }
     }
@@ -117,5 +99,53 @@ export class PendingContacts {
     this.closing = true;
     if (this.closed === undefined) this.closed = this.drain();
     return this.closed;
+  }
+}
+
+type Batch = {
+  name: string;
+  kind: PendingRow['kind'];
+  count: number;
+  detail: string;
+};
+
+/** Federation's diagnostic facts use the same lifetime/coalescing owner as
+ * facade contact timestamps. Authentication and request outcomes never queue. */
+export class PendingContacts extends ContactObservations<Batch> {
+  constructor(
+    server: Database,
+    failed: (error: unknown) => void = (error) =>
+      console.error('federation contact diagnostics:', error),
+  ) {
+    super(
+      (_key, batch) =>
+        server.tx(async (tx) => {
+          // An approval completed while this diagnostic was queued removes the
+          // knock. Do not recreate it from the earlier auth admission.
+          if (
+            (batch.kind === 'inbound' || batch.kind === 'outbound') &&
+            await lookupPeer(tx, batch.name) !== null
+          ) return;
+          await recordPending(
+            tx,
+            batch.name,
+            batch.kind,
+            true,
+            batch.detail,
+            batch.count,
+          );
+        }),
+      (earlier, later) => ({ ...later, count: earlier.count + later.count }),
+      failed,
+    );
+  }
+
+  record(name: string, kind: PendingRow['kind'], detail: string): void {
+    this.observe(JSON.stringify([name, kind]), {
+      name,
+      kind,
+      count: 1,
+      detail,
+    });
   }
 }

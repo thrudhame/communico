@@ -36,6 +36,7 @@ import { exportOwnerControl } from './ownership.ts';
 import { DomainOperations } from './domain.ts';
 import { DeviceOperations, isKeyStream } from './devices.ts';
 import { isToDeviceStream, ToDeviceOperations } from './todevice.ts';
+import { MembershipOperations, startMembershipExports } from './membership.ts';
 
 export async function startHomeLinks(
   app: App,
@@ -91,6 +92,11 @@ export async function startHomeLinks(
     ReturnType<typeof startAccountExports>
   >();
   const accounts = new AccountSnapshots(app.store, app.tenant, pairings);
+  const membershipExports = new Map<
+    string,
+    ReturnType<typeof startAccountExports>
+  >();
+  const memberships = new MembershipOperations(app.store, app.tenant, pairings);
   const domains = new DomainOperations(app.store, app.tenant, pairings);
   const devices = new DeviceOperations(app.store, app.tenant, pairings);
   const toDevice = new ToDeviceOperations(app.store, app.tenant, pairings);
@@ -159,6 +165,7 @@ export async function startHomeLinks(
       authExports.get(id)?.wake();
       keyExports.get(id)?.wake();
       toDeviceExports.get(id)?.wake();
+      membershipExports.get(id)?.wake();
       return;
     }
     await exports.get(id)?.close();
@@ -173,6 +180,8 @@ export async function startHomeLinks(
     keyExports.delete(id);
     await toDeviceExports.get(id)?.close();
     toDeviceExports.delete(id);
+    await membershipExports.get(id)?.close();
+    membershipExports.delete(id);
     await workers.get(id)?.close();
     workers.delete(id);
     let secret: string | undefined;
@@ -244,6 +253,13 @@ export async function startHomeLinks(
             ? devices.apply(journal, stream, id)
             : settings.phase === 'f2' && isToDeviceStream(stream)
             ? toDevice.apply(journal, stream, id)
+            : settings.phase === 'f2' && stream.stream.startsWith('membership:')
+            ? memberships.apply(
+              journal,
+              stream,
+              productionKeyResolver(app.federationKeys),
+              id,
+            )
             : settings.phase === 'f2' && stream.stream.startsWith('room:')
             ? roomReplicas.apply(journal, stream, id)
             : apply(node, stream),
@@ -281,6 +297,7 @@ export async function startHomeLinks(
       tenant: app.tenant,
       peer: node,
       pairing: id,
+      version: settings.phase === 'f2' ? 2 : 1,
       changed: () => workers.get(id)?.wake(),
       failed: (error) => failed(node, error),
     });
@@ -338,6 +355,24 @@ export async function startHomeLinks(
           failed: (error) => failed(node, error),
         }),
       );
+      membershipExports.set(
+        id,
+        startMembershipExports({
+          store: app.store,
+          server: app.server,
+          tenant: app.tenant,
+          pollseconds: settings.pollseconds,
+          users: () => app.tenant.tx((tx) => tx.publicReplica.users()),
+          emit: (localpart) => memberships.bootstrap(localpart, id),
+          // A successful empty bootstrap is also a directory dependency. Wake its
+          // retry independently of whether a membership journal record was added.
+          changed: () => {
+            directoryExports.get(id)?.wake();
+            workers.get(id)?.wake();
+          },
+          failed: (error) => failed(node, error),
+        }),
+      );
     }
   }
   let scanning: Promise<void> | undefined;
@@ -385,6 +420,11 @@ export async function startHomeLinks(
         );
         await Promise.all(
           [...toDeviceExports.values()].map((deliveries) => deliveries.close()),
+        );
+        await Promise.all(
+          [...membershipExports.values()].map((memberships) =>
+            memberships.close()
+          ),
         );
         await Promise.all([...exports.values()].map((rooms) => rooms.close()));
         await Promise.all(

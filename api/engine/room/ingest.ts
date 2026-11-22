@@ -33,7 +33,9 @@ import {
   admitLocalJoin,
   completeRoomWrite,
   enrollCompletion,
+  prepareMembershipAdmission,
   requireCompletionOwner,
+  withMembershipFence,
 } from '#engine/room/hooks.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { getRulebook, type StateMap } from '#engine/rulebook/index.ts';
@@ -134,6 +136,8 @@ export async function sendLocal(
     (tx, permit) => buildInTx(tx, room.id, partial, permit),
     submission,
     localJoiningUser(partial),
+    true,
+    localMembershipAuthor(partial, signer.serverName),
   );
 }
 
@@ -152,6 +156,7 @@ export async function acceptLocal(
     submission,
     localJoiningUser(partial),
     false,
+    localMembershipAuthor(partial, signer.serverName),
   );
 }
 
@@ -188,6 +193,15 @@ function localJoiningUser(event: BuildPartial): string | undefined {
   return event.type === 'm.room.member' && event.state_key === event.sender &&
       ['join', 'knock'].includes(String(event.content.membership))
     ? event.sender
+    : undefined;
+}
+
+function localMembershipAuthor(event: BuildPartial, self: string) {
+  return event.type === 'm.room.member' && domainOf(event.sender) === self
+    ? {
+      userId: event.sender,
+      allowAbsent: localJoiningUser(event) !== undefined,
+    }
     : undefined;
 }
 
@@ -251,6 +265,7 @@ async function submitLocal(
   submission?: LocalSubmission,
   joiningUser?: string,
   completed = true,
+  membership?: { userId: string; allowAbsent: boolean },
 ): Promise<IngestLocalResult> {
   return await room.store.accept(async () => {
     if (!completed) requireCompletionOwner();
@@ -261,21 +276,44 @@ async function submitLocal(
         if (joiningUser !== undefined) {
           await admitLocalJoin(room.store, room.id, joiningUser);
         }
+        let prepared = await submission?.lookup() ?? null;
+        // Exact committed work needs completion repair, not fresh scope. The
+        // new-work fence still covers a prepared event that has not committed.
+        if (membership && submission && prepared) {
+          const receipt = await room.tx((tx) =>
+            submissionReceipt(tx, prepared!.eventId, prepared!.pdu)
+          );
+          if (receipt) {
+            committed = receipt;
+            await submission.finish(
+              receipt.eventId,
+              receipt.standing !== 'rejected',
+              receipt.completion,
+            );
+            return receipt;
+          }
+        }
+        const admission = membership
+          ? await prepareMembershipAdmission(
+            room.store,
+            room.id,
+            membership.userId,
+            membership.allowAbsent,
+          )
+          : undefined;
         if (submission === undefined) {
           const permit = await prepareSigner(signer);
-          committed = await room.tx(async (tx) => {
-            const pdu = await build(tx, permit);
-            await assertLocalAnnotation(tx, pdu);
-            return await ingestInTx(tx, room.id, pdu, {
-              self: signer.serverName,
-            });
-          });
+          committed = await room.tx((tx) =>
+            withMembershipFence(admission, tx, async () => {
+              const pdu = await build(tx, permit);
+              await assertLocalAnnotation(tx, pdu);
+              return await ingestInTx(tx, room.id, pdu, {
+                self: signer.serverName,
+              });
+            })
+          );
           return committed;
         }
-        let prepared = await submission.lookup();
-        // A grounded receipt completes existing work without fresh signing
-        // authority. Otherwise retain the actual prepared signer's dependency
-        // across both tenant preparation and room installation.
         const receipt = prepared === null
           ? null
           : await room.tx((tx) =>
@@ -285,22 +323,24 @@ async function submitLocal(
           ? await prepareSigner(signer)
           : undefined;
         if (prepared === null) {
-          const built = await room.tx(async (tx) => {
-            await submission.admit?.(tx);
-            const pdu = await build(tx, permit!);
-            await assertLocalAnnotation(tx, pdu);
-            const stay = await tx.segments.openStay();
-            const group = stay === null
-              ? null
-              : await tx.state.current(stay.id);
-            await assertLocalEncryption(
-              tx,
-              group,
-              pdu as BuildPartial,
-              signer.serverName,
-            );
-            return pdu;
-          });
+          const built = await room.tx((tx) =>
+            withMembershipFence(admission, tx, async () => {
+              await submission.admit?.(tx);
+              const pdu = await build(tx, permit!);
+              await assertLocalAnnotation(tx, pdu);
+              const stay = await tx.segments.openStay();
+              const group = stay === null
+                ? null
+                : await tx.state.current(stay.id);
+              await assertLocalEncryption(
+                tx,
+                group,
+                pdu as BuildPartial,
+                signer.serverName,
+              );
+              return pdu;
+            })
+          );
           prepared = await submission.prepare(built, permit!.admit);
         }
         const result = await room.tx(async (tx) => {
@@ -311,16 +351,20 @@ async function submitLocal(
           );
           if (receipt !== null) return receipt;
           if (permit?.admit) tx.admit(permit.admit);
-          await submission.admit?.(tx);
-          if (prepared.pdu === null) {
-            throw new Error('E_SUBMISSION_EVENT_MISSING: ' + prepared.eventId);
-          }
-          if (prepared.pdu.event_id !== prepared.eventId) {
-            throw new Error('E_SUBMISSION_ID_MISMATCH');
-          }
-          await assertLocalAnnotation(tx, prepared.pdu);
-          return await ingestInTx(tx, room.id, prepared.pdu, {
-            self: signer.serverName,
+          return await withMembershipFence(admission, tx, async () => {
+            await submission.admit?.(tx);
+            if (prepared.pdu === null) {
+              throw new Error(
+                'E_SUBMISSION_EVENT_MISSING: ' + prepared.eventId,
+              );
+            }
+            if (prepared.pdu.event_id !== prepared.eventId) {
+              throw new Error('E_SUBMISSION_ID_MISMATCH');
+            }
+            await assertLocalAnnotation(tx, prepared.pdu);
+            return await ingestInTx(tx, room.id, prepared.pdu, {
+              self: signer.serverName,
+            });
           });
         });
         committed = result;
@@ -367,10 +411,21 @@ export async function ingestLocal(
     async () => {
       const user = localJoiningUser(pdu as BuildPartial);
       if (user !== undefined) await admitLocalJoin(room.store, room.id, user);
-      return await room.tx(async (tx) => {
-        await admission?.(tx);
-        return await ingestInTx(tx, room.id, pdu, { self });
-      });
+      const membership = localMembershipAuthor(pdu as BuildPartial, self);
+      const scope = membership
+        ? await prepareMembershipAdmission(
+          room.store,
+          room.id,
+          membership.userId,
+          membership.allowAbsent,
+        )
+        : undefined;
+      return await room.tx((tx) =>
+        withMembershipFence(scope, tx, async () => {
+          await admission?.(tx);
+          return await ingestInTx(tx, room.id, pdu, { self });
+        })
+      );
     },
   );
   await afterLocalCommit(room, result.eventId, self);

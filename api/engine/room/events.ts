@@ -10,8 +10,11 @@ import { indexTopology } from './topology.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { canonicalJson } from '#engine/canonical.ts';
 import type { Pdu } from '#engine/pdu.ts';
-import { eventMaterial, type SignatureEvidence } from './signatures.ts';
-import { contentHashMatches, wasHashRedacted } from './verify.ts';
+import {
+  compatibleEventMaterial,
+  type SignatureEvidence,
+} from './signatures.ts';
+import { wasHashRedacted } from './verify.ts';
 
 export type EventRow = {
   id: string;
@@ -317,15 +320,16 @@ export async function mergeEventSignatures(
   const row = await rows.get(evidence.eventId);
   if (row === null) return false;
   const pdu = JSON.parse(row.pdu) as Pdu;
-  const material = eventMaterial(pdu);
   const [held] = await conn.query(
     'SELECT e.hash_redacted, s.signatures, s.home_pdu FROM events e LEFT JOIN event_signatures s ON s.event=e.id WHERE e.id=?',
     [row.id],
   );
   if (
-    material !== evidence.material &&
-    (material !== evidence.redactedMaterial || pdu.type === 'm.room.create' ||
-      (Number(held.hash_redacted) !== 1 && await contentHashMatches(pdu)))
+    !await compatibleEventMaterial(
+      pdu,
+      evidence,
+      Number(held.hash_redacted) === 1,
+    )
   ) {
     throw new MatrixError(
       400,

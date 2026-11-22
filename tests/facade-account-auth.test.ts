@@ -17,6 +17,8 @@ import {
   LinkError,
 } from '#engine/facade/protocol.ts';
 import { serverSchema } from '#engine/server/schema.ts';
+import { projectTenant } from '#engine/server/project-tenant.ts';
+import { withProjectionLock } from '#engine/server/project.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import {
@@ -43,6 +45,11 @@ import { AuthLinkHealth, FacadeAuth } from '#engine/facade/auth.ts';
 import { consumeRefreshToken } from '#engine/tenant/auth.ts';
 import { PASSWORD_FLOWS, requireUia, uiaAction } from '#engine/tenant/uia.ts';
 import { historicalTenantSchema } from './fixtures/tenant-schema-history.ts';
+import {
+  pendingTenantProjection,
+  recordTenantProjection,
+  setTenantProjector,
+} from '#engine/tenant/hooks.ts';
 
 Deno.test('auth publication migration upgrades tenant27 without inventing a publication for older snapshots', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'auth-publication-upgrade-' });
@@ -772,6 +779,223 @@ Deno.test('auth snapshot owner installs only the newest received authority befor
       );
     }
   } finally {
+    await f.close();
+  }
+});
+
+Deno.test('auth freshness completes without adopting an unrelated held tenant projection', async () => {
+  const f = await fixture();
+  const release = Promise.withResolvers<void>();
+  const entered = Promise.withResolvers<void>();
+  let applying: Promise<boolean> | undefined;
+  try {
+    const first = await f.emit();
+    await f.journal.receive('home', [first]);
+    await f.receiver.apply(f.journal, first);
+    const db = await f.edge.tenant('logical.test');
+    const unrelated = await db.tx(recordTenantProjection);
+    const fresh = await f.emit();
+    await f.journal.receive('home', [fresh]);
+    setTenantProjector(async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    applying = f.receiver.apply(f.journal, fresh);
+    assertEquals(
+      await bounded(Promise.race([
+        applying.then(() => 'applied'),
+        entered.promise.then(() => 'unrelated projection'),
+      ])),
+      'applied',
+    );
+    assertEquals(await pendingTenantProjection(db), unrelated);
+    assertEquals(
+      (await f.journal.heads('home', 'in', fresh)).applied.sequence,
+      fresh.sequence,
+    );
+    assertEquals(await verifyUserPassword(f.et, 'alice', 'pw'), true);
+  } finally {
+    release.resolve();
+    await applying?.catch(() => {});
+    setTenantProjector(undefined);
+    await f.close();
+  }
+});
+
+Deno.test('auth projection obligation: freshness replay does not adopt later unrelated work', async () => {
+  const f = await fixture();
+  try {
+    const first = await f.emit();
+    await f.journal.receive('home', [first]);
+    await f.receiver.apply(f.journal, first);
+    const fresh = await f.emit();
+    await f.journal.receive('home', [fresh]);
+    const interrupted = new Proxy(f.journal, {
+      get(journal, key) {
+        if (key === 'apply') {
+          return () => Promise.reject(new Error('lost freshness ACK'));
+        }
+        const value = Reflect.get(journal, key);
+        return typeof value === 'function' ? value.bind(journal) : value;
+      },
+    });
+    await assertRejects(
+      () => f.receiver.apply(interrupted, fresh),
+      Error,
+      'lost freshness ACK',
+    );
+    const db = await f.edge.tenant('logical.test');
+    const later = await db.tx(recordTenantProjection);
+    let projections = 0;
+    setTenantProjector(() => {
+      projections++;
+      return Promise.resolve();
+    });
+    assertEquals(await f.receiver.apply(f.journal, fresh), true);
+    assertEquals(projections, 0, 'freshness replay owns no later projection');
+    assertEquals(await pendingTenantProjection(db), later);
+  } finally {
+    setTenantProjector(undefined);
+    await f.close();
+  }
+});
+
+Deno.test('review projection: completed production auth projection replays its lost ACK without waiting for newer tenant work', async () => {
+  const f = await fixture();
+  const held = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const invoked = Promise.withResolvers<void>();
+  let blocker: Promise<void> | undefined;
+  let applying: Promise<boolean> | undefined;
+  try {
+    setTenantProjector(projectTenant);
+    const first = await f.emit();
+    await f.journal.receive('home', [first]);
+    await f.receiver.apply(f.journal, first);
+    await deactivateUser(f.ht, 'alice');
+    const changed = await f.emit();
+    await f.journal.receive('home', [changed]);
+    const interrupted = new Proxy(f.journal, {
+      get(journal, key) {
+        if (key === 'apply') {
+          return () => Promise.reject(new Error('lost projected ACK'));
+        }
+        const value = Reflect.get(journal, key);
+        return typeof value === 'function' ? value.bind(journal) : value;
+      },
+    });
+    await assertRejects(
+      () => f.receiver.apply(interrupted, changed),
+      Error,
+      'lost projected ACK',
+    );
+    const db = await f.edge.tenant('logical.test');
+    assertEquals(
+      await pendingTenantProjection(db),
+      0,
+      'production projection completed before the lost ACK',
+    );
+    const later = await db.tx(recordTenantProjection);
+    blocker = withProjectionLock(async () => {
+      held.resolve();
+      await release.promise;
+    });
+    await bounded(held.promise);
+    setTenantProjector((...args: Parameters<typeof projectTenant>) => {
+      invoked.resolve();
+      return projectTenant(...args);
+    });
+    applying = f.receiver.apply(f.journal, changed);
+    assertEquals(
+      await bounded(Promise.race([
+        applying.then(() => 'ack'),
+        invoked.promise.then(() => 'newer projection'),
+      ])),
+      'ack',
+      'completed receipt must not invoke or queue behind newer projection',
+    );
+    assertEquals(await applying, true);
+    assertEquals(
+      (await f.journal.heads('home', 'in', changed)).applied.sequence,
+      changed.sequence,
+    );
+    assertEquals(
+      await pendingTenantProjection(db),
+      later,
+      'replay must leave unrelated work pending',
+    );
+    assertEquals(await verifyUserPassword(f.et, 'alice', 'pw'), false);
+  } finally {
+    release.resolve();
+    await blocker;
+    await applying?.catch(() => {});
+    setTenantProjector(undefined);
+    await f.close();
+  }
+});
+
+Deno.test('auth publication retains its semantic projection across tenant-only completion and exact replay', async () => {
+  const f = await fixture();
+  const release = Promise.withResolvers<void>();
+  const entered = Promise.withResolvers<void>();
+  let applying: Promise<boolean> | undefined;
+  try {
+    const first = await f.emit();
+    await f.journal.receive('home', [first]);
+    await f.receiver.apply(f.journal, first);
+    await deactivateUser(f.ht, 'alice');
+    const changed = await f.emit();
+    await f.journal.receive('home', [changed]);
+    let projections = 0;
+    setTenantProjector(() => {
+      projections++;
+      return Promise.resolve();
+    });
+    const interrupted = new Proxy(f.journal, {
+      get(journal, key) {
+        if (key === 'apply') {
+          return () => Promise.reject(new Error('after tenant publication'));
+        }
+        const value = Reflect.get(journal, key);
+        return typeof value === 'function' ? value.bind(journal) : value;
+      },
+    });
+    await assertRejects(
+      () => f.receiver.apply(interrupted, changed),
+      Error,
+      'after tenant publication',
+    );
+    assertEquals(projections, 1);
+    const db = await f.edge.tenant('logical.test');
+    const retained = await pendingTenantProjection(db);
+    assertEquals(retained > 0, true);
+    setTenantProjector(async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    let completed = false;
+    applying = f.receiver.apply(f.journal, changed).then((result) => {
+      completed = true;
+      return result;
+    });
+    await bounded(entered.promise);
+    assertEquals(completed, false);
+    assertEquals(
+      (await f.journal.heads('home', 'in', changed)).applied.sequence,
+      first.sequence,
+    );
+    assertEquals(await pendingTenantProjection(db), retained);
+    release.resolve();
+    assertEquals(await bounded(applying), true);
+    assertEquals(await verifyUserPassword(f.et, 'alice', 'pw'), false);
+    assertEquals(
+      (await f.journal.heads('home', 'in', changed)).applied.sequence,
+      changed.sequence,
+    );
+  } finally {
+    release.resolve();
+    await applying?.catch(() => {});
+    setTenantProjector(undefined);
     await f.close();
   }
 });

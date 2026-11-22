@@ -110,6 +110,35 @@ Deno.test('restore work inventory: every delayed command, pending/frozen federat
         'INSERT INTO push_badges(incarnation,user,revision,sent_revision,expired_revision,attempts,next_ms,created_ms) VALUES(?,?,?,?,?,?,?,?)',
         ['pusher', '@alice:restore.test', 3, 2, 0, 0, 0, now - 100],
       );
+      await tx.execute(
+        'INSERT INTO federation_invite_attempts(room_id,sender,target,event_id,destination,request_json,status,added_ms) VALUES(?,?,?,?,?,?,?,?)',
+        [
+          '!room:test',
+          '@alice:restore.test',
+          '@bob:peer.test',
+          '$invite',
+          'peer.test',
+          '{"private":"prepared invite"}',
+          'pending',
+          now - 100,
+        ],
+      );
+      await tx.execute(
+        'INSERT INTO prejoin_jobs VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+        [
+          'local-leave-job',
+          '!old:test',
+          '@alice:restore.test',
+          '$old-invite',
+          'leave',
+          'rejecting',
+          2,
+          '{"private":"frozen work"}',
+          '{"private":"source evidence"}',
+          now - 100,
+          now + 100,
+        ],
+      );
     });
     assert(
       await freezeBatch(db, 'peer.test', {
@@ -157,6 +186,22 @@ Deno.test('restore work inventory: every delayed command, pending/frozen federat
         assertEquals(result.federation.frozen.length, 1);
         assertEquals(result.federation.frozen[0].txn_id, 'frozen-id');
         assertEquals(String(result.federation.frozen[0].sha256).length, 64);
+        assertEquals(result.federation.prejoin.length, 1);
+        assertEquals(result.federation.prejoin[0].job_id, 'local-leave-job');
+        assert(
+          'invites' in result.federation,
+          'pending prepared invite work is missing from the restore report',
+        );
+        assertEquals(result.federation.invites, [{
+          room_id: '!room:test',
+          sender: '@alice:restore.test',
+          target: '@bob:peer.test',
+          event_id: '$invite',
+          destination: 'peer.test',
+          status: 'pending',
+          added_ms: now - 100,
+          prepared: 0,
+        }]);
         assertEquals(result.push.deliveries.length, 1);
         assertEquals(result.push.badges.length, 1);
         assert(
