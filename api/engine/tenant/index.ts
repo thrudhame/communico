@@ -984,8 +984,15 @@ function bind(
         changed();
       },
       next: () => delayedEvents.next(conn),
-      retry: async (ids: readonly string[], due: number) => {
-        await delayedEvents.retry(conn, ids, due);
+      retry: async (
+        ids: readonly string[],
+        due: number,
+        observed?: readonly Pick<
+          delayedEvents.DelayedEvent,
+          'id' | 'due' | 'since'
+        >[],
+      ) => {
+        await delayedEvents.retry(conn, ids, due, observed);
         changed();
       },
       due: (now: number) => delayedEvents.due(conn, now),

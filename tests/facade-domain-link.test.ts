@@ -333,23 +333,34 @@ Deno.test('domain schedules: signed inventory and suffix retain account-wide rep
     );
     // An existing standalone schedule has no semantic fact until enrollment.
     const homeDb = await f.home.tenant('logical.test');
-    await homeDb.execute(
-      'INSERT INTO delayed_events(id,localpart,room_id,type,state_key,content,delay_ms,since_ms,due_ms,room_pos,state_event) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
-      [
-        event.id,
-        event.localpart,
-        event.roomId,
-        event.type,
-        event.stateKey,
-        JSON.stringify(event.content),
-        event.delay,
-        event.since,
-        event.due,
-        event.roomPos,
-        event.stateEvent,
-      ],
-    );
+    for (const id of ['quarantined-legacy', event.id]) {
+      await homeDb.execute(
+        'INSERT INTO delayed_events(id,localpart,room_id,type,state_key,content,delay_ms,since_ms,due_ms,room_pos,state_event) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+        [
+          id,
+          event.localpart,
+          event.roomId,
+          event.type,
+          event.stateKey,
+          JSON.stringify(event.content),
+          event.delay,
+          event.since,
+          event.due,
+          event.roomPos,
+          event.stateEvent,
+        ],
+      );
+      if (id === 'quarantined-legacy') await homeDb.tx(sanitizeRestoredTenant);
+    }
+    // The same account may contain a restored factless legacy schedule. It is
+    // private quarantine evidence, not permission to reconstruct source history.
     const records = await f.hs.bootstrap('alice', f.bundle.id);
+    assertEquals(
+      await homeDb.query(
+        "SELECT phase FROM delayed_events WHERE id='quarantined-legacy'",
+      ),
+      [{ phase: 'quarantined' }],
+    );
     const body =
       (records.at(-1)!.payload as { body: Record<string, unknown> }).body;
     assertEquals(
@@ -417,7 +428,8 @@ Deno.test('domain schedules: signed inventory and suffix retain account-wide rep
           'delayed_events' in homeList
             ? homeList.delayed_events.map((e) => e.delay_id)
             : [],
-          [edgeId],
+          // Quarantined local evidence stays listed, like any restored row.
+          ['quarantined-legacy', edgeId],
         );
         await assertRejects(
           () => homeWorker.action(edgeId, 'send'),
@@ -431,7 +443,7 @@ Deno.test('domain schedules: signed inventory and suffix retain account-wide rep
         await homeDb.query('SELECT id FROM delayed_events WHERE localpart=?', [
           'alice',
         ]),
-        [],
+        [{ id: 'quarantined-legacy' }],
       );
       const homeExport = await f.hs.export('alice', f.bundle.id);
       assert(
@@ -4150,3 +4162,4 @@ Deno.test('domain history: authenticated current home, account and control bindi
     });
   }
 });
+import { sanitizeRestoredTenant } from '#engine/tenant/restore.ts';

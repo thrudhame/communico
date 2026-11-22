@@ -217,6 +217,8 @@ export const tableContracts = {
       'notification_history',
       // Terminal account lifecycle projection; original source facts survive.
       'notification_retired_users',
+      // Removed-room retirement keeps late authenticated facts unapplied.
+      'notification_retired_rooms',
       'push_targets',
       'push_rejections',
       'push_delivery',

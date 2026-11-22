@@ -13,6 +13,12 @@ import { withCandidateStore } from '#engine/store/candidate.ts';
 import { sanitizeRestoredTenant } from '#engine/tenant/restore.ts';
 import * as delayed from '#engine/tenant/delayed-events.ts';
 import { capabilities } from '#engine/facade/capabilities.ts';
+import {
+  deleteDevice,
+  deviceById,
+  upsertDeviceRow,
+} from '#engine/tenant/devices.ts';
+import { deactivateUserRows } from '#engine/tenant/users.ts';
 
 async function fixture() {
   const dir = await Deno.makeTempDir({ prefix: 'facade-delayed-' });
@@ -157,11 +163,13 @@ Deno.test('facade delayed activation: missing room scope retains the unclaimed n
       tx.delayedEvents.operations('alice')
     );
     await scheduler.drain();
-    assertEquals(await f.edge.tx((tx) => tx.delayedEvents.get(id)), input);
-    assertEquals(
-      await f.edge.tx((tx) => tx.delayedEvents.operations('alice')),
-      before,
-    );
+    const after = await f.edge.tx((tx) => tx.delayedEvents.get(id));
+    assert(after!.due > Date.now());
+    assertEquals({ ...after, due: input.due }, input);
+    const facts = await f.edge.tx((tx) => tx.delayedEvents.operations('alice'));
+    assertEquals(facts.length, before.length + 1);
+    assertEquals(facts.slice(0, -1), before);
+    assertEquals(JSON.parse(facts.at(-1)!.payload).event, after);
   } finally {
     await scheduler.stop();
     await f.close();
@@ -770,6 +778,237 @@ Deno.test('facade delayed replicas: account retirement hides original pending fa
     );
     assertEquals(await f.edge.tx((tx) => tx.delayedEvents.due(999999)), []);
   } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade delayed runnable quota excludes quarantined and foreign ownership evidence', async () => {
+  const f = await fixture();
+  try {
+    const raw = await f.stores[0].tenant('logical.test');
+    await f.home.tx((tx) => tx.delayedEvents.add(event('old-backup'), 1));
+    await raw.tx(sanitizeRestoredTenant);
+    await raw.execute(
+      'INSERT INTO delayed_events SELECT ?,localpart,room_id,type,state_key,content,delay_ms,since_ms,due_ms,room_pos,state_event,?,event_id,pending_pdu,completed FROM delayed_events WHERE id=?',
+      [
+        await f.edge.tx((tx) => tx.delayedEvents.newId()),
+        'pending',
+        'old-backup',
+      ],
+    );
+    await f.home.tx((tx) => tx.delayedEvents.add(event('new-command'), 1));
+    assertEquals(
+      (await f.home.tx((tx) => tx.delayedEvents.due(999999))).map((e) => e.id),
+      ['new-command'],
+    );
+    assertEquals(await f.home.tx((tx) => tx.delayedEvents.next()), 61000);
+    await assertRejects(
+      () => f.home.tx((tx) => tx.delayedEvents.add(event('over-quota'), 1)),
+      MatrixError,
+      'too many',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade delayed prepared identity rejects incomplete null-PDU history in either arrival order', async () => {
+  for (const reversed of [false, true]) {
+    const f = await fixture();
+    try {
+      const source = await f.stores[0].tenant('logical.test');
+      await f.home.tx((tx) =>
+        tx.delayedEvents.add(event('prepared-shape'), 10)
+      );
+      await f.home.tx((tx) => tx.delayedEvents.claim('prepared-shape', 999999));
+      await f.home.tx((tx) =>
+        tx.delayedEvents.prepare('prepared-shape', {
+          event_id: '$fixed',
+          room_id: event().roomId,
+          type: 'm.room.encrypted',
+          sender: '@alice:logical.test',
+          content: { ciphertext: 'fixed' },
+          origin_server_ts: 1234,
+          prev_events: [],
+          auth_events: [],
+          depth: 1,
+          hashes: { sha256: 'fixed' },
+          signatures: {},
+        } as Pdu)
+      );
+      const facts = await f.home.tx((tx) =>
+        tx.delayedEvents.operations('alice')
+      );
+      const body = JSON.parse(facts.at(-1)!.payload);
+      body.pdu = null;
+      const hole = await source.tx((conn) =>
+        writeRegister(
+          conn,
+          { source: 'home', incarnation: 'home-store' },
+          facts[0].semanticKey,
+          'delayed-event',
+          JSON.stringify(body),
+        )
+      );
+      if (!reversed) {
+        for (const fact of facts) {
+          await f.edge.tx((tx) => tx.delayedEvents.import(fact));
+        }
+      }
+      await assertRejects(
+        () => f.edge.tx((tx) => tx.delayedEvents.import(hole.operation)),
+        Error,
+        'invalid delayed event',
+      );
+      if (reversed) {
+        for (const fact of facts.toReversed()) {
+          await f.edge.tx((tx) => tx.delayedEvents.import(fact));
+        }
+      }
+      assertEquals(
+        await f.edge.tx((tx) => tx.delayedEvents.operations('alice')),
+        facts,
+      );
+    } finally {
+      await f.close();
+    }
+  }
+});
+
+for (const deactivate of [false, true]) {
+  Deno.test(`facade delayed immutable receipt identity survives ${deactivate ? 'account retirement' : 'device cleanup'}`, async () => {
+    const f = await fixture();
+    try {
+      const raw = await f.stores[0].tenant('logical.test');
+      await raw.tx((conn) =>
+        upsertDeviceRow(conn, 'schedule-device', 'alice', null)
+      );
+      const device = await raw.tx((conn) =>
+        deviceById(conn, 'schedule-device', 'alice')
+      );
+      const receipt = {
+        device: {
+          localpart: 'alice',
+          deviceId: 'schedule-device',
+          generation: device!.generation,
+        },
+        endpoint: 'delayed',
+        txnId: 'same',
+      };
+      await f.home.tx((tx) =>
+        tx.delayedEvents.add(event('receipt-command'), 10, receipt)
+      );
+      const [original] = await f.home.tx((tx) =>
+        tx.delayedEvents.operations('alice')
+      );
+      if (deactivate) {
+        await raw.tx((conn) =>
+          deactivateUserRows(conn, 'logical.test', 'alice')
+        );
+      } else {
+        await raw.tx((conn) => deleteDevice(conn, 'schedule-device', 'alice'));
+        assertEquals(
+          await f.home.tx((tx) => tx.delayedEvents.receipt(receipt)),
+          null,
+        );
+        await f.home.tx((tx) =>
+          tx.delayedEvents.action('receipt-command', 'restart', 2000)
+        );
+        await raw.tx((conn) =>
+          upsertDeviceRow(conn, 'schedule-device', 'alice', null)
+        );
+        const replacement = await raw.tx((conn) =>
+          deviceById(conn, 'schedule-device', 'alice')
+        );
+        assert(replacement!.generation > device!.generation);
+        const next = {
+          ...receipt,
+          device: { ...receipt.device, generation: replacement!.generation },
+        };
+        assertEquals(
+          await f.home.tx((tx) =>
+            tx.delayedEvents.add(event('replacement-command'), 10, next)
+          ),
+          'replacement-command',
+        );
+        await f.home.tx((tx) => tx.delayedEvents.remove('receipt-command'));
+      }
+      const facts = (await f.home.tx((tx) =>
+        tx.delayedEvents.operations('alice')
+      )).filter((op) =>
+        op.semanticKey === original.semanticKey
+      );
+      for (const fact of facts) {
+        assertEquals(
+          JSON.parse(fact.payload).receipts,
+          JSON.parse(original.payload).receipts,
+        );
+      }
+      for (const fact of facts.toReversed()) {
+        await f.edge.tx((tx) => tx.delayedEvents.import(fact));
+      }
+      assertEquals(
+        await f.edge.tx((tx) => tx.delayedEvents.replicas('alice')),
+        [],
+      );
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+Deno.test('facade delayed pending admission backoff frees the batch without overwriting concurrent restart', async () => {
+  const f = await fixture();
+  let reachedLater = false;
+  let restarted = false;
+  const scheduler = new DelayedEvents({ tenant: f.home, store: f.stores[0] }, {
+    async admitRoom(roomId) {
+      if (roomId === '!later:logical.test') {
+        reachedLater = true;
+        return;
+      }
+      if (!restarted) {
+        restarted = true;
+        await f.home.tx((tx) =>
+          tx.delayedEvents.action('denied-00', 'restart', Date.now() + 60000)
+        );
+      }
+      throw new MatrixError(503, 'M_UNAVAILABLE', 'room replica unavailable');
+    },
+  });
+  try {
+    // One selected row is concurrently restarted, leaving a full denied batch
+    // due unless admission failures themselves are rebased.
+    for (let i = 0; i < 33; i++) {
+      await f.home.tx((tx) =>
+        tx.delayedEvents.add(event('denied-' + String(i).padStart(2, '0')), 40)
+      );
+    }
+    await f.home.tx((tx) =>
+      tx.delayedEvents.add({
+        ...event('later'),
+        roomId: '!later:logical.test',
+        due: 62000,
+      }, 40)
+    );
+    await scheduler.drain();
+    assertEquals(reachedLater, false);
+    const first = await f.home.tx((tx) => tx.delayedEvents.get('denied-00'));
+    assert(
+      first!.due > Date.now() + 60000,
+      'stale batch overwrote a concurrent restart',
+    );
+    await scheduler.drain();
+    assertEquals(
+      reachedLater,
+      true,
+      'denied pending batch starved the later admitted room',
+    );
+    const denied = await f.home.tx((tx) => tx.delayedEvents.get('denied-01'));
+    assertEquals(denied!.phase, 'pending');
+    assertEquals(denied!.since, 1000);
+  } finally {
+    await scheduler.stop();
     await f.close();
   }
 });
