@@ -67,7 +67,7 @@ async function remove(
       } catch (error) {
         if (!(error instanceof Deno.errors.NotFound)) throw error;
         if (cutoff !== null) return null;
-        return await withProjectionLock(async () => {
+        return await withProjectionLock(app.store, async () => {
           const live = app.sender === null
             ? null
             : await app.sender.reviewIntents();
@@ -95,7 +95,7 @@ async function remove(
         );
         if (offered.length === 0) return null;
       }
-      return await withProjectionLock(async () => {
+      return await withProjectionLock(app.store, async () => {
         const live = app.sender === null
           ? null
           : await app.sender.reviewIntents();

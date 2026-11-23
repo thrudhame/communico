@@ -54,7 +54,12 @@ export async function reviewOutbox(app: App, destination: string | null) {
 }
 
 export async function retryOutbox(app: App, destination: string) {
-  await retryPrejoinIntents(app.server, app.tenant.serverName, destination);
+  await retryPrejoinIntents(
+    app.store,
+    app.server,
+    app.tenant.serverName,
+    destination,
+  );
   await retryDestination(app.server, destination);
   app.sender?.wake(destination);
 }
@@ -70,6 +75,11 @@ export async function pruneOutbox(
   app.sender?.wake(destination);
   return pdu +
     (live === null
-      ? await pruneRejectIntents(app.server, app.tenant.serverName, destination)
+      ? await pruneRejectIntents(
+        app.store,
+        app.server,
+        app.tenant.serverName,
+        destination,
+      )
       : live);
 }

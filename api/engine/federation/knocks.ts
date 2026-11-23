@@ -89,7 +89,7 @@ async function performKnockJob(
   return await withRoomLock(
     attempt.roomId,
     () =>
-      withProjectionLock(async () => {
+      withProjectionLock(deps.store, async () => {
         if (await deps.store.roomRetired(attempt.roomId)) return false;
         await assertRoomAcl(deps.store, attempt.roomId, deps.self);
         return await eventStreamTx(deps.server, async (tx) => {
@@ -203,7 +203,7 @@ export async function knockRemote(
         roomId,
         async () => {
           await admitLocalJoin(deps.store, roomId, userId);
-          return await withProjectionLock(async () => {
+          return await withProjectionLock(deps.store, async () => {
             if (await deps.store.roomRetired(roomId)) {
               throw new MatrixError(
                 404,

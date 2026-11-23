@@ -430,7 +430,7 @@ Deno.test('prejoin jobs: expiry retry and prune retain exact old work without bo
     assertEquals(expired.id, original.id);
     assertEquals(expired.work.status, 'failed-retract');
     assertEquals((await provider.review()).length, 1);
-    await retryPrejoinIntents(f.deps.server, 'test', f.origin);
+    await retryPrejoinIntents(f.deps.store, f.deps.server, 'test', f.origin);
     const [retried] = await prejoinJobs(f.deps.server);
     assertEquals(retried.id, original.id);
     assertEquals(retried.work.eventId, original.work.eventId);
@@ -445,7 +445,10 @@ Deno.test('prejoin jobs: expiry retry and prune retain exact old work without bo
       selected,
     );
     await assertRejects(() => admitLocalJoin(f.deps.store, f.roomId, f.user));
-    assertEquals(await pruneRejectIntents(f.deps.server, 'test', f.origin), 1);
+    assertEquals(
+      await pruneRejectIntents(f.deps.store, f.deps.server, 'test', f.origin),
+      1,
+    );
     assertEquals(await prejoinJobs(f.deps.server), []);
     assertEquals(
       (await inviteFor(f.roomId, f.user, f.deps))?.eventId,
@@ -857,7 +860,12 @@ Deno.test('prejoin: compensating departure materialization retains its exact sig
       knockRemote(f.roomId, f.user, {}, [f.origin], f.deps)
     );
     assertEquals(
-      await pruneRejectIntents(f.deps.server, f.deps.self, f.origin),
+      await pruneRejectIntents(
+        f.deps.store,
+        f.deps.server,
+        f.deps.self,
+        f.origin,
+      ),
       1,
     );
     const intent = await inviteFor(f.roomId, f.user, f.deps);
