@@ -5,8 +5,9 @@ import { activateTenantAuthority } from '#engine/tenant/session-authority.ts';
 import { registerUser } from '#engine/tenant/users.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { Turso } from '#engine/store/ffi.ts';
+import { captureBackupOperations } from '#engine/tenant/key-backup.ts';
 
-async function fixture() {
+async function fixture(enrolled = true) {
   const dir = await Deno.makeTempDir({ prefix: 'facade-backup-' });
   const stores: Awaited<ReturnType<typeof openStore>>[] = [];
   const tenants: Awaited<ReturnType<typeof openTenant>>[] = [];
@@ -21,15 +22,17 @@ async function fixture() {
     stores.push(store);
     const tenant = await openTenant(store, 'logical.test', { create: true });
     await registerUser(tenant, { localpart: 'alice', password: 'pw' });
-    await (await store.tenant(tenant.serverName)).tx((conn) =>
-      activateTenantAuthority(conn, {
-        node,
-        incarnation: node + '-store',
-        homeIncarnation: 'home-store',
-        edgeNode: 'edge',
-        edgeIncarnation: 'edge-store',
-      })
-    );
+    if (enrolled) {
+      await (await store.tenant(tenant.serverName)).tx((conn) =>
+        activateTenantAuthority(conn, {
+          node,
+          incarnation: node + '-store',
+          homeIncarnation: 'home-store',
+          edgeNode: 'edge',
+          edgeIncarnation: 'edge-store',
+        })
+      );
+    }
     tenants.push(tenant);
   }
   return {
@@ -52,6 +55,63 @@ async function fixture() {
   };
 }
 
+Deno.test('facade backup complete revision: bootstrap waits for every exact session dependency', async () => {
+  const f = await fixture(false);
+  try {
+    await f.home.tx((tx) =>
+      tx.keyBackup.version('alice', 'post', undefined, metadata)
+    );
+    await f.home.tx((tx) =>
+      tx.keyBackup.keys('alice', 'put', '1', '!r:logical.test', undefined, {
+        sessions: { a: session, b: session },
+      })
+    );
+    for (const [i, node] of ['home', 'edge'].entries()) {
+      await (await f.stores[i].tenant('logical.test')).tx((conn) =>
+        activateTenantAuthority(conn, {
+          node,
+          incarnation: node + '-store',
+          homeIncarnation: 'home-store',
+          edgeNode: 'edge',
+          edgeIncarnation: 'edge-store',
+        })
+      );
+    }
+    const facts = await (await f.stores[0].tenant('logical.test')).tx((conn) =>
+      captureBackupOperations(conn, 'alice')
+    );
+    const revision = facts.find((op) =>
+      JSON.parse(op.semanticKey).length === 3
+    )!;
+    const sessions = facts.filter((op) =>
+      JSON.parse(op.semanticKey).length === 5
+    );
+    await f.edge.tx((tx) => tx.keyBackup.import(revision));
+    for (const fact of sessions) {
+      for (
+        const read of [
+          () => f.edge.tx((tx) => tx.keyBackup.version('alice', 'get', '1')),
+          () => f.edge.tx((tx) => tx.keyBackup.keys('alice', 'get', '1')),
+        ]
+      ) {
+        const error = await assertRejects(read, MatrixError);
+        assertEquals(error.status, 503);
+      }
+      await f.edge.tx((tx) => tx.keyBackup.import(fact));
+    }
+    assertEquals(
+      await f.edge.tx((tx) => tx.keyBackup.version('alice', 'get', '1')),
+      await f.home.tx((tx) => tx.keyBackup.version('alice', 'get', '1')),
+    );
+    assertEquals(
+      await f.edge.tx((tx) => tx.keyBackup.keys('alice', 'get', '1')),
+      await f.home.tx((tx) => tx.keyBackup.keys('alice', 'get', '1')),
+    );
+  } finally {
+    await f.close();
+  }
+});
+
 const metadata = {
   algorithm: 'm.megolm_backup.v1.curve25519-aes-sha2',
   auth_data: { public_key: 'opaque' },
@@ -62,6 +122,61 @@ const session = {
   is_verified: true,
   session_data: { ciphertext: 'encrypted', mac: 'mac', ephemeral: 'key' },
 };
+
+for (const order of ['metadata-first', 'sessions-first'] as const) {
+  Deno.test(`facade backup complete revision: ${order} cuts keep matching etag and keys`, async () => {
+    const f = await fixture();
+    try {
+      const room = '!r:logical.test';
+      await f.home.tx((tx) =>
+        tx.keyBackup.version('alice', 'post', undefined, metadata)
+      );
+      for (const fact of await f.operations()) {
+        await f.edge.tx((tx) => tx.keyBackup.import(fact));
+      }
+      const read = (tenant: typeof f.home) =>
+        tenant.tx(async (tx) => ({
+          metadata: await tx.keyBackup.version('alice', 'get', '1'),
+          keys: await tx.keyBackup.keys('alice', 'get', '1'),
+        }));
+      for (const action of ['insert', 'replace', 'delete'] as const) {
+        const previous = await read(f.edge);
+        const before = new Set(
+          (await f.operations()).map((op) => op.operationId),
+        );
+        await f.home.tx((tx) =>
+          action === 'delete'
+            ? tx.keyBackup.keys('alice', 'delete', '1', room, 's')
+            : tx.keyBackup.keys('alice', 'put', '1', room, 's', {
+              ...session,
+              forwarded_count: action === 'replace' ? 0 : 1,
+            })
+        );
+        const delta = (await f.operations()).filter((op) =>
+          !before.has(op.operationId)
+        );
+        const facts = delta.sort((a, b) =>
+          order === 'metadata-first'
+            ? a.semanticKey.length - b.semanticKey.length
+            : b.semanticKey.length - a.semanticKey.length
+        );
+        assertEquals(facts.length, 2);
+        await f.edge.tx((tx) => tx.keyBackup.import(facts[0]));
+        assertEquals(
+          await read(f.edge),
+          previous,
+          `${action} exposed a partial revision`,
+        );
+        await f.edge.tx((tx) => tx.keyBackup.import(facts[1]));
+        assertEquals(await read(f.edge), await read(f.home));
+        await f.edge.tx((tx) => tx.keyBackup.import(facts[0]));
+        assertEquals(await read(f.edge), await read(f.home));
+      }
+    } finally {
+      await f.close();
+    }
+  });
+}
 
 Deno.test('facade backup delta: one-session upload work does not grow with backup size', async () => {
   const samples: { size: number; rows: number; facts: number }[] = [];
@@ -483,18 +598,19 @@ Deno.test('facade backup: failed passive import rolls back its fact and all vers
     );
     const facts = await f.operations();
     await f.edge.tx((tx) => tx.keyBackup.import(facts[0]));
+    await f.edge.tx((tx) => tx.keyBackup.import(facts[1]));
     const db = await f.stores[1].tenant('logical.test');
     await db.exec(
       "CREATE TRIGGER fail_backup_import BEFORE INSERT ON backup_sessions BEGIN SELECT RAISE(ABORT,'backup import failed'); END",
     );
-    await assertRejects(() => f.edge.tx((tx) => tx.keyBackup.import(facts[1])));
+    await assertRejects(() => f.edge.tx((tx) => tx.keyBackup.import(facts[2])));
     await db.exec('DROP TRIGGER fail_backup_import');
-    assertEquals((await f.operations(1)).length, 1);
+    assertEquals((await f.operations(1)).length, 2);
     assertEquals(
       await f.edge.tx((tx) => tx.keyBackup.version('alice', 'get')),
       { ...metadata, version: '1', count: 0, etag: '0' },
     );
-    await f.edge.tx((tx) => tx.keyBackup.import(facts[1]));
+    await f.edge.tx((tx) => tx.keyBackup.import(facts[2]));
     const restored = await f.edge.tx((tx) =>
       tx.keyBackup.keys('alice', 'get', '1')
     );

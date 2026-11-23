@@ -38,6 +38,9 @@ type Session = {
   session_data: Json;
 };
 type Entry = { room: string; session: string; data: Session };
+export const BACKUP_PUBLICATION_SQL = `
+ALTER TABLE backup_versions ADD COLUMN publication_id TEXT;
+`;
 const missing = () =>
   new MatrixError(404, 'M_NOT_FOUND', 'Unknown backup version or key');
 function invalid(message: string): never {
@@ -63,7 +66,24 @@ async function versionRow(
       'SELECT version_no,algorithm,auth_data,etag,deleted FROM backup_versions WHERE localpart=? AND version_no=?',
       [user, versionNumber(version)],
     );
-  if (!rows.length) throw missing();
+  if (!rows.length) {
+    const pending = await conn.query(
+      "SELECT 1 FROM domain_operations o WHERE kind='backup' AND json_extract(semantic_key,'$[1]')=?" +
+        (version === undefined
+          ? ''
+          : " AND json_extract(semantic_key,'$[2]')=?") +
+        " AND NOT EXISTS (SELECT 1 FROM backup_versions v WHERE v.localpart=json_extract(o.semantic_key,'$[1]') AND v.version_no=CAST(json_extract(o.semantic_key,'$[2]') AS INTEGER)) LIMIT 1",
+      [user, ...(version === undefined ? [] : [version])],
+    );
+    if (pending.length) {
+      throw new MatrixError(
+        503,
+        'M_UNAVAILABLE',
+        'backup revision unavailable',
+      );
+    }
+    throw missing();
+  }
   const row = rows[0];
   return {
     version_no: Number(row.version_no),
@@ -277,6 +297,7 @@ export async function backupKeys(
     (room === undefined ? '' : ' AND room_id=?') +
     (session === undefined ? '' : ' AND session_id=?');
   let changed = false;
+  const sessions: string[] = [];
   if (action === 'put') {
     const current = await versionRow(conn, user);
     if (current.version_no !== row.version_no) {
@@ -320,7 +341,7 @@ export async function backupKeys(
           payload,
           previous.length ? String(previous[0].payload) : undefined,
         );
-        await recordBackupSession(
+        const fact = await recordBackupSession(
           conn,
           user,
           row.version_no,
@@ -328,6 +349,7 @@ export async function backupKeys(
           entry.session,
           entry.data,
         );
+        if (fact) sessions.push(fact.operation.operationId);
         changed = true;
       }
     }
@@ -352,7 +374,7 @@ export async function backupKeys(
       session,
     );
     for (const entry of removed) {
-      await recordBackupSession(
+      const fact = await recordBackupSession(
         conn,
         user,
         row.version_no,
@@ -360,6 +382,7 @@ export async function backupKeys(
         String(entry.session_id),
         null,
       );
+      if (fact) sessions.push(fact.operation.operationId);
     }
   } else {
     const rows = await conn.query(
@@ -401,7 +424,7 @@ export async function backupKeys(
       'UPDATE backup_versions SET etag=? WHERE localpart=? AND version_no=?',
       [row.etag, user, row.version_no],
     );
-    await recordBackupVersion(conn, user, row.version_no);
+    await recordBackupVersion(conn, user, row.version_no, sessions);
   }
   return await stats(conn, user, row);
 }
@@ -446,6 +469,7 @@ type BackupRevision = {
   etag: string;
   deleted: boolean;
   count: number;
+  sessions: string[];
 };
 
 async function heldRevision(
@@ -461,6 +485,7 @@ async function heldRevision(
     etag: String(row.etag),
     deleted: row.deleted === 1,
     count: (await stats(conn, user, row)).count,
+    sessions: [],
   };
 }
 
@@ -484,7 +509,7 @@ async function recordBackupSession(
   const authority = await tenantAuthority(conn);
   if (!authority) return;
   if (authority.node !== 'home') throw new Error('backup source is not home');
-  await writeRegister(
+  return await writeRegister(
     conn,
     { source: authority.node, incarnation: authority.incarnation },
     sessionKey(user, version, room, session),
@@ -493,7 +518,12 @@ async function recordBackupSession(
   );
 }
 
-async function recordBackupVersion(conn: Conn, user: string, version: number) {
+async function recordBackupVersion(
+  conn: Conn,
+  user: string,
+  version: number,
+  sessions: string[] = [],
+) {
   const authority = await tenantAuthority(conn);
   if (!authority) return;
   if (authority.node !== 'home') throw new Error('backup source is not home');
@@ -502,7 +532,7 @@ async function recordBackupVersion(conn: Conn, user: string, version: number) {
     { source: authority.node, incarnation: authority.incarnation },
     semanticKey(user, String(version)),
     'backup',
-    JSON.stringify(await heldRevision(conn, user, version)),
+    JSON.stringify({ ...await heldRevision(conn, user, version), sessions }),
   );
 }
 
@@ -537,11 +567,10 @@ export async function captureBackupOperations(conn: Conn, user: string) {
   ) {
     const version = Number(row.version_no);
     if (
-      !(await registerOperations(conn, semanticKey(user, String(version))))
+      (await registerOperations(conn, semanticKey(user, String(version))))
         .length
-    ) {
-      await recordBackupVersion(conn, user, version);
-    }
+    ) continue;
+    const sessions: string[] = [];
     for (
       const entry of await conn.query(
         'SELECT room_id,session_id,payload FROM backup_sessions WHERE localpart=? AND version_no=? ORDER BY room_id,session_id',
@@ -549,12 +578,11 @@ export async function captureBackupOperations(conn: Conn, user: string) {
       )
     ) {
       const room = String(entry.room_id), session = String(entry.session_id);
-      if (
-        !(await registerOperations(
-          conn,
-          sessionKey(user, version, room, session),
-        )).length
-      ) {
+      let held = await readRegister(
+        conn,
+        sessionKey(user, version, room, session),
+      );
+      if (!held.winner) {
         await recordBackupSession(
           conn,
           user,
@@ -563,8 +591,14 @@ export async function captureBackupOperations(conn: Conn, user: string) {
           session,
           JSON.parse(String(entry.payload)),
         );
+        held = await readRegister(
+          conn,
+          sessionKey(user, version, room, session),
+        );
       }
+      sessions.push(held.winner!.operationId);
     }
+    await recordBackupVersion(conn, user, version, sessions);
   }
   return await backupOperations(conn, user);
 }
@@ -621,12 +655,14 @@ function revisionOf(
   if (
     body.version !== key[2] ||
     Object.keys(body).sort().join(',') !==
-      'algorithm,auth_data,count,deleted,etag,version' ||
+      'algorithm,auth_data,count,deleted,etag,sessions,version' ||
     typeof body.algorithm !== 'string' || !body.algorithm ||
     typeof body.etag !== 'string' || !/^(0|[1-9][0-9]*)$/.test(body.etag) ||
     !Number.isSafeInteger(Number(body.etag)) ||
     typeof body.deleted !== 'boolean' || !Number.isSafeInteger(body.count) ||
-    Number(body.count) < 0
+    Number(body.count) < 0 || !Array.isArray(body.sessions) ||
+    body.sessions.some((id) => typeof id !== 'string' || !id) ||
+    new Set(body.sessions).size !== body.sessions.length
   ) {
     throw new Error('invalid backup metadata');
   }
@@ -638,60 +674,115 @@ function revisionOf(
   return { user: key[1], version, revision: body as unknown as BackupRevision };
 }
 
-/** Home facts project their own key only. Metadata never rehydrates a version
- * after its first materialization; a late session cannot revive a deleted version. */
+/** Retention is independent of publication. A metadata revision names its exact
+ * session delta; neither side becomes visible until the entire revision is held. */
 export async function importBackup(
   conn: Conn,
   operation: RegisterOperation,
   limits: Limits,
   history?: DomainHistoryProof,
 ) {
-  const { user } = revisionOf(operation, limits);
+  const { user, version } = revisionOf(operation, limits);
   await requireTenantDomainSource(conn, operation, user, history);
-  const result = await importRegisterOperation(conn, operation);
+  await importRegisterOperation(conn, operation);
   const [account] = await conn.query(
     'SELECT deactivated FROM users WHERE localpart=?',
     [user],
   );
   if (!account) throw new Error('backup account unavailable');
-  if (account.deactivated === 1 || !result.changed || !result.winner) return;
-  const winner = revisionOf(result.winner, limits);
-  const { version, revision } = winner;
-  if (!revision) {
-    await projectBackupSession(conn, user, winner);
-    return;
-  }
+  if (account.deactivated === 1) return;
+  await publishBackupRevisions(conn, user, version, limits);
+}
+
+async function publishBackupRevisions(
+  conn: Conn,
+  user: string,
+  version: number,
+  limits: Limits,
+) {
+  const key = semanticKey(user, String(version));
+  const held = await readRegister(conn, key);
+  if (!held.winner) return;
   const [previous] = await conn.query(
-    'SELECT 1 FROM backup_versions WHERE localpart=? AND version_no=?',
+    'SELECT publication_id FROM backup_versions WHERE localpart=? AND version_no=?',
     [user, version],
   );
-  if (previous && revision.deleted) {
-    await forgetBackupEntries(conn, user, version);
-  }
-  await conn.execute(
-    'INSERT INTO backup_versions(localpart,version_no,algorithm,auth_data,etag,deleted,session_count,restore_bytes) VALUES(?,?,?,?,?,?,0,?) ON CONFLICT(localpart,version_no) DO UPDATE SET algorithm=excluded.algorithm,auth_data=excluded.auth_data,etag=excluded.etag,deleted=excluded.deleted',
-    [
-      user,
-      version,
-      revision.algorithm,
-      JSON.stringify(revision.auth_data),
-      Number(revision.etag),
-      revision.deleted ? 1 : 0,
-      EMPTY_BACKUP_BYTES,
-    ],
+  const published = previous?.publication_id;
+  const operations = new Map(
+    [...held.conflicts, held.winner].map((op) => [op.operationId, op]),
   );
-  if (!previous && !revision.deleted) {
-    for (
-      const row of await conn.query(
-        "SELECT DISTINCT semantic_key FROM domain_operations WHERE kind='backup' AND json_array_length(semantic_key)=5 AND json_extract(semantic_key,'$[1]')=? AND json_extract(semantic_key,'$[2]')=?",
-        [user, String(version)],
-      )
-    ) {
-      const held = await readRegister(conn, String(row.semantic_key));
-      if (held.winner) {
-        await projectBackupSession(conn, user, revisionOf(held.winner, limits));
-      }
+  const revisions: RegisterOperation[] = [];
+  const seen = new Set<string>();
+  function visit(op: RegisterOperation) {
+    if (op.operationId === published || seen.has(op.operationId)) return;
+    seen.add(op.operationId);
+    for (const dot of op.context) {
+      const id = JSON.stringify([
+        dot.source,
+        dot.incarnation,
+        op.stream,
+        dot.sequence,
+      ]);
+      const parent = operations.get(id);
+      if (!parent) throw new Error('backup revision predecessor unavailable');
+      visit(parent);
     }
+    revisions.push(op);
+  }
+  visit(held.winner);
+  for (const op of revisions) {
+    const revision = revisionOf(op, limits).revision!;
+    const delta: ReturnType<typeof revisionOf>[] = [];
+    for (const id of revision.sessions) {
+      const [row] = await conn.query(
+        'SELECT semantic_key FROM domain_operations WHERE operation_id=?',
+        [id],
+      );
+      if (!row) return;
+      const view = await readRegister(conn, String(row.semantic_key));
+      const session = [view.winner, ...view.conflicts].find((fact) =>
+        fact?.operationId === id
+      );
+      if (!session) return;
+      const fact = revisionOf(session, limits);
+      if (
+        fact.user !== user || fact.version !== version ||
+        fact.data === undefined
+      ) {
+        throw new Error('backup revision session mismatch');
+      }
+      delta.push(fact);
+    }
+    // Reconstruct an unqualified legacy replica only from the complete root,
+    // never from independently materialized session winners.
+    if (previous && !published && op === revisions[0]) {
+      await forgetBackupEntries(conn, user, version);
+    }
+    await conn.execute(
+      'INSERT INTO backup_versions(localpart,version_no,algorithm,auth_data,etag,deleted,session_count,restore_bytes) VALUES(?,?,?,?,?,?,0,?) ON CONFLICT(localpart,version_no) DO UPDATE SET algorithm=excluded.algorithm,auth_data=excluded.auth_data,etag=excluded.etag,deleted=excluded.deleted',
+      [
+        user,
+        version,
+        revision.algorithm,
+        JSON.stringify(revision.auth_data),
+        Number(revision.etag),
+        revision.deleted ? 1 : 0,
+        EMPTY_BACKUP_BYTES,
+      ],
+    );
+    if (revision.deleted) await forgetBackupEntries(conn, user, version);
+    else for (const fact of delta) await projectBackupSession(conn, user, fact);
+    const [total] = await conn.query(
+      'SELECT session_count FROM backup_versions WHERE localpart=? AND version_no=?',
+      [user, version],
+    );
+    if (Number(total.session_count) !== revision.count) {
+      throw new Error('backup revision accounting mismatch');
+    }
+    await conn.execute(
+      'UPDATE backup_versions SET publication_id=? WHERE localpart=? AND version_no=?',
+      [op.operationId, user, version],
+    );
   }
 }
 
@@ -708,8 +799,6 @@ async function projectBackupSession(
     'SELECT deleted FROM backup_versions WHERE localpart=? AND version_no=?',
     [user, version],
   );
-  // Authentic session facts may precede their metadata in transport. First
-  // metadata import projects retained winners once; later updates are O(change).
   if (!metadata || metadata.deleted === 1) return;
   if (data === null) {
     await forgetBackupEntries(conn, user, version, room, session);
