@@ -1178,10 +1178,10 @@ function appliedReadTests() {
             MatrixError,
             'replica unavailable',
           );
-          await assertRejects(
-            () => federationHierarchy(f.source.roomId, 'logical.test', false),
-            MatrixError,
-            'replica unavailable',
+          assertEquals(
+            (await federationHierarchy(f.source.roomId, 'logical.test', false))
+              .room.room_id,
+            f.source.roomId,
           );
           await (await f.edgeServer()).tx((conn) => readAdmission.check(conn));
           const before = await journal.heads('home', 'in', room);
@@ -1301,7 +1301,7 @@ function appliedReadTests() {
     }
   });
 
-  Deno.test('applied read split preserves federation hierarchy child admission', async () => {
+  Deno.test('PAIR503: federation hierarchy serves the applied child publication', async () => {
     const f = await fixture();
     try {
       const root = await createRoom(f.home, {
@@ -1364,31 +1364,46 @@ function appliedReadTests() {
         keyDocument: () => Promise.reject(new Error('unused')),
         publicRooms: async () => (await directory.snapshot())!.publicRooms,
       });
-      assertEquals(
-        (await federationHierarchy(root.roomId, 'logical.test', false)).children
-          .length,
-        1,
+      const initial = await federationHierarchy(
+        root.roomId,
+        'remote.test',
+        false,
       );
+      assertEquals(initial.children.map((child) => child.room_id), [
+        f.source.roomId,
+      ]);
       const next = await f.source.addEvent({
-        type: 'm.room.join_rules',
+        type: 'm.room.server_acl',
         state_key: '',
-        content: { join_rule: 'invite' },
+        content: { allow: ['*'], deny: ['remote.test'] },
       });
       await f.ingest([next]);
       const suffix = await f.exports();
       assert(suffix);
       await journal.receive('home', [suffix]);
-      await assertRejects(
-        () => federationHierarchy(root.roomId, 'logical.test', false),
-        MatrixError,
-        'replica unavailable',
+      const held = await journal.heads('home', 'in', suffix);
+      assertEquals(held.received.sequence, suffix.sequence);
+      assertEquals(held.applied.sequence, childRecord.sequence);
+      assertEquals(
+        await federationHierarchy(root.roomId, 'remote.test', false),
+        initial,
       );
+      assertEquals(await journal.heads('home', 'in', suffix), held);
       const client = await clientHierarchy(
         root.roomId,
         f.source.creator,
         hierarchyQuery(new URLSearchParams('limit=10')),
       );
       assert(client.rooms.some((room) => room.room_id === f.source.roomId));
+      assert(await (await f.replicas()).apply(journal, suffix));
+      const applied = await federationHierarchy(
+        root.roomId,
+        'remote.test',
+        false,
+      );
+      assertEquals(applied.room, initial.room);
+      assertEquals(applied.children, []);
+      assertEquals(applied.inaccessible_children, [f.source.roomId]);
     } finally {
       await closeApp();
       await f.close();
