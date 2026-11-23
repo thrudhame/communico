@@ -85,6 +85,8 @@ export async function startFacade(
             );
           }
           if (required === 'public' || required === 'rooms') {
+            // Require the applied bootstrap only. Endpoint owners decide if
+            // an admission also needs a particular current cut.
             await runtime.requireReadScope('directory');
           }
           if (

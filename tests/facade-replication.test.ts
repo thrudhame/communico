@@ -5052,7 +5052,7 @@ Deno.test('directory and peer policy exports use the published server cut withou
   }
 });
 
-Deno.test('real replica HTTP reads distinguish required cuts from absence and bind home directory policy', async () => {
+Deno.test('PAIR503: public federation reads serve the applied publication', async (t) => {
   const f = await fixture();
   let http: Deno.HttpServer<Deno.NetAddr> | undefined;
   setConfigForTests({
@@ -5094,7 +5094,8 @@ Deno.test('real replica HTTP reads distinguish required cuts from absence and bi
         Promise.reject(new Error('unused key-document callback')),
       keys: keyStore(await f.edgeServer(), { signer: f.node.signer() }),
       signer: f.node.signer(),
-      publicRooms: async () => (await directory.snapshot())!.publicRooms,
+      publicRooms: async () =>
+        (await directory.snapshot('applied'))!.publicRooms,
     });
     http = Deno.serve(
       { hostname: '127.0.0.1', port: 0, onListen: () => {} },
@@ -5161,20 +5162,66 @@ Deno.test('real replica HTTP reads distinguish required cuts from absence and bi
     const next = await f.directoryExport();
     assert(next);
     await journal.receive('home', [next]);
-    assertEquals((await call('GET', profile)).status, 503);
     assert(await directory.apply(journal, next));
-    setConfigForTests({
-      server: { name: 'logical.test', role: 'facade' },
-      federation: { enabled: true, publicrooms: false },
-    });
-    const published = await call('GET', p + 'publicRooms');
-    assertEquals(published.status, 200);
-    assertEquals(
-      (published.body.chunk as { room_id: string }[]).map((room) =>
-        room.room_id
-      ),
-      [f.source.roomId],
+    await f.tenant.tx((tx) =>
+      tx.profiles.set('alice', 'displayname', 'New Alice')
     );
+    const newUser = await f.publicExport();
+    assert(newUser);
+    setConfigForTests({
+      server: { name: 'logical.test' },
+      federation: { enabled: true, mode: 'open', publicrooms: false },
+    });
+    const newInventory = await f.directoryExport();
+    assert(newInventory);
+    await journal.receive('home', [newUser]);
+    await journal.receive('home', [newInventory]);
+    const readers = [
+      { name: 'profile', get: () => call('GET', profile) },
+      { name: 'alias', get: () => call('GET', alias) },
+      { name: 'devices', get: () => call('GET', devices) },
+      {
+        name: 'keys query',
+        get: () => call('POST', p + 'user/keys/query', query),
+      },
+    ];
+    for (const { name, get } of readers) {
+      await t.step(name, async () => {
+        const result = await get();
+        assertEquals(result.status, 200, JSON.stringify(result.body));
+        if (name === 'profile') {
+          assertEquals(result.body, { displayname: 'Linked Alice' });
+        } else if (name === 'alias') {
+          assertEquals(result.body, {
+            room_id: f.source.roomId,
+            servers: ['logical.test'],
+          });
+        }
+      });
+    }
+    for (const method of ['GET', 'POST'] as const) {
+      await t.step(method + ' publicRooms', async () => {
+        const result = await call(
+          method,
+          p + 'publicRooms',
+          method === 'POST' ? {} : undefined,
+        );
+        assertEquals(result.status, 200, JSON.stringify(result.body));
+        assertEquals(
+          (result.body.chunk as { room_id: string }[]).map((room) =>
+            room.room_id
+          ),
+          [f.source.roomId],
+        );
+      });
+    }
+    assert(await directory.apply(journal, newInventory));
+    assert(await (await f.publicOwner()).apply(journal, newUser));
+    assertEquals((await call('GET', p + 'publicRooms')).status, 403);
+    assertEquals(await call('GET', profile), {
+      status: 200,
+      body: { displayname: 'New Alice' },
+    });
   } finally {
     await http?.shutdown();
     await closeApp();
