@@ -48,7 +48,7 @@ async function assertNoJoinCleanup(
     ? eventId
     : null;
   const server = await store.server();
-  const result = await withProjectionLock(() => {
+  const result = await withProjectionLock(store, () => {
     const inflight = prejoinLeaveActive(store, roomId, userId);
     return eventStreamTx(server, async (tx) => {
       if (!inflight) await settleSupersededPrejoin(tx, roomId, userId);

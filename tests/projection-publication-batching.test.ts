@@ -135,7 +135,7 @@ async function together(
   };
   const entered = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
-  const held = withProjectionLock(async () => {
+  const held = withProjectionLock(store, async () => {
     entered.resolve();
     await release.promise;
   });
@@ -177,6 +177,204 @@ async function durableTables(store: Store) {
   }
   return result;
 }
+
+for (const changes of [35, 335]) {
+  Deno.test(`publication batching: a contended ${changes}-change same-room ready prefix takes one commit`, async () => {
+    await fixture(async (store, rooms) => {
+      const { g } = rooms[0];
+      const expectedByRoom: string[][] = [];
+      // Two change rows per live message (event plus its delivery effect),
+      // and one standalone signature intent reproduce the odd 335-row page.
+      for (const room of rooms) {
+        const expected = [room.event.eventId];
+        expectedByRoom.push(expected);
+        await room.g.room.tx((tx) =>
+          tx.changes.append('signature', room.g.tipId, {})
+        );
+        for (let at = 0; at < (changes - 3) / 2; at++) {
+          const event = await sendLocal(room.g.room, {
+            type: 'm.room.message',
+            sender: at % 2 ? '@bob:test' : room.g.creator,
+            content: { body: `prefix ${at}`, msgtype: 'm.text' },
+          }, room.g.signer);
+          room.event = event;
+          expected.push(event.eventId);
+        }
+      }
+      const expected = expectedByRoom[0];
+      const server = await store.server();
+      const mark = await get(server, sourceOf(g.roomId));
+      assertEquals(rooms[0].event.completion!.through - mark, changes);
+      const original = server.tx.bind(server);
+      const commits: string[][] = [];
+      server.tx = async (fn, options) => {
+        const committed = await original(async (tx) => {
+          const execute = tx.execute.bind(tx);
+          let publishes = false;
+          tx.execute = (sql, values) => {
+            if (sql.includes('INSERT INTO feed')) publishes = true;
+            return execute(sql, values);
+          };
+          const value = await fn(tx);
+          const published = publishes
+            ? (await tx.query(
+              'SELECT event FROM feed WHERE room=? AND pos>? ORDER BY seq',
+              [g.roomId, mark],
+            )).map((row) => String(row.event))
+            : null;
+          if (publishes) {
+            assertEquals(
+              (await tx.query(
+                'SELECT event FROM feed WHERE room=? AND event IN (SELECT CAST(value AS TEXT) FROM json_each(?)) ORDER BY seq',
+                [rooms[1].g.roomId, JSON.stringify(expectedByRoom[1])],
+              )).map((row) => row.event),
+              expectedByRoom[1],
+              'every already-ready room progresses in this same commit',
+            );
+          }
+          return { value, published };
+        }, options);
+        if (committed.published !== null) commits.push(committed.published);
+        return committed.value;
+      };
+      try {
+        assertEquals((await together(store, rooms)).map((r) => r.status), [
+          'fulfilled',
+          'fulfilled',
+        ]);
+        assertEquals(
+          commits.length,
+          1,
+          'commit turns must not scale with ready units',
+        );
+        assertEquals(
+          commits[0],
+          expected,
+          'the first group includes the whole ready prefix',
+        );
+        assertEquals(
+          (await server.query('SELECT event FROM feed WHERE event=?', [
+            rooms[1].event.eventId,
+          ])).length,
+          1,
+          'the other ready room progresses in the same group',
+        );
+        const beforeReplay = commits.length;
+        await Promise.all(
+          rooms.map(({ event }) => projectThrough(store, event.completion!)),
+        );
+        assertEquals(
+          commits.length,
+          beforeReplay,
+          'replay publishes no duplicate feed rows',
+        );
+        assertEquals(
+          (await server.query(
+            'SELECT event FROM feed WHERE room=? AND pos>? ORDER BY seq',
+            [
+              g.roomId,
+              mark,
+            ],
+          )).map((row) => row.event),
+          expected,
+        );
+      } finally {
+        server.tx = original;
+      }
+    });
+  });
+}
+
+Deno.test('publication batching: fixed-cut callers share ready preparation, not callback completion', async () => {
+  await fixture(async (store, rooms) => {
+    const originalRoom = store.room.bind(store);
+    const captures = new Map<string, number>();
+    store.room = async (...args) => {
+      const db = await originalRoom(...args);
+      return {
+        ...db,
+        tx: async (fn, options) => {
+          const value = await db.tx(fn, options);
+          if (isPreparedResult(value)) {
+            captures.set(args[0], (captures.get(args[0]) ?? 0) + 1);
+          }
+          return value;
+        },
+      };
+    };
+    const duplicates: Promise<void>[] = [];
+    try {
+      const result = await together(store, rooms, async () => {
+        for (const { event } of rooms) {
+          duplicates.push(projectThrough(store, event.completion!));
+          duplicates.push(projectThrough(store, event.completion!));
+        }
+        await setImmediate();
+      });
+      await Promise.all(duplicates);
+      assertEquals(
+        result.map((r) => r.status),
+        ['fulfilled', 'fulfilled'],
+      );
+      assertEquals(rooms.map(({ g }) => captures.get(g.roomId)), [1, 1]);
+    } finally {
+      await Promise.allSettled(duplicates);
+      store.room = originalRoom;
+    }
+
+    const { g } = rooms[0];
+    const first = await sendLocal(g.room, {
+      type: 'm.room.message',
+      sender: g.creator,
+      content: { body: 'held callback', msgtype: 'm.text' },
+    }, g.signer);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const stop = onProjected(async (candidate, roomId, through) => {
+      if (
+        candidate === store && roomId === g.roomId &&
+        through === first.completion!.through
+      ) {
+        entered.resolve();
+        await release.promise;
+      }
+    });
+    const pending = projectThrough(store, first.completion!);
+    try {
+      await entered.promise;
+      const next = await sendLocal(g.room, {
+        type: 'm.room.message',
+        sender: g.creator,
+        content: { body: 'later fixed cut', msgtype: 'm.text' },
+      }, g.signer);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          projectThrough(store, next.completion!),
+          new Promise<never>((_, reject) => {
+            timer = setTimeout(
+              () => reject(new Error('callback retained room preparation')),
+              5000,
+            );
+          }),
+        ]);
+      } finally {
+        clearTimeout(timer);
+      }
+      assertEquals(
+        (await (await store.server()).query(
+          'SELECT event FROM feed WHERE event=?',
+          [next.eventId],
+        )).length,
+        1,
+      );
+    } finally {
+      release.resolve();
+      await pending;
+      stop();
+    }
+  });
+});
 
 Deno.test('publication batching: a single ready unit uses set-wise notification work with identical durable facts', async () => {
   await fixture(async (baseline, rooms, dir) => {
@@ -408,6 +606,101 @@ for (
   });
 }
 
+Deno.test('publication batching: same-room dependent effects equal ordered unit commits', async () => {
+  await fixture(async (baseline, rooms, dir) => {
+    const { g, event } = rooms[0];
+    const events = [event];
+    events.push(
+      await sendLocal(g.room, {
+        type: 'm.room.message',
+        sender: '@bob:test',
+        content: {
+          body: 'reply',
+          msgtype: 'm.text',
+          'm.relates_to': { rel_type: 'm.thread', event_id: event.eventId },
+        },
+      }, g.signer),
+    );
+    events.push(
+      await sendLocal(g.room, {
+        type: 'm.room.redaction',
+        sender: g.creator,
+        content: { redacts: events[1].eventId },
+      }, g.signer),
+    );
+    events.push(
+      await sendLocal(g.room, {
+        type: 'm.room.member',
+        sender: g.creator,
+        state_key: '@bob:test',
+        content: { membership: 'leave' },
+      }, g.signer),
+    );
+    events.push(
+      await sendLocal(g.room, {
+        type: 'm.room.encryption',
+        sender: g.creator,
+        state_key: '',
+        content: { algorithm: 'm.megolm.v1.aes-sha2' },
+      }, g.signer),
+    );
+    await setReceipt(
+      await baseline.server(),
+      g.roomId,
+      '@bob:test',
+      'm.read',
+      events[1].eventId,
+    );
+    await baseline.close();
+    const now = Date.now;
+    Date.now = () => 1800000000000;
+    const results = [];
+    try {
+      for (const grouped of [false, true]) {
+        const copy = dir +
+          (grouped ? '-dependent-group' : '-dependent-ordered');
+        await cp(dir, copy, { recursive: true });
+        const store = await openStore({
+          dir: copy,
+          library: './.native/libturso_ffi.so',
+          checkpointlogbytes: 65536,
+          maxopenfiles: 16,
+          idleseconds: 300,
+        }, {
+          schemas: {
+            room: roomSchema,
+            server: serverSchema,
+            tenant: tenantSchema,
+          },
+        });
+        try {
+          if (grouped) await projectThrough(store, events.at(-1)!.completion!);
+          else {for (const entry of events) {
+              await projectThrough(store, entry.completion!);
+            }}
+          results.push(await durableTables(store));
+          await projectThrough(store, events.at(-1)!.completion!);
+          assertEquals(
+            await durableTables(store),
+            results.at(-1),
+            'replay changes no durable dependent facts',
+          );
+        } finally {
+          await store.close();
+          await Deno.remove(copy, { recursive: true });
+        }
+      }
+      assertEquals(
+        results[1],
+        results[0],
+        'feed, receipts, notifications, redactions, relations, membership and device facts match the ordered baseline',
+      );
+    } finally {
+      Date.now = now;
+    }
+  });
+});
+
 Deno.test('publication batching: rollback acknowledges nothing and isolates a permanently failing room without consuming sequences', async () => {
   await fixture(async (store, rooms) => {
     const server = await store.server();
@@ -565,7 +858,7 @@ Deno.test('publication batching: lifecycle replacement fences a prepared generat
     let replacement: Promise<void> | undefined;
     const result = await together(store, rooms, undefined, (at) => {
       if (at !== 1) return Promise.resolve();
-      replacement = withProjectionLock(async () => {
+      replacement = withProjectionLock(store, async () => {
         await finishRoomRemoval(store, rooms[1].g.roomId, {
           why: 'batch generation fence',
           intents: [],
@@ -598,7 +891,7 @@ Deno.test('publication batching: lifecycle replacement fences a prepared generat
   });
 });
 
-Deno.test('publication batching: a different Store ends the already-ready FIFO prefix', async () => {
+Deno.test('publication batching: a different Store has an independent commit owner', async () => {
   await fixture(async (first, rooms) => {
     await fixture(async (second, others) => {
       const server = await first.server();
@@ -644,10 +937,27 @@ Deno.test('publication batching: a different Store ends the already-ready FIFO p
           void middle.catch(() => {});
           await Promise.race([prepared.promise, middle]);
           await setImmediate();
+          // The first Store's real writer is still held. Another Store must
+          // finish, not merely enqueue behind that unrelated owner's barrier.
+          let timer: ReturnType<typeof setTimeout> | undefined;
+          try {
+            await Promise.race([
+              middle,
+              new Promise<never>((_, reject) => {
+                timer = setTimeout(
+                  () =>
+                    reject(new Error('unrelated Store blocked publication')),
+                  5000,
+                );
+              }),
+            ]);
+          } finally {
+            clearTimeout(timer);
+          }
         });
         await middle;
         assertEquals(result.map((r) => r.status), ['fulfilled', 'fulfilled']);
-        assertEquals(commits, [[ids[0]], [ids[1]]]);
+        assertEquals(commits, [ids]);
         assertEquals(
           await get(await second.server(), sourceOf(others[0].g.roomId)),
           others[0].event.completion!.through,
@@ -725,7 +1035,7 @@ for (const lifecycle of [false, true]) {
       };
       const entered = Promise.withResolvers<void>();
       const release = Promise.withResolvers<void>();
-      const held = withProjectionLock(async () => {
+      const held = withProjectionLock(store, async () => {
         entered.resolve();
         await release.promise;
       });
@@ -735,7 +1045,7 @@ for (const lifecycle of [false, true]) {
         await entered.promise;
         for (let index = 0; index < rooms.length; index++) {
           if (index === 1 && lifecycle) {
-            jobs.push(withProjectionLock(async () => {
+            jobs.push(withProjectionLock(store, async () => {
               atBoundary = (await server.query(select, ids)).map((r) =>
                 String(r.event)
               );

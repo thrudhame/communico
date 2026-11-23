@@ -563,7 +563,7 @@ export class MembershipOperations {
     const result = await withRoomLock(
       state.roomId,
       () =>
-        withProjectionLock(async () => {
+        withProjectionLock(this.store, async () => {
           if (await this.store.roomRetired(state.roomId)) {
             throw new LinkError(
               'LINK_UNAVAILABLE',

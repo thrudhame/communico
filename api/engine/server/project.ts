@@ -46,7 +46,6 @@ import {
 import { reconcileReceiptMarks } from '#engine/server/ephemeral.ts';
 import {
   capturePushesAt,
-  prepareCapturedPush,
   prepareCapturedPushes,
   type PushCapture,
   type PushPublication,
@@ -64,8 +63,7 @@ export function sourceOf(roomId: string): string {
   return roomSource('room', roomId);
 }
 
-// Capture pagination, not writer ownership. Contention ends a transaction at
-// its next complete event/effect unit; uncontended pages batch complete units.
+// Capture pagination, not a writer quota. A ready page contains complete units.
 const BATCH = 500;
 
 // Ingest appends an event/transition and its membership, redaction and delivery
@@ -110,7 +108,7 @@ async function captureChanges(room: Room, mark: number, head: number) {
 type PublicationTurn = {
   store: Store;
   roomId: string;
-  prepare: (contended: boolean) => Promise<Prepared[] | null>;
+  prepare: () => Promise<Prepared[] | null>;
   finish: (ready: Prepared[] | null) => Promise<TurnOutcome>;
   resolve: (value: TurnOutcome) => void;
   reject: (error: unknown) => void;
@@ -123,10 +121,217 @@ type TurnOutcome =
 type WriterTurn =
   | { kind: 'lifecycle'; run: () => Promise<void> }
   | { kind: 'publication'; work: PublicationTurn };
-const writerQueue: WriterTurn[] = [];
-let writing = false;
-let waitingWriters = 0;
-const roomQueues = new WeakMap<Store, Map<string, Promise<void>>>();
+// The durable event stream is Store-owned, not process-global. Room preparation
+// and lifecycle exclusion use this same owner, including startup and drain.
+const publishers = new WeakMap<Store, PublicationService>();
+function publicationService(store: Store): PublicationService {
+  let owner = publishers.get(store);
+  if (owner === undefined) {
+    owner = new PublicationService(store);
+    publishers.set(store, owner);
+    store.onDrain(() => owner!.drain());
+  }
+  return owner;
+}
+
+class PublicationService {
+  private readonly rooms = new Map<string, { requests: ProjectionRequest[] }>();
+  readonly queue: WriterTurn[] = [];
+  private writing = false;
+  private readonly tasks = new Set<Promise<unknown>>();
+
+  constructor(private readonly store: Store) {}
+
+  project(
+    roomId: string,
+    admitted: Promise<ProjectionAdmission>,
+  ): Promise<PublicationResult> {
+    const result = Promise.withResolvers<PublicationResult>();
+    const request: ProjectionRequest = { admitted, ...result };
+    void admitted.then((value) => {
+      request.value = value;
+    }, () => {});
+    let room = this.rooms.get(roomId);
+    if (room === undefined) {
+      room = { requests: [] };
+      this.rooms.set(roomId, room);
+      const state = room;
+      void this.track(
+        Promise.resolve().then(() => this.prepareRoom(roomId, state)),
+      );
+    }
+    room.requests.push(request);
+    return result.promise;
+  }
+
+  private async prepareRoom(
+    roomId: string,
+    state: { requests: ProjectionRequest[] },
+  ): Promise<void> {
+    try {
+      while (state.requests.length) {
+        // Admission fixes each receipt cut. Sharing capture never substitutes a
+        // newer head for that obligation; arrivals cannot extend this snapshot.
+        const snapshot = state.requests.slice();
+        const admitted = await Promise.allSettled(
+          snapshot.map((r) => r.admitted),
+        );
+        for (let at = 0; at < snapshot.length; at++) {
+          if (admitted[at].status === 'rejected') {
+            snapshot[at].reject((admitted[at] as PromiseRejectedResult).reason);
+            state.requests.splice(state.requests.indexOf(snapshot[at]), 1);
+          }
+        }
+        const ready = snapshot.filter((r) => r.value !== undefined);
+        if (!ready.length) continue;
+        const generation = ready[0].value!.generation;
+        const compatible = ready.filter((r) =>
+          r.value!.generation === generation
+        );
+        const selected = compatible.reduce((a, b) =>
+          a.value!.head >= b.value!.head ? a : b
+        ).value!;
+        const notify = async (result: PublicationResult) => {
+          const mark = result.removed
+            ? selected.head
+            : await get(await this.store.server(), sourceOf(roomId));
+          // Also release a later smaller fixed-cut waiter already covered by the
+          // commit. It shares facts, never this worker's subsequent preparation.
+          for (const request of state.requests.slice()) {
+            const value = request.value;
+            if (value === undefined || value.generation !== generation) {
+              continue;
+            }
+            try {
+              if (!result.removed) {
+                await value.room.tx(async (tx) => {
+                  if (value.target !== undefined) {
+                    await tx.completion.validate(value.target);
+                  }
+                });
+              }
+              await value.progress?.();
+              if (value.head > mark) continue;
+              state.requests.splice(state.requests.indexOf(request), 1);
+              request.resolve(result);
+            } catch (error) {
+              state.requests.splice(state.requests.indexOf(request), 1);
+              request.reject(error);
+            }
+          }
+        };
+        try {
+          await projectRoom(
+            this.store,
+            roomId,
+            selected.room,
+            selected.head,
+            selected.target,
+            notify,
+          );
+        } catch (error) {
+          // Only this immutable snapshot failed. Later demand retains its own
+          // admission/capability and can retry the uncommitted suffix.
+          for (const request of compatible) {
+            const at = state.requests.indexOf(request);
+            if (at < 0) continue;
+            state.requests.splice(at, 1);
+            request.reject(error);
+          }
+        }
+      }
+    } finally {
+      this.rooms.delete(roomId);
+    }
+  }
+
+  track<T>(task: Promise<T>): Promise<T> {
+    this.tasks.add(task);
+    const release = () => {
+      this.tasks.delete(task);
+    };
+    void task.then(release, release);
+    return task;
+  }
+
+  enqueue(turn: WriterTurn): void {
+    this.queue.push(turn);
+    if (this.writing) return;
+    this.writing = true;
+    void this.track(Promise.resolve().then(() => this.run()));
+  }
+
+  async drain(): Promise<void> {
+    const errors: unknown[] = [];
+    while (this.tasks.size) {
+      for (const result of await Promise.allSettled([...this.tasks])) {
+        if (result.status === 'rejected') errors.push(result.reason);
+      }
+    }
+    if (errors.length) {
+      throw new AggregateError(errors, 'publication drain failed');
+    }
+  }
+
+  private async run(): Promise<void> {
+    try {
+      while (this.queue.length) {
+        const first = this.queue.shift()!;
+        if (first.kind === 'lifecycle') {
+          await first.run();
+          continue;
+        }
+        // Freeze every already-ready prefix ahead of the next lifecycle barrier.
+        // New arrivals never extend this finite admitted group.
+        const group = [first.work];
+        while (this.queue[0]?.kind === 'publication') {
+          group.push(
+            (this.queue.shift()! as Extract<WriterTurn, {
+              kind: 'publication';
+            }>).work,
+          );
+        }
+        try {
+          await publishGroup(group);
+        } catch (error) {
+          if (group.length === 1) {
+            first.work.reject(error);
+            continue;
+          }
+          // A rollback acknowledges nothing. Retry complete room prefixes in
+          // isolation; policy and transaction-attempt state are recaptured.
+          for (const work of group) {
+            try {
+              await publishGroup([work]);
+            } catch (error) {
+              work.reject(error);
+            }
+          }
+        }
+      }
+    } finally {
+      this.writing = false;
+    }
+  }
+}
+
+type ProjectionAdmission = {
+  room: Room;
+  head: number;
+  generation: string;
+  target?: CompletionCut | CompletionTarget;
+  progress?: () => Promise<void>;
+};
+type PublicationResult = {
+  listeners: typeof projectedListeners;
+  removed: boolean;
+};
+type ProjectionRequest = {
+  admitted: Promise<ProjectionAdmission>;
+  value?: ProjectionAdmission;
+  resolve(value: PublicationResult): void;
+  reject(error: unknown): void;
+};
 
 // Projection listeners (the federation sender's wake, 4c-2): registered
 // like the room hooks, fired after each completed projection. Each emission
@@ -169,7 +374,8 @@ export function project(store: Store, roomId: string): Promise<void> {
   // append more work. Keep the capability with its cut for lifecycle fencing.
   const admitted = (async () => {
     const room = await openRoom(store, roomId);
-    return { room, head: await room.tx((tx) => tx.changes.head()) };
+    const cut = await room.tx((tx) => tx.completion.capture());
+    return { room, head: cut.through, generation: cut.generation };
   })();
   return enqueueProjection(store, roomId, admitted);
 }
@@ -182,7 +388,12 @@ export function projectThrough(
   const admitted = (async () => {
     const room = await openRoom(store, target.roomId);
     await room.tx((tx) => tx.completion.validate(target));
-    return { room, head: target.through, target };
+    return {
+      room,
+      head: target.through,
+      generation: target.generation,
+      target,
+    };
   })();
   return enqueueProjection(store, target.roomId, admitted);
 }
@@ -197,7 +408,13 @@ export function publishThrough(
   const admitted = (async () => {
     const room = await openRoom(store, target.roomId);
     await room.tx((tx) => tx.completion.validate(target));
-    return { room, head: target.through, target, progress };
+    return {
+      room,
+      head: target.through,
+      generation: target.generation,
+      target,
+      progress,
+    };
   })();
   return enqueueProjection(store, target.roomId, admitted);
 }
@@ -261,34 +478,19 @@ async function finishPublished(
 function enqueueProjection(
   store: Store,
   roomId: string,
-  admitted: Promise<
-    {
-      room: Room;
-      head: number;
-      target?: CompletionCut | CompletionTarget;
-      progress?: () => Promise<void>;
-    }
-  >,
+  admitted: Promise<ProjectionAdmission>,
 ): Promise<void> {
   // A failed admission can settle while its predecessor still owns the queue.
   // The queued result below retains the rejection for the actual caller.
   void admitted.catch(() => {});
-  let rooms = roomQueues.get(store);
-  if (rooms === undefined) roomQueues.set(store, rooms = new Map());
-  // This room's baseline has one capture owner; independent rooms prepare
-  // concurrently. A failed page releases its owner for the next roll-forward.
-  const run = (rooms.get(roomId) ?? Promise.resolve()).catch(() => {}).then(
-    async () => {
-      const { room, head, target, progress } = await admitted;
-      await projectRoom(store, roomId, room, head, target, progress);
-    },
-  );
-  rooms.set(roomId, run);
-  const release = () => {
-    if (rooms.get(roomId) === run) rooms.delete(roomId);
-  };
-  void run.then(release, release);
-  return run;
+  const owner = publicationService(store);
+  const published = owner.project(roomId, admitted);
+  return owner.track(published.then(async (result) => {
+    const { room, head, target, progress } = await admitted;
+    if (progress === undefined) {
+      await finishProjection(store, roomId, room, head, target, result);
+    }
+  }));
 }
 
 async function projectRoom(
@@ -297,7 +499,8 @@ async function projectRoom(
   room: Room,
   head: number,
   target?: CompletionCut | CompletionTarget,
-  progress?: () => Promise<void>,
+  progress: (result: PublicationResult) => Promise<void> = () =>
+    Promise.resolve(),
 ): Promise<void> {
   const server = await store.server();
   capture: for (;;) {
@@ -349,7 +552,7 @@ async function projectRoom(
       // the committed prefix cursor; live work still owes the complete seed.
       let index = 0;
       do {
-        const applied = await withProjectionLock(async () => {
+        const applied = await withProjectionLock(store, async () => {
           if (!await current()) return false;
           return await applyHistoricalRelations(server, roomId, seed, index);
         });
@@ -407,7 +610,7 @@ async function projectRoom(
       const outcome = seed === null && device === null && drop !== 0 &&
           index < prepared.length
         ? await new Promise<TurnOutcome>((resolve, reject) => {
-          enqueueWriter({
+          publicationService(store).enqueue({
             kind: 'publication',
             work: {
               store,
@@ -415,29 +618,14 @@ async function projectRoom(
               localServers,
               resolve,
               reject,
-              prepare: async (contended) => {
+              prepare: async () => {
                 if (!await current()) return null;
-                const ready: Prepared[] = [];
-                for (let at = index; at < prepared.length; at++) {
-                  const item = prepared[at];
-                  ready.push(
-                    !contended && 'pushCapture' in item &&
-                      item.pushCapture !== null
-                      ? {
-                        ...item,
-                        push: await prepareCapturedPush(
-                          store,
-                          item.pushCapture,
-                        ),
-                      }
-                      : item,
-                  );
-                  if (
-                    (contended || waitingWriters > 0) &&
-                    !samePublicationUnit(item.change, prepared[at + 1]?.change)
-                  ) break;
-                }
-                return ready;
+                // Return fresh policy slots, not mutations retained across a
+                // rolled-back attempt. Same-room dependencies are applied in
+                // order inside the one transaction, never one writer per unit.
+                return prepared.slice(index).map((item) =>
+                  'pushCapture' in item ? { ...item, push: null } : item
+                );
               },
               finish: async (ready) => {
                 if (ready === null) return { kind: 'retry' };
@@ -452,73 +640,15 @@ async function projectRoom(
             },
           });
         })
-        : await withProjectionLock(lifecycle);
+        : await withProjectionLock(store, lifecycle);
       if (outcome.kind === 'retry') continue capture;
-      await progress?.();
+      await progress({
+        listeners: outcome.kind === 'complete'
+          ? outcome.listeners
+          : [...projectedListeners],
+        removed: drop === 0,
+      });
       if (outcome.kind === 'complete') {
-        if (progress !== undefined) return;
-        if (drop !== 0) {
-          // Durable completion and an explicit projection pass are different
-          // notifications. A repeated legacy pass still hints its captured
-          // audience; target completion/retirement never replay witnessed work.
-          const cut = target ??
-            {
-              ...await room.tx((tx) => tx.completion.capture()),
-              through: head,
-            };
-          try {
-            const completed = await room.tx((tx) => tx.completion.state());
-            if (
-              target === undefined &&
-              (completed.completedThrough >= head ||
-                completing.get(store)?.has(completionKey(cut)))
-            ) {
-              // An earlier callback flight has already captured its audience.
-              // This pass owns its new hint audience independently, while still
-              // retaining the original completion until its real settlement.
-              const failures = (await Promise.all([
-                dispatchProjected(store, roomId, head, outcome.listeners),
-                completePublished(store, cut).then(
-                  () => [],
-                  (error) => [error],
-                ),
-              ])).flat();
-              if (failures.length) {
-                throw new AggregateError(
-                  failures,
-                  'E_PROJECTION_CALLBACK: ' + roomId,
-                );
-              }
-            } else {
-              await completePublished(store, cut);
-            }
-          } catch (error) {
-            if (target !== undefined) throw error;
-            console.error(`projection listener failed for ${roomId}:`, error);
-          }
-          return;
-        }
-        // Preserve acknowledged observer work (including rule migration) and
-        // same-room ordering without blocking independent publication writers.
-        const failures = await dispatchProjected(
-          store,
-          roomId,
-          head,
-          outcome.listeners,
-        );
-        if (target === undefined) {
-          for (const error of failures) {
-            console.error(`projection listener failed for ${roomId}:`, error);
-          }
-        }
-        if (target !== undefined) {
-          if (failures.length) {
-            throw new AggregateError(
-              failures,
-              `E_COMPLETION_CALLBACK: ${roomId}/${head}`,
-            );
-          }
-        }
         return;
       }
       index = outcome.end;
@@ -527,81 +657,105 @@ async function projectRoom(
   }
 }
 
-/** Room lifecycle operations use the same serialization as projection. */
-export function withProjectionLock<T>(fn: () => Promise<T>): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    enqueueWriter({
-      kind: 'lifecycle',
-      run: async () => {
-        try {
-          resolve(await fn());
-        } catch (error) {
-          reject(error);
-        }
-      },
-    });
-  });
-}
-
-function enqueueWriter(turn: WriterTurn): void {
-  writerQueue.push(turn);
-  waitingWriters++;
-  if (writing) return;
-  writing = true;
-  void Promise.resolve().then(drainWriter);
-}
-
-async function drainWriter(): Promise<void> {
-  try {
-    while (writerQueue.length) {
-      const first = writerQueue.shift()!;
-      waitingWriters--;
-      if (first.kind === 'lifecycle') {
-        await first.run();
-        continue;
-      }
-      // Snapshot ONLY the already-ready same-Store FIFO prefix. Enqueues during
-      // validation, policy reads or commit cannot enlarge this admitted group.
-      const group = [first.work];
-      while (
-        writerQueue[0]?.kind === 'publication' &&
-        writerQueue[0].work.store === first.work.store
+async function finishProjection(
+  store: Store,
+  roomId: string,
+  room: Room,
+  head: number,
+  target: CompletionCut | CompletionTarget | undefined,
+  outcome: PublicationResult,
+): Promise<void> {
+  if (!outcome.removed) {
+    // Durable completion and an explicit projection pass are different
+    // notifications. A repeated legacy pass still hints its captured
+    // audience; target completion/retirement never replay witnessed work.
+    const cut = target ??
+      {
+        ...await room.tx((tx) => tx.completion.capture()),
+        through: head,
+      };
+    try {
+      const completed = await room.tx((tx) => tx.completion.state());
+      if (
+        target === undefined &&
+        (completed.completedThrough >= head ||
+          completing.get(store)?.has(completionKey(cut)))
       ) {
-        group.push(
-          (writerQueue.shift()! as Extract<WriterTurn, {
-            kind: 'publication';
-          }>).work,
-        );
-        waitingWriters--;
-      }
-      try {
-        await publishGroup(group);
-      } catch (error) {
-        if (group.length === 1) {
-          first.work.reject(error);
-          continue;
+        // An earlier callback flight has already captured its audience.
+        // This pass owns its new hint audience independently, while still
+        // retaining the original completion until its real settlement.
+        const failures = (await Promise.all([
+          dispatchProjected(store, roomId, head, outcome.listeners),
+          completePublished(store, cut).then(
+            () => [],
+            (error) => [error],
+          ),
+        ])).flat();
+        if (failures.length) {
+          throw new AggregateError(
+            failures,
+            'E_PROJECTION_CALLBACK: ' + roomId,
+          );
         }
-        // The group rolled back: no waiter, sequence or watermark was
-        // acknowledged. Isolate through the same individual application path,
-        // in original FIFO order, with fresh attempt/policy input for each unit.
-        for (const work of group) {
-          try {
-            await publishGroup([work]);
-          } catch (error) {
-            work.reject(error);
-          }
-        }
+      } else {
+        await completePublished(store, cut);
       }
+    } catch (error) {
+      if (target !== undefined) throw error;
+      console.error(`projection listener failed for ${roomId}:`, error);
     }
-  } finally {
-    writing = false;
+    return;
   }
+  // Preserve acknowledged observer work (including rule migration) and
+  // same-room ordering without blocking independent publication writers.
+  const failures = await dispatchProjected(
+    store,
+    roomId,
+    head,
+    outcome.listeners,
+  );
+  if (target === undefined) {
+    for (const error of failures) {
+      console.error(`projection listener failed for ${roomId}:`, error);
+    }
+  }
+  if (target !== undefined) {
+    if (failures.length) {
+      throw new AggregateError(
+        failures,
+        `E_COMPLETION_CALLBACK: ${roomId}/${head}`,
+      );
+    }
+  }
+  return;
+}
+
+/** Room lifecycle operations use the same serialization as projection. */
+export function withProjectionLock<T>(
+  store: Store,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const owner = publicationService(store);
+  return owner.track(
+    new Promise<T>((resolve, reject) => {
+      owner.enqueue({
+        kind: 'lifecycle',
+        run: async () => {
+          try {
+            resolve(await fn());
+          } catch (error) {
+            reject(error);
+          }
+        },
+      });
+    }),
+  );
 }
 
 async function publishGroup(group: PublicationTurn[]): Promise<void> {
   const captured: { work: PublicationTurn; ready: Prepared[] | null }[] = [];
   for (const work of group) {
-    captured.push({ work, ready: await work.prepare(group.length > 1) });
+    captured.push({ work, ready: await work.prepare() });
   }
   const active = captured.filter((entry): entry is {
     work: PublicationTurn;
@@ -625,11 +779,39 @@ async function publishGroup(group: PublicationTurn[]): Promise<void> {
     const server = await group[0].store.server();
     const now = Date.now();
     await eventStreamTx(server, async (tx) => {
-      if (await applyIndependentPublications(tx, active, now)) return;
-      for (const { work, ready } of active) {
-        for (const item of ready) {
-          await apply(tx, work.roomId, item, now, work.localServers);
+      // Each wave contains one complete unit per room. The next same-room unit
+      // reads the effects of its predecessor in this same atomic attempt, while
+      // compatible independent rooms still use the set insertion path. No
+      // semantic dependency is mistaken for another writer turn.
+      const remaining = active.map(({ work, ready }) => ({
+        work,
+        ready,
+        at: 0,
+      }));
+      while (remaining.some((entry) => entry.at < entry.ready.length)) {
+        const wave = [];
+        for (const entry of remaining) {
+          if (entry.at === entry.ready.length) continue;
+          const start = entry.at++;
+          while (
+            samePublicationUnit(
+              entry.ready[entry.at - 1].change,
+              entry.ready[entry.at]?.change,
+            )
+          ) entry.at++;
+          wave.push({
+            work: entry.work,
+            ready: entry.ready.slice(start, entry.at),
+          });
         }
+        if (await applyIndependentPublications(tx, wave, now)) continue;
+        for (const { work, ready } of wave) {
+          for (const item of ready) {
+            await apply(tx, work.roomId, item, now, work.localServers);
+          }
+        }
+      }
+      for (const { work, ready } of active) {
         await reconcileReceiptMarks(tx, work.roomId);
         await reconcileNotificationReads(tx, work.roomId, now);
         const pos = ready.at(-1)!.change.pos;
@@ -918,7 +1100,6 @@ async function applyHistoricalRelations(
       }
       await reconcileNotificationEvent(tx, roomId, event, now);
       end++;
-      if (waitingWriters > 0) break;
     }
     await reconcileReceiptMarks(tx, roomId);
     await reconcileNotificationReads(tx, roomId, now);

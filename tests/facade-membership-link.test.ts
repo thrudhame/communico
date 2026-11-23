@@ -1945,6 +1945,7 @@ Deno.test('membership terminal: a verified causal rejection publishes real leave
     assertEquals(displayed[0].status, 'rejected');
     assert(displayed[0].seq > before[0].seq);
     const departure = await prejoinDeparture(displayed[0], {
+      store: f.home,
       server: db,
       signer: {
         ...f.ht.signer(),
@@ -2137,6 +2138,7 @@ Deno.test('membership source intent: legacy retraction without a departure compl
         if (position !== null) assertEquals(displayed[0].seq, position);
         position = displayed[0].seq;
         const departure = await prejoinDeparture(displayed[0], {
+          store: f.home,
           server: db,
           signer: {
             ...f.ht.signer(),
@@ -2206,6 +2208,7 @@ Deno.test('membership terminal authority: actual local leave survives source job
       if (seq !== null) assertEquals(displayed.seq, seq);
       seq = displayed.seq;
       const departure = await prejoinDeparture(displayed, {
+        store: f.home,
         server: db,
         signer: {
           ...f.ht.signer(),

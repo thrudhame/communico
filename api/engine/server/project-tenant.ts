@@ -28,7 +28,7 @@ export async function projectTenant(
     through !== undefined &&
     await completedTenantProjection(await store.tenant(tenant)) >= through
   ) return;
-  return withProjectionLock(async () => {
+  return withProjectionLock(store, async () => {
     const server = await store.server(), db = await store.tenant(tenant);
     if (
       through !== undefined &&

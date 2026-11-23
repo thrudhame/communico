@@ -272,7 +272,7 @@ Deno.test('push upgrade: durable chunks release projection lock, interleaved liv
       await secondSeed.promise;
       const live = project(store, other.roomId);
       await live;
-      const between = withProjectionLock(async () => {
+      const between = withProjectionLock(store, async () => {
         assertEquals(
           visited,
           2,
@@ -368,7 +368,7 @@ Deno.test('push upgrade: durable chunks release projection lock, interleaved liv
     const seeding = project(store, old.roomId);
     try {
       await nextSeed.promise;
-      const sameRoomBoundary = withProjectionLock(async () => {
+      const sameRoomBoundary = withProjectionLock(store, async () => {
         assertEquals(await get(db, 'push-context:' + old.roomId), firstCut);
         assertEquals(
           (await db.query('SELECT COUNT(*) AS n FROM feed WHERE event=?', [

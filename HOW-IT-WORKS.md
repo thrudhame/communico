@@ -280,23 +280,27 @@ the next projection or startup rolls forward from its watermark.
 (`api/engine/room/schema.ts:109-120`, `api/engine/room/ingest.ts:685-714`,
 `api/engine/room/hooks.ts:21-48`, `api/engine/server/startup.ts:13-38`)
 
-Each room has one store-lifetime projection capture owner. Independent rooms
-prepare immutable room facts outside the global mutation queue. The existing
-500-change page bounds capture, extending only to finish its final event/effect
-unit. Uncontended units batch, but queued writer demand ends the turn after a
-complete event and its accepted membership, redaction and delivery effects.
-Policy inputs belong to that turn; its committed prefix reconciles once before
-the next queued writer runs. A caller's
-room capability and head are captured at admission, before waiting for an earlier
-room owner; later writes cannot enlarge that queued caller's obligation. Application rechecks both
-watermarks and the original room capability's incarnation before writing.
-Historical-context seed edges similarly commit the completed prefix cursor;
-same-room live publication waits for complete context. A page's immutable event,
-publication and push contexts share one room attempt and its state-group reader;
-unchanged publication state is not reconstructed once per event. Single-event
-push readers use the same capture owner. Tenant push decisions
-are recaptured inside each publication turn, so preparation cannot
-resurrect a deactivated account's notification facts.
+One Store-owned publication service owns both commit and lifecycle exclusion.
+Each room prepares immutable contiguous prefixes independently. Fixed-cut callers
+share this work without sharing or enlarging their receipt obligations. The
+existing 500-change page bounds capture, extending only to finish its final
+event/effect unit. The commit owner freezes all already-ready prefixes ahead of
+the next lifecycle barrier; later arrivals cannot extend that finite group.
+Consecutive same-room units and other ready rooms publish in one atomic server
+transaction, without a per-unit writer turn, timer or numeric batch quota.
+Independent room units use set insertion; dependent same-room units see their
+predecessors' effects in transaction order. Feed ranges are reserved only inside
+that owning transaction. A rollback acknowledges no prefix or sequence.
+
+Application rechecks expected watermarks and the original room capability's
+incarnation before writing. Required callbacks retain separate completion and
+cannot hold the writer or room preparation owner. Store shutdown drains admitted
+publication and callbacks before native storage closes. Historical-context pages
+commit their cursor atomically; same-room live publication waits for complete
+context. A page's immutable event, publication and push contexts share one room
+attempt and its state-group reader; unchanged publication state is not rebuilt
+per event. Tenant push decisions are recaptured for each admitted commit group,
+so a later group cannot resurrect a deactivated account's notification facts.
 (`api/engine/server/{project,push-project}.ts`)
 
 F2 room-replica v2 verifies each added signature and unions it in a room-owned
