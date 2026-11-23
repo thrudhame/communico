@@ -292,6 +292,11 @@ CREATE INDEX delayed_events_runnable_due ON delayed_events(due_ms,id) WHERE phas
 CREATE INDEX delayed_events_runnable_user ON delayed_events(localpart) WHERE phase IN ('pending','sending');
 `;
 
+const DELAYED_RETRY_SQL = `
+ALTER TABLE delayed_events ADD COLUMN retry_ms INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX delayed_events_retry_due ON delayed_events(MAX(due_ms,retry_ms),id) WHERE phase IN ('pending','sending');
+`;
+
 const PUBLIC_REPLICAS_SQL = `
 CREATE TABLE public_user_replicas(localpart TEXT PRIMARY KEY NOT NULL REFERENCES users(localpart),source_cut INTEGER NOT NULL,snapshot_json TEXT NOT NULL);
 `;
@@ -304,7 +309,7 @@ INSERT INTO deactivation_work SELECT localpart,EXISTS(SELECT 1 FROM erased_users
 `;
 
 export const tenantSchema: SchemaProvider = {
-  version: 43,
+  version: 44,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
     await db.exec(E2EE_SQL);
@@ -324,6 +329,7 @@ export const tenantSchema: SchemaProvider = {
     await db.exec(SLIDING_SYNC_SQL);
     await db.exec(DELAYED_EVENTS_SQL);
     await db.exec(DELAYED_RUNNABLE_INDEXES_SQL);
+    await db.exec(DELAYED_RETRY_SQL);
     await db.exec(PUBLIC_REPLICAS_SQL);
     await db.exec(OWNER_CONTROL_SQL);
     await db.exec(ACCOUNT_AUTH_SQL);
@@ -348,6 +354,7 @@ export const tenantSchema: SchemaProvider = {
     await db.exec(TO_DEVICE_ROUTE_LOOKUPS_SQL);
   },
   migrations: {
+    43: (conn) => conn.exec(DELAYED_RETRY_SQL),
     42: (conn) => conn.exec(DELAYED_RUNNABLE_INDEXES_SQL),
     41: (conn) => conn.exec(LINK_APPLICATION_PROJECTION_SQL),
     40: (conn) => conn.exec(TO_DEVICE_ROUTE_LOOKUPS_SQL),

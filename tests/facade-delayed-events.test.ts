@@ -164,12 +164,10 @@ Deno.test('facade delayed activation: missing room scope retains the unclaimed n
     );
     await scheduler.drain();
     const after = await f.edge.tx((tx) => tx.delayedEvents.get(id));
-    assert(after!.due > Date.now());
-    assertEquals({ ...after, due: input.due }, input);
+    assertEquals(after, input);
+    assert((await f.edge.tx((tx) => tx.delayedEvents.next()))! > Date.now());
     const facts = await f.edge.tx((tx) => tx.delayedEvents.operations('alice'));
-    assertEquals(facts.length, before.length + 1);
-    assertEquals(facts.slice(0, -1), before);
-    assertEquals(JSON.parse(facts.at(-1)!.payload).event, after);
+    assertEquals(facts, before);
   } finally {
     await scheduler.stop();
     await f.close();
@@ -789,7 +787,7 @@ Deno.test('facade delayed runnable quota excludes quarantined and foreign owners
     await f.home.tx((tx) => tx.delayedEvents.add(event('old-backup'), 1));
     await raw.tx(sanitizeRestoredTenant);
     await raw.execute(
-      'INSERT INTO delayed_events SELECT ?,localpart,room_id,type,state_key,content,delay_ms,since_ms,due_ms,room_pos,state_event,?,event_id,pending_pdu,completed FROM delayed_events WHERE id=?',
+      'INSERT INTO delayed_events SELECT ?,localpart,room_id,type,state_key,content,delay_ms,since_ms,due_ms,room_pos,state_event,?,event_id,pending_pdu,completed,retry_ms FROM delayed_events WHERE id=?',
       [
         await f.edge.tx((tx) => tx.delayedEvents.newId()),
         'pending',
@@ -956,6 +954,70 @@ for (const deactivate of [false, true]) {
     }
   });
 }
+
+Deno.test('facade delayed retry deadlines remain local while explicit transitions replicate', async () => {
+  const f = await fixture();
+  try {
+    const command = event('local-retry');
+    await f.home.tx((tx) => tx.delayedEvents.add(command, 10));
+    const original = await f.home.tx((tx) =>
+      tx.delayedEvents.operations('alice')
+    );
+    for (const deadline of [62000, 63000, 64000]) {
+      await f.home.tx((tx) =>
+        tx.delayedEvents.retry([command.id], deadline, [command])
+      );
+      assertEquals(
+        await f.home.tx((tx) => tx.delayedEvents.operations('alice')),
+        original,
+      );
+      assertEquals(
+        (await f.home.tx((tx) => tx.delayedEvents.get(command.id)))!.due,
+        command.due,
+      );
+      assertEquals(await f.home.tx((tx) => tx.delayedEvents.next()), deadline);
+      assertEquals(
+        await f.home.tx((tx) => tx.delayedEvents.due(deadline - 1)),
+        [],
+      );
+      assertEquals(
+        await f.home.tx((tx) =>
+          tx.delayedEvents.claim(command.id, deadline - 1)
+        ),
+        null,
+      );
+    }
+    await f.home.tx((tx) =>
+      tx.delayedEvents.action(command.id, 'restart', 2000)
+    );
+    assertEquals(await f.home.tx((tx) => tx.delayedEvents.next()), 62000);
+    assertEquals(
+      (await f.home.tx((tx) => tx.delayedEvents.due(62000))).length,
+      1,
+    );
+    await f.home.tx((tx) => tx.delayedEvents.claim(command.id, 62000));
+    const claimed = await f.home.tx((tx) =>
+      tx.delayedEvents.operations('alice')
+    );
+    assert(claimed.length > original.length);
+    await f.home.tx((tx) => tx.delayedEvents.retry([command.id], 65000));
+    assertEquals(
+      await f.home.tx((tx) => tx.delayedEvents.operations('alice')),
+      claimed,
+    );
+    await f.home.tx((tx) => tx.delayedEvents.remove(command.id));
+    assertEquals(await f.home.tx((tx) => tx.delayedEvents.next()), null);
+    assertEquals(
+      JSON.parse(
+        (await f.home.tx((tx) => tx.delayedEvents.operations('alice'))).at(-1)!
+          .payload,
+      ).event.phase,
+      'cancelled',
+    );
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('facade delayed pending admission backoff frees the batch without overwriting concurrent restart', async () => {
   const f = await fixture();

@@ -993,7 +993,6 @@ function bind(
         >[],
       ) => {
         await delayedEvents.retry(conn, ids, due, observed);
-        changed();
       },
       due: (now: number) => delayedEvents.due(conn, now),
       claim: async (id: string, now: number) => {

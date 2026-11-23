@@ -541,7 +541,7 @@ export async function action(
   if (action === 'cancel') return await remove(conn, id);
   await retain(conn, id);
   await conn.execute(
-    "UPDATE delayed_events SET since_ms=?,due_ms=? WHERE id=? AND phase='pending'",
+    "UPDATE delayed_events SET since_ms=?,due_ms=?,retry_ms=0 WHERE id=? AND phase='pending'",
     [
       action === 'restart' ? now : event.since,
       action === 'restart' ? now + event.delay : now,
@@ -553,7 +553,7 @@ export async function action(
 export async function next(conn: Conn): Promise<number | null> {
   const owner = await runnableSelection(conn);
   const [row] = await conn.query(
-    'SELECT MIN(due_ms) AS n FROM delayed_events WHERE ' +
+    'SELECT MIN(MAX(due_ms,retry_ms)) AS n FROM delayed_events WHERE ' +
       owner.sql,
     owner.params,
   );
@@ -566,26 +566,26 @@ export async function retry(
   observed: readonly Pick<DelayedEvent, 'id' | 'due' | 'since'>[] = [],
 ): Promise<void> {
   for (const id of ids) {
-    await requireOwner(conn, id);
-    await retain(conn, id);
+    const event = await get(conn, id);
+    if (event === null) continue;
+    requireUnfenced(event.phase);
     const selected = observed.find((event) => event.id === id);
     // Room admission precedes claim. Rebase that still-pending selection only
     // if no concurrent restart/send changed its observed deadline or origin.
     await conn.execute(
-      "UPDATE delayed_events SET due_ms=? WHERE id=? AND (phase='sending'" +
+      "UPDATE delayed_events SET retry_ms=? WHERE id=? AND (phase='sending'" +
         (selected ? " OR (phase='pending' AND due_ms=? AND since_ms=?)" : '') +
         ')',
       [due, id, ...(selected ? [selected.due, selected.since] : [])],
     );
-    await retain(conn, id);
   }
 }
 export async function due(conn: Conn, now: number): Promise<DelayedEvent[]> {
   const owner = await runnableSelection(conn);
   return (await conn.query(
-    'SELECT * FROM delayed_events WHERE due_ms<=? AND ' +
+    'SELECT * FROM delayed_events WHERE MAX(due_ms,retry_ms)<=? AND ' +
       owner.sql +
-      ' ORDER BY due_ms,id LIMIT 32',
+      ' ORDER BY MAX(due_ms,retry_ms),id LIMIT 32',
     [now, ...owner.params],
   )).map(eventOf);
 }
@@ -595,10 +595,14 @@ export async function claim(
   now: number,
 ): Promise<DelayedEvent | null> {
   const event = await get(conn, id);
+  const [local] = await conn.query(
+    'SELECT retry_ms FROM delayed_events WHERE id=?',
+    [id],
+  );
   // Selection is only a hint. A concurrent heartbeat may have restarted the
   // deadline before this transaction acquired the command.
   if (
-    event === null || event.due > now ||
+    event === null || event.due > now || Number(local.retry_ms) > now ||
     !['pending', 'sending'].includes(event.phase)
   ) return null;
   await retain(conn, id);
