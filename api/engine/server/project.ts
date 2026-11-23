@@ -147,7 +147,11 @@ class PublicationService {
     admitted: Promise<ProjectionAdmission>,
   ): Promise<PublicationResult> {
     const result = Promise.withResolvers<PublicationResult>();
-    const request: ProjectionRequest = { admitted, ...result };
+    const request: ProjectionRequest = {
+      admitted,
+      progress: Promise.resolve(),
+      ...result,
+    };
     void admitted.then((value) => {
       request.value = value;
     }, () => {});
@@ -202,7 +206,11 @@ class PublicationService {
             if (value === undefined || value.generation !== generation) {
               continue;
             }
-            try {
+            const covered = value.head <= mark;
+            // Each caller owns its ordered progress chain and settlement. A
+            // committed cut releases preparation before callbacks run, so a
+            // slow caller cannot retain other waiters or the room worker.
+            const progress = request.progress.then(async () => {
               if (!result.removed) {
                 await value.room.tx(async (tx) => {
                   if (value.target !== undefined) {
@@ -211,13 +219,18 @@ class PublicationService {
                 });
               }
               await value.progress?.();
-              if (value.head > mark) continue;
+            });
+            request.progress = progress;
+            if (covered) {
               state.requests.splice(state.requests.indexOf(request), 1);
-              request.resolve(result);
-            } catch (error) {
-              state.requests.splice(state.requests.indexOf(request), 1);
-              request.reject(error);
             }
+            void this.track(progress.then(() => {
+              if (covered) request.resolve(result);
+            }, (error) => {
+              const at = state.requests.indexOf(request);
+              if (at >= 0) state.requests.splice(at, 1);
+              request.reject(error);
+            }));
           }
         };
         try {
@@ -230,13 +243,32 @@ class PublicationService {
             notify,
           );
         } catch (error) {
-          // Only this immutable snapshot failed. Later demand retains its own
-          // admission/capability and can retry the uncommitted suffix.
-          for (const request of compatible) {
+          // Sharing preparation is not sharing a failure obligation. A valid
+          // earlier cut must be recaptured independently after the shared page
+          // rolls back, without acknowledging the later failing suffix.
+          for (
+            const request of compatible.toSorted((a, b) =>
+              a.value!.head - b.value!.head
+            )
+          ) {
             const at = state.requests.indexOf(request);
             if (at < 0) continue;
-            state.requests.splice(at, 1);
-            request.reject(error);
+            const value = request.value!;
+            try {
+              if (compatible.length === 1) throw error;
+              await projectRoom(
+                this.store,
+                roomId,
+                value.room,
+                value.head,
+                value.target,
+                notify,
+              );
+            } catch (error) {
+              const pending = state.requests.indexOf(request);
+              if (pending >= 0) state.requests.splice(pending, 1);
+              request.reject(error);
+            }
           }
         }
       }
@@ -328,6 +360,7 @@ type PublicationResult = {
 };
 type ProjectionRequest = {
   admitted: Promise<ProjectionAdmission>;
+  progress: Promise<void>;
   value?: ProjectionAdmission;
   resolve(value: PublicationResult): void;
   reject(error: unknown): void;

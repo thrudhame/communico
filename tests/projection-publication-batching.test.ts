@@ -10,6 +10,7 @@ import {
   onProjected,
   project,
   projectThrough,
+  publishThrough,
   sourceOf,
   withProjectionLock,
 } from '#engine/server/project.ts';
@@ -80,6 +81,192 @@ async function fixture(
 }
 
 type TestRooms = Parameters<Parameters<typeof fixture>[0]>[1];
+
+async function bounded<T>(promise: Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error('publication request stalled')),
+          3000,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Admit both fixed cuts before capture while the real writer is held. The
+// larger first request selects one shared page covering the smaller request.
+async function sharedCuts(
+  store: Store,
+  room: TestRooms[number],
+  first: () => Promise<void>,
+  observe: (small: Promise<void>, large: Promise<void>) => Promise<void>,
+) {
+  const originalRoom = store.room.bind(store);
+  const prepared = Promise.withResolvers<void>();
+  store.room = async (...args) => {
+    const db = await originalRoom(...args);
+    if (args[0] !== room.g.roomId) return db;
+    return {
+      ...db,
+      tx: async (fn, options) => {
+        const value = await db.tx(fn, options);
+        if (isPreparedResult(value)) prepared.resolve();
+        return value;
+      },
+    };
+  };
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const held = withProjectionLock(store, async () => {
+    entered.resolve();
+    await release.promise;
+  });
+  const jobs: Promise<void>[] = [];
+  try {
+    await bounded(entered.promise);
+    const large = first();
+    void large.catch(() => {});
+    jobs.push(large);
+    const small = projectThrough(store, room.event.completion!);
+    void small.catch(() => {});
+    jobs.push(small);
+    await bounded(Promise.race([
+      prepared.promise,
+      large.then(() => {
+        throw new Error('projection settled before preparation');
+      }),
+    ]));
+    await setImmediate();
+    release.resolve();
+    await held;
+    await observe(small, large);
+  } finally {
+    release.resolve();
+    await held;
+    await Promise.allSettled(jobs);
+    store.room = originalRoom;
+  }
+}
+
+Deno.test('publication batching review: pending progress belongs only to its request', async () => {
+  await fixture(async (store, rooms) => {
+    const room = rooms[0];
+    const next = await sendLocal(room.g.room, {
+      type: 'm.room.message',
+      sender: room.g.creator,
+      content: { body: 'larger progress cut', msgtype: 'm.text' },
+    }, room.g.signer);
+    const release = Promise.withResolvers<void>();
+    const entered = Promise.withResolvers<void>();
+    let pending = false;
+    try {
+      await sharedCuts(
+        store,
+        room,
+        () =>
+          publishThrough(store, next.completion!, async () => {
+            entered.resolve();
+            await release.promise;
+          }),
+        async (small, large) => {
+          void large.finally(() => {
+            pending = false;
+          }).catch(() => {});
+          pending = true;
+          try {
+            await bounded(entered.promise);
+            await bounded(small);
+            assertEquals(
+              pending,
+              true,
+              'larger callback still owns its settlement',
+            );
+            const later = await sendLocal(room.g.room, {
+              type: 'm.room.message',
+              sender: room.g.creator,
+              content: { body: 'worker continues', msgtype: 'm.text' },
+            }, room.g.signer);
+            await bounded(projectThrough(store, later.completion!));
+          } finally {
+            release.resolve();
+          }
+        },
+      );
+    } finally {
+      release.resolve();
+    }
+  });
+});
+
+Deno.test('publication batching review: a failing shared suffix preserves the smaller cut', async () => {
+  await fixture(async (store, rooms) => {
+    const room = rooms[0];
+    const next = await sendLocal(room.g.room, {
+      type: 'm.room.message',
+      sender: room.g.creator,
+      content: { body: 'failing later cut', msgtype: 'm.text' },
+    }, room.g.signer);
+    const server = await store.server();
+    const original = server.tx.bind(server);
+    let rollbacks = 0;
+    server.tx = (fn, options) =>
+      original(async (tx) => {
+        const value = await fn(tx);
+        if (
+          (await tx.query('SELECT event FROM feed WHERE event=?', [
+            next.eventId,
+          ])).length
+        ) {
+          rollbacks++;
+          throw new Error('permanent later-cut failure');
+        }
+        return value;
+      }, options);
+    try {
+      await sharedCuts(
+        store,
+        room,
+        () => projectThrough(store, next.completion!),
+        async (small, large) => {
+          const result = await bounded(Promise.allSettled([small, large]));
+          assertEquals(result.map((r) => r.status), ['fulfilled', 'rejected']);
+          assertEquals(
+            await get(server, sourceOf(room.g.roomId)),
+            room.event.completion!.through,
+          );
+          assertEquals(
+            (await server.query(
+              'SELECT event FROM feed WHERE event IN (?,?) ORDER BY seq',
+              [room.event.eventId, next.eventId],
+            )).map((r) => r.event),
+            [room.event.eventId],
+          );
+          assertEquals(
+            rollbacks > 0,
+            true,
+            'shared transaction really rolled back',
+          );
+        },
+      );
+    } finally {
+      server.tx = original;
+    }
+    await projectThrough(store, next.completion!);
+    assertEquals(
+      (await server.query(
+        'SELECT event FROM feed WHERE event IN (?,?) ORDER BY seq',
+        [room.event.eventId, next.eventId],
+      )).map((r) => r.event),
+      [room.event.eventId, next.eventId],
+    );
+  });
+});
 
 function isPreparedResult(value: unknown): boolean {
   const result =
