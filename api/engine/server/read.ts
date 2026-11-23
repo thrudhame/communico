@@ -67,6 +67,23 @@ export async function relevantFeedChanged(
   return Number(rows[0].changed) !== 0;
 }
 
+// Select the joined room delta at the caller's server cut. The existing
+// room/seq index makes each probe independent of the room's history length.
+export async function changedJoinedRooms(
+  db: Pick<Db, 'query'>,
+  userId: string,
+  since: number,
+  through: number,
+): Promise<Set<string>> {
+  if (since >= through) return new Set();
+  const rows = await db.query(
+    `SELECT m.room FROM memberships m WHERE m.user=? AND m.membership='join'
+       AND EXISTS (SELECT 1 FROM feed f WHERE f.room=m.room AND f.seq>? AND f.seq<=?)`,
+    [userId, since, through],
+  );
+  return new Set(rows.map((row) => String(row.room)));
+}
+
 export type FeedRow = {
   seq: number;
   room: string;
