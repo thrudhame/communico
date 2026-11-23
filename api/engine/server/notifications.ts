@@ -1099,6 +1099,12 @@ export async function requireNotificationHistory(
         String(row.semantic_key),
       );
       if (selected && savedNotification(selected).notify) {
+        const value = savedNotification(selected);
+        // OOB display is transient. An invite fact without a current display
+        // or accepted room event is retained evidence, not a history dependency.
+        if (
+          value.source === 'invite' && !await notificationTarget(conn, value)
+        ) continue;
         throw new MatrixError(
           503,
           'M_UNAVAILABLE',
@@ -1107,6 +1113,23 @@ export async function requireNotificationHistory(
       }
     }
   });
+}
+
+async function notificationTarget(
+  tx: Conn,
+  value: ReturnType<typeof savedNotification>,
+) {
+  const [target] = await tx.query(
+    "SELECT seq,pos FROM event_index WHERE event=? AND room=? AND standing='accepted' AND grounding='grounded' AND seq IS NOT NULL",
+    [value.event, value.room],
+  );
+  if (target) return target;
+  if (value.source !== 'invite') return undefined;
+  const [invite] = await tx.query(
+    "SELECT seq,seq AS pos FROM prejoin_memberships WHERE room_id=? AND user_id=? AND event_id=? AND kind='invite' AND status='pending'",
+    [value.room, value.user, value.event],
+  );
+  return invite;
 }
 
 /** Source facts may precede room evidence. Event projection revisits only the
@@ -1143,17 +1166,8 @@ async function projectImportedNotificationEvent(
       (Number(prior.native) === 1 ||
         prior.operation_id === selected.operationId)
     ) continue;
-    const [target] = await tx.query(
-      "SELECT seq,pos FROM event_index WHERE event=? AND room=? AND standing='accepted' AND grounding='grounded' AND seq IS NOT NULL",
-      [event, room],
-    );
-    const [invite] = value.source === 'invite'
-      ? await tx.query(
-        "SELECT seq FROM prejoin_memberships WHERE room_id=? AND user_id=? AND event_id=? AND kind='invite' AND status='pending'",
-        [room, value.user, event],
-      )
-      : [];
-    if (!target && !invite) continue;
+    const target = await notificationTarget(tx, value);
+    if (!target) continue;
     if (prior) {
       await removeDecisionProjection(
         tx,
@@ -1163,13 +1177,13 @@ async function projectImportedNotificationEvent(
         false,
       );
     }
-    const seq = Number(target?.seq ?? invite.seq);
+    const seq = Number(target.seq);
     await projectDecision(
       tx,
       room,
       event,
       seq,
-      Number(target?.pos ?? seq),
+      Number(target.pos ?? seq),
       {
         tenant: value.tenant,
         user: value.user,

@@ -14,6 +14,7 @@ import {
 import {
   captureNotificationOperations,
   notificationOperations,
+  recordNotificationOperation,
 } from '#engine/server/notification-operations.ts';
 import { createHash } from 'node:crypto';
 import type { PushPublication } from '#engine/server/push-project.ts';
@@ -110,6 +111,81 @@ function publication(notify = true): PushPublication {
       },
     }],
   };
+}
+
+for (const status of ['absent', 'joined', 'left'] as const) {
+  Deno.test(`facade notifications: late invite fact with ${status} display cannot block account history`, async () => {
+    const f = await fixture();
+    try {
+      const saved = await f.home.tx((conn) =>
+        recordNotificationOperation(
+          conn,
+          '!room:test',
+          '$late-invite',
+          'invite',
+          publication().decisions[0],
+          1000,
+        )
+      );
+      if (status !== 'absent') {
+        await f.edge.execute(
+          'INSERT INTO prejoin_memberships(room_id,user_id,event_id,room_version,event_json,invite_room_state,origin,received_ms,status,seq,kind) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+          [
+            '!room:test',
+            '@bob:test',
+            '$late-invite',
+            '11',
+            '{}',
+            '[]',
+            'test',
+            1000,
+            status,
+            72,
+            'invite',
+          ],
+        );
+      }
+      await f.edge.tx((conn) =>
+        importNotificationOperation(conn, saved!.operation, 2000)
+      );
+      await requireNotificationHistory(f.edge, '@bob:test');
+      assertEquals(await f.edge.query('SELECT * FROM notifications'), []);
+      // The fact is retained, not discarded: matching future pending evidence
+      // may still materialize it at its receiver-local position.
+      await f.edge.execute('DELETE FROM prejoin_memberships');
+      await f.edge.execute(
+        'INSERT INTO prejoin_memberships(room_id,user_id,event_id,room_version,event_json,invite_room_state,origin,received_ms,status,seq,kind) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+        [
+          '!room:test',
+          '@bob:test',
+          '$late-invite',
+          '11',
+          '{}',
+          '[]',
+          'test',
+          1000,
+          'pending',
+          73,
+          'invite',
+        ],
+      );
+      await assertRejects(
+        () => requireNotificationHistory(f.edge, '@bob:test'),
+        Error,
+        'saved notification evidence unavailable',
+      );
+      await f.edge.tx((conn) =>
+        reconcileNotificationEvent(conn, '!room:test', '$late-invite', 3000)
+      );
+      await requireNotificationHistory(f.edge, '@bob:test');
+      assertEquals(
+        await f.edge.query('SELECT event,event_seq FROM notifications'),
+        [{ event: '$late-invite', event_seq: 73 }],
+      );
+    } finally {
+      await f.close();
+    }
+  });
 }
 
 Deno.test('facade notifications: both qualified and v12-derived room IDs publish and import', async (t) => {
