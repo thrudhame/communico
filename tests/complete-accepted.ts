@@ -10,7 +10,17 @@ export async function completeAccepted(
   roomId: string,
   eventId?: string,
 ): Promise<void> {
-  const room = await openRoom(owner.store, roomId);
+  await completeRoomCut(owner.store, owner.tenant.serverName, roomId, eventId);
+}
+
+// The same exact obligation for store-level fixtures without a tenant.
+export async function completeRoomCut(
+  store: Store,
+  self: string,
+  roomId: string,
+  eventId?: string,
+): Promise<void> {
+  const room = await openRoom(store, roomId);
   const target = await room.tx((tx) =>
     eventId === undefined
       ? tx.completion.capture()
@@ -19,9 +29,5 @@ export async function completeAccepted(
   if (target === null) {
     throw new Error('accepted fixture event has no completion receipt');
   }
-  await completionService(owner.store).complete(
-    room,
-    owner.tenant.serverName,
-    target,
-  );
+  await completionService(store).complete(room, self, target);
 }
