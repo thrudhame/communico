@@ -33,6 +33,7 @@ import {
   admitLocalJoin,
   completeRoomWrite,
   enrollCompletion,
+  enrollRoomWrite,
   prepareJoinObservation,
   prepareMembershipAdmission,
   requireCompletionOwner,
@@ -547,6 +548,12 @@ export async function afterLocalCommit(
   await afterRoomCommit(room, self, [eventId]);
 }
 
+// What a writer's caller waits for after its room commit. 'published' callers
+// need the completed state (local sends, joins, history). 'accepted' callers
+// answer once the commit is durable: the committed head is the obligation and
+// the store-lifetime owner (or startup discovery) completes it.
+export type CommitWait = 'published' | 'accepted';
+
 // Every arrival-capable composition completes the same durable dependency
 // queue before projection, including history and snapshot evidence. Call only
 // after releasing the room lock; recovery acquires it for each eligible job.
@@ -555,7 +562,9 @@ export async function afterRoomCommit(
   self: string,
   arrived: readonly string[] = [],
   signal?: AbortSignal,
+  wait: CommitWait = 'published',
 ): Promise<void> {
+  if (wait === 'accepted' && await enrollRoomWrite(room, self)) return;
   const owned = completeRoomWrite(room, self, signal);
   if (owned !== undefined) {
     await owned;

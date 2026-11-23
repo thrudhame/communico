@@ -8,6 +8,9 @@ import { peerStatus } from '#engine/federation/sender.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { createRoom } from '#engine/room/create.ts';
 import { openRoom, type Room } from '#engine/room/index.ts';
+import { completeAccepted } from './complete-accepted.ts';
+import { roomDeliveredBySync } from './support/sync-delivery.ts';
+import { holdPublication } from './support/hold-publication.ts';
 import { httpSuite } from './http-app.ts';
 import {
   fedCaller,
@@ -96,6 +99,64 @@ function send(id: string, pdus: Pdu[], edus: Json[] = []) {
     edus,
   });
 }
+
+// Watchdog only: it fails a hung operation, never releases publication.
+function guard<T>(task: Promise<T>, what: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
+    task,
+    new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(what)), 10000);
+    }),
+  ]).finally(() => clearTimeout(timer));
+}
+
+test('send: real HTTP answers decided acceptance before publication, then sync receives it once', async () => {
+  const s = await setup();
+  const pdu = await message(s, 'HTTP acceptance before publication');
+  const eventId = String(pdu.event_id);
+  const hold = holdPublication(theApp(), s.id);
+  try {
+    await roomDeliveredBySync(matrix, token, s.id, async () => {
+      const answer = await guard(
+        send('held-publication', [pdu]),
+        'HTTP /send waited for publication',
+      );
+      assertEquals(answer, { status: 200, body: { pdus: { [eventId]: {} } } });
+      await guard(
+        hold.entered,
+        'accepted HTTP event never reached publication',
+      );
+      assertEquals(
+        (await s.held.tx((tx) => tx.events.getStatus(eventId)))?.standing,
+        'accepted',
+      );
+      assertEquals(
+        await theApp().server.query(
+          'SELECT event FROM feed WHERE room=? AND event=?',
+          [s.id, eventId],
+        ),
+        [],
+      );
+      hold.release();
+      return [eventId];
+    });
+    assertEquals(await send('held-publication', [pdu]), {
+      status: 200,
+      body: { pdus: { [eventId]: {} } },
+    });
+    assertEquals(
+      await theApp().server.query(
+        'SELECT event FROM feed WHERE room=? AND event=?',
+        [s.id, eventId],
+      ),
+      [{ event: eventId }],
+    );
+  } finally {
+    hold.release();
+    hold.restore();
+  }
+});
 
 test('send: origin/caps and changed-body replay preserve the first per-PDU answer', async () => {
   const s = await setup();
@@ -316,6 +377,8 @@ test('send: missing prevs persist pending waits without news; zero retention dro
       ]);
       assert(waits.every((w) => w.expires !== null));
     });
+    // /send answers at acceptance; projection readers wait on the room's cut.
+    await completeAccepted(theApp(), s.id);
     const indexed = await theApp().server.query(
       'SELECT seq,grounding FROM event_index WHERE event=?',
       [String(pending.event_id)],
@@ -343,6 +406,7 @@ test('send: missing prevs persist pending waits without news; zero retention dro
       await s.held.tx((tx) => tx.events.get(String(dropped.event_id))),
       null,
     );
+    await completeAccepted(theApp(), s.id);
     assertEquals(
       await theApp().server.query('SELECT 1 FROM event_index WHERE event=?', [
         String(dropped.event_id),
@@ -402,26 +466,37 @@ for (const retention of ['default', 'zero'] as const) {
       assertEquals(first.status, 200);
       const receipt = (first.body.pdus as Json)[bId] as Json;
       assert(typeof receipt.error === 'string');
+      // /send answers at acceptance: absence is checked at the completed cut,
+      // arrivals through real since-token long polls woken by the notifier.
+      await completeAccepted(theApp(), s.id);
       const waiting = await sync(before.next);
       assertEquals(waiting.ids, []);
-      assertEquals(await send(`unreject-${retention}-A`, [a]), {
-        status: 200,
-        body: { pdus: { [aId]: {} } },
+      await roomDeliveredBySync(matrix, token, s.id, async () => {
+        assertEquals(await send(`unreject-${retention}-A`, [a]), {
+          status: 200,
+          body: { pdus: { [aId]: {} } },
+        });
+        return retention === 'default' ? [aId, bId] : [aId];
       });
-      const arrived = await sync(waiting.next);
-      assertEquals(arrived.ids, retention === 'default' ? [aId, bId] : [aId]);
-      const resent = await send(`unreject-${retention}-B-again`, [b]);
-      assertEquals(resent, {
-        status: 200,
-        body: { pdus: { [bId]: {} } },
-      });
+      const mark = await sync();
+      const redeliver = async () => {
+        assertEquals(await send(`unreject-${retention}-B-again`, [b]), {
+          status: 200,
+          body: { pdus: { [bId]: {} } },
+        });
+        return [bId];
+      };
+      if (retention === 'default') {
+        await redeliver();
+        await completeAccepted(theApp(), s.id);
+        assertEquals((await sync(mark.next)).ids, []);
+      } else {
+        await roomDeliveredBySync(matrix, token, s.id, redeliver);
+      }
       // Redelivery is now grounded and succeeds, unlike the original refusal.
       assert(
         typeof ((first.body.pdus as Json)[bId] as Json).error === 'string',
       );
-      const after = await sync(arrived.next);
-      assertEquals(after.ids, retention === 'default' ? [] : [bId]);
-      assertEquals((await sync(after.next)).ids, []);
       const response = await matrix(
         new Request(
           'http://x/_matrix/client/v3/rooms/' + enc(s.id) +

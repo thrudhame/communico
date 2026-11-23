@@ -22,6 +22,7 @@ import { ingestRemote } from '#engine/room/remote.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { installServerHooks } from '#engine/server/startup.ts';
+import { completeRoomCut } from './complete-accepted.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { type Genesis, genesis } from './fixtures/genesis.ts';
 import { authAt } from './fixtures/auth.ts';
@@ -531,7 +532,9 @@ Deno.test('send: per-PDU outcomes — accepted {}, unknown room, refused error, 
       {},
       'rejection is not an error',
     );
-    // the accepted one is really in the room now (indexed, sequenced)
+    // the accepted one is really in the room now (indexed, sequenced) once
+    // its accepted cut completes; /send itself answers at acceptance
+    await completeRoomCut(store, s.deps.self, s.g.roomId);
     const server = await store.server();
     const rows = await server.query(
       'SELECT standing, seq FROM event_index WHERE event = ?',
@@ -731,7 +734,8 @@ Deno.test('send: unknown prev returns a per-PDU error while retaining pending wa
       status.waits.map((w) => w.missing).sort(),
       ['$madeupprev1', '$madeupprev2'],
     );
-    // a placeholder is never news (no feed seq)
+    // a placeholder is never news (no feed seq), even at its completed cut
+    await completeRoomCut(store, s.deps.self, s.g.roomId);
     const server = await store.server();
     const indexed = await server.query(
       'SELECT seq, grounding FROM event_index WHERE event = ?',

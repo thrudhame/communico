@@ -4,6 +4,7 @@
 // The real federation client and key store arrive in stage 4; tests use
 // the fakes in tests/fixtures/.
 import type { Pdu } from '#engine/pdu.ts';
+import type { CommitWait } from '#engine/room/ingest.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { recoverableUpstream } from '#engine/net/upstream-error.ts';
 
@@ -165,4 +166,7 @@ export type RemoteDeps = {
     userId: string;
     observation?: import('./hooks.ts').LocalJoinObservation;
   };
+  // Default 'published'. Inbound federation transactions answer at durable
+  // acceptance; their publication stays with the store's completion owner.
+  completion?: CommitWait;
 };
