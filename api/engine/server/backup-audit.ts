@@ -32,7 +32,8 @@ export async function auditServer(
       if (
         !Number.isInteger(row.phase) || Number(row.phase) < 0 ||
         Number(row.phase) > 4 ||
-        typeof plan.oldPower !== 'object' || plan.oldPower === null ||
+        typeof plan.request?.version !== 'string' ||
+        !Array.isArray(plan.request?.creators) ||
         (plan.prepared !== null && (
           plan.prepared.roomId !== row.replacement_room ||
           plan.prepared.options?.creator !== row.user_id ||

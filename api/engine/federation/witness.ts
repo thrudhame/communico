@@ -58,8 +58,11 @@ export function documentsFromAnswer(
   serverName: string,
 ): KeyDocShape[] {
   const obj = objectOf(raw, 'notary');
-  return arrayOf(obj.server_keys, keyDocument, 'notary')
-    .filter((doc) => doc.server_name === serverName);
+  // A batched response contains independent origins. Route before validating
+  // origin-specific material so a foreign malformed document cannot hide ours.
+  return arrayOf(obj.server_keys, (doc) => objectOf(doc, 'notary'), 'notary')
+    .filter((doc) => doc.server_name === serverName)
+    .map(keyDocument);
 }
 
 export async function askWitnesses(opts: {

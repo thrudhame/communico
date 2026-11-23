@@ -4,11 +4,13 @@ import {
   UpstreamError,
   UpstreamHttpError,
 } from '#engine/net/upstream-error.ts';
+import { matrixFailure } from '#engine/request-diagnostics.ts';
 
 // Matrix-shaped 500 (uncaught errors). context.error holds the thrown
-// value; the framework already logged it. Never leak internals.
+// value. Retain safe request correlation even when the framework also logs it.
 // deno-lint-ignore require-await
-export default async function (_request: PathfinderRequest, context: Context) {
+export default async function (request: PathfinderRequest, context: Context) {
+  matrixFailure(request, context);
   if (context.error instanceof UpstreamHttpError) {
     return json(context.error.responseBody(), {
       status: context.error.status,

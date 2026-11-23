@@ -4,9 +4,11 @@ import type { Database } from '#engine/store/db.ts';
 import type { PreparedRoom } from '#engine/room/create.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 
+// The normalized client request a retained replacement answers.
+export type UpgradeRequest = { version: string; creators: string[] };
 export type UpgradePlan = {
   prepared: PreparedRoom | null;
-  oldPower: Record<string, unknown>;
+  request: UpgradeRequest;
   canonical: Record<string, unknown> | null;
 };
 export type RoomUpgrade = {
@@ -45,14 +47,32 @@ export async function retainRoomUpgrade(
     [value.oldRoom, value.user, value.replacement, JSON.stringify(value.plan)],
   );
   const retained = (await roomUpgrade(db, value.oldRoom))!;
-  if (retained.user !== value.user) {
+  requireRetainedRequest(retained, value.user, value.plan.request);
+  return retained;
+}
+
+/** One retained replacement answers exactly one owner and request. */
+export function requireRetainedRequest(
+  retained: RoomUpgrade,
+  user: string,
+  request: UpgradeRequest,
+) {
+  if (
+    retained.user !== user ||
+    requestKey(retained.plan.request) !== requestKey(request)
+  ) {
     throw new MatrixError(
       400,
       'M_BAD_STATE',
       'An upgrade for this room is already retained',
     );
   }
-  return retained;
+}
+
+function requestKey(request: UpgradeRequest | undefined) {
+  return JSON.stringify(
+    request ? [request.version, [...request.creators].sort()] : null,
+  );
 }
 
 export async function advanceRoomUpgrade(
@@ -78,11 +98,13 @@ export async function withRoomUpgrade(
   db: Database,
   oldRoom: string,
   user: string,
+  request: UpgradeRequest,
   run: () => Promise<{ replacement_room: string }>,
 ) {
   let flights = active.get(db);
   if (!flights) active.set(db, flights = new Map());
-  const key = JSON.stringify([oldRoom, user]);
+  // A different request never joins this flight; the retained row decides.
+  const key = JSON.stringify([oldRoom, user, requestKey(request)]);
   let flight = flights.get(key);
   if (!flight) {
     flight = Promise.resolve().then(run);

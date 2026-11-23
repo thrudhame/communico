@@ -11,7 +11,11 @@
 // missingEvents/backfill/makeJoin/sendJoin throw (the caller catches
 // into its ladder/failover).
 import { config } from '#engine/config.ts';
-import { type Fetcher, SendJoinRefused } from '#engine/room/deps.ts';
+import {
+  type Fetcher,
+  SendJoinNotDispatched,
+  SendJoinRefused,
+} from '#engine/room/deps.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import type { Database as Db } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
@@ -28,17 +32,14 @@ import {
   transactionPdus,
 } from './responses.ts';
 import {
-  FederationHttpError,
   federationRequest,
+  isDefiniteFederationRefusal,
   isEndpointUnknown,
 } from './client.ts';
 
-function sendJoinFailure(error: unknown): never {
-  if (
-    error instanceof FederationHttpError && error.matrixBody &&
-    error.remoteStatus >= 400 && error.remoteStatus < 500 &&
-    error.remoteStatus !== 408 && error.remoteStatus !== 429
-  ) {
+function sendJoinFailure(error: unknown, dispatched: boolean): never {
+  if (!dispatched) throw new SendJoinNotDispatched(error);
+  if (isDefiniteFederationRefusal(error)) {
     throw new SendJoinRefused(
       error.status,
       error.errcode,
@@ -218,28 +219,34 @@ export function productionFetcher(
     // on endpoint-unknown. `event` arrives WITH its computed id — the
     // wire form strips it (and unsigned) and carries it on the path.
     sendJoin: async (roomId, event, via) => {
-      const wire = { ...(event as unknown as Record<string, unknown>) };
-      const eventId = String(wire.event_id);
-      delete wire.event_id;
-      delete wire.unsigned;
-      const body = new TextEncoder().encode(JSON.stringify(wire));
+      let dispatched = false;
       try {
-        const res = await federationRequest(server, signer, {
-          room: { store, id: roomId, participation: true },
-          destination: via,
-          method: 'PUT',
-          path: `/_matrix/federation/v2/send_join/${
-            encodeURIComponent(roomId)
-          }/${encodeURIComponent(eventId)}`,
-          body,
-          maxBytes: bulk(),
-        });
-        return sendJoinResponse(res.json);
-      } catch (e) {
-        if (!isEndpointUnknown(e)) sendJoinFailure(e);
-        let res;
+        const wire = { ...(event as unknown as Record<string, unknown>) };
+        const eventId = String(wire.event_id);
+        delete wire.event_id;
+        delete wire.unsigned;
+        const body = new TextEncoder().encode(JSON.stringify(wire));
         try {
-          res = await federationRequest(server, signer, {
+          const res = await federationRequest(server, signer, {
+            room: { store, id: roomId, participation: true },
+            destination: via,
+            method: 'PUT',
+            path: `/_matrix/federation/v2/send_join/${
+              encodeURIComponent(roomId)
+            }/${encodeURIComponent(eventId)}`,
+            body,
+            maxBytes: bulk(),
+            beforeDispatch: () => {
+              dispatched = true;
+            },
+          });
+          return sendJoinResponse(res.json);
+        } catch (e) {
+          if (!isEndpointUnknown(e)) throw e;
+          // A completed endpoint-unknown refusal proves v2 did not apply. The v1
+          // fallback gets its own pre-dispatch outcome, not v2's dispatch flag.
+          dispatched = false;
+          const res = await federationRequest(server, signer, {
             room: { store, id: roomId, participation: true },
             destination: via,
             method: 'PUT',
@@ -248,11 +255,14 @@ export function productionFetcher(
             }/${encodeURIComponent(eventId)}`,
             body,
             maxBytes: bulk(),
+            beforeDispatch: () => {
+              dispatched = true;
+            },
           });
-        } catch (error) {
-          sendJoinFailure(error);
+          return sendJoinResponse(res.json, true);
         }
-        return sendJoinResponse(res.json, true);
+      } catch (error) {
+        sendJoinFailure(error, dispatched);
       }
     },
   };

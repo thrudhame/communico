@@ -4,6 +4,32 @@ import { roomSchema } from '#engine/room/index.ts';
 import { openStore } from '#engine/store/index.ts';
 import { testSigner } from './fixtures/signer.ts';
 
+Deno.test('independent concurrent fixed-clock v12 creates publish distinct rooms', async () => {
+  const dir = await Deno.makeTempDir();
+  const store = await openStore({
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  }, { schemas: { room: roomSchema } });
+  const now = Date.now;
+  try {
+    Date.now = () => 1700000000000;
+    const signer = await testSigner();
+    const results = await Promise.all([
+      createRoom(store, { creator: '@dev:test', version: '12' }, signer),
+      createRoom(store, { creator: '@dev:test', version: '12' }, signer),
+    ]);
+    assertEquals(new Set(results.map((result) => result.roomId)).size, 2);
+    assertEquals((await roomDirectories(dir)).length, 2);
+  } finally {
+    Date.now = now;
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 async function roomDirectories(root: string): Promise<string[]> {
   try {
     return (await Array.fromAsync(Deno.readDir(root + '/rooms')))

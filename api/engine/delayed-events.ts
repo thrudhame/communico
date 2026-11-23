@@ -338,7 +338,7 @@ export class DelayedEvents {
     const events = await this.#app.tenant.tx((tx) =>
       tx.delayedEvents.due(Date.now())
     );
-    const retained: string[] = [];
+    const retained: DelayedEvent[] = [];
     for (const event of events) {
       if (this.#stopped) break;
       try {
@@ -348,14 +348,18 @@ export class DelayedEvents {
         if (!(error instanceof MatrixError)) {
           console.error('delayed event delivery failed; retry pending');
         }
-        retained.push(event.id);
+        retained.push(event);
       }
     }
     // Rebase the whole failed batch after processing it. Even a slow batch
     // must leave a window for later due commands, not refill its own 32 slots.
     if (retained.length !== 0) {
       await this.#app.tenant.tx((tx) =>
-        tx.delayedEvents.retry(retained, Date.now() + 1000)
+        tx.delayedEvents.retry(
+          retained.map((event) => event.id),
+          Date.now() + 1000,
+          retained,
+        )
       );
     }
   }

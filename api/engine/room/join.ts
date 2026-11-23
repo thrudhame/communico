@@ -27,6 +27,7 @@ import { finalizeBuilt, roomCreateId } from '#engine/room/build.ts';
 import {
   type Fetcher,
   type KeyResolver,
+  SendJoinNotDispatched,
   SendJoinRefused,
 } from '#engine/room/deps.ts';
 import {
@@ -64,6 +65,7 @@ import {
   clearJoinAttempt,
   type JoinAttempt,
   joinAttemptCommitted,
+  refuseJoinAttempt,
   releaseJoinAttempt,
 } from '#engine/server/join-attempts.ts';
 
@@ -241,6 +243,12 @@ async function joinVia(
     // 3. send_join — the answer is untrusted input
     const resp = await deps.fetcher.sendJoin(args.roomId, signed, candidate)
       .catch((error: unknown) => {
+        if (error instanceof SendJoinNotDispatched) {
+          // Persist the same proof of no remote membership as a peer refusal,
+          // so even a failed deletion cannot create compensating leave debt.
+          refused = true;
+          throw error.error;
+        }
         refused = error instanceof SendJoinRefused;
         throw error;
       });
@@ -434,7 +442,11 @@ async function joinVia(
     return { roomId: args.roomId, eventId };
   } finally {
     try {
-      if (refused || await joinAttemptCommitted(store, attempt)) {
+      if (refused) {
+        const server = await store.server();
+        await refuseJoinAttempt(server, attempt);
+        await clearJoinAttempt(server, attempt);
+      } else if (await joinAttemptCommitted(store, attempt)) {
         await clearJoinAttempt(await store.server(), attempt);
       } else if (deps.leave !== undefined) {
         await deps.leave(attempt);

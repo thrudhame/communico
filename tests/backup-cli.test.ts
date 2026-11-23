@@ -1,6 +1,8 @@
+import { DiagnosticCommand } from '#tests/helpers/child-diagnostics.ts';
 import { assert, assertEquals } from '@std/assert';
 import { join } from '@std/path';
 import metadata from '#root/deno.json' with { type: 'json' };
+import { fixtureListeners } from './helpers/fixture-listeners.ts';
 
 // Real task permissions, separate server processes and public consumers. The
 // backup client receives an unusable native path to prove the live owner does it.
@@ -17,18 +19,13 @@ for (
     const target = join(dir, 'target.toml');
     const bundle = join(dir, "server's backup");
     const passphrase = join(dir, 'passphrase');
-    const listener = Deno.listen({ hostname: '127.0.0.1', port: 0 });
-    const port = listener.addr.port;
-    listener.close();
-    const tlsListener = Deno.listen({ hostname: '127.0.0.1', port: 0 });
-    const tlsPort = tlsListener.addr.port;
-    tlsListener.close();
+    let port = 0;
     await Deno.writeTextFile(passphrase, 'control passphrase\n', {
       mode: 0o600,
     });
-    const common = `[server]\nname="control.test"\nport=${port}\n` +
+    const common = `[server]\nname="control.test"\nport=0\n` +
       (defaultSocket ? '' : `[admin]\nsocket="${socket}"\n`) +
-      `[federation]\nenabled=true\nport=${tlsPort}\ncert="tests/fixtures/tls/localhost.crt"\nkey="tests/fixtures/tls/localhost.key"\n[backup]\nencrypt=${encrypted}\npassphrasefile="${passphrase}"\n`;
+      `[federation]\nenabled=true\nport=0\ncert="tests/fixtures/tls/localhost.crt"\nkey="tests/fixtures/tls/localhost.key"\n[backup]\nencrypt=${encrypted}\npassphrasefile="${passphrase}"\n`;
     await Deno.writeTextFile(
       config,
       common +
@@ -65,9 +62,13 @@ for (
       return data;
     };
     const start = async (configPath: string) => {
-      const child = new Deno.Command(Deno.execPath(), {
-        args: metadata.tasks.start.split(' ').slice(1),
-        env: { ...env, COMMUNICO_CONFIG: configPath },
+      const listeners = await fixtureListeners(configPath);
+      const child = new DiagnosticCommand(Deno.execPath(), {
+        args: [
+          ...metadata.tasks.start.split(' ').slice(1, -1),
+          'tests/fixtures/listener-child.ts',
+        ],
+        env: { ...env, COMMUNICO_CONFIG: configPath, ...listeners.env },
         stdout: 'piped',
         stderr: 'piped',
       }).spawn();
@@ -81,6 +82,7 @@ for (
         return output;
       });
       running = state;
+      port = await listeners.port('client');
       const deadline = Date.now() + 15000;
       for (;;) {
         try {
@@ -115,7 +117,7 @@ for (
       expected = 0,
       extra: Record<string, string> = {},
     ) => {
-      const result = await new Deno.Command(Deno.execPath(), {
+      const result = await new DiagnosticCommand(Deno.execPath(), {
         args: ['task', task, '--', ...args],
         env: { ...env, COMMUNICO_CONFIG: configPath, ...extra },
         stdout: 'piped',

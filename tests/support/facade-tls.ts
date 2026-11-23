@@ -1,3 +1,4 @@
+import { DiagnosticCommand } from '#tests/helpers/child-diagnostics.ts';
 import { join } from 'node:path';
 import { certificatePin } from '#engine/facade/identity.ts';
 
@@ -5,7 +6,7 @@ import { certificatePin } from '#engine/facade/identity.ts';
 export async function facadeTls() {
   const dir = await Deno.makeTempDir({ prefix: 'facade-tls-' });
   async function openssl(...args: string[]) {
-    const result = await new Deno.Command('openssl', {
+    const result = await new DiagnosticCommand('openssl', {
       args,
       cwd: dir,
       stdout: 'null',

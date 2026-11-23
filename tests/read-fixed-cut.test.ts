@@ -3,6 +3,7 @@ import { startHttp } from '#tests/http-app.ts';
 import { createRoom } from '#engine/room/create.ts';
 import { join } from '#engine/client/membership.ts';
 import { completionService } from '#engine/server/completion.ts';
+import { deliveredBySync } from '#tests/support/sync-delivery.ts';
 
 function guard<T>(task: Promise<T>): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -101,6 +102,43 @@ for (const reader of ['sender', 'foreign'] as const) {
       };
       const firstId = await send('before-read');
       await guard(firstEntered.promise);
+      if (reader === 'foreign') {
+        // No pending send belongs to this device. Its fixed view is the applied
+        // cut before the held first send, not that sender's accepted target.
+        sync = http.matrix(
+          new Request('http://x/_matrix/client/v3/sync?timeout=0', {
+            headers: { Authorization: 'Bearer ' + bob.access_token },
+          }),
+        );
+        for (let n = 0; n < 8; n++) {
+          laterIds.push(await send('after-read-' + n));
+        }
+        const response = await guard(sync);
+        assertEquals(response.status, 200);
+        const body = await response.json();
+        assert(!JSON.stringify(body).includes(firstId));
+        for (const id of laterIds) assert(!JSON.stringify(body).includes(id));
+        assertEquals(
+          await app.server.query('SELECT event FROM feed WHERE event=?', [
+            firstId,
+          ]),
+          [],
+          'foreign sync returned while the first accepted send remained held',
+        );
+        await deliveredBySync(http.matrix, bob.access_token!, () => {
+          firstRelease.resolve();
+          return Promise.resolve({ [created.roomId]: [firstId, ...laterIds] });
+        }, {
+          since: String(body.next_batch),
+          observed: (events) => {
+            if (events[created.roomId].includes(firstId)) {
+              laterRelease.resolve();
+            }
+          },
+        });
+        await guard(laterEntered.promise);
+        return;
+      }
       owner.wait = (...args) => {
         if (args[0].roomId === created.roomId && args[1] === 'publication') {
           captured.resolve(args[0].through);

@@ -1,17 +1,41 @@
 // The application-owned failure disclosure boundary. One atomic record
 // keeps concurrent failures correlated, without serializing request objects or
-// arbitrary exception properties/causes that may carry private payloads.
+// arbitrary exception properties that may carry private payloads. Only Error
+// causes/aggregate children cross the same explicit projection recursively.
 import { HttpError } from '@pathfinder/pathfinder';
+import type {
+  Context,
+  Middleware,
+  PathfinderRequest,
+} from '@pathfinder/pathfinder';
 import { accessLogPath } from './access-log.ts';
 import { LinkError } from './facade/protocol.ts';
 import { MatrixError } from './matrix-error.ts';
+import { UpstreamError } from './net/upstream-error.ts';
 
-function safeException(error: unknown) {
+export function safeException(
+  error: unknown,
+  seen = new Set<Error>(),
+): Record<string, unknown> {
+  if (error instanceof Error) {
+    if (seen.has(error)) {
+      return { name: 'Circular', message: 'circular Error reference' };
+    }
+    seen.add(error);
+  }
   return error instanceof Error
     ? {
       name: error.name,
       message: error.message,
       stack: error.stack,
+      // Peer decoder/socket causes may contain response bytes or credential
+      // URLs. Preserve UpstreamError's existing explicit disclosure boundary.
+      ...(error.cause instanceof Error && !(error instanceof UpstreamError)
+        ? { cause: safeException(error.cause, seen) }
+        : {}),
+      ...(error instanceof AggregateError
+        ? { errors: error.errors.map((child) => safeException(child, seen)) }
+        : {}),
       ...(error instanceof HttpError || error instanceof LinkError
         ? { status: error.status }
         : {}),
@@ -42,6 +66,51 @@ export function requestFailure(
     'http failure: ' + JSON.stringify({
       method: request.method ?? 'UNKNOWN',
       path,
+      error: safeException(error),
+    }),
+  );
+}
+
+const diagnosed = new WeakMap<Context, unknown>();
+export function matrixFailure(
+  request: PathfinderRequest,
+  context: Context,
+): void {
+  if (diagnosed.has(context) && diagnosed.get(context) === context.error) {
+    return;
+  }
+  diagnosed.set(context, context.error);
+  requestFailure(request._raw, context.error);
+}
+
+/** Includes typed HttpError 5xx, which bypass a 500 renderer. Unexpected
+ * exceptions are recorded during rendering so a later post-function fault
+ * cannot hide them. The context owns deduplication, never an exception object
+ * shared by concurrent requests. Framework-internal catches remain raw logs. */
+export const matrixDiagnostics: Middleware =
+  (request, context) => (response) => {
+    if (context.error !== undefined && response.status >= 500) {
+      matrixFailure(request, context);
+    }
+  };
+
+export function workerFailure(
+  context: {
+    owner: string;
+    server: string;
+    node?: string;
+    peer?: string;
+    scope?: string;
+  },
+  error: unknown,
+): void {
+  console.error(
+    'worker failure: ' + JSON.stringify({
+      owner: context.owner,
+      server: context.server,
+      node: context.node,
+      peer: context.peer,
+      scope: context.scope,
       error: safeException(error),
     }),
   );

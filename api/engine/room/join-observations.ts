@@ -5,7 +5,7 @@ import { appendChange } from './changes.ts';
 import type { LocalJoinObservation } from './hooks.ts';
 import { latestStay } from './segments.ts';
 import { current, groupKey } from './state.ts';
-import { getEvent } from './events.ts';
+import { getEvent, getStatus } from './events.ts';
 
 export const JOIN_OBSERVATIONS_SQL = `
 CREATE TABLE local_join_observations(event TEXT PRIMARY KEY NOT NULL,data TEXT NOT NULL);
@@ -36,7 +36,8 @@ export async function retainJoinObservation(
 ) {
   const observation = await transitionObservation(conn, user, data);
   if (observation === undefined) return;
-  if ((await conn.query('SELECT 1 FROM events WHERE id=?', [event])).length) {
+  const status = await getStatus(conn, event);
+  if (status !== null && status.grounding !== 'pending') {
     return;
   }
   await conn.execute(
@@ -49,17 +50,16 @@ export async function completeJoinObservation(
   event: string,
   data?: LocalJoinObservation,
 ) {
-  const [old] = await conn.query(
-    "SELECT 1 FROM changes WHERE kind='rejoin-observation' AND event=?",
-    [event],
-  );
-  if (old) return;
+  // The retained-row key lookup comes first: every grounded event asks.
   const [retained] = await conn.query(
     'SELECT data FROM local_join_observations WHERE event=?',
     [event],
   );
   const observed = retained ? JSON.parse(String(retained.data)) : data;
-  if (observed !== undefined) {
-    await appendChange(conn, 'rejoin-observation', event, observed);
-  }
+  if (observed === undefined) return;
+  const [old] = await conn.query(
+    "SELECT 1 FROM changes WHERE kind='rejoin-observation' AND event=?",
+    [event],
+  );
+  if (!old) await appendChange(conn, 'rejoin-observation', event, observed);
 }

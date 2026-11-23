@@ -14,7 +14,11 @@ import {
 } from '#engine/tenant/profile-fanout.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 
-export type ProfileFanoutFailure = { room: string; error: unknown };
+export type ProfileFanoutFailure = {
+  room: string | null;
+  user?: string;
+  error: unknown;
+};
 type Dependencies = {
   store: Store;
   tenant: Tenant;
@@ -61,46 +65,58 @@ export class ProfileFanoutWork {
     ) {
       const userFailed: ProfileFanoutFailure[] = [];
       let work: ProfileFanout | undefined = first;
-      while (work) {
-        const user = '@' + work.localpart + ':' + tenant.serverName;
-        const rooms = (await roomsFor(server, user, 'admission')).filter((m) =>
-          m.membership === 'join'
-        ).map((m) => m.roomId);
-        const current: ProfileFanout = work;
-        try {
-          await tenant.tx((tx) => tx.profiles.fanout.discover(current, rooms));
-          for (
-            const result of await tenant.tx((tx) =>
-              tx.profiles.fanout.rooms(current)
-            )
-          ) {
-            try {
-              if (result.completed) {
-                if (result.accepted === false) {
-                  throw new MatrixError(
-                    403,
-                    'M_FORBIDDEN',
-                    'profile membership rejected',
-                  );
+      try {
+        while (work) {
+          const user = '@' + work.localpart + ':' + tenant.serverName;
+          const rooms = (await roomsFor(server, user, 'admission')).filter((
+            m,
+          ) => m.membership === 'join').map((m) => m.roomId);
+          const current: ProfileFanout = work;
+          try {
+            await tenant.tx((tx) =>
+              tx.profiles.fanout.discover(current, rooms)
+            );
+            for (
+              const result of await tenant.tx((tx) =>
+                tx.profiles.fanout.rooms(current)
+              )
+            ) {
+              try {
+                if (result.completed) {
+                  if (result.accepted === false) {
+                    throw new MatrixError(
+                      403,
+                      'M_FORBIDDEN',
+                      'profile membership rejected',
+                    );
+                  }
+                  continue;
                 }
-                continue;
+                await this.#deliver(current, result.room, user);
+              } catch (error) {
+                if (error instanceof SupersededProfile) break;
+                userFailed.push({ room: result.room, error });
               }
-              await this.#deliver(current, result.room, user);
-            } catch (error) {
-              if (error instanceof SupersededProfile) break;
-              userFailed.push({ room: result.room, error });
             }
+          } catch (error) {
+            if (!(error instanceof SupersededProfile)) throw error;
           }
-        } catch (error) {
-          if (!(error instanceof SupersededProfile)) throw error;
+          // A winner committed while a PDU was in flight cannot lose its new
+          // corrective work to the old completion. Revisit that revision now.
+          const [latest] = await tenant.tx((tx) =>
+            tx.profiles.fanout.list(current.localpart)
+          );
+          work = latest?.revision !== current.revision ? latest : undefined;
+          if (work) userFailed.splice(0, userFailed.length);
         }
-        // A winner committed while a PDU was in flight cannot lose its new
-        // corrective work to the old completion. Revisit that revision now.
-        const [latest] = await tenant.tx((tx) =>
-          tx.profiles.fanout.list(current.localpart)
-        );
-        work = latest?.revision !== current.revision ? latest : undefined;
-        if (work) userFailed.splice(0, userFailed.length);
+      } catch (error) {
+        // No room is known when account discovery fails. Keep the user's root
+        // and report the failure without aborting unrelated users' turns.
+        userFailed.push({
+          room: null,
+          user: '@' + first.localpart + ':' + tenant.serverName,
+          error,
+        });
       }
       failed.push(...userFailed);
     }

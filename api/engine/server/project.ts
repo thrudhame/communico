@@ -23,7 +23,7 @@ import type { Conn } from '#engine/store/db.ts';
 import type { Store } from '#engine/store/index.ts';
 import { roomSource } from '#engine/store/projection-sources.ts';
 import { queueBadge } from '#engine/server/push-queue.ts';
-import { advance, advanceAll, get } from '#engine/store/watermark.ts';
+import { advance, advanceAll, get, getAll } from '#engine/store/watermark.ts';
 import { changedColumns } from '#engine/store/changed.ts';
 import { domainOf } from '#engine/ids.ts';
 import {
@@ -334,11 +334,17 @@ async function projectRoom(
       // A drop/recreate cannot publish an earlier incarnation's captured page.
       await room.tx(async (tx) => {
         if (target !== undefined) await tx.completion.validate(target);
-        return await tx.changes.head();
       });
-      return await get(server, sourceOf(roomId)) === mark &&
-        await get(server, roomSource('push-context', roomId)) === contextMark &&
-        await get(server, roomSource('receipt-graph', roomId)) === receiptMark;
+      const [currentMark, currentContext, currentReceipt] = await getAll(
+        server,
+        [
+          sourceOf(roomId),
+          roomSource('push-context', roomId),
+          roomSource('receipt-graph', roomId),
+        ],
+      );
+      return currentMark === mark && currentContext === contextMark &&
+        currentReceipt === receiptMark;
     };
     if (seed !== null) {
       // Context edges batch until another writer needs the owner. Publish only
@@ -621,9 +627,7 @@ async function publishGroup(group: PublicationTurn[]): Promise<void> {
     const server = await group[0].store.server();
     const now = Date.now();
     await eventStreamTx(server, async (tx) => {
-      if (
-        active.length > 1 && await applyIndependentPublications(tx, active, now)
-      ) return;
+      if (await applyIndependentPublications(tx, active, now)) return;
       for (const { work, ready } of active) {
         for (const item of ready) {
           await apply(tx, work.roomId, item, now, work.localServers);
@@ -974,9 +978,20 @@ type Prepared =
     | { kind: 'redaction'; target: string }
     | { kind: 'delivery'; destinations: string[] }
     | { kind: 'signature' }
-    | { kind: 'local-participation'; user: string }
-    | { kind: 'rejoin-observation'; observation: RejoinObservation }
+    // Retained evidence of a join that is no longer current is inert.
+    | { kind: 'local-participation'; user: string; current: boolean }
+    | {
+      kind: 'rejoin-observation';
+      observation: RejoinObservation;
+      current: boolean;
+    }
   );
+
+// Standing is mutable room evidence, not a self-join change's identity: a
+// join no longer accepted and grounded must not hold the room cursor.
+function currentJoin(status: { standing: string; grounding: string } | null) {
+  return status?.standing === 'accepted' && status.grounding === 'grounded';
+}
 
 function eventPayloadOf(change: Change): EventPayload {
   const data = JSON.parse(change.data) as EventPayload;
@@ -1181,12 +1196,18 @@ async function prepare(
             : await tx.events.getStatus(change.event);
           const pdu = row === null ? null : JSON.parse(row.pdu) as Pdu;
           if (
-            pdu?.type !== 'm.room.member' || pdu.sender !== observation.user ||
+            pdu?.type !== 'm.room.member' ||
             pdu.state_key !== observation.user ||
-            pdu.content?.membership !== 'join' ||
-            status?.standing !== 'accepted' || status.grounding !== 'grounded'
+            !(pdu.content?.membership === 'invite' ||
+              (pdu.content?.membership === 'join' &&
+                pdu.sender === observation.user))
           ) throw new Error('invalid rejoin observation');
-          out.push({ change, kind: 'rejoin-observation', observation });
+          out.push({
+            change,
+            kind: 'rejoin-observation',
+            observation,
+            current: currentJoin(status),
+          });
           break;
         }
         case 'local-participation': {
@@ -1201,10 +1222,14 @@ async function prepare(
           if (
             typeof data.user !== 'string' || pdu?.type !== 'm.room.member' ||
             pdu.sender !== data.user || pdu.state_key !== data.user ||
-            pdu.content?.membership !== 'join' ||
-            status?.standing !== 'accepted' || status.grounding !== 'grounded'
+            pdu.content?.membership !== 'join'
           ) throw new Error('E_LOCAL_PARTICIPATION_IDENTITY');
-          out.push({ change, kind: 'local-participation', user: data.user });
+          out.push({
+            change,
+            kind: 'local-participation',
+            user: data.user,
+            current: currentJoin(status),
+          });
           break;
         }
         case 'signature': {
@@ -1431,6 +1456,7 @@ async function apply(
   const { change } = item;
   switch (item.kind) {
     case 'rejoin-observation':
+      if (!item.current) return;
       for (const self of localServers) {
         if (item.observation.user.endsWith(':' + self)) {
           await projectRejoin(
@@ -1444,6 +1470,7 @@ async function apply(
       }
       return;
     case 'local-participation':
+      if (!item.current) return;
       await tx.execute(
         'UPDATE event_index SET local_join_user=? WHERE room=? AND event=? AND local_join_user IS NOT ?',
         [item.user, roomId, change.event, item.user],

@@ -17,6 +17,7 @@ import { messages } from './timeline.ts';
 import { formatStreamToken } from './tokens.ts';
 import { parseLocalStreamToken, requireStreamDomain } from './positions.ts';
 import { roomCompletion } from './completion.ts';
+import type { DeviceIdentity } from '#engine/tenant/devices.ts';
 
 function forbidden(): never {
   throw new MatrixError(403, 'M_FORBIDDEN', 'no room preview available');
@@ -81,8 +82,9 @@ export async function roomInitialSync(
   device: string | null,
   limit: number,
   signal?: AbortSignal,
+  identity: DeviceIdentity | null = null,
 ) {
-  await roomCompletion(theApp(), [roomId], signal);
+  await roomCompletion(theApp(), [roomId], signal, identity);
   return await withRoomLock(roomId, async () => {
     const app = theApp(), snapshot = await previewCut(roomId, user);
     const domain = await requireStreamDomain(app.server, null);
@@ -147,6 +149,7 @@ export async function roomEvents(
   rawFrom: string | null,
   timeout: number,
   signal: AbortSignal,
+  identity: DeviceIdentity | null = null,
 ) {
   if (!roomId.startsWith('!')) invalid('room_id is required');
   const app = theApp();
@@ -155,7 +158,7 @@ export async function roomEvents(
   const domain = await requireStreamDomain(app.server, null);
   const bookmark = (seq: number) =>
     formatStreamToken(seq, 0, 0, 0, 0, 0, 0, 0, undefined, undefined, domain);
-  await roomCompletion(app, [roomId], signal);
+  await roomCompletion(app, [roomId], signal, identity);
   // An omitted cursor begins now, not at room genesis.
   let from = parsed?.eSeq ?? await eventStreamMax(app.server);
   const start = rawFrom ?? bookmark(from);

@@ -143,8 +143,18 @@ function approvedVerificationKeys(
       unchanged();
       const { roster, document: raw } = await load();
       unchanged();
+      const pending = (reason: string): never => {
+        // Optional evidence is a cache-only observation, not required admission.
+        if (context?.discovery === 'cached') {
+          throw new UpstreamError('validation', {
+            phase: 'key-lookup',
+            reason: 'local key unavailable without complete cached authority',
+          });
+        }
+        throw new VerificationUnavailable(reason);
+      };
       if (roster === null) {
-        throw new VerificationUnavailable('key roster not ready');
+        return pending('key roster not ready');
       }
       const key = roster.keys.find((key) =>
         key.keyId === keyId &&
@@ -152,7 +162,7 @@ function approvedVerificationKeys(
           (purpose !== 'request' && floor <= key.retiredAt))
       );
       if (roster.server === name && key && raw === null) {
-        throw new VerificationUnavailable('key document not ready');
+        return pending('key document not ready');
       }
       let document: KeyDoc | null = null;
       if (roster && raw !== null) {
@@ -807,12 +817,22 @@ export class FacadeKeys {
         JSON.parse(String(held.document_json)),
         roster,
       );
-    } catch {
-      throw new MatrixError(
+    } catch (cause) {
+      const failure = new MatrixError(
         503,
         'M_UNAVAILABLE',
         'co-signed key document not ready',
       );
+      // JSON parser text can contain document bytes. Keep that detail behind
+      // the established upstream disclosure boundary, not in the diagnostic.
+      failure.cause = cause instanceof SyntaxError
+        ? new UpstreamError('validation', {
+          phase: 'key-document',
+          reason: 'invalid retained key document JSON',
+          cause,
+        })
+        : cause;
+      throw failure;
     }
     if (now >= doc.valid_until_ts) {
       throw new MatrixError(

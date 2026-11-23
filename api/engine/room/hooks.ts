@@ -28,6 +28,8 @@ export type RoomHooks = {
 };
 
 let hooks: RoomHooks | null = null;
+// Visibility-restoring membership transitions (self join or a local invite)
+// retain the same exact remove-wins forget context before room publication.
 export type LocalJoinObservation = Record<string, unknown>;
 const joinObservations = new WeakMap<
   Store,
@@ -96,16 +98,22 @@ export async function withMembershipFence<T>(
 }
 
 export type RestrictedKnowledge = 'complete' | 'partial' | 'unavailable';
+export type PreparedRestrictedKnowledge = {
+  knowledge: RestrictedKnowledge;
+  checkCurrent?: CommitCheck;
+};
 const restrictedViews = new WeakMap<
   Store,
-  (roomId: string) => Promise<RestrictedKnowledge>
+  (roomId: string) => Promise<RestrictedKnowledge | PreparedRestrictedKnowledge>
 >();
 
 // The composition owner knows whether this store covers the whole logical
 // server. Room admission never reaches into an app or a replica coordinator.
 export function setRestrictedKnowledge(
   store: Store,
-  view: (roomId: string) => Promise<RestrictedKnowledge>,
+  view: (
+    roomId: string,
+  ) => Promise<RestrictedKnowledge | PreparedRestrictedKnowledge>,
 ): void {
   restrictedViews.set(store, view);
 }
@@ -114,7 +122,17 @@ export async function restrictedKnowledge(
   store: Store,
   roomId: string,
 ): Promise<RestrictedKnowledge> {
-  return await restrictedViews.get(store)?.(roomId) ?? 'complete';
+  return (await prepareRestrictedKnowledge(store, roomId)).knowledge;
+}
+
+// Discovery projects the knowledge label; a vouching write may also carry the
+// prepared allowed-scope authority into its own native commit boundary.
+export async function prepareRestrictedKnowledge(
+  store: Store,
+  roomId: string,
+): Promise<PreparedRestrictedKnowledge> {
+  const value = await restrictedViews.get(store)?.(roomId) ?? 'complete';
+  return typeof value === 'string' ? { knowledge: value } : value;
 }
 
 export function setJoinAdmission(
@@ -156,6 +174,17 @@ export function enrollCompletion(
   if (hooks?.enroll === undefined) return false;
   hooks.enroll(room, self, target);
   return true;
+}
+
+// Durable acceptance without waiting: the committed head is already the
+// recoverable obligation; enrolling starts this process's owner on it.
+export async function enrollRoomWrite(
+  room: Room,
+  self: string,
+): Promise<boolean> {
+  if (hooks?.enroll === undefined) return false;
+  const target = await room.tx((tx) => tx.completion.capture());
+  return enrollCompletion(room, self, target);
 }
 
 export function completeRoomWrite(

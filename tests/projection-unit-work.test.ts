@@ -63,7 +63,10 @@ Deno.test('publication unit: contended turns publish complete acceptance and rec
     const originalTenant = store.tenant.bind(store);
     const turns: { room: string; through: number }[] = [];
     const observations: { room: string; through: number }[] = [];
-    let baselineReads = 0, receiptReconciliations = 0, eventApplies = 0;
+    let baselineReads = 0,
+      validationReads = 0,
+      receiptReconciliations = 0,
+      eventApplies = 0;
     let policySnapshots = 0,
       tenantTransactions = 0,
       publicationTransactions = 0,
@@ -95,8 +98,9 @@ Deno.test('publication unit: contended turns publish complete acceptance and rec
             conn.query = (sql, values) => {
               if (
                 !policy &&
-                sql ===
-                  'SELECT display_name, avatar_url, deactivated FROM users WHERE localpart = ?'
+                // Account admission identifies the policy attempt for scalar
+                // and selected-set readers, independent of their SQL shape.
+                /\b(?:FROM|JOIN)\s+users\b/i.test(sql)
               ) {
                 policy = true;
                 policySnapshots++;
@@ -111,6 +115,9 @@ Deno.test('publication unit: contended turns publish complete acceptance and rec
     server.query = (sql, values) => {
       if (sql === 'SELECT position FROM watermarks WHERE source = ?') {
         baselineReads++;
+      }
+      if (sql.includes('json_each(?)') && sql.includes('JOIN watermarks')) {
+        validationReads++;
       }
       return originalQuery(sql, values);
     };
@@ -160,6 +167,7 @@ Deno.test('publication unit: contended turns publish complete acceptance and rec
         turns: turns.length,
         turns_per_event: turns.length / 24,
         baseline_reads: baselineReads,
+        validation_reads: validationReads,
         receipt_reconciliations: receiptReconciliations,
         notification_reconciliations: notificationReconciliations,
         tenant_policy_snapshots: policySnapshots,
@@ -192,7 +200,8 @@ Deno.test('publication unit: contended turns publish complete acceptance and rec
       publicationTransactions,
       'each committed ready-room group owns exactly one fresh tenant policy snapshot',
     );
-    assertEquals(baselineReads, turns.length * 3 + rooms.length * 4);
+    assertEquals(baselineReads, rooms.length * 4);
+    assertEquals(validationReads, turns.length);
     assertEquals(eventApplies, 24);
     for (const { g, events } of rooms) {
       const source = 'room:' + g.roomId;

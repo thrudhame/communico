@@ -22,6 +22,8 @@ import {
   LinkError,
 } from '#engine/facade/protocol.ts';
 import { serverSchema } from '#engine/server/schema.ts';
+import { projectTenant } from '#engine/server/project-tenant.ts';
+import { withProjectionLock } from '#engine/server/project.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import {
@@ -51,6 +53,9 @@ import { AuthLinkHealth, FacadeAuth } from '#engine/facade/auth.ts';
 import { consumeRefreshToken } from '#engine/tenant/auth.ts';
 import { PASSWORD_FLOWS, requireUia, uiaAction } from '#engine/tenant/uia.ts';
 import { historicalTenantSchema } from './fixtures/tenant-schema-history.ts';
+import { exportKeyRoster, FacadeKeys } from '#engine/facade/control.ts';
+import { VerificationUnavailable } from '#engine/facade/signing-authority.ts';
+import { facadeFailure, FacadeObservations } from './helpers/facade-process.ts';
 import {
   pendingTenantProjection,
   recordTenantProjection,
@@ -114,7 +119,7 @@ Deno.test('auth publication migration upgrades tenant27 without inventing a publ
   }
 });
 
-async function fixture() {
+async function fixture(installOwner = true) {
   const dir = await Deno.makeTempDir({ prefix: 'facade-account-auth-' });
   const open = (name: string) =>
     openStore({
@@ -178,7 +183,7 @@ async function fixture() {
   );
   const owner = await exportOwnerControl(home, ht, hp, bundle.id);
   await journal.receive('home', [owner]);
-  await owners.apply(journal, owner);
+  if (installOwner) await owners.apply(journal, owner);
   const receiver = new AccountSnapshots(edge, et, fp, owners);
   const emit = (credentials = true) =>
     exportAccountAuth(home, ht, hp, bundle.id, 'alice', credentials);
@@ -191,6 +196,7 @@ async function fixture() {
     hp,
     fp,
     node,
+    owner,
     owners,
     bundle,
     journal,
@@ -255,6 +261,147 @@ async function fixture() {
     },
   };
 }
+
+for (const stage of ['absent', 'server-installed'] as const) {
+  Deno.test(`AUTHFLAKE: ${stage} ownership blocks auth until both files are installed`, async () => {
+    const f = await fixture(false);
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    let installing: Promise<boolean> | undefined;
+    try {
+      const auth = await f.emit();
+      await f.journal.receive('home', [auth]);
+      if (stage === 'server-installed') {
+        const tenant = await f.edge.tenant('logical.test');
+        const owner = new OwnerControls(
+          await f.edge.server(),
+          {
+            ...tenant,
+            tx: async (fn, options) => {
+              entered.resolve();
+              await release.promise;
+              return await tenant.tx(fn, options);
+            },
+          },
+          f.fp,
+          f.node,
+        );
+        installing = owner.apply(f.journal, f.owner);
+        installing.catch(entered.reject);
+        await bounded(entered.promise);
+      }
+      const observations = new FacadeObservations();
+      const pending = observations.applied(auth.stream).catch((error) => error);
+      const error = await assertRejects(
+        () => f.receiver.apply(f.journal, auth),
+        MatrixError,
+        'ownership control unavailable',
+      );
+      const event = facadeFailure('inbox ' + auth.stream, error, {
+        peer: 'home',
+        ...auth,
+        after: 0,
+      });
+      observations.accept(event);
+      assertEquals(event.kind, 'blocked');
+      assertEquals(error instanceof VerificationUnavailable, true);
+      assertEquals(error.status, 503);
+      assertEquals(
+        (await f.journal.heads('home', 'in', auth)).applied.sequence,
+        0,
+      );
+      assertEquals(
+        await (await f.edge.server()).query('SELECT * FROM facade_scopes'),
+        [],
+      );
+      assertEquals(
+        await (await f.edge.tenant('logical.test')).query(
+          'SELECT * FROM users',
+        ),
+        [],
+      );
+      release.resolve();
+      if (installing) await bounded(installing);
+      else await f.owners.apply(f.journal, f.owner);
+      assertEquals(await f.receiver.apply(f.journal, auth), true);
+      observations.accept({ kind: 'applied', peer: 'home', record: auth });
+      assertEquals(await pending, auth);
+      assertEquals(
+        (await f.journal.heads('home', 'in', auth)).applied.hash,
+        auth.hash,
+      );
+      assertEquals(await verifyUserPassword(f.et, 'alice', 'pw'), true);
+    } finally {
+      release.resolve();
+      await installing?.catch(() => {});
+      await f.close();
+    }
+  });
+}
+
+Deno.test('AUTHFLAKE: an installing key roster blocks auth without changing the enrolled grant', async () => {
+  const f = await fixture();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let installing: Promise<boolean> | undefined;
+  const apply = f.journal.apply.bind(f.journal);
+  try {
+    const server = await f.edge.server();
+    const keys = new FacadeKeys(
+      server,
+      f.node.signer(),
+      f.node.publicKey,
+      f.fp,
+    );
+    const roster = await exportKeyRoster(
+      f.home,
+      f.ht,
+      'edge_a',
+      f.bundle.id,
+      (_id, document) => keys.cosign(document),
+    );
+    await f.journal.receive('home', [roster]);
+    const auth = await f.emit();
+    await f.journal.receive('home', [auth]);
+    const grant = await f.fp.active();
+    // FacadeKeys enters changeSigningAuthority before this existing callback.
+    f.journal.apply = async (...args) => {
+      if (args[1].stream === 'control') {
+        entered.resolve();
+        await release.promise;
+      }
+      return await apply(...args);
+    };
+    installing = keys.apply(f.journal, roster);
+    installing.catch(entered.reject);
+    await bounded(entered.promise);
+    const error = await assertRejects(
+      () => f.receiver.apply(f.journal, auth),
+      VerificationUnavailable,
+      'facade verification authority changed',
+    );
+    assertEquals(facadeFailure('inbox ' + auth.stream, error).kind, 'blocked');
+    assertEquals(await f.fp.active(), grant);
+    assertEquals(
+      (await f.journal.heads('home', 'in', auth)).applied.sequence,
+      0,
+    );
+    assertEquals(
+      await (await f.edge.tenant('logical.test')).query('SELECT * FROM users'),
+      [],
+    );
+    release.resolve();
+    assertEquals(await bounded(installing), true);
+    assertEquals(await f.fp.active(), grant);
+    assertEquals(await f.receiver.apply(f.journal, auth), true);
+    assertEquals(await verifyUserPassword(f.et, 'alice', 'pw'), true);
+  } finally {
+    release.resolve();
+    await installing?.catch(() => {});
+    f.journal.apply = apply;
+    await f.close();
+  }
+});
 
 Deno.test('local auth clock observations cannot abort an imported authority commit', async () => {
   const f = await fixture();
@@ -861,6 +1008,80 @@ Deno.test('auth projection obligation: freshness replay does not adopt later unr
     assertEquals(projections, 0, 'freshness replay owns no later projection');
     assertEquals(await pendingTenantProjection(db), later);
   } finally {
+    setTenantProjector(undefined);
+    await f.close();
+  }
+});
+
+Deno.test('review projection: completed production auth projection replays its lost ACK without waiting for newer tenant work', async () => {
+  const f = await fixture();
+  const held = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const invoked = Promise.withResolvers<void>();
+  let blocker: Promise<void> | undefined;
+  let applying: Promise<boolean> | undefined;
+  try {
+    setTenantProjector(projectTenant);
+    const first = await f.emit();
+    await f.journal.receive('home', [first]);
+    await f.receiver.apply(f.journal, first);
+    await deactivateUser(f.ht, 'alice');
+    const changed = await f.emit();
+    await f.journal.receive('home', [changed]);
+    const interrupted = new Proxy(f.journal, {
+      get(journal, key) {
+        if (key === 'apply') {
+          return () => Promise.reject(new Error('lost projected ACK'));
+        }
+        const value = Reflect.get(journal, key);
+        return typeof value === 'function' ? value.bind(journal) : value;
+      },
+    });
+    await assertRejects(
+      () => f.receiver.apply(interrupted, changed),
+      Error,
+      'lost projected ACK',
+    );
+    const db = await f.edge.tenant('logical.test');
+    assertEquals(
+      await pendingTenantProjection(db),
+      0,
+      'production projection completed before the lost ACK',
+    );
+    const later = await db.tx(recordTenantProjection);
+    blocker = withProjectionLock(async () => {
+      held.resolve();
+      await release.promise;
+    });
+    await bounded(held.promise);
+    setTenantProjector((...args: Parameters<typeof projectTenant>) => {
+      invoked.resolve();
+      return projectTenant(...args);
+    });
+    applying = f.receiver.apply(f.journal, changed);
+    assertEquals(
+      await bounded(Promise.race([
+        applying.then(() => 'ack'),
+        invoked.promise.then(() => 'newer projection'),
+      ])),
+      'ack',
+      'completed receipt must not invoke or queue behind newer projection',
+    );
+    assertEquals(await applying, true);
+    assertEquals(
+      (await f.journal.heads('home', 'in', changed)).applied.sequence,
+      changed.sequence,
+    );
+    assertEquals(
+      await pendingTenantProjection(db),
+      later,
+      'replay must leave unrelated work pending',
+    );
+    assertEquals(await verifyUserPassword(f.et, 'alice', 'pw'), false);
+  } finally {
+    release.resolve();
+    await blocker;
+    await applying?.catch(() => {});
     setTenantProjector(undefined);
     await f.close();
   }

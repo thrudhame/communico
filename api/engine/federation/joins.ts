@@ -391,6 +391,7 @@ async function sendMembership(
   const publish = async (tx: Parameters<Parameters<typeof room.tx>[0]>[0]) => {
     const retained = await tx.membershipReceipts.get(operation, inputHash);
     if (retained !== null) return retained;
+    if (admission) tx.admit(admission.checkCurrent);
     admission?.checkCurrent();
     const save = async (response: Record<string, unknown>) => {
       const saved = await tx.membershipReceipts.save(

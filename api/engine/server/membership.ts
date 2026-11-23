@@ -140,17 +140,25 @@ async function materialize(
 
 export type ForgetAccess = 'read' | 'admission';
 
+export type ReceiveFence = ReturnType<typeof receivedFence>;
+
 /** Complete applied visibility is readable during a newer suffix. Producers
  * still require the current receive cut; missing bootstrap or causal evidence
- * never proves that a private visibility intent is absent. */
+ * never proves that a private visibility intent is absent. A transaction Conn
+ * cannot capture the fence itself: its owner captures it before db.tx. */
 export async function requireForgetKnowledge(
   conn: Pick<Conn, 'query'>,
   user: string,
   access: ForgetAccess = 'admission',
+  fence?: ReceiveFence,
 ) {
-  const current = 'path' in conn && 'tx' in conn
-    ? receivedFence(conn as Database)
-    : undefined;
+  const current = fence ??
+    ('path' in conn && 'tx' in conn
+      ? receivedFence(conn as Database)
+      : undefined);
+  if (access === 'admission' && current === undefined) {
+    throw new Error('forget admission requires a receive fence');
+  }
   const [binding] = await conn.query(
     "SELECT a.pairing,r.server_name FROM facade_owner_activation a JOIN runtime_identity r ON r.singleton=1 AND r.role='facade'",
   );
@@ -214,18 +222,19 @@ export async function captureForgetOperations(conn: Conn, user: string) {
   return await forgetOperations(conn, user);
 }
 
-/** Prepared outside room transactions; only exact accepted joins retain it. */
+/** Prepared outside room transactions; accepted joins/invites retain it. */
 export async function prepareRejoin(
   db: Database,
   room: string,
   user: string,
 ): Promise<LocalJoinObservation> {
+  const fence = receivedFence(db);
   const observation = await db.tx(async (conn) => {
     const source = await authority(conn);
     if (source && domainOf(user) !== source.server) {
       throw new Error('forget account differs');
     }
-    if (source) await requireForgetKnowledge(conn, user);
+    if (source) await requireForgetKnowledge(conn, user, 'admission', fence);
     if (source?.source === 'home') await captureForgetOperations(conn, user);
     const view = await readRegister(conn, keyOf(user, room));
     const ready = [view.winner, ...view.conflicts].filter((
@@ -267,11 +276,12 @@ export async function projectRejoin(
     }
     // A pre-identity observation cannot claim that it observed later enrolled
     // intent. Retain it as evidence without inventing distributed authorship.
-  } else {
-    if (
-      !source || source.source !== observation.source ||
-      source.incarnation !== observation.incarnation
-    ) throw new Error('rejoin source changed');
+  } else if (
+    // Like pre-identity context, a superseded writer's observation is
+    // retained evidence; the current writer cannot adopt its authorship.
+    source && source.source === observation.source &&
+    source.incarnation === observation.incarnation
+  ) {
     const key = keyOf(observation.user, room);
     if (
       !(await registerOperations(conn, key)).some((op) => {
@@ -396,6 +406,7 @@ export async function forget(
   userId: string,
   self: string,
 ) {
+  const fence = receivedFence(db);
   await db.tx(async (tx) => {
     const [current] = await tx.query(
       'SELECT membership FROM memberships WHERE user=? AND room=?',
@@ -413,7 +424,7 @@ export async function forget(
     }
     const source = await authority(tx);
     if (source) {
-      await requireForgetKnowledge(tx, userId);
+      await requireForgetKnowledge(tx, userId, 'admission', fence);
       if (domainOf(userId) !== source.server || self !== source.server) {
         throw new Error('forget account differs');
       }

@@ -4,6 +4,7 @@ import { theApp } from '#engine/app.ts';
 import { setConfigForTests } from '#engine/config.ts';
 import { roomEvents } from '#engine/client/peeking.ts';
 import { observePeekingWait } from '#tests/support/peeking-turn.ts';
+import { completeAccepted } from '#tests/complete-accepted.ts';
 
 type Json = Record<string, unknown>;
 const suite = httpSuite('HTTP room peeking');
@@ -51,13 +52,18 @@ async function fixture(prefix: string) {
       }],
     })).room_id,
   );
-  const send = async (name: string) =>
-    String(
+  const send = async (name: string) => {
+    const eventId = String(
       (await ok(base(room) + '/send/m.room.message/' + name, a.access_token!, {
         msgtype: 'm.text',
         body: name,
       }, 'PUT')).event_id,
     );
+    // Foreign preview assertions below concern the applied server cut. The
+    // HTTP send acknowledges room acceptance, not another reader's publication.
+    await completeAccepted(theApp(), room, eventId);
+    return eventId;
+  };
   return { a, b, room, send };
 }
 

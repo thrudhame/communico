@@ -133,7 +133,9 @@ function checked(raw: RegisterOperation): RegisterOperation {
   };
 }
 
-function fromRow(row: Record<string, unknown>): RegisterOperation {
+export function registerOperationFromRow(
+  row: Record<string, unknown>,
+): RegisterOperation {
   return {
     operationId: String(row.operation_id),
     source: String(row.source),
@@ -155,7 +157,7 @@ export async function registerOperations(
   return (await conn.query(
     'SELECT * FROM domain_operations WHERE semantic_key=?',
     [key],
-  )).map(fromRow).sort(compare);
+  )).map(registerOperationFromRow).sort(compare);
 }
 
 /** Capture a pre-semantic local value only before authentic history exists.
@@ -254,7 +256,14 @@ export async function readRegister(
   conn: Conn,
   key: string,
 ): Promise<RegisterView> {
-  const all = await registerOperations(conn, key), rows = resolved(all);
+  return registerView(await registerOperations(conn, key));
+}
+
+/** Scalar and batched owners use the same causal closure and frontier verdict. */
+export function registerView(
+  operations: readonly RegisterOperation[],
+): RegisterView {
+  const all = [...operations].sort(compare), rows = resolved(all);
   const frontier = maxima(rows), winner = frontier.at(-1) ?? null;
   const ready = new Set(rows.map((row) => row.operationId));
   return {
@@ -293,7 +302,10 @@ export async function importRegisterOperation(
     ],
   );
   if (existing) {
-    if (JSON.stringify(fromRow(existing)) !== JSON.stringify(operation)) {
+    if (
+      JSON.stringify(registerOperationFromRow(existing)) !==
+        JSON.stringify(operation)
+    ) {
       throw new Error('register operation divergence');
     }
     return {

@@ -9,9 +9,12 @@ import {
   membershipHistory,
   retainMembershipOperation,
 } from '#engine/server/membership-history.ts';
-import type {
-  MembershipOperation,
-  MembershipState,
+import {
+  appendMembershipSuccessor,
+  type MembershipOperation,
+  membershipOperations,
+  type MembershipState,
+  recordMembershipOperation,
 } from '#engine/server/membership-operations.ts';
 
 function fact(
@@ -381,6 +384,104 @@ Deno.test('membership history: rollback removes admission and no successor is ma
   });
 });
 
+Deno.test('membership history: a fresh observation preserves both same-source branches after prepared completion', async () => {
+  const operations: MembershipOperation[] = [];
+  await fixture(async (server) => {
+    const first = withState(fact(), { eventId: '$first', status: 'pending' });
+    const state = JSON.parse(first.payload) as MembershipState;
+    await server.execute(
+      "INSERT INTO publication_domain VALUES(1,'home','publication','domain')",
+    );
+    await server.execute('INSERT INTO facade_owner_controls VALUES(?,?,?,?)', [
+      'membership-test',
+      1,
+      'verified-test',
+      canonicalJson({
+        body: {
+          server: 'logical.test',
+          nodes: [{ node: 'home', incarnation: 'home-incarnation' }],
+        },
+      }),
+    ]);
+    await server.execute(
+      "INSERT INTO facade_owner_activation VALUES('membership-test',1,'verified-test')",
+    );
+    await server.execute(
+      `INSERT INTO prejoin_memberships(room_id,user_id,event_id,room_version,event_json,invite_room_state,origin,received_ms,status,seq,kind)
+       VALUES(?,?,?,?,?,?,?,1,'pending',1,'invite')`,
+      [
+        state.roomId,
+        state.userId,
+        state.eventId,
+        state.roomVersion,
+        state.eventJson,
+        state.inviteRoomState,
+        state.origin,
+      ],
+    );
+    const observe = () =>
+      server.tx((conn) =>
+        recordMembershipOperation(conn, state.roomId, state.userId)
+      );
+    await observe();
+    const [a1] = await server.tx((conn) =>
+      membershipOperations(conn, state.userId)
+    );
+    await server.execute('UPDATE prejoin_memberships SET event_id=?', [
+      '$z-new',
+    ]);
+    await observe();
+    const [, a2] = await server.tx((conn) =>
+      membershipOperations(conn, state.userId)
+    );
+    const a3 = await server.tx((conn) =>
+      appendMembershipSuccessor(conn, a1, {
+        ...JSON.parse(a1.payload) as MembershipState,
+        status: 'rejected',
+      })
+    );
+    // Completing A1 must not retrospectively observe the newer A2 invitation.
+    assertEquals(a3.context, [dot(a1)]);
+    await server.execute('UPDATE prejoin_memberships SET event_id=?', [
+      '$a-fresh',
+    ]);
+    await observe();
+    operations.push(
+      ...await server.tx((conn) => membershipOperations(conn, state.userId)),
+    );
+    assertEquals(operations[3].context, [dot(a2), dot(a3)]);
+    assertEquals(
+      (await server.tx((conn) => membershipHistory(conn, a1.semanticKey)))
+        .frontier,
+      [operations[3]],
+    );
+  });
+  const permutations = (
+    values: MembershipOperation[],
+  ): MembershipOperation[][] =>
+    values.length === 0
+      ? [[]]
+      : values.flatMap((value, index) =>
+        permutations(values.filter((_, at) => at !== index)).map((
+          rest,
+        ) => [value, ...rest])
+      );
+  for (const order of permutations(operations)) {
+    await fixture(async (server) => {
+      for (const operation of order) {
+        await server.tx((conn) => retainMembershipOperation(conn, operation));
+      }
+      const selected = await server.tx((conn) =>
+        membershipDisplay(conn, operations[0].semanticKey, false)
+      );
+      assertEquals(selected.pending, []);
+      assertEquals(selected.frontier, [operations[3]]);
+      assertEquals(selected.display, [operations[3]]);
+      assertEquals(await server.query('SELECT * FROM prejoin_memberships'), []);
+    });
+  }
+});
+
 Deno.test('membership history: malformed identity, source, payload and causal contexts are rejected', () => {
   const original = fact();
   assertEquals(checkedMembershipOperation(original), original);
@@ -396,8 +497,10 @@ Deno.test('membership history: malformed identity, source, payload and causal co
       { kind: 'profile' },
       { payloadHash: 'bad' },
       { context: [dot(original)] },
+      { context: [dot(fact('home', 2))] },
       { context: [{ ...dot(original), sequence: 0 }] },
-      { context: [dot(fact('edge')), dot(fact('edge', 2))] },
+      { context: [dot(fact('edge')), dot(fact('edge'))] },
+      { context: [dot(fact('edge', 2)), dot(fact('edge'))] },
     ]
   ) {
     assertThrows(() =>

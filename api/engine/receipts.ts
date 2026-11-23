@@ -8,6 +8,7 @@ import { putAccountData } from '#engine/tenant/accountdata.ts';
 import { localpartOf } from '#engine/ids.ts';
 import { canSeeEvent } from '#engine/client/visibility.ts';
 import { roomCompletion } from '#engine/client/completion.ts';
+import type { DeviceIdentity } from '#engine/tenant/devices.ts';
 
 // The tenant owns complete account-domain admission; the replica owns room
 // readiness. Check both before reading server membership or room visibility so
@@ -16,13 +17,14 @@ async function requireReceiptScope(
   roomId: string,
   userId: string,
   signal?: AbortSignal,
+  device: DeviceIdentity | null = null,
 ) {
   const app = theApp();
   await app.tenant.tx((tx) =>
     tx.ingress.check({ kind: 'domain', localpart: localpartOf(userId) })
   );
   const admission = await app.replica?.prepareRoomScope(roomId, true);
-  await roomCompletion(app, [roomId], signal);
+  await roomCompletion(app, [roomId], signal, device);
   admission?.checkCurrent();
   return admission;
 }
@@ -32,9 +34,10 @@ export async function setFullyRead(
   userId: string,
   eventId: string,
   signal?: AbortSignal,
+  device: DeviceIdentity | null = null,
 ): Promise<void> {
   const app = theApp();
-  const admission = await requireReceiptScope(roomId, userId, signal);
+  const admission = await requireReceiptScope(roomId, userId, signal, device);
   let known = false;
   try {
     const room = await openRoom(app.store, roomId);
@@ -61,7 +64,11 @@ export async function setReceipt(
   userId: string,
   receiptType: 'm.read' | 'm.read.private' | 'm.fully_read',
   eventId: string,
-  opts: { threadId?: unknown; signal?: AbortSignal } = {},
+  opts: {
+    threadId?: unknown;
+    signal?: AbortSignal;
+    device?: DeviceIdentity | null;
+  } = {},
 ): Promise<void> {
   const server = theApp().server;
   if (receiptType === 'm.fully_read') {
@@ -72,10 +79,15 @@ export async function setReceipt(
         'thread_id must not be set for m.fully_read',
       );
     }
-    await setFullyRead(roomId, userId, eventId, opts.signal);
+    await setFullyRead(roomId, userId, eventId, opts.signal, opts.device);
     return;
   }
-  const admission = await requireReceiptScope(roomId, userId, opts.signal);
+  const admission = await requireReceiptScope(
+    roomId,
+    userId,
+    opts.signal,
+    opts.device,
+  );
   let threadId: string | null = null;
   if (opts.threadId !== undefined) {
     const joined = await isJoined(server, roomId, userId);

@@ -5,11 +5,13 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import { presenceFor } from '#engine/server/ephemeral.ts';
 import { completionAudience, roomCompletion } from './completion.ts';
 import type { ReplicaRoomAdmission } from '#engine/facade/directory.ts';
+import type { DeviceIdentity } from '#engine/tenant/devices.ts';
 
 export async function getPresence(
   observer: string,
   subject: string,
   signal?: AbortSignal,
+  device: DeviceIdentity | null = null,
 ) {
   const app = theApp();
   const admissions: ReplicaRoomAdmission[] = [];
@@ -20,7 +22,7 @@ export async function getPresence(
       const admission = await app.replica?.prepareReadRoomScope(room);
       if (admission) admissions.push(admission);
     }
-    await roomCompletion(app, rooms, signal);
+    await roomCompletion(app, rooms, signal, device);
   }
   const row =
     (await presenceFor(app.server, observer, [subject], async (tx) => {

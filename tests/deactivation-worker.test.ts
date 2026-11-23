@@ -22,6 +22,81 @@ import { fakeKeyResolver } from './fixtures/remote.ts';
 
 installServerHooks();
 
+Deno.test('deactivation workers isolate discovery admission failure and retain the blocked account', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'deactivation-discovery-' });
+  const store = await openStore({
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  }, {
+    schemas: { room: roomSchema, tenant: tenantSchema, server: serverSchema },
+  });
+  try {
+    const tenant = await openTenant(store, 'test', { create: true });
+    const rooms = [];
+    for (const lp of ['alice', 'bob']) {
+      await registerUser(tenant, { localpart: lp, password: 'pw' });
+      rooms.push(
+        await createRoom(
+          store,
+          { creator: '@' + lp + ':test' },
+          tenant.signer(),
+        ),
+      );
+      await deactivateUser(tenant, lp);
+    }
+    const server = await store.server(), query = server.query;
+    const blocked = new MatrixError(
+      503,
+      'M_UNAVAILABLE',
+      'fixture discovery admission',
+    );
+    server.query = function (...args) {
+      if (args[1]?.includes('@alice:test')) return Promise.reject(blocked);
+      return query.apply(this, args);
+    };
+    const failures: unknown[] = [];
+    const options = {
+      store,
+      tenant,
+      prepareSigner: () => Promise.resolve(tenant.signer()),
+      wake: (_destination: string) => {},
+      failed: (error: unknown) => failures.push(error),
+    };
+    try {
+      await runDeactivationWork(options);
+    } finally {
+      server.query = query;
+    }
+    assertEquals(failures, [blocked]);
+    assertEquals(
+      (await membershipOf(
+        await openRoom(store, rooms[0].roomId),
+        '@alice:test',
+      ))?.membership,
+      'join',
+    );
+    assertEquals(
+      (await membershipOf(await openRoom(store, rooms[1].roomId), '@bob:test'))
+        ?.membership,
+      'leave',
+    );
+    await runDeactivationWork(options);
+    assertEquals(
+      (await membershipOf(
+        await openRoom(store, rooms[0].roomId),
+        '@alice:test',
+      ))?.membership,
+      'leave',
+    );
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 for (const kind of ['invite', 'knock']) {
   Deno.test(`deactivation retains one durable OOB ${kind} departure without requiring a room file or remote availability`, async () => {
     const dir = await Deno.makeTempDir({ prefix: 'deactivation-oob-' });
