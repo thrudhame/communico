@@ -129,8 +129,12 @@ export type InviteDeps = {
 // OOB invite transitions share projection's lifecycle lane. A removal captures
 // candidate ownership and cleans up under that same lane, so neither new
 // rejections nor sender failover can invalidate its durable cut.
-function inviteTransition<T>(server: Db, fn: (tx: Conn) => Promise<T>) {
-  return withProjectionLock(() => eventStreamTx(server, fn));
+function inviteTransition<T>(
+  store: Store,
+  server: Db,
+  fn: (tx: Conn) => Promise<T>,
+) {
+  return withProjectionLock(store, () => eventStreamTx(server, fn));
 }
 
 // The spec's stripped-state list (CS:2810-2827) + the inviter's member
@@ -761,96 +765,99 @@ export async function receiveInvite(
   // store: a room we HOLD does nothing else (the event arrives by /send
   // too, invites-v2.yaml:40-42); otherwise the out-of-band row so the
   // invitee sees it
-  return await withRoomLock(roomId, () =>
-    withProjectionLock(async () => {
-      const retained = await prejoinResult(deps.server, operation, inputHash);
-      if (retained !== null) return retained;
-      if (admission) await deps.server.tx(admission.check);
-      await assertRoomAcl(deps.store, roomId, origin);
-      if (await deps.store.roomRetired(roomId)) {
-        throw new MatrixError(404, 'M_NOT_FOUND', 'room removal is pending');
-      }
-      if (await participating(deps, roomId)) {
-        return await deps.server.tx(async (tx) => {
-          await admission?.check(tx);
-          const result = await savePrejoinResult(
-            tx,
-            operation,
-            roomId,
-            inputHash,
-            response,
-          );
-          admission?.checkCurrent();
-          return result;
-        });
-      }
-      const publication = await prepareInvitePush(
-        deps.store,
-        deps.self,
-        signed,
-      );
-      const now = Date.now();
-      return await eventStreamTx(deps.server, async (tx) => {
-        await admission?.check(tx);
-        const finish = async () => {
-          const result = await savePrejoinResult(
-            tx,
-            operation,
-            roomId,
-            inputHash,
-            response,
-          );
-          admission?.checkCurrent();
-          return result;
-        };
-        const evaluated = await tx.query(
-          'SELECT 1 FROM push_evaluations WHERE tenant=? AND user=? AND event=?',
-          [deps.self, target, eventId],
-        );
-        if (evaluated.length) return await finish();
-        const previous = await tx.query(
-          'SELECT event_id FROM prejoin_memberships WHERE room_id=? AND user_id=?',
-          [roomId, target],
-        );
-        // Redelivery is not a new invitation, including after local rejection.
-        if (previous[0]?.event_id === eventId) return await finish();
-        if (permit.admit) tx.admit(permit.admit);
-        await recordMembershipOperation(tx, roomId, target);
-        if (previous.length) {
-          await withdrawInvitePush(
-            tx,
-            target,
-            roomId,
-            String(previous[0].event_id),
-          );
+  return await withRoomLock(
+    roomId,
+    () =>
+      withProjectionLock(deps.store, async () => {
+        const retained = await prejoinResult(deps.server, operation, inputHash);
+        if (retained !== null) return retained;
+        if (admission) await deps.server.tx(admission.check);
+        await assertRoomAcl(deps.store, roomId, origin);
+        if (await deps.store.roomRetired(roomId)) {
+          throw new MatrixError(404, 'M_NOT_FOUND', 'room removal is pending');
         }
-        const seq = await nextEventSeq(tx);
-        await tx.execute(
-          `INSERT INTO prejoin_memberships(room_id, user_id, event_id, room_version, event_json, invite_room_state, origin, received_ms, status, seq)
+        if (await participating(deps, roomId)) {
+          return await deps.server.tx(async (tx) => {
+            await admission?.check(tx);
+            const result = await savePrejoinResult(
+              tx,
+              operation,
+              roomId,
+              inputHash,
+              response,
+            );
+            admission?.checkCurrent();
+            return result;
+          });
+        }
+        const publication = await prepareInvitePush(
+          deps.store,
+          deps.self,
+          signed,
+        );
+        const now = Date.now();
+        return await eventStreamTx(deps.server, async (tx) => {
+          await admission?.check(tx);
+          const finish = async () => {
+            const result = await savePrejoinResult(
+              tx,
+              operation,
+              roomId,
+              inputHash,
+              response,
+            );
+            admission?.checkCurrent();
+            return result;
+          };
+          const evaluated = await tx.query(
+            'SELECT 1 FROM push_evaluations WHERE tenant=? AND user=? AND event=?',
+            [deps.self, target, eventId],
+          );
+          if (evaluated.length) return await finish();
+          const previous = await tx.query(
+            'SELECT event_id FROM prejoin_memberships WHERE room_id=? AND user_id=?',
+            [roomId, target],
+          );
+          // Redelivery is not a new invitation, including after local rejection.
+          if (previous[0]?.event_id === eventId) return await finish();
+          if (permit.admit) tx.admit(permit.admit);
+          await recordMembershipOperation(tx, roomId, target);
+          if (previous.length) {
+            await withdrawInvitePush(
+              tx,
+              target,
+              roomId,
+              String(previous[0].event_id),
+            );
+          }
+          const seq = await nextEventSeq(tx);
+          await tx.execute(
+            `INSERT INTO prejoin_memberships(room_id, user_id, event_id, room_version, event_json, invite_room_state, origin, received_ms, status, seq)
        VALUES(?,?,?,?,?,?,?,?,'pending',?)
        ON CONFLICT(room_id, user_id) DO UPDATE SET event_id = excluded.event_id,
          room_version = excluded.room_version, event_json = excluded.event_json,
          invite_room_state = excluded.invite_room_state, origin = excluded.origin,
            received_ms = excluded.received_ms, status = 'pending', seq = excluded.seq,
             kind='invite', revision=prejoin_memberships.revision+1, candidates='[]', leave_json=NULL, local_leave_json=NULL, expires_ms=NULL`,
-          [
-            roomId,
-            target,
-            eventId,
-            roomVersion,
-            JSON.stringify(signed),
-            JSON.stringify(stripped),
-            origin,
-            now,
-            seq,
-          ],
-        );
-        await applyInvitePush(tx, roomId, eventId, seq, publication, now);
-        await recordMembershipOperation(tx, roomId, target);
-        await supersedePrejoinKnocks(tx, roomId, target);
-        return await finish();
-      });
-    }));
+            [
+              roomId,
+              target,
+              eventId,
+              roomVersion,
+              JSON.stringify(signed),
+              JSON.stringify(stripped),
+              origin,
+              now,
+              seq,
+            ],
+          );
+          await applyInvitePush(tx, roomId, eventId, seq, publication, now);
+          await recordMembershipOperation(tx, roomId, target);
+          await supersedePrejoinKnocks(tx, roomId, target);
+          return await finish();
+        });
+      }),
+  );
 }
 
 // --- REJECT (ruling F) -----------------------------------------------------
@@ -885,7 +892,7 @@ export async function rejectInviteRemote(
   >,
   reason?: string,
 ): Promise<void> {
-  const candidates = await withProjectionLock(async () => {
+  const candidates = await withProjectionLock(deps.store, async () => {
     // The request signer reads durable server authority. Capture it before the
     // server transaction, only when this lifecycle still needs a new departure.
     // Prepared departures remain replayable without renewing signing authority.
@@ -1003,7 +1010,7 @@ async function buildLocalPrejoinLeave(
 
 export async function prejoinDeparture(
   invite: StoredInvite,
-  deps: Pick<InviteDeps, 'server' | 'signer'>,
+  deps: Pick<InviteDeps, 'store' | 'server' | 'signer'>,
 ): Promise<Pdu | null> {
   const event = JSON.parse(invite.eventJson) as Pdu;
   if (
@@ -1014,7 +1021,7 @@ export async function prejoinDeparture(
   }
   // Existing installations may have a pending intent without a local event.
   // Materialize once under the same revision owner; never synthesize per read.
-  return await withProjectionLock(async () => {
+  return await withProjectionLock(deps.store, async () => {
     const snapshot = await deps.server.query(
       'SELECT local_leave_json FROM prejoin_memberships WHERE room_id=? AND user_id=? AND revision=? AND seq=?',
       [invite.roomId, invite.userId, invite.revision, invite.seq],
@@ -1176,19 +1183,23 @@ async function performRejectInvite(
         signer: prepared!,
       })
       : JSON.parse(invite.leaveJson) as Pdu;
-    const active = await inviteTransition(deps.server, async (tx) => {
-      if (prepared?.admit) tx.admit(prepared.admit);
-      return await updatePrejoinJob(tx, job, {
-        ...invite,
-        leaveJson: JSON.stringify(signed),
-      }, false);
-    });
+    const active = await inviteTransition(
+      deps.store,
+      deps.server,
+      async (tx) => {
+        if (prepared?.admit) tx.admit(prepared.admit);
+        return await updatePrejoinJob(tx, job, {
+          ...invite,
+          leaveJson: JSON.stringify(signed),
+        }, false);
+      },
+    );
     if (!active) return;
     await sendRemoteLeave(destination, signed, invite.roomVersion, deps);
     // delivered: the row becomes 'rejected', and the SIGNED LEAVE becomes
     // the rendered event — the out-of-band leave section of /sync carries
     // it in state.events (stage 5; SyncLeftFrom wants a leave event there)
-    await inviteTransition(deps.server, async (tx) => {
+    await inviteTransition(deps.store, deps.server, async (tx) => {
       await updatePrejoinJob(tx, active, {
         ...active.work,
         status: 'rejected',
@@ -1260,6 +1271,7 @@ export function inviteIntentProvider(
         )
       ) {
         await inviteTransition(
+          deps.store,
           server,
           (tx) =>
             settleSupersededPrejoin(
@@ -1277,6 +1289,7 @@ export function inviteIntentProvider(
       if (await deps.store.roomRetired(invite.roomId)) continue;
       if (invite.expiresMs !== null && Date.now() >= invite.expiresMs) {
         await inviteTransition(
+          deps.store,
           server,
           async (tx) => {
             return await updatePrejoinJob(
@@ -1312,7 +1325,7 @@ export function inviteIntentProvider(
       return {
         id: 'reject-invite:' + key,
         run: async () => {
-          const active = await withProjectionLock(async () => {
+          const active = await withProjectionLock(deps.store, async () => {
             if (await deps.store.roomRetired(invite.roomId)) return false;
             const current = await prejoinJob(server, job.id);
             return current?.work.revision === invite.revision &&
@@ -1329,7 +1342,7 @@ export function inviteIntentProvider(
           progress.delete(key);
         },
         failed: () =>
-          withProjectionLock(async () => {
+          withProjectionLock(deps.store, async () => {
             if (await deps.store.roomRetired(invite.roomId)) return;
             const current = (await prejoinJob(server, job.id))?.work;
             if (
@@ -1356,7 +1369,13 @@ export function inviteIntentProvider(
   return Object.assign(provider, {
     review: () => listRejectIntents(deps.server, deps.self, progress),
     prune: (destination: string) =>
-      pruneRejectIntents(deps.server, deps.self, destination, progress),
+      pruneRejectIntents(
+        deps.store,
+        deps.server,
+        deps.self,
+        destination,
+        progress,
+      ),
   });
 }
 
@@ -1427,12 +1446,13 @@ export async function listRejectIntents(
 }
 
 export async function pruneRejectIntents(
+  store: Store,
   server: Db,
   self: string,
   destination: string,
   progress: InviteProgress = new Map(),
 ): Promise<number> {
-  return await inviteTransition(server, async (tx) => {
+  return await inviteTransition(store, server, async (tx) => {
     const rows = (await listRejectIntents(tx, self, progress)).filter((r) =>
       r.destination === destination
     );
@@ -1476,11 +1496,12 @@ export async function pruneRejectIntents(
 }
 
 export async function retryPrejoinIntents(
+  store: Store,
   server: Db,
   self: string,
   destination: string,
 ): Promise<void> {
-  await inviteTransition(server, async (tx) => {
+  await inviteTransition(store, server, async (tx) => {
     await tx.execute(
       "UPDATE federation_invite_attempts SET status='pending' WHERE destination=? AND status IN ('failed','refused')",
       [destination],
@@ -1532,7 +1553,7 @@ export async function acceptRescind(
   if (membership !== 'leave' && membership !== 'ban') return false;
   const target = String(pdu.state_key == null ? '' : pdu.state_key);
   const sender = String(pdu.sender == null ? '' : pdu.sender);
-  return await inviteTransition(deps.server, async (tx) => {
+  return await inviteTransition(deps.store, deps.server, async (tx) => {
     const rows = await tx.query(
       'SELECT * FROM prejoin_memberships WHERE room_id=? AND user_id=?',
       [roomId, target],
@@ -1585,7 +1606,7 @@ export async function markInviteJoined(
   userId: string,
   deps: InviteDeps,
 ): Promise<void> {
-  await inviteTransition(deps.server, async (tx) => {
+  await inviteTransition(deps.store, deps.server, async (tx) => {
     const rows = await tx.query(
       "SELECT event_id FROM prejoin_memberships WHERE room_id = ? AND user_id = ? AND status IN ('pending','attempting')",
       [roomId, userId],

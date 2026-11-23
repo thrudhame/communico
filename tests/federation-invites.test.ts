@@ -1071,7 +1071,7 @@ Deno.test('inviter: definite missing-param refusal keeps exact intent for explic
       assertEquals(await provider(server, h.fake.name), null);
       assertEquals((await provider.review()).length, 1);
       const before = canonicalJson(h.inviteRequests[0]);
-      await retryPrejoinIntents(server, 'test', h.fake.name);
+      await retryPrejoinIntents(store, server, 'test', h.fake.name);
       const job = await provider(server, h.fake.name);
       assert(job);
       h.response = () => null;

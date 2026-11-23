@@ -1049,7 +1049,7 @@ Deno.test('review projection: completed production auth projection replays its l
       'production projection completed before the lost ACK',
     );
     const later = await db.tx(recordTenantProjection);
-    blocker = withProjectionLock(async () => {
+    blocker = withProjectionLock(f.edge, async () => {
       held.resolve();
       await release.promise;
     });

@@ -490,6 +490,7 @@ async function assembleSync(
           : Number(row.seq) > i.since.eSeq
       ) {
         const pdu = await prejoinDeparture(inviteOf(row), {
+          store: app.store,
           server: app.server,
           signer: app.tenant.signer(),
         });

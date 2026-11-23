@@ -77,9 +77,9 @@ Deno.test('publication unit: contended turns publish complete acceptance and rec
         ...db,
         tx: (fn, options) => {
           tenantTransactions++;
-          // Demand arrives while capturing policy, before the turn chooses its
-          // complete input prefix. No unused policy may be repeatedly prepared.
-          waiting.push(withProjectionLock(async () => {
+          // This lifecycle demand arrives after a finite ready group is admitted.
+          // It must see that group whole, before the next policy snapshot.
+          waiting.push(withProjectionLock(store, async () => {
             for (const { g, baseline } of rooms) {
               const source = 'room:' + g.roomId;
               const [mark] = await originalQuery(
@@ -190,8 +190,8 @@ Deno.test('publication unit: contended turns publish complete acceptance and rec
     );
     assertEquals(
       turns.length,
-      24,
-      'contention must cost one turn per accepted event, not per raw change',
+      rooms.length,
+      'contention must publish each whole ready room prefix, not one turn per event',
     );
     assertEquals(receiptReconciliations, turns.length);
     assertEquals(notificationReconciliations, turns.length);
@@ -200,23 +200,19 @@ Deno.test('publication unit: contended turns publish complete acceptance and rec
       publicationTransactions,
       'each committed ready-room group owns exactly one fresh tenant policy snapshot',
     );
-    assertEquals(baselineReads, rooms.length * 4);
+    assertEquals(baselineReads, rooms.length * 5);
     assertEquals(validationReads, turns.length);
     assertEquals(eventApplies, 24);
     for (const { g, events } of rooms) {
       const source = 'room:' + g.roomId;
-      const last = turns.findIndex((turn) =>
+      const completed = turns.filter((turn) =>
         turn.room === source &&
         turn.through === events.at(-1)!.completion!.through
       );
       assertEquals(
-        rooms.every(({ g: other }) =>
-          turns.slice(0, last + 1).some((turn) =>
-            turn.room === 'room:' + other.roomId
-          )
-        ),
-        true,
-        'one room drained its backlog before another room received any writer turn',
+        completed.length,
+        1,
+        'each ready room prefix completes exactly once despite continued lifecycle arrivals',
       );
       assertEquals(
         (await server.query(
