@@ -24,6 +24,6 @@ export default async function (
     request.params.eventId as string,
     body,
     origin,
-    inviteDeps(),
+    inviteDeps(request._raw.signal),
   );
 }

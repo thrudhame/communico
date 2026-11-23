@@ -358,7 +358,7 @@ type InboxOptions = {
   peer: string;
   pollseconds: number;
   apply(stream: Stream): Promise<boolean>;
-  changed(): void;
+  changed(stream: Stream): void;
   failed(error: unknown, stream?: Stream, after?: number): void;
 };
 
@@ -421,7 +421,7 @@ export class InboxWorker {
                 applied = next.applied.sequence;
                 dependencies.track(stream, next, () => start(stream));
                 dependencies.progressed(stream);
-                options.changed();
+                options.changed(stream);
               }
             } catch (error) {
               this.failed(error, stream, applied);

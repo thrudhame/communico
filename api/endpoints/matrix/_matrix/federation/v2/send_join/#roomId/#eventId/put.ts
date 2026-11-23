@@ -25,7 +25,7 @@ export default async function (
     body,
     origin,
     'v2',
-    inviteDeps(),
+    inviteDeps(request._raw.signal),
     request.query.get('omit_members') === 'true',
   );
 }

@@ -28,6 +28,7 @@ import type { Tenant } from '#engine/tenant/index.ts';
 import { appendRecord, type Journal, receivedFence } from './journal.ts';
 import type { Pairings } from './pairing.ts';
 import { membershipExportPrefix } from './membership.ts';
+import { ReplicaCutPending, type ReplicaReadiness } from './readiness.ts';
 import { signingFence } from './signing-authority.ts';
 import { type CommitCheck, commitCheck } from '#engine/store/commit.ts';
 import {
@@ -282,22 +283,50 @@ function selectedAccountScope(
 
 type ScopeAccess = 'current' | 'applied';
 
+function pendingSuffix(row: Record<string, unknown> | undefined): boolean {
+  return !!row && Number(row.received) > Number(row.applied);
+}
+
+function pendingAccount(
+  row: Record<string, unknown> | undefined,
+  pairing: string,
+  stream: string,
+): ReplicaCutPending | undefined {
+  if (pendingSuffix(row)) return new ReplicaCutPending(pairing, stream, false);
+  if (row && Number(row.owner_received) > Number(row.owner_applied ?? 0)) {
+    return new ReplicaCutPending(pairing, 'owner-control', false);
+  }
+  if (!row || Number(row.applied) === 0) {
+    return new ReplicaCutPending(pairing, stream, true);
+  }
+  if (Number(row.owner_applied ?? 0) === 0) {
+    return new ReplicaCutPending(pairing, 'owner-control', true);
+  }
+}
+
 export class DirectoryReplicas {
   constructor(
     private readonly db: Database,
     private readonly pairings: Pairings,
     private readonly self: string,
     private readonly phase: 'f1' | 'f2' = config().facade.phase as 'f1' | 'f2',
+    private readonly readiness?: ReplicaReadiness,
   ) {}
 
-  private async currentSnapshot(access: ScopeAccess = 'current') {
-    const context = (await this.pairings.active()).body.transcript.body.context;
+  private async snapshotAt(pairing: string, access: ScopeAccess) {
     const [row] = await this.db.query(
-      "SELECT r.record_json FROM facade_streams s JOIN facade_records r ON r.peer=s.peer AND r.direction=s.direction AND r.source=s.source AND r.incarnation=s.incarnation AND r.stream=s.stream AND r.sequence=s.applied JOIN facade_scopes v ON v.incarnation=s.incarnation AND v.scope=s.stream AND v.ready=1 WHERE s.peer='home' AND s.direction='in' AND s.source='home' AND s.incarnation=? AND s.stream='directory'" +
-        (access === 'current' ? ' AND s.received=s.applied' : ''),
-      [context.id],
+      "SELECT s.received,s.applied,v.ready,r.record_json FROM facade_streams s LEFT JOIN facade_records r ON r.peer=s.peer AND r.direction=s.direction AND r.source=s.source AND r.incarnation=s.incarnation AND r.stream=s.stream AND r.sequence=s.applied LEFT JOIN facade_scopes v ON v.incarnation=s.incarnation AND v.scope=s.stream WHERE s.peer='home' AND s.direction='in' AND s.source='home' AND s.incarnation=? AND s.stream='directory'",
+      [pairing],
     );
-    if (!row) return null;
+    if (access === 'current' && pendingSuffix(row)) {
+      throw new ReplicaCutPending(pairing, 'directory', false);
+    }
+    if (!row || Number(row.applied) === 0) {
+      throw new ReplicaCutPending(pairing, 'directory', !pendingSuffix(row));
+    }
+    if (Number(row.ready) !== 1 || !row.record_json) {
+      throw new MatrixError(503, 'M_UNAVAILABLE', 'replica unavailable');
+    }
     const record = JSON.parse(String(row.record_json));
     return {
       version: Number(record.version),
@@ -308,11 +337,22 @@ export class DirectoryReplicas {
   async snapshot(
     access: ScopeAccess = 'current',
   ): Promise<DirectoryReplica | null> {
-    return (await this.currentSnapshot(access))?.view ?? null;
+    const pairing =
+      (await this.pairings.active()).body.transcript.body.context.id;
+    try {
+      return (await this.snapshotAt(pairing, access)).view;
+    } catch (error) {
+      if (error instanceof MatrixError && error.status === 503) return null;
+      throw error;
+    }
   }
 
-  async requireScope(scope: string, allowAbsent = false): Promise<void> {
-    if (await this.scopeState(scope) === 'absent' && !allowAbsent) {
+  async requireScope(
+    scope: string,
+    allowAbsent = false,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (await this.scopeState(scope, signal) === 'absent' && !allowAbsent) {
       throw new MatrixError(404, 'M_NOT_FOUND', 'scope not found');
     }
   }
@@ -327,39 +367,48 @@ export class DirectoryReplicas {
     }
   }
 
-  async scopeState(scope: string): Promise<'ready' | 'absent'> {
-    return await this.scopeStateFor(scope, 'current');
+  async scopeState(
+    scope: string,
+    signal?: AbortSignal,
+  ): Promise<'ready' | 'absent'> {
+    return await this.admit(() => this.scopeStateFor(scope, 'current'), signal);
+  }
+
+  private admit<T>(read: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    return signal && this.readiness
+      ? this.readiness.wait(read, signal)
+      : read();
   }
 
   private async scopeStateFor(
     scope: string,
     access: ScopeAccess,
   ): Promise<'ready' | 'absent'> {
-    const snapshot = await this.currentSnapshot(access);
-    const view = snapshot?.view;
+    const grant = await this.pairings.active();
+    const pairing = grant.body.transcript.body.context.id;
+    const snapshot = await this.snapshotAt(pairing, access);
+    const view = snapshot.view;
     const unavailable = () => {
       throw new MatrixError(503, 'M_UNAVAILABLE', 'replica unavailable');
     };
-    if (!view) unavailable();
     if (scope === 'directory') return 'ready';
     if (scope === 'rooms') {
-      if (this.phase === 'f2' && snapshot!.version !== 2) unavailable();
+      if (this.phase === 'f2' && snapshot.version !== 2) unavailable();
       // An ordinary inventory read does not depend on every received room.
       // Its selected audience prepares each actual room dependency separately.
       if (access === 'applied') return 'ready';
-      const grant = await this.pairings.active();
       const incoming = await this.db.query(
         "SELECT DISTINCT stream FROM facade_streams WHERE peer='home' AND direction='in' AND source='home' AND incarnation=? AND (stream LIKE 'room:%' OR stream LIKE 'membership:%')",
-        [grant.body.transcript.body.context.id],
+        [pairing],
       );
       const local = await this.db.tx((conn) =>
-        this.localScopesAt(conn, grant.body.transcript.body.context.id)
+        this.localScopesAt(conn, pairing)
       );
       for (
         const room of new Set([
-          ...view!.rooms.map((id) => 'room:' + id),
+          ...view.rooms.map((id) => 'room:' + id),
           ...(this.phase === 'f2'
-            ? view!.users.map((id) => 'membership:' + id)
+            ? view.users.map((id) => 'membership:' + id)
             : []),
           ...incoming.map((row) => String(row.stream)).filter((stream) =>
             this.phase === 'f2' || stream.startsWith('room:')
@@ -369,14 +418,13 @@ export class DirectoryReplicas {
       ) await this.requireScope(room);
       return 'ready';
     }
-    const grant = await this.pairings.active();
     return await this.db.tx((conn) =>
       this.scopeStateAt(
         conn,
         scope,
-        grant.body.transcript.body.context.id,
+        pairing,
         grant.body.revision,
-        view!.cuts[scope],
+        view.cuts[scope],
         access,
       )
     );
@@ -389,8 +437,12 @@ export class DirectoryReplicas {
     roomId: string,
     allowAbsent = false,
     localUser?: string,
+    signal?: AbortSignal,
   ): Promise<ReplicaRoomAdmission> {
-    return await this.prepareScope(roomId, allowAbsent, 'current', localUser);
+    return await this.admit(
+      () => this.prepareScope(roomId, allowAbsent, 'current', localUser),
+      signal,
+    );
   }
 
   async prepareReadRoomScope(
@@ -409,16 +461,15 @@ export class DirectoryReplicas {
     const received = receivedFence(this.db), authority = signingFence(this.db);
     const grant = await this.pairings.active();
     const pairing = grant.body.transcript.body.context.id;
-    const snapshot = await this.currentSnapshot(access);
-    const view = snapshot?.view;
+    const snapshot = await this.snapshotAt(pairing, access);
+    const view = snapshot.view;
     const unavailable = (): never => {
       throw new MatrixError(503, 'M_UNAVAILABLE', 'replica unavailable');
     };
-    if (!view) unavailable();
     const scope = 'room:' + roomId;
     const localAuth = new Set<string>();
     if (localUser !== undefined) {
-      if (!view!.users.includes(localUser)) unavailable();
+      if (!view.users.includes(localUser)) unavailable();
       for (
         const stream of [
           'auth:' + localUser,
@@ -441,7 +492,6 @@ export class DirectoryReplicas {
       }
     }, authority);
     const check = async (conn: Conn) => {
-      conn.admit(checkCurrent);
       const [binding] = await conn.query(
         "SELECT state,grant_json FROM facade_pairings WHERE id=? AND side='facade'",
         [pairing],
@@ -463,15 +513,19 @@ export class DirectoryReplicas {
             grant.body.revision,
             this.self,
           )
-        ) unavailable();
+        ) {
+          const pending = pendingAccount(account, pairing, 'auth:' + localUser);
+          if (pending) throw pending;
+          unavailable();
+        }
         const membership = 'membership:' + localUser;
-        if (snapshot!.version !== 2) unavailable();
+        if (snapshot.version !== 2) unavailable();
         await this.scopeStateAt(
           conn,
           membership,
           pairing,
           grant.body.revision,
-          view!.cuts[membership],
+          view.cuts[membership],
         );
       }
       const state = await this.scopeStateAt(
@@ -479,13 +533,14 @@ export class DirectoryReplicas {
         scope,
         pairing,
         grant.body.revision,
-        view!.cuts[scope],
+        view.cuts[scope],
         access,
         localAuth,
       );
       if (state === 'absent' && !allowAbsent) {
         throw new MatrixError(404, 'M_NOT_FOUND', 'scope not found');
       }
+      conn.admit(checkCurrent);
     };
     await this.db.tx(check);
     return { check, checkCurrent };
@@ -528,6 +583,11 @@ export class DirectoryReplicas {
         return 'ready';
       }
       if (held || required !== undefined) {
+        if (
+          pendingSuffix(held) || Number(held?.applied ?? 0) < (required ?? 0)
+        ) {
+          throw new ReplicaCutPending(pairing, scope, !pendingSuffix(held));
+        }
         throw new MatrixError(503, 'M_UNAVAILABLE', 'replica unavailable');
       }
       return 'absent';
@@ -547,6 +607,11 @@ export class DirectoryReplicas {
       Number(held.source_cut) >= (required ?? 0)
     ) return 'ready';
     if (required !== undefined || held) {
+      if (
+        pendingSuffix(held) || Number(held?.source_cut ?? 0) < (required ?? 0)
+      ) {
+        throw new ReplicaCutPending(pairing, scope, !pendingSuffix(held));
+      }
       throw new MatrixError(503, 'M_UNAVAILABLE', 'replica unavailable');
     }
     if (scope.startsWith('room:')) {
@@ -560,6 +625,12 @@ export class DirectoryReplicas {
         return 'ready';
       }
       if (local.length) {
+        const pending = local.map((row) =>
+          pendingAccount(row, pairing, String(row.stream))
+        );
+        const next = pending.find((cut) => cut && !cut.needsHome) ??
+          pending.find((cut) => cut);
+        if (next) throw next;
         throw new MatrixError(503, 'M_UNAVAILABLE', 'replica unavailable');
       }
     }

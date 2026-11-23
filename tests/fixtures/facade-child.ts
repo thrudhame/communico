@@ -5,6 +5,7 @@ import { Pairings } from '#engine/facade/pairing.ts';
 import { AuthLinkHealth } from '#engine/facade/auth.ts';
 import { FacadeKeys } from '#engine/facade/control.ts';
 import { DirectoryReplicas } from '#engine/facade/directory.ts';
+import { AccountSnapshots } from '#engine/facade/accounts.ts';
 import { HomeEgress } from '#engine/facade/home-egress.ts';
 import { RoomReplicas } from '#engine/facade/replication.ts';
 import { InboxWorker } from '#engine/facade/worker.ts';
@@ -158,6 +159,11 @@ const roomApply = RoomReplicas.prototype.apply;
 RoomReplicas.prototype.apply = async function (...args) {
   await beforeFacadePublication('apply:' + args[1].stream);
   return await roomApply.apply(this, args);
+};
+const accountApply = AccountSnapshots.prototype.apply;
+AccountSnapshots.prototype.apply = async function (...args) {
+  await beforeFacadePublication('apply:' + args[1].stream);
+  return await accountApply.apply(this, args);
 };
 
 // Hold publication of already committed bytes outside every transaction. The

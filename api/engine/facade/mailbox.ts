@@ -208,7 +208,10 @@ export class Mailbox {
       pairings: Pairings;
       transaction: TransactionDeps;
       phase?: 'f1' | 'f2';
-      scopeState(scope: string): Promise<'ready' | 'absent'>;
+      scopeState(
+        scope: string,
+        signal?: AbortSignal,
+      ): Promise<'ready' | 'absent'>;
       acceptEdu(
         origin: string,
         raw: unknown,
@@ -333,7 +336,11 @@ export class Mailbox {
     if (changed) collision();
   }
 
-  async receive(origin: string, txnId: string): Promise<TxnResult> {
+  async receive(
+    origin: string,
+    txnId: string,
+    signal?: AbortSignal,
+  ): Promise<TxnResult> {
     const key = ingressOperation(origin, txnId);
     const previous = this.locks.get(key) ?? Promise.resolve();
     let release!: () => void;
@@ -344,7 +351,8 @@ export class Mailbox {
     this.locks.set(key, tail);
     await previous;
     try {
-      return await this.process(origin, txnId);
+      signal?.throwIfAborted();
+      return await this.process(origin, txnId, signal);
     } catch (error) {
       if (
         error instanceof MatrixError && [400, 429, 503].includes(error.status)
@@ -401,7 +409,11 @@ export class Mailbox {
     return JSON.parse(encoded) as T;
   }
 
-  private async process(origin: string, txnId: string): Promise<TxnResult> {
+  private async process(
+    origin: string,
+    txnId: string,
+    signal?: AbortSignal,
+  ): Promise<TxnResult> {
     const entry = await this.admission(origin, txnId);
     if (entry.response) return entry.response;
     await this.db.tx((conn) => checkBinding(conn, entry));
@@ -418,7 +430,10 @@ export class Mailbox {
       async ([roomId, inputs]) => {
         try {
           const result = await this.child(entry, 'room', roomId, async () => {
-            if (await this.options.scopeState('room:' + roomId) === 'absent') {
+            if (
+              await this.options.scopeState('room:' + roomId, signal) ===
+                'absent'
+            ) {
               return {
                 roomId,
                 result: await absentTransactionRoom(inputs),

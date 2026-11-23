@@ -19,6 +19,6 @@ export default async function (request: PathfinderRequest, context: Context) {
     request.params.eventId as string,
     await parseJson(request),
     origin,
-    inviteDeps(),
+    inviteDeps(request._raw.signal),
   );
 }

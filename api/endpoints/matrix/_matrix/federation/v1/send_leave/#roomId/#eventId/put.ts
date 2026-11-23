@@ -25,6 +25,6 @@ export default async function (
     body,
     origin,
     'v1',
-    inviteDeps(),
+    inviteDeps(request._raw.signal),
   );
 }

@@ -23,6 +23,6 @@ export default async function (
     request.params.roomId as string,
     body as Record<string, unknown>,
     origin,
-    serveDeps(),
+    serveDeps(request._raw.signal),
   );
 }

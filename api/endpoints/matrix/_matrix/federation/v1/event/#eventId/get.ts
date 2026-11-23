@@ -20,6 +20,6 @@ export default async function (
   return await serveEvent(
     request.params.eventId as string,
     origin,
-    serveDeps(),
+    serveDeps(request._raw.signal),
   );
 }

@@ -31,6 +31,9 @@ import { keyStore } from '#engine/federation/keys.ts';
 import { inviteDependencies } from '#engine/federation/dependencies.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
 import { exportKeyRoster, FacadeKeys } from '#engine/facade/control.ts';
+import { exportAccountAuth } from '#engine/facade/accounts.ts';
+import { MembershipOperations } from '#engine/facade/membership.ts';
+import { exportOwnerControl, OwnerControls } from '#engine/facade/ownership.ts';
 import { startInboxWorker } from '#engine/facade/worker.ts';
 import * as serving from '#engine/federation/serve.ts';
 import { pathfinder } from '@pathfinder/pathfinder';
@@ -1721,6 +1724,184 @@ Deno.test('PAIR503: signed membership validation precedes pending facade cuts', 
     setConfigForTests({});
   }
 });
+
+for (const dependency of ['directory', 'account'] as const) {
+  Deno.test(`PAIR503: federation admission waits for held ${dependency} publication`, async () => {
+    setConfigForTests({
+      server: { name: 'logical.test' },
+      federation: { enabled: true, mode: 'open' },
+      facade: { phase: 'f2' },
+    });
+    const tls = await facadeTls();
+    const f = await fixture(serverSchema, '11', tls.facadePin);
+    let child: Awaited<ReturnType<typeof facadeProcess>> | undefined;
+    try {
+      const pairings = await f.edgePairings(), server = await f.edgeServer();
+      const journal = new Journal(server, LINK_SUPPORTED);
+      const directory = await f.directoryOwner();
+      const guest = await makeRemoteServer('guest.test');
+      await seedServer(server, guest);
+      const publishDirectory = async () => {
+        await recoverServer(f.home);
+        const record = await exportDirectoryReplica(
+          f.home,
+          f.tenant,
+          f.node.node,
+          f.bundle.id,
+          2,
+        );
+        assert(record);
+        await journal.receive('home', [record]);
+        return record;
+      };
+      let request: Parameters<ReturnType<typeof fedCaller>>;
+      let publication;
+      if (dependency === 'directory') {
+        const room = await f.exports();
+        assert(room);
+        await journal.receive('home', [room]);
+        assert(await (await f.replicas()).apply(journal, room));
+        assert(await directory.apply(journal, await publishDirectory()));
+        await setVisibility(await f.home.server(), f.source.roomId, 'public');
+        publication = await publishDirectory();
+        request = [
+          'GET',
+          '/_matrix/federation/v1/make_knock/' +
+          encodeURIComponent(f.source.roomId) + '/%40guest%3Aguest.test?ver=11',
+        ];
+      } else {
+        const keyOwner = new FacadeKeys(
+          server,
+          f.node.signer(),
+          f.node.publicKey,
+          pairings,
+        );
+        const roster = await exportKeyRoster(
+          f.home,
+          f.tenant,
+          f.node.node,
+          f.bundle.id,
+          (_id, doc) => keyOwner.cosign(doc),
+        );
+        assert(roster);
+        await journal.receive('home', [roster]);
+        assert(await keyOwner.apply(journal, roster));
+        await f.tenant.tx((tx) => tx.users.insert('alice', 'Alice'));
+        const control = await exportOwnerControl(
+          f.home,
+          f.tenant,
+          f.homePairings,
+          f.bundle.id,
+        );
+        await enrolledTenant(
+          f.edgeStore(),
+          pairings,
+          'logical.test',
+          f.node.node,
+        );
+        const controls = new OwnerControls(
+          server,
+          await f.edgeStore().tenant('logical.test'),
+          pairings,
+          f.node,
+        );
+        await journal.receive('home', [control]);
+        assert(await controls.apply(journal, control));
+        publication = await exportAccountAuth(
+          f.home,
+          f.tenant,
+          f.homePairings,
+          f.bundle.id,
+          'alice',
+          false,
+        );
+        assertEquals(
+          await new MembershipOperations(f.home, f.tenant, f.homePairings)
+            .bootstrap('alice', f.bundle.id),
+          [],
+        );
+        assert(await directory.apply(journal, await publishDirectory()));
+        await journal.receive('home', [publication]);
+        const roomId = '!inbound-invite:guest.test';
+        const invite = await signTemplate({
+          room_id: roomId,
+          type: 'm.room.member',
+          sender: '@guest:guest.test',
+          state_key: '@alice:logical.test',
+          content: { membership: 'invite' },
+          depth: 5,
+          prev_events: [],
+          auth_events: [],
+        }, guest);
+        request = [
+          'PUT',
+          '/_matrix/federation/v2/invite/' + encodeURIComponent(roomId) + '/' +
+          encodeURIComponent(String(invite.event_id)),
+          { room_version: '11', event: invite, invite_room_state: [] },
+        ];
+      }
+      const before = await journal.heads('home', 'in', publication);
+      assertEquals(before.received.sequence, publication.sequence);
+      assertEquals(before.applied.sequence, publication.sequence - 1);
+      assert(publication.hash);
+      await f.edgeStore().close();
+      const path = tls.dir + '/readiness.toml';
+      await Deno.writeTextFile(
+        path,
+        `[server]\nname="logical.test"\nrole="facade"\nport=0\n[store]\ndir="${f.dir}/edge"\n[media]\nroot="${f.dir}/media"\n[admin]\nsocket="${tls.dir}/ready.sock"\n[federation]\nenabled=true\nport=0\ncert="${tls.dir}/facade.crt"\nkey="${tls.dir}/facade.key"\n[facade]\nphase="f2"\nnodeid="edge_a"\nurl="https://facade.test"\nlinkport=0\nlinkcert="${tls.dir}/facade.crt"\nlinkkey="${tls.dir}/facade.key"\nlinkcacerts=["${tls.dir}/ca.crt"]\npollseconds=1\n`,
+      );
+      const hold = 'apply:' + publication.stream;
+      child = await facadeProcess(path, 'facade: link/local admin ready', [
+        hold,
+      ]);
+      const waiting = await child.holdPublication(hold);
+      await bounded(waiting.held(), 5000);
+      const base = `http://127.0.0.1:${await child.port('client')}`;
+      const call = fedCaller((request) => {
+        const url = new URL(request.url);
+        return fetch(new Request(base + url.pathname + url.search, request));
+      }, guest);
+      const pending = call(...request);
+      const early = await Promise.race([
+        pending.then((result) => [result.status, result.body.errcode]),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 750)),
+      ]);
+      await waiting.release();
+      await bounded(
+        child.observations.tail('home', [{
+          ...publication,
+          received: { sequence: publication.sequence, hash: publication.hash },
+        }]),
+        5000,
+      );
+      // A baseline early refusal must not hide an invalid fixture. Check the
+      // exact signed operation after actual apply before asserting the wait.
+      const result = await bounded(
+        early === null ? pending : call(...request),
+        5000,
+      );
+      if (dependency === 'directory') {
+        assertEquals([result.status, result.body.errcode], [
+          403,
+          'M_FORBIDDEN',
+        ]);
+      } else {
+        assertEquals(result.status, 200, JSON.stringify(result.body));
+        assert(object(object(result.body.event).signatures)['logical.test']);
+      }
+      assertEquals(
+        early,
+        null,
+        'admission answered before the required cut applied',
+      );
+    } finally {
+      await child?.dispose();
+      await tls.close();
+      await f.close();
+      setConfigForTests({});
+    }
+  });
+}
 
 Deno.test('cold inbox rejection before Journal.apply rejects the finite tail promptly', async () => {
   const tls = await facadeTls();

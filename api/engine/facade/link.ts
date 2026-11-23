@@ -201,6 +201,8 @@ export function linkHandler(options: {
   notices?: NoticeHub;
   changed?(): Promise<void>;
   contacted?(): void;
+  reconciled?(pairing: string): void;
+  received?(): void;
   reconciling?(): (pairing: string, heads: unknown) => void;
   connected?(pairing: string, signal: AbortSignal): void;
   signKeyDocument?(raw: unknown): Promise<string>;
@@ -329,6 +331,7 @@ export function linkHandler(options: {
       return Response.json(await read());
     }
     if (route === 'hello') {
+      options.reconciled?.(id);
       const outgoing = await activeStreams('out');
       return response({
         revision: grant.body.revision,
@@ -403,9 +406,13 @@ export function linkHandler(options: {
       reconciling?.(id, [{ ...stream, head }]);
     }
     await journal.receive('home', records);
+    options.reconciled?.(id);
     // An empty page polls durable results, not a source mutation. Echoing it as
     // a notice makes every reconciler pass schedule another identical pass.
-    if (records.length) await options.changed?.();
+    if (records.length) {
+      if (options.received) options.received();
+      else await options.changed?.();
+    }
     return response({
       ack: await journal.acknowledgement('home', stream, after, options.limits),
     });

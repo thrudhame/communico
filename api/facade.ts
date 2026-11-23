@@ -85,7 +85,7 @@ export async function startFacade(
             );
           }
           if (required === 'public' || required === 'rooms') {
-            await runtime.requireScope('directory');
+            await runtime.requireReadScope('directory');
           }
           if (
             required === 'public' || required === 'rooms' ||

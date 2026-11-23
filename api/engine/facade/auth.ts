@@ -19,6 +19,11 @@ import type { Pairings } from './pairing.ts';
 import { type Cut, LinkError } from './protocol.ts';
 
 export class AuthLinkHealth {
+  private readonly delivery = new Map<string, {
+    until: number;
+    timer?: ReturnType<typeof setTimeout>;
+    waiters: Set<() => void>;
+  }>();
   private readonly connections = new Map<
     AbortSignal,
     { pairing: string; heads: Map<string, Cut> }
@@ -35,9 +40,68 @@ export class AuthLinkHealth {
   connected(pairing: string, signal: AbortSignal): void {
     if (signal.aborted || this.connections.has(signal)) return;
     this.connections.set(signal, { pairing, heads: new Map() });
-    signal.addEventListener('abort', () => this.connections.delete(signal), {
-      once: true,
-    });
+    signal.addEventListener('abort', () => {
+      this.connections.delete(signal);
+      if (!this.canDeliver(pairing)) this.deliveryLost(pairing);
+    }, { once: true });
+  }
+
+  private deliveryAt(pairing: string) {
+    const held = this.delivery.get(pairing) ?? {
+      until: 0,
+      waiters: new Set<() => void>(),
+    };
+    this.delivery.set(pairing, held);
+    return held;
+  }
+
+  /** Poll has no disconnect event. Only a subscribed, remotely missing cut
+   * needs a one-shot notification at the existing freshness boundary. */
+  reconciled(pairing: string): void {
+    if (this.settings.notify !== 'poll') return;
+    const held = this.deliveryAt(pairing);
+    held.until = performance.now() + this.settings.pollseconds * 1000;
+    this.armDeliveryExpiry(pairing);
+  }
+
+  canDeliver(pairing: string): boolean {
+    return this.settings.notify === 'poll'
+      ? performance.now() < (this.delivery.get(pairing)?.until ?? 0)
+      : [...this.connections].some(([signal, connection]) =>
+        !signal.aborted && connection.pairing === pairing
+      );
+  }
+
+  onDeliveryLoss(pairing: string, wake: () => void): () => void {
+    const held = this.deliveryAt(pairing);
+    held.waiters.add(wake);
+    this.armDeliveryExpiry(pairing);
+    return () => {
+      held.waiters.delete(wake);
+      if (!held.waiters.size) {
+        clearTimeout(held.timer);
+        held.timer = undefined;
+        if (!this.canDeliver(pairing)) this.delivery.delete(pairing);
+      }
+    };
+  }
+
+  private deliveryLost(pairing: string): void {
+    const held = this.delivery.get(pairing);
+    if (!held) return;
+    for (const wake of held.waiters) wake();
+    if (!held.waiters.size) this.delivery.delete(pairing);
+  }
+
+  private armDeliveryExpiry(pairing: string): void {
+    const held = this.delivery.get(pairing);
+    if (this.settings.notify !== 'poll' || !held?.waiters.size) return;
+    clearTimeout(held.timer);
+    held.timer = setTimeout(() => {
+      held.timer = undefined;
+      if (this.canDeliver(pairing)) this.armDeliveryExpiry(pairing);
+      else this.deliveryLost(pairing);
+    }, Math.ceil(held.until - performance.now()));
   }
 
   observe(pairing: string, raw: unknown, now = Date.now()): void {

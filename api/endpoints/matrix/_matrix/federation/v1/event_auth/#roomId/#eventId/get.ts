@@ -21,6 +21,6 @@ export default async function (
     request.params.roomId as string,
     request.params.eventId as string,
     origin,
-    serveDeps(),
+    serveDeps(request._raw.signal),
   );
 }
