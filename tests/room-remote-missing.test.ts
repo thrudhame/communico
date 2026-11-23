@@ -762,64 +762,75 @@ Deno.test('missing: budget exhausted → pending + wait; the later arrival resum
   });
 });
 
-Deno.test('missing: a pending resident join completes its retained observation when a later arrival grounds it', async () => {
-  await withStore(async (store) => {
-    const s = await setup(store, {
-      roomId: '!m-join:test',
-      deps: { limits: { waitMs: 0, limit: 10, budgetMs: 0 } },
-    });
-    const parent = await msg(s, 'parent', [s.joinId], 50);
-    const local = '@lena:remote.test';
-    const member = {
-      type: 'm.room.member',
-      sender: local,
-      state_key: local,
-      content: { membership: 'join' },
-    };
-    const join = await remoteEvent(s.g.roomId, s.server, '11', {
-      ...member,
-      prev_events: [String(parent.event_id)],
-      auth_events: await authAt(s.g.room, member, s.joinId),
-      depth: 51,
-      origin_server_ts: 1051,
-    });
-    const eventId = String(join.event_id);
-    const observation = {
-      user: local,
-      source: null,
-      incarnation: null,
-      observed: [],
-    };
-    const observed = () =>
-      s.g.room.tx(async (tx) =>
-        (await tx.changes.after(0, 500)).filter((c) =>
-          c.kind === 'rejoin-observation' && c.event === eventId
-        ).map((c) => JSON.parse(c.data))
+for (const ordinaryFirst of [false, true]) {
+  Deno.test(`missing: a pending resident join completes its retained observation (ordinary first: ${ordinaryFirst})`, async () => {
+    await withStore(async (store) => {
+      const s = await setup(store, {
+        roomId: '!m-join:test',
+        deps: { limits: { waitMs: 0, limit: 10, budgetMs: 0 } },
+      });
+      const parent = await msg(s, 'parent', [s.joinId], 50);
+      const local = '@lena:remote.test';
+      const member = {
+        type: 'm.room.member',
+        sender: local,
+        state_key: local,
+        content: { membership: 'join' },
+      };
+      const join = await remoteEvent(s.g.roomId, s.server, '11', {
+        ...member,
+        prev_events: [String(parent.event_id)],
+        auth_events: await authAt(s.g.room, member, s.joinId),
+        depth: 51,
+        origin_server_ts: 1051,
+      });
+      const eventId = String(join.event_id);
+      const observation = {
+        user: local,
+        source: null,
+        incarnation: null,
+        observed: [],
+      };
+      const observed = () =>
+        s.g.room.tx(async (tx) =>
+          (await tx.changes.after(0, 500)).filter((c) =>
+            c.kind === 'rejoin-observation' && c.event === eventId
+          ).map((c) => JSON.parse(c.data))
+        );
+      if (ordinaryFirst) {
+        const ordinary = await ingestRemote(
+          s.g.room,
+          [join],
+          s.server.name,
+          s.deps,
+        );
+        assertEquals(ordinary[0].outcome, 'pending');
+      }
+      const first = await ingestRemote(s.g.room, [join], s.server.name, {
+        ...s.deps,
+        localJoin: { eventId, userId: local, observation },
+      });
+      assertEquals(first[0].outcome, 'pending');
+      assertEquals(await observed(), []);
+      // The resume driver grounds it without the resident call's context.
+      const second = await ingestRemote(
+        s.g.room,
+        [parent],
+        s.server.name,
+        s.deps,
       );
-    const first = await ingestRemote(s.g.room, [join], s.server.name, {
-      ...s.deps,
-      localJoin: { eventId, userId: local, observation },
+      assertEquals(second[0].outcome, 'accepted');
+      await s.g.room.tx(async (tx) =>
+        assertEquals(await tx.events.getStatus(eventId), {
+          ...(await tx.events.getStatus(eventId))!,
+          standing: 'accepted',
+          grounding: 'grounded',
+        })
+      );
+      assertEquals(await observed(), [observation]);
     });
-    assertEquals(first[0].outcome, 'pending');
-    assertEquals(await observed(), []);
-    // The resume driver grounds it without the resident call's context.
-    const second = await ingestRemote(
-      s.g.room,
-      [parent],
-      s.server.name,
-      s.deps,
-    );
-    assertEquals(second[0].outcome, 'accepted');
-    await s.g.room.tx(async (tx) =>
-      assertEquals(await tx.events.getStatus(eventId), {
-        ...(await tx.events.getStatus(eventId))!,
-        standing: 'accepted',
-        grounding: 'grounded',
-      })
-    );
-    assertEquals(await observed(), [observation]);
   });
-});
+}
 
 Deno.test('missing: a retained local join completes its observation when another path stores it first', async () => {
   await withStore(async (store) => {

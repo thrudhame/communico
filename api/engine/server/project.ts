@@ -1196,9 +1196,11 @@ async function prepare(
             : await tx.events.getStatus(change.event);
           const pdu = row === null ? null : JSON.parse(row.pdu) as Pdu;
           if (
-            pdu?.type !== 'm.room.member' || pdu.sender !== observation.user ||
+            pdu?.type !== 'm.room.member' ||
             pdu.state_key !== observation.user ||
-            pdu.content?.membership !== 'join'
+            !(pdu.content?.membership === 'invite' ||
+              (pdu.content?.membership === 'join' &&
+                pdu.sender === observation.user))
           ) throw new Error('invalid rejoin observation');
           out.push({
             change,

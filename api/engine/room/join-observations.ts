@@ -5,7 +5,7 @@ import { appendChange } from './changes.ts';
 import type { LocalJoinObservation } from './hooks.ts';
 import { latestStay } from './segments.ts';
 import { current, groupKey } from './state.ts';
-import { getEvent } from './events.ts';
+import { getEvent, getStatus } from './events.ts';
 
 export const JOIN_OBSERVATIONS_SQL = `
 CREATE TABLE local_join_observations(event TEXT PRIMARY KEY NOT NULL,data TEXT NOT NULL);
@@ -36,7 +36,8 @@ export async function retainJoinObservation(
 ) {
   const observation = await transitionObservation(conn, user, data);
   if (observation === undefined) return;
-  if ((await conn.query('SELECT 1 FROM events WHERE id=?', [event])).length) {
+  const status = await getStatus(conn, event);
+  if (status !== null && status.grounding !== 'pending') {
     return;
   }
   await conn.execute(

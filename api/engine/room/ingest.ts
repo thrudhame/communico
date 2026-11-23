@@ -251,6 +251,11 @@ function localMembershipAuthor(event: BuildPartial, self: string) {
     ? {
       userId: event.sender,
       allowAbsent: localJoiningUser(event) !== undefined,
+      visibilityUser: event.content.membership === 'invite' &&
+          typeof event.state_key === 'string' &&
+          domainOf(event.state_key) === self
+        ? event.state_key
+        : undefined,
     }
     : undefined;
 }
@@ -315,7 +320,11 @@ function submitLocal(
   submission?: LocalSubmission,
   joiningUser?: string,
   completed?: boolean,
-  membership?: { userId: string; allowAbsent: boolean },
+  membership?: {
+    userId: string;
+    allowAbsent: boolean;
+    visibilityUser?: string;
+  },
 ): Promise<IngestLocalResult>;
 function submitLocal(
   room: Room,
@@ -330,7 +339,11 @@ async function submitLocal(
   submission?: LocalSubmission,
   joiningUser?: string,
   completed = true,
-  membership?: { userId: string; allowAbsent: boolean },
+  membership?: {
+    userId: string;
+    allowAbsent: boolean;
+    visibilityUser?: string;
+  },
 ): Promise<IngestLocalResult | null> {
   return await room.store.accept(async () => {
     if (!completed) requireCompletionOwner();
@@ -341,9 +354,10 @@ async function submitLocal(
         if (joiningUser !== undefined) {
           await admitLocalJoin(room.store, room.id, joiningUser);
         }
-        const observation = joiningUser === undefined
+        const visibilityUser = membership?.visibilityUser ?? joiningUser;
+        const observation = visibilityUser === undefined
           ? undefined
-          : await prepareJoinObservation(room.store, room.id, joiningUser);
+          : await prepareJoinObservation(room.store, room.id, visibilityUser);
         let prepared = await submission?.lookup() ?? null;
         // Exact committed work needs completion repair, not fresh scope. The
         // new-work fence still covers a prepared event that has not committed.
@@ -377,7 +391,7 @@ async function submitLocal(
               if (pdu === null) return null;
               await assertLocalAnnotation(tx, pdu);
               const transition = await tx.joinObservations.transition(
-                joiningUser,
+                visibilityUser,
                 observation,
               );
               const result = await ingestInTx(tx, room.id, pdu, {
@@ -385,7 +399,7 @@ async function submitLocal(
               });
               if (
                 !result.receipt && result.standing === 'accepted' &&
-                pdu.content?.membership === 'join'
+                ['join', 'invite'].includes(String(pdu.content?.membership))
               ) await tx.joinObservations.complete(result.eventId, transition);
               return result;
             })
@@ -417,10 +431,12 @@ async function submitLocal(
                 pdu as BuildPartial,
                 signer.serverName,
               );
-              if (pdu.content?.membership === 'join') {
+              if (
+                ['join', 'invite'].includes(String(pdu.content?.membership))
+              ) {
                 await tx.joinObservations.retain(
                   String(pdu.event_id),
-                  joiningUser,
+                  visibilityUser,
                   observation,
                 );
               }
@@ -453,7 +469,9 @@ async function submitLocal(
             });
             if (
               !result.receipt && result.standing === 'accepted' &&
-              prepared.pdu.content?.membership === 'join'
+              ['join', 'invite'].includes(
+                String(prepared.pdu.content?.membership),
+              )
             ) await tx.joinObservations.complete(result.eventId);
             return result;
           });
@@ -504,10 +522,11 @@ export async function ingestLocal(
     async () => {
       const user = localJoiningUser(pdu as BuildPartial);
       if (user !== undefined) await admitLocalJoin(room.store, room.id, user);
-      const observation = user === undefined
-        ? undefined
-        : await prepareJoinObservation(room.store, room.id, user);
       const membership = localMembershipAuthor(pdu as BuildPartial, self);
+      const visibilityUser = membership?.visibilityUser ?? user;
+      const observation = visibilityUser === undefined
+        ? undefined
+        : await prepareJoinObservation(room.store, room.id, visibilityUser);
       const scope = membership
         ? await prepareMembershipAdmission(
           room.store,
@@ -520,13 +539,13 @@ export async function ingestLocal(
         withMembershipFence(scope, tx, async () => {
           await admission?.(tx);
           const transition = await tx.joinObservations.transition(
-            user,
+            visibilityUser,
             observation,
           );
           const result = await ingestInTx(tx, room.id, pdu, { self });
           if (
             !result.receipt && result.standing === 'accepted' &&
-            pdu.content?.membership === 'join'
+            ['join', 'invite'].includes(String(pdu.content?.membership))
           ) await tx.joinObservations.complete(result.eventId, transition);
           return result;
         })

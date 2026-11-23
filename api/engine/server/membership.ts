@@ -222,7 +222,7 @@ export async function captureForgetOperations(conn: Conn, user: string) {
   return await forgetOperations(conn, user);
 }
 
-/** Prepared outside room transactions; only exact accepted joins retain it. */
+/** Prepared outside room transactions; accepted joins/invites retain it. */
 export async function prepareRejoin(
   db: Database,
   room: string,

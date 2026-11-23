@@ -1619,6 +1619,71 @@ Deno.test('facade forget: visibility failure rolls back the source fact and impo
   }
 });
 
+for (
+  const [newerForget, ingress] of [[false, 'send'], [true, 'send'], [
+    false,
+    'ingest',
+  ], [true, 'ingest']] as const
+) {
+  Deno.test(`facade forget: accepted in-room invite restores only observed visibility (${ingress}, newer forget: ${newerForget})`, async () => {
+    const f = await fixture();
+    const user = '@alice:logical.test';
+    try {
+      installJoinAdmission(f.home);
+      const created = await createRoom(f.home, {
+        creator: '@bob:logical.test',
+        preset: 'public_chat',
+      }, f.ht.signer());
+      const room = await openRoom(f.home, created.roomId),
+        db = await f.home.server();
+      await joinLocal(room, user, f.ht.signer());
+      await project(f.home, room.id);
+      await leaveLocal(room, user, f.ht.signer());
+      await project(f.home, room.id);
+      await forget(db, room.id, user, 'logical.test');
+      setJoinObservation(f.home, async (roomId, userId) => {
+        const captured = await prepareRejoin(db, roomId, userId);
+        if (newerForget) await forget(db, roomId, userId, 'logical.test');
+        return captured;
+      });
+      const partial = {
+        type: 'm.room.member',
+        sender: '@bob:logical.test',
+        state_key: user,
+        content: { membership: 'invite' },
+      };
+      const result = ingress === 'send'
+        ? await sendLocal(room, partial, f.ht.signer())
+        : await ingestLocal(
+          room,
+          await room.tx((tx) => buildInTx(tx, room.id, partial, f.ht.signer())),
+          f.ht.serverName,
+        );
+      assertEquals(result.standing, 'accepted');
+      await project(f.home, room.id);
+      assertEquals(
+        (await membershipOf(db, room.id, user))!.forgotten,
+        newerForget,
+      );
+      const operations = await db.tx((tx) => forgetOperations(tx, user));
+      const count = operations.length;
+      await project(f.home, room.id);
+      assertEquals(
+        (await db.tx((tx) => forgetOperations(tx, user))).length,
+        count,
+      );
+      assertEquals(
+        operations.some((op) =>
+          JSON.parse(op.payload).eventId === result.eventId
+        ),
+        true,
+      );
+    } finally {
+      await f.close();
+    }
+  });
+}
+
 Deno.test('facade forget: actual local join retains admission context across cold projection and idempotent retry', async () => {
   const f = await fixture();
   const user = '@alice:logical.test';
