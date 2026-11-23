@@ -25,7 +25,7 @@
 // parents held, their after-states resolve instead — P15). resumeWaits
 // is the recheck driver: a later arrival of what a wait missed re-runs
 // it (old ruling B).
-import { canonicalJson } from '#engine/canonical.ts';
+import { assertCanonicalNumbers, canonicalJson } from '#engine/canonical.ts';
 import { domainOf } from '#engine/ids.ts';
 import { eventIdFor } from '#engine/eventid.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
@@ -39,7 +39,11 @@ import {
   withMembershipFence,
 } from '#engine/room/hooks.ts';
 import type { Pdu } from '#engine/pdu.ts';
-import { getRulebook, type StateMap } from '#engine/rulebook/index.ts';
+import {
+  getRulebook,
+  type RoomVersionSpec,
+  type StateMap,
+} from '#engine/rulebook/index.ts';
 import {
   namedLevel,
   parsePowerLevels,
@@ -140,6 +144,50 @@ export async function sendLocal(
     true,
     localMembershipAuthor(partial, signer.serverName),
   );
+}
+
+export type StateUpdate = (
+  current: Record<string, unknown> | undefined,
+  spec: RoomVersionSpec,
+) => Record<string, unknown> | null;
+
+// Decide conditional state changes on the same live snapshot that builds and
+// ingests them. Callers cannot carry a read across the room-write boundary.
+export async function updateLocalState(
+  room: Room,
+  sender: string,
+  type: string,
+  stateKey: string,
+  update: StateUpdate,
+  signer: Signer,
+): Promise<IngestLocalResult | null> {
+  return await submitLocal(room, signer, async (tx, permit) => {
+    const stay = await tx.segments.latestStay();
+    if (stay === null) throw new Error('E_NO_STAY: ' + room.id);
+    const group = await tx.state.current(stay.id);
+    const id = group === null
+      ? null
+      : await tx.state.groupKey(group, type, stateKey);
+    const row = id === null ? null : await tx.events.get(id);
+    const current = row === null ? undefined : JSON.parse(row.pdu) as Pdu;
+    const content = update(
+      current?.content,
+      getRulebook(await roomVersionOf(tx, stay.id)).spec,
+    );
+    if (content === null) return null;
+    assertCanonicalNumbers(content);
+    if (
+      current?.sender === sender &&
+      canonicalJson(current.content ?? {}) === canonicalJson(content)
+    ) return current;
+    return await buildInTx(tx, room.id, {
+      type,
+      state_key: stateKey,
+      sender,
+      content,
+      origin_server_ts: Date.now(),
+    }, permit);
+  }, undefined);
 }
 
 // Only client message composition selects acceptance. The existing helpers keep
@@ -259,19 +307,34 @@ async function submissionReceipt(
 // Persist exact signed bytes before the room commit. A retry reconciles by
 // event id before lifecycle/permission checks, without authoring on a new tip.
 // Cross-file writes stay outside retryable room transactions.
-async function submitLocal(
+function submitLocal(
   room: Room,
   signer: Signer,
   build: (tx: RoomTx, signer: Signer) => Promise<Pdu>,
   submission?: LocalSubmission,
   joiningUser?: string,
+  completed?: boolean,
+  membership?: { userId: string; allowAbsent: boolean },
+): Promise<IngestLocalResult>;
+function submitLocal(
+  room: Room,
+  signer: Signer,
+  build: (tx: RoomTx, signer: Signer) => Promise<Pdu | null>,
+  submission: undefined,
+): Promise<IngestLocalResult | null>;
+async function submitLocal(
+  room: Room,
+  signer: Signer,
+  build: (tx: RoomTx, signer: Signer) => Promise<Pdu | null>,
+  submission?: LocalSubmission,
+  joiningUser?: string,
   completed = true,
   membership?: { userId: string; allowAbsent: boolean },
-): Promise<IngestLocalResult> {
+): Promise<IngestLocalResult | null> {
   return await room.store.accept(async () => {
     if (!completed) requireCompletionOwner();
-    let committed: IngestLocalResult | undefined;
-    let result: IngestLocalResult;
+    let committed: IngestLocalResult | null | undefined;
+    let result: IngestLocalResult | null;
     try {
       result = await withRoomLock(room.id, async () => {
         if (joiningUser !== undefined) {
@@ -310,6 +373,7 @@ async function submitLocal(
           committed = await room.tx((tx) =>
             withMembershipFence(admission, tx, async () => {
               const pdu = await build(tx, permit);
+              if (pdu === null) return null;
               await assertLocalAnnotation(tx, pdu);
               const transition = await tx.joinObservations.transition(
                 joiningUser,
@@ -340,6 +404,7 @@ async function submitLocal(
             withMembershipFence(admission, tx, async () => {
               await submission.admit?.(tx);
               const pdu = await build(tx, permit!);
+              if (pdu === null) throw new Error('E_SUBMISSION_BUILD_MISSING');
               await assertLocalAnnotation(tx, pdu);
               const stay = await tx.segments.openStay();
               const group = stay === null
@@ -413,7 +478,9 @@ async function submitLocal(
     }
     // A wait naming this event (a redaction target, a missing prev) is
     // re-run now that it has arrived (R10 — the 3c recheck driver).
-    if (completed) {
+    if (result === null) {
+      await projectAfterWrite(room.store, room.id);
+    } else if (completed) {
       await afterLocalCommit(room, result.eventId, signer.serverName);
     }
     return result;

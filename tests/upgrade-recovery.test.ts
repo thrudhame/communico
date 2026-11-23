@@ -8,6 +8,130 @@ import { lookupAlias } from '#engine/server/aliases.ts';
 import { join, leave } from '#engine/client/membership.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 
+for (const kind of ['tombstone', 'power'] as const) {
+  Deno.test(`upgrade conditional ${kind} write preserves a competing state update`, async () => {
+    const dir = await Deno.makeTempDir({ prefix: 'upgrade-conditional-' });
+    const app = await openApp({
+      dir,
+      library: './.native/libturso_ffi.so',
+      checkpointlogbytes: 65536,
+      maxopenfiles: 8,
+      idleseconds: 300,
+    });
+    try {
+      const user = await registerUser(app.tenant, {
+        localpart: 'upgrader',
+        password: 'pw',
+      });
+      const moderator = '@moderator:' +
+        user.user_id.split(':').slice(1).join(':');
+      const old = await createRoom({ creator: user.user_id, version: '11' });
+      const other = await createRoom({ creator: user.user_id, version: '11' });
+      const original =
+        (await stateAtSeq(old.roomId, null, [['m.room.power_levels', '']]))[0]
+          .content;
+      await writeStateKey(old.roomId, user.user_id, 'm.room.power_levels', '', {
+        ...original,
+        users: { [user.user_id]: 100, [moderator]: 50 },
+      });
+      const room = app.store.room.bind(app.store);
+      const execute = app.server.execute.bind(app.server);
+      let armed = false, opens = 0, injected = false, published = false;
+      app.server.execute = async (sql, values) => {
+        const result = await execute(sql, values);
+        if (
+          sql.startsWith('UPDATE room_upgrades SET phase=') &&
+          values?.[0] === (kind === 'tombstone' ? 2 : 3)
+        ) armed = true;
+        return result;
+      };
+      app.store.room = async (id, options) => {
+        // The first open starts the conditional action. Its next room open
+        // is either a separate stale-read/write gap, or post-commit repair
+        // when the action is atomic. Inject outside either room transaction.
+        if (armed && id === old.roomId && ++opens === 2) {
+          armed = false;
+          injected = true;
+          if (kind === 'tombstone') {
+            published =
+              (await stateAtSeq(old.roomId, null, [['m.room.tombstone', '']]))
+                .length > 0;
+            await writeStateKey(
+              old.roomId,
+              user.user_id,
+              'm.room.tombstone',
+              '',
+              {
+                body: 'concurrent authorized replacement',
+                replacement_room: other.roomId,
+              },
+            );
+          } else {
+            const pl = (await stateAtSeq(old.roomId, null, [[
+              'm.room.power_levels',
+              '',
+            ]]))[0].content;
+            await writeStateKey(
+              old.roomId,
+              user.user_id,
+              'm.room.power_levels',
+              '',
+              {
+                ...pl,
+                users: { [user.user_id]: 100, [moderator]: 0 },
+                kick: 65,
+              },
+            );
+          }
+        }
+        return await room(id, options);
+      };
+      let failure: unknown;
+      try {
+        await upgradeRoom(old.roomId, user.user_id, '12');
+      } catch (error) {
+        failure = error;
+      } finally {
+        app.store.room = room;
+        app.server.execute = execute;
+      }
+      assertEquals(injected, true, 'fixture missed the read/write gap');
+      const state = await stateAtSeq(old.roomId, null);
+      if (kind === 'tombstone') {
+        assertEquals(
+          state.find((r) => r.type === 'm.room.tombstone')?.content,
+          {
+            body: 'concurrent authorized replacement',
+            replacement_room: other.roomId,
+          },
+        );
+        const [retained] = await app.server.query(
+          'SELECT phase FROM room_upgrades WHERE old_room_id=?',
+          [old.roomId],
+        );
+        if (!published) {
+          assertEquals(failure instanceof MatrixError && failure.status, 503);
+          assertEquals(retained.phase, 2);
+        } else {
+          assertEquals(failure, undefined);
+        }
+      } else {
+        assertEquals(failure, undefined);
+        const locked = state.find((r) =>
+          r.type === 'm.room.power_levels'
+        )!.content;
+        assertEquals((locked.users as Record<string, number>)[moderator], 0);
+        assertEquals(locked.kick, 65);
+        assertEquals(locked.invite, 50);
+        assertEquals(locked.events_default, 50);
+      }
+    } finally {
+      await closeApp();
+      await Deno.remove(dir, { recursive: true });
+    }
+  });
+}
+
 for (const version of ['11', '12']) {
   for (const cut of ['before-publication', 'after-publication', 'push-rules']) {
     Deno.test(`upgrade v${version} cold retry after ${cut} retains its room identity`, async () => {

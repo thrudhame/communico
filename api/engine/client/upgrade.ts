@@ -20,11 +20,10 @@ import {
   withRoomUpgrade,
 } from '#engine/server/room-upgrades.ts';
 import { membershipOf } from '#engine/server/read.ts';
-import { requireRoomForAdmission, stateAtSeq, versionOf } from './room.ts';
-import { getRulebook } from '#engine/rulebook/index.ts';
+import { requireRoomForAdmission, stateAtSeq } from './room.ts';
 import { parsePowerLevels } from '#engine/rulebook/power-levels.ts';
 import { powerFor } from './directory.ts';
-import { writeStateKey } from './write.ts';
+import { updateStateKey } from './write.ts';
 import { reconcileRoomRules } from './rule-migration.ts';
 const TRANSFER = [
   'm.room.server_acl',
@@ -189,17 +188,17 @@ export async function upgradeRoom(
         type: string,
         content: Record<string, unknown>,
       ) => {
-        const current =
-          (await stateAtSeq(roomId, null, [[type, '']], 'admission'))[0]
-            ?.content;
-        if (
-          current === undefined ||
-          canonicalJson(current) !== canonicalJson(content)
-        ) {
-          await writeStateKey(roomId, userId, type, '', content);
-        } else {
-          await projectAfterWrite(app.store, roomId);
-        }
+        await updateStateKey(
+          roomId,
+          userId,
+          type,
+          '',
+          (current) =>
+            current !== undefined &&
+              canonicalJson(current) === canonicalJson(content)
+              ? null
+              : content,
+        );
       };
       if (retained.phase === 0) {
         if (retained.plan.prepared) {
@@ -244,30 +243,32 @@ export async function upgradeRoom(
         await advanceRoomUpgrade(app.server, retained, 2);
       }
       if (retained.phase === 2) {
-        const existing = (await stateAtSeq(
+        await updateStateKey(
           oldRoomId,
-          null,
-          [['m.room.tombstone', '']],
-          'admission',
-        ))[0]
-          ?.content.replacement_room;
-        if (typeof existing === 'string') {
-          if (existing !== retained.replacement) {
-            throw new MatrixError(
-              503,
-              'M_UNAVAILABLE',
-              'retained upgrade differs from the published tombstone',
-            );
-          }
-          // The existing PDU is the authority, including its original body and
-          // event ID. Reconcile effects without authoring another tombstone.
-          await projectAfterWrite(app.store, oldRoomId);
-        } else {
-          await writeOnce(oldRoomId, 'm.room.tombstone', {
-            body: 'This room has been replaced',
-            replacement_room: retained.replacement,
-          });
-        }
+          userId,
+          'm.room.tombstone',
+          '',
+          (current) => {
+            const existing = current?.replacement_room;
+            if (typeof existing === 'string') {
+              if (existing !== retained.replacement) {
+                throw new MatrixError(
+                  503,
+                  'M_UNAVAILABLE',
+                  'retained upgrade differs from the published tombstone',
+                );
+              }
+              // The existing PDU is the authority, including its original body and
+              // event ID. Reconcile effects without authoring another tombstone.
+              return null;
+            } else {
+              return {
+                body: 'This room has been replaced',
+                replacement_room: retained.replacement,
+              };
+            }
+          },
+        );
         await advanceRoomUpgrade(app.server, retained, 3);
       }
       if (retained.phase === 3) {
@@ -275,25 +276,30 @@ export async function upgradeRoom(
           // Synapse's lockdown: from the CURRENT power levels, raise only
           // invite/events_default below max(users_default + 1, 50). A retry
           // never restores power the room changed after the upgrade began.
-          const current = (await stateAtSeq(
+          await updateStateKey(
             oldRoomId,
-            null,
-            [['m.room.power_levels', '']],
-            'admission',
-          ))[0]?.content;
-          const parsed = current === undefined ? null : parsePowerLevels(
-            current,
-            getRulebook(await versionOf(room)).spec,
+            userId,
+            'm.room.power_levels',
+            '',
+            (current, spec) => {
+              const parsed = current === undefined ? null : parsePowerLevels(
+                current,
+                spec,
+              );
+              if (current !== undefined && parsed?.ok) {
+                const pl = parsed.pl;
+                const restricted = Math.max((pl.users_default ?? 0) + 1, 50);
+                const locked = { ...current };
+                for (const key of ['invite', 'events_default'] as const) {
+                  if ((pl[key] ?? 0) < restricted) locked[key] = restricted;
+                }
+                return canonicalJson(current) === canonicalJson(locked)
+                  ? null
+                  : locked;
+              }
+              return null;
+            },
           );
-          if (current !== undefined && parsed?.ok) {
-            const pl = parsed.pl;
-            const restricted = Math.max((pl.users_default ?? 0) + 1, 50);
-            const locked = { ...current };
-            for (const key of ['invite', 'events_default'] as const) {
-              if ((pl[key] ?? 0) < restricted) locked[key] = restricted;
-            }
-            await writeOnce(oldRoomId, 'm.room.power_levels', locked);
-          }
         } catch (e) {
           // Synapse treats only authorization refusal as optional lockdown.
           // Storage/projection faults retain this phase for a truthful retry.
