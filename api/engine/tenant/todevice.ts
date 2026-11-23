@@ -16,7 +16,11 @@ import { domainOf, localpartOf } from '#engine/ids.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { hashToken } from '#engine/tenant/auth.ts';
 import { registryDevice, tenantAuthority } from './session-authority.ts';
-import { encodeStreamToken, type StreamToken } from '#engine/client/tokens.ts';
+import {
+  encodeStreamToken,
+  formatPosition,
+  type StreamToken,
+} from '#engine/client/tokens.ts';
 import { encodeEnvelope } from '#engine/federation-envelope.ts';
 import {
   acknowledgeToDeviceTargets,
@@ -461,9 +465,13 @@ export async function deliverSliding(
   connection: string,
   limit: number,
   limits: KeyLimits,
+  domain?: string,
 ): Promise<{ events: Json[]; nextBatch: string }> {
   const page = await inboxPage(conn, d, limits, limit);
-  const nextBatch = crypto.randomUUID();
+  const payload = crypto.randomUUID();
+  const nextBatch = domain === undefined
+    ? payload
+    : formatPosition(domain, payload);
   await recordDelivery(
     conn,
     d,

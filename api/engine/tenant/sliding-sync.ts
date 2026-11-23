@@ -4,6 +4,7 @@ import type { DeviceIdentity } from './devices.ts';
 import { current } from './e2ee.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Config } from '#engine/config.ts';
+import { formatPosition } from '#engine/client/tokens.ts';
 
 type Limits = Config['slidingsync'];
 export type PositionLease = {
@@ -124,6 +125,7 @@ export async function commitPosition(
   state: Record<string, unknown>,
   limits: Limits,
   now: number,
+  domain?: string,
 ): Promise<string> {
   await current(conn, d);
   const rows = await conn.query(
@@ -178,7 +180,10 @@ export async function commitPosition(
       [lease.connection, lease.position],
     );
   }
-  const token = crypto.randomUUID();
+  const payload = crypto.randomUUID();
+  const token = domain === undefined
+    ? payload
+    : formatPosition(domain, payload);
   await conn.execute('INSERT INTO sliding_sync_positions VALUES(?,?,?)', [
     token,
     lease.connection,

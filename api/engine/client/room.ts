@@ -6,7 +6,7 @@ import type { Pdu } from '#engine/pdu.ts';
 import { roomVersionOf } from '#engine/room/build.ts';
 import { openRoom, parseCursor, type Room } from '#engine/room/index.ts';
 import { membershipOf } from '#engine/server/read.ts';
-import { parseStreamToken } from './tokens.ts';
+import { localPaginationToken, parseLocalStreamToken } from './positions.ts';
 import { admitState } from './state-admission.ts';
 
 export type RoomAccess = 'read' | 'admission';
@@ -98,10 +98,12 @@ export async function stateSeqAtToken(
 ): Promise<number | null> {
   let seq = leaveAt;
   if (raw !== null) {
-    const stream = parseStreamToken(raw);
+    const stream = await parseLocalStreamToken(theApp().server, raw);
     let requested = stream?.eSeq;
     if (requested === undefined) {
-      const cursor = parseCursor(raw);
+      const cursor = parseCursor(
+        await localPaginationToken(theApp().server, raw),
+      );
       if (cursor === null) {
         throw new MatrixError(400, 'M_INVALID_PARAM', 'unknown state token');
       }

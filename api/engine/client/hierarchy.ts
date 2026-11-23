@@ -1,5 +1,6 @@
 // Space traversal owns pagination, not room membership or metadata policy.
 import { theApp } from '#engine/app.ts';
+import { bindPaginationToken, localPaginationToken } from './positions.ts';
 import { config } from '#engine/config.ts';
 import { domainOf } from '#engine/ids.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
@@ -179,6 +180,9 @@ export async function clientHierarchy(
   options: ReturnType<typeof hierarchyQuery>,
 ) {
   const app = theApp(), limits = config().hierarchy, now = Date.now();
+  const from = options.from === null
+    ? null
+    : await localPaginationToken(app.server, options.from);
   let cache = sessions.get(app.store);
   if (cache === undefined) {
     cache = new Map();
@@ -193,8 +197,8 @@ export async function clientHierarchy(
     depth: 0,
   };
   let walk: Walk;
-  if (options.from !== null) {
-    const saved = cache.get(options.from);
+  if (from !== null) {
+    const saved = cache.get(from);
     if (
       saved === undefined || saved.user !== user || saved.root !== root ||
       saved.suggested !== options.suggested || saved.depth !== options.depth
@@ -259,7 +263,10 @@ export async function clientHierarchy(
   const serialized = JSON.stringify(walk);
   for (const [token, saved] of cache) {
     if (saved.user === user && JSON.stringify(saved) === serialized) {
-      return { rooms, next_batch: token };
+      return {
+        rooms,
+        next_batch: await bindPaginationToken(app.server, token),
+      };
     }
   }
   const owned =
@@ -273,7 +280,7 @@ export async function clientHierarchy(
   }
   const next = crypto.randomUUID();
   cache.set(next, walk);
-  return { rooms, next_batch: next };
+  return { rooms, next_batch: await bindPaginationToken(app.server, next) };
 }
 
 export async function federationHierarchy(

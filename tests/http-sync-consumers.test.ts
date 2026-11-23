@@ -1,5 +1,6 @@
 // Remaining doltgres sync consumer assertions, using the landed room routes.
 import { assert, assertEquals } from '@std/assert';
+import { parsePosition } from '#engine/client/tokens.ts';
 import { theApp } from '#engine/app.ts';
 import { config, setConfigForTests } from '#engine/config.ts';
 import { resetCaCertsForTests } from '#engine/federation/client.ts';
@@ -11,6 +12,7 @@ import { fedCaller } from '#tests/http-federation.ts';
 import { remoteEvent, wireOf } from '#tests/fixtures/remote.ts';
 import { type FakeRoom, makeFakeRoom } from '#tests/fixtures/remote-room.ts';
 import { httpSuite } from '#tests/http-app.ts';
+import { parseStreamToken } from '#engine/client/tokens.ts';
 
 type Json = Record<string, unknown>;
 const suite = httpSuite('HTTP sync consumers');
@@ -65,7 +67,7 @@ suite.test('sync tokens bound messages in both directions and preserve room curs
   await send(1);
   await send(2);
   const first = (await sync(token)).next_batch;
-  assert(/^s\d+_p\d+_t\d+_r\d+_a\d+_d\d+_m\d+_k\d+_n\d+$/.test(String(first)));
+  assert(parseStreamToken(String(first))?.domain);
   await send(3);
   await send(4);
   const second = (await sync(token)).next_batch;
@@ -92,7 +94,7 @@ suite.test('sync tokens bound messages in both directions and preserve room curs
   assertEquals(garbage.body.errcode, 'M_INVALID_PARAM');
   const page = await call(base + '/messages?dir=b&limit=2', token);
   assertEquals(page.status, 200);
-  assert(/^c\d+_\d+$/.test(String(page.body.end)));
+  assert(/^c\d+_\d+$/.test(parsePosition(String(page.body.end))!.payload));
   const next = await call(
     base + '/messages?dir=b&limit=2&from=' + page.body.end,
     token,

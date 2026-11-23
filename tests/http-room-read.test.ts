@@ -1,5 +1,6 @@
 // doltgres messages/context/event-visibility/legacy-room contracts.
 import { assert, assertEquals } from '@std/assert';
+import { parsePosition } from '#engine/client/tokens.ts';
 import { httpSuite } from '#tests/http-app.ts';
 import { theApp } from '#engine/app.ts';
 import { eventStreamMax } from '#engine/server/stream.ts';
@@ -90,7 +91,7 @@ test('messages: five-part/bare stream tokens, bounds, c-token paging, filtered e
   assertEquals((await get('dir=x')).body.errcode, 'M_INVALID_PARAM');
   assertEquals((await get('dir=b&filter=not-json')).body.errcode, 'M_BAD_JSON');
   const one = await get('dir=b&limit=2');
-  assert(/^c\d+_-?\d+$/.test(String(one.body.end)));
+  assert(/^c\d+_-?\d+$/.test(parsePosition(String(one.body.end))!.payload));
   const two = await get('dir=b&limit=2&from=' + one.body.end);
   assertEquals(bodies(two.body.chunk), ['m3', 'm2']);
   assertEquals(

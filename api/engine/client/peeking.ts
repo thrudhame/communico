@@ -14,7 +14,8 @@ import { admitState } from './state-admission.ts';
 import { renderEvents } from './render.ts';
 import { clientEventsForRows } from './state.ts';
 import { messages } from './timeline.ts';
-import { parseStreamToken } from './tokens.ts';
+import { formatStreamToken } from './tokens.ts';
+import { parseLocalStreamToken, requireStreamDomain } from './positions.ts';
 import { roomCompletion } from './completion.ts';
 import type { DeviceIdentity } from '#engine/tenant/devices.ts';
 
@@ -86,13 +87,27 @@ export async function roomInitialSync(
   await roomCompletion(theApp(), [roomId], signal, identity);
   return await withRoomLock(roomId, async () => {
     const app = theApp(), snapshot = await previewCut(roomId, user);
+    const domain = await requireStreamDomain(app.server, null);
+    const bookmark = formatStreamToken(
+      snapshot.cut,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      undefined,
+      undefined,
+      domain,
+    );
     const page = await messages({
       roomId,
       userId: user,
       deviceId: device,
       leaveAt: snapshot.cut,
       dir: 'b',
-      fromToken: 's' + snapshot.cut,
+      fromSeq: snapshot.cut,
       toToken: null,
       limit,
       lazyLoadMembers: false,
@@ -108,7 +123,7 @@ export async function roomInitialSync(
       membership: snapshot.membership,
       messages: {
         chunk: page.chunk.reverse(),
-        end: 's' + snapshot.cut,
+        end: bookmark,
         ...(page.end === undefined ? {} : { start: page.end }),
       },
       state: await clientEventsForRows(
@@ -137,13 +152,16 @@ export async function roomEvents(
   identity: DeviceIdentity | null = null,
 ) {
   if (!roomId.startsWith('!')) invalid('room_id is required');
-  const parsed = parseStreamToken(rawFrom);
-  if (rawFrom !== null && parsed === null) invalid('bad from token');
   const app = theApp();
+  const parsed = await parseLocalStreamToken(app.server, rawFrom);
+  if (rawFrom !== null && parsed === null) invalid('bad from token');
+  const domain = await requireStreamDomain(app.server, null);
+  const bookmark = (seq: number) =>
+    formatStreamToken(seq, 0, 0, 0, 0, 0, 0, 0, undefined, undefined, domain);
   await roomCompletion(app, [roomId], signal, identity);
   // An omitted cursor begins now, not at room genesis.
   let from = parsed?.eSeq ?? await eventStreamMax(app.server);
-  const start = rawFrom ?? 's' + from;
+  const start = rawFrom ?? bookmark(from);
   const deadline = Date.now() +
     Math.min(timeout, config().peeking.maxtimeoutms);
   while (true) {
@@ -186,7 +204,7 @@ export async function roomEvents(
       });
       signal.throwIfAborted();
       if (result.chunk.length || Date.now() >= deadline) {
-        return { chunk: result.chunk, start, end: 's' + result.end };
+        return { chunk: result.chunk, start, end: bookmark(result.end) };
       }
       from = result.end;
       if (!result.more) await changed;

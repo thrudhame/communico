@@ -1,4 +1,5 @@
 import { assertEquals, assertRejects, assertThrows } from '@std/assert';
+import { config } from '#engine/config.ts';
 import { canonicalJson } from '#engine/canonical.ts';
 import {
   AccountSnapshots,
@@ -8,7 +9,11 @@ import {
 } from '#engine/facade/accounts.ts';
 import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
 import { Journal } from '#engine/facade/journal.ts';
-import { exportOwnerControl, OwnerControls } from '#engine/facade/ownership.ts';
+import {
+  exportOwnerControl,
+  OwnerControls,
+  publicationIdentity,
+} from '#engine/facade/ownership.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
 import { JournalReconciler } from '#engine/facade/worker.ts';
 import {
@@ -40,6 +45,9 @@ import {
 } from '#engine/tenant/auth.ts';
 import { captureSessionAuthority } from '#engine/tenant/session-authority.ts';
 import { deleteDevices } from '#engine/tenant/devices.ts';
+import { deviceIdentity } from '#engine/tenant/txns.ts';
+import { insertMessage } from '#engine/tenant/todevice.ts';
+import { validateUpload } from '#engine/tenant/e2ee.ts';
 import { bounded } from './helpers/server-process.ts';
 import { AuthLinkHealth, FacadeAuth } from '#engine/facade/auth.ts';
 import { consumeRefreshToken } from '#engine/tenant/auth.ts';
@@ -1988,6 +1996,149 @@ Deno.test('facade authority reaches home durably before ACK and never becomes a 
     assertEquals(
       await f.reverse.applyFromFacade(f.destination, f.bundle.id, record),
       false,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('Q2 unsupported same-device ingress movement preserves owner, sessions, key pools and issued inbox cuts', async () => {
+  const f = await reverseFixture();
+  try {
+    const session = await loginUser(f.et, {
+      localpart: 'alice',
+      password: 'pw',
+      deviceId: 'q2-outside',
+      refresh: true,
+    });
+    const device = await deviceIdentity(f.et, 'alice', 'q2-outside');
+    const db = await f.edge.tenant('logical.test');
+    const publication = await publicationIdentity(
+      await f.edge.server(),
+      f.node.node,
+    );
+    await f.et.tx((tx) =>
+      tx.e2ee.upload(
+        device,
+        validateUpload(
+          {
+            one_time_keys: { 'curve25519:q2': 'retained-public-key' },
+            fallback_keys: { 'curve25519:q2-fallback': 'retained-fallback' },
+          },
+          '@alice:logical.test',
+          device.deviceId,
+          config().e2ee,
+        ),
+      )
+    );
+    for (const n of [1, 2]) {
+      await db.tx((conn) =>
+        insertMessage(conn, device, 'q2-message-' + n, {
+          type: 'm.room_key',
+          content: { n },
+        }, config().e2ee)
+      );
+    }
+    const issued = await f.et.tx(async (tx) => {
+      const lease = await tx.slidingSync.begin(device, 'q2-encryption', null);
+      const inbox = await tx.toDevice.deliverSliding(
+        device,
+        lease.connection,
+        1,
+        config().e2ee,
+        String(publication.domain),
+      );
+      const pos = await tx.slidingSync.commit(
+        device,
+        lease,
+        {},
+        undefined,
+        String(publication.domain),
+      );
+      return { lease, inbox, pos };
+    });
+    assertEquals(
+      issued.inbox.events.map((event) => (event.content as { n: number }).n),
+      [1],
+    );
+    const record = await f.reverseEmit();
+    await f.reverse.applyFromFacade(f.destination, f.bundle.id, record);
+    const snapshot = async () => {
+      const stores = [];
+      for (const store of [f.home, f.edge]) {
+        const tenant = await store.tenant('logical.test');
+        const tables = await tenant.query(
+          "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso%' ORDER BY name",
+        );
+        const rows = [];
+        for (const table of tables) {
+          rows.push([
+            table.name,
+            await tenant.query(`SELECT * FROM "${table.name}" ORDER BY rowid`),
+          ]);
+        }
+        stores.push(rows);
+      }
+      return stores;
+    };
+    const before = await snapshot();
+    for (
+      const attempt of [
+        () =>
+          loginUser(f.ht, {
+            localpart: 'alice',
+            password: 'pw',
+            deviceId: 'q2-outside',
+            refresh: true,
+          }),
+        () => lookupToken(f.ht, session.accessToken),
+        () => consumeRefreshToken(f.ht, session.refreshToken!),
+      ]
+    ) {
+      const error = await assertRejects(
+        attempt,
+        MatrixError,
+        'operation owner unavailable',
+      );
+      assertEquals([error.status, error.errcode], [503, 'M_UNAVAILABLE']);
+      assertEquals(
+        await snapshot(),
+        before,
+        'an unsupported ingress move must not mutate either device authority',
+      );
+    }
+    assertEquals(
+      (await lookupToken(f.et, session.accessToken))?.user_id,
+      '@alice:logical.test',
+    );
+    const tail = await f.et.tx(async (tx) => {
+      const lease = await tx.slidingSync.begin(
+        device,
+        'q2-encryption',
+        issued.pos,
+      );
+      await tx.toDevice.acknowledgeSliding(
+        device,
+        lease.connection,
+        issued.inbox.nextBatch,
+      );
+      return await tx.toDevice.deliverSliding(
+        device,
+        lease.connection,
+        1,
+        config().e2ee,
+        String(publication.domain),
+      );
+    });
+    assertEquals(
+      tail.events.map((event) => (event.content as { n: number }).n),
+      [2],
+    );
+    assertEquals(
+      (await db.query('SELECT key_id FROM one_time_keys')).map((row) =>
+        row.key_id
+      ),
+      ['q2'],
     );
   } finally {
     await f.close();

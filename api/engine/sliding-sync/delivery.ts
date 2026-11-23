@@ -9,6 +9,7 @@ type Json = Record<string, unknown>;
 
 export async function publishSlidingResponse(input: {
   tenant: Tenant;
+  domain: string;
   device: DeviceIdentity;
   lease: PositionLease;
   state: Json;
@@ -16,7 +17,8 @@ export async function publishSlidingResponse(input: {
   toDevice?: Extensions['to_device'];
   signal?: AbortSignal;
 }): Promise<Json> {
-  const { tenant, device, lease, state, response, toDevice, signal } = input;
+  const { tenant, domain, device, lease, state, response, toDevice, signal } =
+    input;
   signal?.throwIfAborted();
   return await tenant.tx(async (tx) => {
     signal?.throwIfAborted();
@@ -35,6 +37,7 @@ export async function publishSlidingResponse(input: {
         lease.connection,
         toDevice.limit,
         config().e2ee,
+        domain,
       );
       extensions.to_device = {
         next_batch: page.nextBatch,
@@ -42,7 +45,13 @@ export async function publishSlidingResponse(input: {
       };
     }
     signal?.throwIfAborted();
-    const pos = await tx.slidingSync.commit(device, lease, state);
+    const pos = await tx.slidingSync.commit(
+      device,
+      lease,
+      state,
+      undefined,
+      domain,
+    );
     // Abort during the final native operations must still roll back the
     // successor, acknowledgment and delivery proof before returning any body.
     signal?.throwIfAborted();

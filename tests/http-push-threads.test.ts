@@ -1,6 +1,7 @@
 import { assert, assertEquals } from '@std/assert';
 import { httpSuite } from '#tests/http-app.ts';
 import { observeSyncWait } from '#tests/support/sync-turn.ts';
+import { parseStreamToken } from '#engine/client/tokens.ts';
 import { roomDeliveredBySync } from '#tests/support/sync-delivery.ts';
 
 type Json = Record<string, unknown>;
@@ -196,8 +197,8 @@ suite.test('private count-only zero wakes owner with a filtered timeline', async
     await turns.close();
   }
   assert(
-    Number(String(result.next_batch).match(/_n(\d+)/)?.[1]) >
-      Number(String(first.next_batch).match(/_n(\d+)/)?.[1]),
+    parseStreamToken(String(result.next_batch))!.nSeq! >
+      parseStreamToken(String(first.next_batch))!.nSeq!,
   );
   assertEquals(entry(result, room).unread_notifications, count(0));
   assertEquals((entry(result, room).timeline as Json).events, []);
@@ -316,7 +317,7 @@ suite.test('redaction withdraws unread contributions and wakes a count-only zero
   assertEquals(entry(result, room).unread_notifications, count(0));
   assertEquals((entry(result, room).timeline as Json).events, []);
   assert(
-    Number(String(result.next_batch).match(/_n(\d+)/)?.[1]) >
-      Number(String(first.next_batch).match(/_n(\d+)/)?.[1]),
+    parseStreamToken(String(result.next_batch))!.nSeq! >
+      parseStreamToken(String(first.next_batch))!.nSeq!,
   );
 });

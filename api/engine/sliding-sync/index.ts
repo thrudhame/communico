@@ -18,6 +18,7 @@ import { deviceIdentity } from '#engine/tenant/txns.ts';
 import { captureTyping } from '#engine/typing.ts';
 import { waitForSync } from '#engine/sync-wait.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { requireSlidingDomain } from '#engine/client/positions.ts';
 import { selectLists } from './lists.ts';
 import { roomPayloads, type SentRoom } from './rooms.ts';
 import { publishSlidingResponse } from './delivery.ts';
@@ -55,6 +56,10 @@ export async function slidingSync(input: {
   signal?: AbortSignal;
 }) {
   const app = theApp(), request = input.request, signal = input.signal;
+  const domain = await requireSlidingDomain(app.server, request.pos);
+  if (request.extensions.to_device?.enabled) {
+    await requireSlidingDomain(app.server, request.extensions.to_device.since);
+  }
   if (input.deviceId === null) {
     throw new MatrixError(
       400,
@@ -194,6 +199,7 @@ export async function slidingSync(input: {
           selection,
           {
             eventCut: server.eventCut,
+            domain,
             requestSince: previous?.eventCut ?? null,
             direct: tenant.direct,
             previous: previous?.rooms ?? {},
@@ -306,6 +312,7 @@ export async function slidingSync(input: {
       });
       const response = await publishSlidingResponse({
         tenant: app.tenant,
+        domain,
         device,
         lease,
         ...captured,

@@ -6,6 +6,7 @@ import { notificationHistoryCutoff } from '#engine/server/notification-history.t
 import type { Pdu } from '#engine/pdu.ts';
 import { visiblePrejoin } from '#engine/server/prejoin.ts';
 import { completionAudience, roomCompletion } from './completion.ts';
+import { bindPaginationToken, localPaginationToken } from './positions.ts';
 import type { DeviceIdentity } from '#engine/tenant/devices.ts';
 
 function invalid(message: string): never {
@@ -21,7 +22,10 @@ export async function notificationsFor(
   signal?: AbortSignal,
   device: DeviceIdentity | null = null,
 ) {
-  const from = query.get('from');
+  const raw = query.get('from');
+  const from = raw === null
+    ? null
+    : await localPaginationToken(theApp().server, raw);
   let cursor = Number.MAX_SAFE_INTEGER;
   if (from !== null) {
     if (!/^n[1-9][0-9]*$/.test(from)) invalid('invalid notification cursor');
@@ -83,7 +87,10 @@ export async function notificationsFor(
       }
     }
     if (event !== null && notifications.length === limit) {
-      return { notifications, next_token: 'n' + cursor };
+      return {
+        notifications,
+        next_token: await bindPaginationToken(app.server, 'n' + cursor),
+      };
     }
     cursor = Number(row.seq);
     scanned++;
@@ -98,6 +105,8 @@ export async function notificationsFor(
   }
   return {
     notifications,
-    ...(rows.length > scanned ? { next_token: 'n' + cursor } : {}),
+    ...(rows.length > scanned
+      ? { next_token: await bindPaginationToken(app.server, 'n' + cursor) }
+      : {}),
   };
 }

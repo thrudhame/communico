@@ -4,6 +4,7 @@ import { theApp } from '#engine/app.ts';
 import { loginUser } from '#engine/tenant/users.ts';
 import { config, setConfigForTests } from '#engine/config.ts';
 import { observeSyncWait } from '#tests/support/sync-turn.ts';
+import { encodeStreamToken, parseStreamToken } from '#engine/client/tokens.ts';
 
 type Json = {
   next_batch: string;
@@ -185,10 +186,11 @@ suite.test('250 messages drain 100/100/50, forged known-head cut replays, older 
   }
   const first = await sync(b.access_token!, before.next_batch);
   assertEquals(first.to_device.events.length, 100);
-  const forged = first.next_batch.replace(/_m\d+/, '_m250').replace(
-    /_k\d+/,
-    '_k0',
-  );
+  const forged = encodeStreamToken({
+    ...parseStreamToken(first.next_batch)!,
+    mSeq: 250,
+    kSeq: 0,
+  });
   const replay = await sync(b.access_token!, forged);
   assertEquals(replay.to_device, first.to_device);
   const second = await sync(b.access_token!, first.next_batch);
@@ -214,7 +216,10 @@ suite.test('250 messages drain 100/100/50, forged known-head cut replays, older 
   await call(
     b.access_token!,
     'sync?since=' +
-      encodeURIComponent(third.next_batch.replace(/_m\d+/, '_m999999')),
+      encodeURIComponent(encodeStreamToken({
+        ...parseStreamToken(third.next_batch)!,
+        mSeq: 999999,
+      })),
     undefined,
     'GET',
     200,

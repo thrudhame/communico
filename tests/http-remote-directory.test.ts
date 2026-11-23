@@ -1,4 +1,5 @@
 import { assertEquals, assertThrows } from '@std/assert';
+import { parsePosition } from '#engine/client/tokens.ts';
 import { theApp } from '#engine/app.ts';
 import { setConfigForTests } from '#engine/config.ts';
 import { lookupRoom } from '#engine/client/room.ts';
@@ -487,7 +488,7 @@ suite.test('105 published rooms retain the shared Synapse cap and reachable tail
             (next.chunk as Json[]).length,
             Math.min(size, 105 - size),
           );
-          assertEquals(next.prev_batch, '0');
+          assertEquals(parsePosition(String(next.prev_batch))?.payload, '0');
           if (size === 100) {
             assertEquals(next.next_batch, undefined);
             const ids = [...page.chunk as Json[], ...next.chunk as Json[]]

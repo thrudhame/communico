@@ -32,7 +32,7 @@ import {
   text,
 } from './protocol.ts';
 
-type PublicationIdentity = {
+export type PublicationIdentity = {
   node: string;
   incarnation: string;
   domain: string;
@@ -63,6 +63,22 @@ function mismatch(message: string): never {
   throw new LinkError('LINK_IDENTITY_MISMATCH', message, 403);
 }
 
+/** Read-only consumers never initialize missing composition authority. */
+export async function readPublicationIdentity(
+  db: Pick<Database, 'query'>,
+): Promise<PublicationIdentity | null> {
+  const [held] = await db.query(
+    'SELECT node,incarnation,domain FROM publication_domain WHERE singleton=1',
+  );
+  return held
+    ? {
+      node: String(held.node),
+      incarnation: String(held.incarnation),
+      domain: String(held.domain),
+    }
+    : null;
+}
+
 /** One boot-independent publication domain. Call only from node composition,
  * never infer the local node from an imported record. Restore fencing is separate. */
 export async function publicationIdentity(
@@ -76,18 +92,12 @@ export async function publicationIdentity(
     domain: crypto.randomUUID(),
   };
   return await db.tx(async (conn) => {
-    const [held] = await conn.query(
-      'SELECT node,incarnation,domain FROM publication_domain WHERE singleton=1',
-    );
+    const held = await readPublicationIdentity(conn);
     if (held) {
       if (held.node !== node) {
         mismatch('publication domain belongs to another node');
       }
-      return {
-        node,
-        incarnation: String(held.incarnation),
-        domain: String(held.domain),
-      };
+      return held;
     }
     await conn.execute(
       'INSERT INTO publication_domain(singleton,node,incarnation,domain) VALUES(1,?,?,?)',

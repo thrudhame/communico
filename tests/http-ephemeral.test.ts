@@ -16,6 +16,7 @@ import { makeFakeRoom } from '#tests/fixtures/remote-room.ts';
 import { fakeFetcher, fakeKeyResolver } from '#tests/fixtures/remote.ts';
 import { testRemoteServer, testSigner } from '#tests/fixtures/signer.ts';
 import { joinRemote } from '#engine/room/join.ts';
+import { parseStreamToken } from '#engine/client/tokens.ts';
 
 type Json = Record<string, unknown>;
 const suite = httpSuite('HTTP ephemeral streams');
@@ -78,11 +79,7 @@ suite.test('typing starts/stops/expires, has no room_id, does not leak, and is p
     401,
   );
   let before = await sync(b.access_token!, '&since=s0');
-  assert(
-    /^s\d+_p\d+_t\d+_r\d+_a\d+_d\d+_m\d+_k\d+_n\d+$/.test(
-      String(before.next_batch),
-    ),
-  );
+  assert(parseStreamToken(String(before.next_batch))?.domain);
   for (
     const body of [{ typing: true, timeout: 10000 }, { typing: false }, {
       typing: true,
@@ -399,8 +396,8 @@ suite.test('inbound receipt admission cannot retain arbitrary room-user pairs or
   );
   const after = await sync(a.access_token!, '&since=' + before.next_batch);
   assertEquals(
-    String(after.next_batch).match(/_r\d+/)?.[0],
-    String(before.next_batch).match(/_r\d+/)?.[0],
+    parseStreamToken(String(after.next_batch))?.rSeq,
+    parseStreamToken(String(before.next_batch))?.rSeq,
   );
   assertEquals(eventOf(after, roomId, 'm.receipt'), undefined);
 });

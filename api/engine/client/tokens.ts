@@ -1,5 +1,7 @@
 // Storage-neutral wire grammar. Sync recovery is applied by its consumer, never
 // by room pagination, which reads only its own event/room cursor boundary.
+import { Buffer } from 'node:buffer';
+
 export type StreamToken = {
   eSeq: number;
   pSeq: number;
@@ -11,9 +13,13 @@ export type StreamToken = {
   kSeq: number;
   nSeq?: number;
   epoch?: string;
+  domain?: string;
 };
 
-export type DurableStreamHeads = Omit<Required<StreamToken>, 'epoch' | 'tSeq'>;
+export type DurableStreamHeads = Omit<
+  Required<StreamToken>,
+  'epoch' | 'domain' | 'tSeq'
+>;
 
 /** Synapse's future-token recovery: clamp durable streams to allocated maxima.
  * Typing is intentionally excluded because its process-local stream may reset.
@@ -36,6 +42,54 @@ export function boundFutureToken(
 
 export function parseStreamToken(raw: string | null): StreamToken | null {
   if (raw === null) return null;
+  if (raw.startsWith('v1.')) {
+    const envelope = parsePosition(raw);
+    if (envelope === null) return null;
+    // Only the existing numeric grammar can inhabit an envelope. Requiring the
+    // issued spelling prevents padding, JSON and shorthand aliases from hashing
+    // into another token's inbox receipt. Domain validation is the consumer's job.
+    const cuts = parseLegacyToken(envelope.payload);
+    if (cuts === null || encodeStreamToken(cuts) !== envelope.payload) {
+      return null;
+    }
+    const token = { ...cuts, domain: envelope.domain };
+    return encodeStreamToken(token) === raw ? token : null;
+  }
+  return parseLegacyToken(raw);
+}
+
+function validDomain(domain: string): boolean {
+  return /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(domain);
+}
+
+/** One canonical envelope for node-local positions. Each consumer still owns
+ * its payload grammar, ordering and admission; this grants no ACK authority. */
+export function formatPosition(domain: string, payload: string): string {
+  if (!validDomain(domain)) throw new TypeError('invalid publication domain');
+  return 'v1.' +
+    Buffer.from(JSON.stringify([domain, payload])).toString('base64url');
+}
+
+export function parsePosition(
+  raw: string,
+): { domain: string; payload: string } | null {
+  if (!/^v1\.[A-Za-z0-9_-]+$/.test(raw)) return null;
+  let envelope: unknown;
+  try {
+    envelope = JSON.parse(Buffer.from(raw.slice(3), 'base64url').toString());
+  } catch {
+    return null;
+  }
+  if (
+    !Array.isArray(envelope) || envelope.length !== 2 ||
+    typeof envelope[0] !== 'string' || !validDomain(envelope[0]) ||
+    typeof envelope[1] !== 'string' ||
+    formatPosition(envelope[0], envelope[1]) !== raw
+  ) return null;
+  return { domain: envelope[0], payload: envelope[1] };
+}
+
+function parseLegacyToken(raw: string): StreamToken | null {
   const m =
     /^s(\d+)(?:_p(\d+))?(?:_t(\d+))?(?:_r(\d+))?(?:_a(\d+))?(?:_d(\d+))?(?:_m(\d+))?(?:_k(\d+))?(?:_n(\d+))?(?:_z([a-f0-9]{32}))?$/
       .exec(
@@ -72,10 +126,14 @@ export function formatStreamToken(
   kSeq = 0,
   nSeq?: number,
   epoch?: string,
+  domain?: string,
 ): string {
-  return `s${eSeq}_p${pSeq}_t${tSeq}_r${rSeq}_a${aSeq}_d${dSeq}_m${mSeq}_k${kSeq}` +
+  const cuts =
+    `s${eSeq}_p${pSeq}_t${tSeq}_r${rSeq}_a${aSeq}_d${dSeq}_m${mSeq}_k${kSeq}` +
     (nSeq === undefined ? '' : `_n${nSeq}`) +
     (epoch === undefined ? '' : `_z${epoch}`);
+  if (domain === undefined) return cuts;
+  return formatPosition(domain, cuts);
 }
 
 export function encodeStreamToken(t: StreamToken): string {
@@ -90,5 +148,6 @@ export function encodeStreamToken(t: StreamToken): string {
     t.kSeq,
     t.nSeq,
     t.epoch,
+    t.domain,
   );
 }

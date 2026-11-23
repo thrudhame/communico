@@ -426,6 +426,11 @@ deletion authority, count/byte limits preserve the tail, and an evicted receipt
 replays rather than consumes data. Ordinary sync remains a direct consumer of
 the same owner. Polling inspects the same issued acknowledgment boundary without
 consuming it, so received pages do not make every encryption poll immediate.
+Top-level sliding positions and enabled to-device receipts carry the existing
+publication domain. Foreign positions are refused before completion, lease,
+presence or inbox effects. The tenant stores and hashes the exact issued wire
+spelling, not a token wrapped after receipt creation. Disabled extensions ignore
+their supplied cursors; a no-pos replacement preserves unacknowledged inbox data.
 (`api/engine/tenant/todevice.ts`)
 
 Account-data delivery captures the global/selected room bodies, push rules and
@@ -648,8 +653,18 @@ own membership on initial/full-state/new-join responses, and changed memberships
 across limited incremental gaps, for both state forms.
 (`api/engine/syncfeed.ts:99-144`, `api/engine/client/render.ts:29-54`)
 
-The token grammar is `s<e>_p<p>_t<t>_r<r>_a<a>`: events, presence, typing,
-receipts and account data. Omitted suffix components parse as zero. Room
+New stream tokens use a canonical `v1.` base64url JSON envelope containing the
+store's existing publication-domain UUID and the numeric `s...` cuts. Ordinary
+sync, key changes, state-at, stream pagination and room previews reject a foreign
+domain before interpreting its numbers. Sync checks before completion admission,
+presence, waiting or inbox effects. Only the original home-store binding accepts
+legacy unnamespaced cuts; facade positions always carry their own domain. Exact
+issued tokens retain the inbox receipt authority; stripping the domain or repairing
+future numbers cannot manufacture it. Legacy positions retain read baselines only;
+their inbox is republished under a new domain-bound receipt before deletion.
+Internal preview/search boundaries use explicit local numeric cuts, never invented
+legacy wire tokens. Segment and other pagination formats retain
+their separate cursor contracts. Room
 feed entries and out-of-band invite transitions share one durable event
 allocator. Invites and knocks use one typed, revisioned `prejoin_memberships`
 row per room/user. They never provision a room file or open a stay. A later
@@ -1363,8 +1378,9 @@ boundary before promotion, without opening the app.
 
 Server schema v28 adds a persistent restore recovery identity and report marker
 after the facade journal, pairing and runtime-identity migrations.
-Ordinary sync tokens retain their legacy wire form until the first restore, then
-carry that identity. A different identity resets the entire sync baseline before
+Ordinary sync tokens carry that recovery epoch independently of their stable
+publication domain after the first restore. A different epoch within the same
+domain resets the entire sync baseline before
 inbox acknowledgment or long-polling, even after numeric streams catch up.
 Ordinary state dialects admit the restored end state at an empty, limited timeline
 boundary, with a backward cursor retaining archived history. Replayed held event
