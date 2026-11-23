@@ -462,20 +462,23 @@ Deno.test('F2 membership activates only delivered methods and their independent 
       'rooms',
     ]);
   }
+  // PAIR503 ruling (2026-11-23): membership sends validate intrinsic content
+  // before room readiness and ACL. Make routes and invite still use rooms.
   for (const name of ['send_join', 'send_knock', 'send_leave']) {
     routes.push([
       'PUT',
       '/_matrix/federation/v1/' + name + '/room/event',
-      'rooms',
+      'membership-send',
     ]);
   }
-  for (const name of ['send_join', 'send_leave', 'invite']) {
+  for (const name of ['send_join', 'send_leave']) {
     routes.push([
       'PUT',
       '/_matrix/federation/v2/' + name + '/room/event',
-      'rooms',
+      'membership-send',
     ]);
   }
+  routes.push(['PUT', '/_matrix/federation/v2/invite/room/event', 'rooms']);
   for (const name of ['join', 'knock']) {
     routes.push([
       'POST',
