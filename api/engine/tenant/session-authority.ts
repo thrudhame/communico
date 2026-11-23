@@ -3,6 +3,7 @@
 import { canonicalJson } from '#engine/canonical.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Conn } from '#engine/store/db.ts';
+import type { Row } from '#engine/store/ffi.ts';
 import { nextCounter } from '#engine/tenant/accountdata.ts';
 import { deleteDevice } from '#engine/tenant/devices.ts';
 import { appendImportedKeyNotice } from '#engine/tenant/changes.ts';
@@ -215,9 +216,19 @@ export async function registryDevice(
     "SELECT payload FROM authority_facts WHERE localpart=? AND kind='device'",
     [localpart],
   );
-  const candidates = rows.map((row) =>
-    JSON.parse(String(row.payload)) as AuthorityFact
-  ).filter((fact) => fact.deviceId === deviceId);
+  return registryDeviceFromFacts(
+    rows.map((row) => JSON.parse(String(row.payload)) as AuthorityFact),
+    deviceId,
+  );
+}
+
+function registryDeviceFromFacts(
+  facts: readonly AuthorityFact[],
+  deviceId: string,
+) {
+  const candidates = facts.filter((fact) =>
+    fact.kind === 'device' && fact.deviceId === deviceId
+  );
   candidates.sort((a, b) =>
     a.node === b.node ? b.seq - a.seq : a.node === 'home' ? -1 : 1
   );
@@ -419,46 +430,94 @@ export async function retainedSessionAuthority(
     [hash, refresh ? 1 : 0],
   );
   if (!session) return null;
-  if (
-    (await conn.query(
-      "SELECT id FROM authority_facts WHERE localpart=? AND kind='revoke' AND json_extract(payload,'$.target')=?",
-      [session.localpart, hash],
-    )).length
-  ) invalid();
-  if (
-    (await conn.query('SELECT deactivated FROM users WHERE localpart=?', [
+  const facts =
+    (await conn.query('SELECT payload FROM authority_facts WHERE localpart=?', [
       session.localpart,
-    ]))[0]?.deactivated === 1
+    ]))
+      .map((row) => JSON.parse(String(row.payload)) as AuthorityFact);
+  const [account] = await conn.query(
+    'SELECT deactivated FROM users WHERE localpart=?',
+    [session.localpart],
+  );
+  return validateRetainedSession(session, facts, account?.deactivated === 1);
+}
+
+function validateRetainedSession(
+  session: Row,
+  facts: readonly AuthorityFact[],
+  deactivated: boolean,
+) {
+  if (
+    deactivated || facts.some((fact) =>
+      fact.kind === 'deactivate' ||
+      (fact.kind === 'revoke' && fact.target === session.hash)
+    )
   ) invalid();
   const observed = JSON.parse(String(session.barriers)) as string[];
   if (
-    (await conn.query(
-      "SELECT id FROM authority_facts WHERE localpart=? AND kind='deactivate'",
-      [session.localpart],
-    )).length
-  ) invalid();
-  if (
-    (await accountBarriers(conn, String(session.localpart))).some((id) =>
-      !observed.includes(id)
-    )
+    facts.some((fact) => fact.kind === 'barrier' && !observed.includes(fact.id))
   ) invalid();
   if (session.device_id !== null) {
-    const current = await registryDevice(
-      conn,
-      String(session.localpart),
-      String(session.device_id),
-    );
+    const current = registryDeviceFromFacts(facts, String(session.device_id));
     if (!current || current.id !== session.device_incarnation) {
       invalid(current?.node === 'home' && session.node !== 'home');
     }
     if (
-      (await conn.query(
-        "SELECT id FROM authority_facts WHERE localpart=? AND kind='delete' AND json_extract(payload,'$.target')=?",
-        [session.localpart, current.id],
-      )).length
+      facts.some((fact) => fact.kind === 'delete' && fact.target === current.id)
     ) invalid();
   }
   return session;
+}
+
+/** Attempt-local batch input, not a second admission policy or a persistent cache. */
+export async function captureRetainedSessionAuthorities(
+  conn: Conn,
+  hashes: readonly string[],
+) {
+  const sessions = new Map((await conn.query(
+    'SELECT s.* FROM json_each(?) selected JOIN session_authority s ON s.hash=CAST(selected.value AS TEXT)',
+    [JSON.stringify([...new Set(hashes)])],
+  )).map((row) => [String(row.hash), row]));
+  const users = JSON.stringify([
+    ...new Set([...sessions.values()].map((row) => String(row.localpart))),
+  ]);
+  const facts = new Map<string, AuthorityFact[]>();
+  for (
+    const row of await conn.query(
+      'SELECT f.localpart,f.payload FROM json_each(?) selected JOIN authority_facts f ON f.localpart=CAST(selected.value AS TEXT)',
+      [users],
+    )
+  ) {
+    const lp = String(row.localpart);
+    const group = facts.get(lp) ?? [];
+    group.push(JSON.parse(String(row.payload)) as AuthorityFact);
+    facts.set(lp, group);
+  }
+  const accounts = new Map((await conn.query(
+    'SELECT u.localpart,u.deactivated FROM json_each(?) selected JOIN users u ON u.localpart=CAST(selected.value AS TEXT)',
+    [users],
+  )).map((row) => [String(row.localpart), row.deactivated === 1]));
+  return (hash: string, refresh: boolean) => {
+    const session = sessions.get(hash);
+    if (!session || session.refresh !== (refresh ? 1 : 0)) return null;
+    const lp = String(session.localpart);
+    return validateRetainedSession(
+      session,
+      facts.get(lp) ?? [],
+      accounts.get(lp) ?? false,
+    );
+  };
+}
+
+export function assertSessionAuthorityOwner(
+  identity: AuthorityIdentity | null,
+  session: Row | null,
+) {
+  if (
+    identity && session &&
+    (session.node !== identity.node ||
+      session.incarnation !== identity.incarnation)
+  ) ownerUnavailable();
 }
 
 export async function requireSessionAuthority(
@@ -469,11 +528,8 @@ export async function requireSessionAuthority(
   const identity = await tenantAuthority(conn);
   if (!identity) return;
   const session = await retainedSessionAuthority(conn, hash, refresh);
-  if (!session) return; // Unknown digests retain the normal lookup's null/401.
-  if (
-    session.node !== identity.node ||
-    session.incarnation !== identity.incarnation
-  ) ownerUnavailable();
+  // Unknown digests retain the normal lookup's null/401.
+  assertSessionAuthorityOwner(identity, session);
 }
 
 export async function captureSessionAuthority(
