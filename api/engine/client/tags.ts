@@ -57,7 +57,7 @@ export async function changeTag(
       );
     }
     if (
-      await membershipOf(app.server, roomId, caller) === null &&
+      await membershipOf(app.server, roomId, caller, 'admission') === null &&
       await inviteFor(roomId, caller, inviteDeps()) === null
     ) {
       throw new MatrixError(403, 'M_FORBIDDEN', 'room membership required');

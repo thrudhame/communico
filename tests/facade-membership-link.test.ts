@@ -21,6 +21,7 @@ import {
 } from '#engine/facade/directory.ts';
 import { exportOwnerControl, OwnerControls } from '#engine/facade/ownership.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
+import { changeSigningAuthority } from '#engine/facade/signing-authority.ts';
 import {
   LINK_CAPABILITIES,
   LINK_SUPPORTED,
@@ -1397,9 +1398,9 @@ Deno.test('membership application: account completion wakes a blocked OOB stream
       },
     });
     await blocked.promise;
-    assertEquals(failures[0] instanceof LinkError, true);
-    assertEquals((failures[0] as LinkError).code, 'LINK_UNAVAILABLE');
-    assertEquals((failures[0] as LinkError).status, 503);
+    assert(failures[0] instanceof LinkError);
+    assertEquals(failures[0].code, 'LINK_UNAVAILABLE');
+    assertEquals(failures[0].status, 503);
     assertEquals((await f.ej.heads('home', 'in', record)).applied.sequence, 0);
     assertEquals(await invitesOf(state.userId, { server: db }), []);
     release.resolve();
@@ -2737,6 +2738,40 @@ Deno.test('membership admission: retirement during key verification cannot commi
       [],
     );
   } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership admission: invalidation after retention callback cannot cross native commit', async () => {
+  const f = await fixture();
+  const server = await f.edge.server();
+  const original = server.tx.bind(server);
+  try {
+    const { record, keys } = await incoming(f, 'home');
+    server.tx = (fn, options) =>
+      original(async (conn) => {
+        const result = await fn(conn);
+        const retained = await conn.query(
+          "SELECT 1 FROM domain_operations WHERE kind='membership'",
+        );
+        if (retained.length) {
+          // Complete a no-storage invalidation after the last owner callback check.
+          await changeSigningAuthority(server, () =>
+            Promise.resolve(), () =>
+            Promise.resolve());
+        }
+        return result;
+      }, options);
+    await assertRejects(() => f.es.retain(record, keys));
+    server.tx = original;
+    assertEquals(
+      await server.query(
+        "SELECT * FROM domain_operations WHERE kind='membership'",
+      ),
+      [],
+    );
+  } finally {
+    server.tx = original;
     await f.close();
   }
 });

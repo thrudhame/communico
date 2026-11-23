@@ -162,6 +162,8 @@ function bind(
     return value;
   };
   return {
+    admit: (check: import('#engine/store/commit.ts').CommitCheck) =>
+      conn.admit(check),
     ingress: { check: authorize },
     domains: {
       authorize: async (
@@ -207,7 +209,11 @@ function bind(
         input?: unknown,
       ) => {
         if (action === 'get') {
-          await authorize({ kind: 'domain', localpart, feature: 'backups' });
+          await authorize({
+            kind: 'domain-read',
+            localpart,
+            feature: 'backups',
+          });
         }
         return await keyBackup.backupVersion(
           conn,
@@ -227,7 +233,11 @@ function bind(
         input?: unknown,
       ) => {
         if (action === 'get') {
-          await authorize({ kind: 'domain', localpart, feature: 'backups' });
+          await authorize({
+            kind: 'domain-read',
+            localpart,
+            feature: 'backups',
+          });
         }
         return await keyBackup.backupKeys(
           conn,
@@ -920,12 +930,20 @@ function bind(
         history?: import('#engine/facade/domain-control.ts').DomainHistoryProof,
       ) => delayedEvents.importOperation(conn, operation, history),
       replicas: async (localpart: string) => {
-        await authorize({ kind: 'domain', localpart, feature: 'schedules' });
+        await authorize({
+          kind: 'domain-read',
+          localpart,
+          feature: 'schedules',
+        });
         return await delayedEvents.replicas(conn, localpart);
       },
       get: admittedDelay,
       list: async (localpart: string) => {
-        await authorize({ kind: 'domain', localpart, feature: 'schedules' });
+        await authorize({
+          kind: 'domain-read',
+          localpart,
+          feature: 'schedules',
+        });
         return await delayedEvents.list(conn, localpart);
       },
       receipt: async (receipt: delayedEvents.DelayReceipt) => {

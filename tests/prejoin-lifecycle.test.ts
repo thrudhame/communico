@@ -878,6 +878,38 @@ Deno.test('prejoin: compensating departure materialization retains its exact sig
     assertEquals(await prejoinDeparture(current, f.deps), departure);
     assertEquals(await facts(), retained);
   }, 'edge'));
+Deno.test('prejoin: signing dependency survives the server owner callback', () =>
+  fixture(async (f) => {
+    const before = await inviteFor(f.roomId, f.user, f.deps);
+    const original = f.deps.server.tx.bind(f.deps.server);
+    let current = true;
+    const signer = {
+      ...f.deps.signer,
+      admit: () => {
+        if (!current) throw new Error('signing authority retired');
+      },
+    };
+    f.deps.server.tx = (fn, options) =>
+      original(async (conn) => {
+        const result = await fn(conn);
+        current = false;
+        return result;
+      }, options);
+    try {
+      await assertRejects(
+        () =>
+          rejectInviteRemote(f.roomId, f.user, {
+            ...f.deps,
+            signer,
+          }),
+        Error,
+        'signing authority retired',
+      );
+    } finally {
+      f.deps.server.tx = original;
+    }
+    assertEquals(await inviteFor(f.roomId, f.user, f.deps), before);
+  }));
 
 Deno.test('prejoin: repeated concurrent rejection retains one signed local departure and revision', () =>
   fixture(async (f) => {

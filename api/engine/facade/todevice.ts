@@ -231,7 +231,7 @@ export class ToDeviceOperations {
     });
     const application = await (await this.store.tenant(context.server)).tx(
       async (conn) => {
-        unchanged();
+        conn.admit(unchanged);
         for (const view of bindings) await this.tenantSelected(conn, view);
         const identity = await tenantAuthority(conn);
         requireSelectionReady(!!identity, 'ingress awaits tenant authority');
@@ -312,7 +312,6 @@ export class ToDeviceOperations {
         );
         const changed = (await syncStreamHeads(conn)).inbox !== before.inbox ||
           beforeOperation?.operation_id !== afterOperation?.operation_id;
-        unchanged();
         return { ...applied, changed };
       },
     );
@@ -370,7 +369,7 @@ export class ToDeviceOperations {
     const after = exported ? Number(exported.source_cut) : 0;
     const application = await (await this.store.tenant(binding.server)).tx(
       async (conn) => {
-        unchanged();
+        conn.admit(unchanged);
         await this.tenantSelected(conn, binding);
         const before = await syncStreamHeads(conn);
         const applied = await applyLinkApplication(
@@ -400,7 +399,6 @@ export class ToDeviceOperations {
         );
         const inboxChanged =
           (await syncStreamHeads(conn)).inbox !== before.inbox;
-        unchanged();
         return { ...applied, inboxChanged };
       },
     );
@@ -532,7 +530,7 @@ export class ToDeviceOperations {
     });
     const application = await tenant.tx(
       async (conn) => {
-        unchanged();
+        conn.admit(unchanged);
         await this.tenantSelected(conn, view);
         const applied = await applyLinkApplication(
           conn,
@@ -552,9 +550,7 @@ export class ToDeviceOperations {
             return { result: { ...result, inboxChanged } };
           },
         );
-        // Revocation before this admission cut rolls back fact, inbox and receipt.
-        // A successful commit is immutable admitted work even across retirement.
-        unchanged();
+        // The connection retains authority through native COMMIT.
         return applied;
       },
     );

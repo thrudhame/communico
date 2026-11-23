@@ -9,7 +9,7 @@ export default async function (request: PathfinderRequest, context: Context) {
   await authenticate(request, context);
   await (context.state.tenant as Tenant).tx((tx) =>
     tx.ingress.check({
-      kind: 'domain',
+      kind: 'domain-read',
       localpart: localpartOf(context.state.user as string),
       feature: 'notifications',
     })

@@ -384,7 +384,7 @@ export function startHomeLinkWorker(
 /** Facade application is local and independent of the home socket. The same
  * explicit domain completion contract is used by both runtime roles. */
 type InboxOptions = {
-  journal: Journal;
+  journal: Pick<Journal, 'streams' | 'heads'>;
   peer: string;
   pollseconds: number;
   apply(stream: Stream): Promise<boolean>;

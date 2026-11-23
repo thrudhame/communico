@@ -574,7 +574,7 @@ export class DeviceOperations {
     await server.tx(check);
     const application = await tenant.tx(
       async (conn) => {
-        unchanged();
+        conn.admit(unchanged);
         await this.tenantSelected(conn, view);
         const applied = await applyLinkApplication(
           conn,
@@ -640,10 +640,7 @@ export class DeviceOperations {
             return { result: { ...result, publicKeysChanged } };
           },
         );
-        // This synchronous fence is the admission cut. A retirement begun before
-        // it rolls back fact + receipt. Once it passes, a successful owner commit
-        // is admitted immutable work, even if revocation overlaps native COMMIT.
-        unchanged();
+        // The connection retains authority through native COMMIT.
         return applied;
       },
     );

@@ -23,7 +23,7 @@ import { lookupAlias, registerAlias } from '#engine/server/aliases.ts';
 import { deviceIdentity, transactionSubmission } from '#engine/tenant/txns.ts';
 import { localpartOf } from '#engine/ids.ts';
 import { getProfile } from '#engine/tenant/users.ts';
-import { requireRoom, stateAtSeq, versionOf } from './room.ts';
+import { requireRoomForAdmission, stateAtSeq, versionOf } from './room.ts';
 
 export type { CreateRoomOptions };
 
@@ -87,7 +87,7 @@ export async function sendEvent(
   deviceGeneration?: number,
 ) {
   const app = theApp();
-  const room = await requireRoom(roomId);
+  const room = await requireRoomForAdmission(roomId);
   const submission = transactionSubmission(
     app.tenant,
     deviceId === null ? null : await deviceIdentity(
@@ -126,7 +126,7 @@ export async function writeStateKey(
   stateKey: string,
   content: Record<string, unknown>,
 ) {
-  const room = await requireRoom(roomId);
+  const room = await requireRoomForAdmission(roomId);
   if (type === 'm.room.create') {
     throw new MatrixError(
       400,
@@ -135,14 +135,15 @@ export async function writeStateKey(
     );
   }
   if (
-    (await membershipOf(theApp().server, roomId, userId))?.membership !== 'join'
+    (await membershipOf(theApp().server, roomId, userId, 'admission'))
+      ?.membership !== 'join'
   ) {
     throw new MatrixError(403, 'M_FORBIDDEN', 'not joined to ' + roomId);
   }
   assertCanonicalNumbers(content);
-  const cur = (await stateAtSeq(roomId, null)).find((r) =>
-    r.type === type && r.stateKey === stateKey
-  );
+  const cur = (await stateAtSeq(roomId, null, undefined, 'admission')).find((
+    r,
+  ) => r.type === type && r.stateKey === stateKey);
   if (cur) {
     const row = await room.tx((tx) => tx.events.get(cur.eventId));
     const pdu = row === null ? null : JSON.parse(row.pdu) as Pdu;
@@ -184,7 +185,7 @@ export async function redactEvent(
   deviceGeneration?: number,
 ) {
   const app = theApp();
-  const room = await requireRoom(roomId);
+  const room = await requireRoomForAdmission(roomId);
   const res = await redact(
     room,
     userId,

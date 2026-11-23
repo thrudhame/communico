@@ -3,7 +3,7 @@
 import { theApp } from '#engine/app.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { setTyping, type TypingDevice } from '#engine/typing.ts';
-import { lookupRoom } from './room.ts';
+import { lookupRoomForAdmission } from './room.ts';
 
 export async function setClientTyping(
   roomId: string,
@@ -13,7 +13,7 @@ export async function setClientTyping(
   device?: TypingDevice,
 ): Promise<void> {
   if (
-    await lookupRoom(roomId) === null ||
+    await lookupRoomForAdmission(roomId) === null ||
     !await setTyping(theApp().server, roomId, userId, typing, timeout, device)
   ) {
     throw new MatrixError(403, 'M_FORBIDDEN', 'not joined to ' + roomId);

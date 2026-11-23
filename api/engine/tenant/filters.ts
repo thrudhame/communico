@@ -401,7 +401,11 @@ export async function loadFilter(
   filterId: string,
 ): Promise<unknown | null> {
   const filter = await tenant.tx(async (tx) => {
-    await tx.ingress.check({ kind: 'domain', localpart, feature: 'filters' });
+    await tx.ingress.check({
+      kind: 'domain-read',
+      localpart,
+      feature: 'filters',
+    });
     return await tx.filters.read(localpart, filterId);
   });
   return filter === null ? null : JSON.parse(filter);

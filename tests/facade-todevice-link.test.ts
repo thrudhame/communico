@@ -970,7 +970,9 @@ Deno.test('to-device ingress: missing tenant control cannot fall back to standal
   }
 });
 
-for (const cut of ['home-export', 'tenant-authority'] as const) {
+for (
+  const cut of ['home-export', 'account-selection', 'tenant-authority'] as const
+) {
   Deno.test(`to-device readiness: ${cut} waits without inbox or cursor effects`, async () => {
     const f = await fixture();
     try {
@@ -978,10 +980,16 @@ for (const cut of ['home-export', 'tenant-authority'] as const) {
       const store = home ? f.home : f.edge;
       const db = await store.tenant('logical.test');
       const server = await store.server();
-      const table = home ? 'facade_exports' : 'tenant_authority';
+      const table = home
+        ? 'facade_exports'
+        : cut === 'account-selection'
+        ? 'account_auth_snapshots'
+        : 'tenant_authority';
       const owner = home ? server : db;
       const predicate = home
         ? "scope='auth:@alice:logical.test'"
+        : cut === 'account-selection'
+        ? "localpart='alice'"
         : 'singleton=1';
       const [held] = await owner.query(
         'SELECT * FROM ' + table + ' WHERE ' + predicate,

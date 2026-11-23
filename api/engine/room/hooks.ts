@@ -9,6 +9,7 @@ import type { Store } from '#engine/store/index.ts';
 import type { Conn } from '#engine/store/db.ts';
 import type { CompletionCut, CompletionTarget } from './completion.ts';
 import type { Room } from './index.ts';
+import type { CommitCheck } from '#engine/store/commit.ts';
 
 export type RoomHooks = {
   project: (store: Store, roomId: string) => Promise<void>;
@@ -52,7 +53,7 @@ const joinAdmissions = new WeakMap<
 
 export type MembershipAdmission = {
   check?(conn: Conn): Promise<void>;
-  checkCurrent(): void;
+  checkCurrent: CommitCheck;
 };
 const membershipAdmissions = new WeakMap<
   Store,
@@ -87,12 +88,11 @@ export async function prepareMembershipAdmission(
 
 export async function withMembershipFence<T>(
   admission: MembershipAdmission | undefined,
+  transaction: { admit(check: CommitCheck): void },
   operation: () => Promise<T>,
 ): Promise<T> {
-  admission?.checkCurrent();
-  const result = await operation();
-  admission?.checkCurrent();
-  return result;
+  if (admission) transaction.admit(admission.checkCurrent);
+  return await operation();
 }
 
 export type RestrictedKnowledge = 'complete' | 'partial' | 'unavailable';

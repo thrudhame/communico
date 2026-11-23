@@ -3,7 +3,7 @@
 import type { App } from '#engine/app.ts';
 import { config } from '#engine/config.ts';
 import { capabilities } from './capabilities.ts';
-import { exportKeyRoster } from './control.ts';
+import { exportKeyRoster, refreshRetiredKeyDocument } from './control.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
 import { openJournalClient } from './client.ts';
 import { certificatePin, readProtectedFile } from './identity.ts';
@@ -51,6 +51,11 @@ export async function startHomeLinks(
       403,
     );
   }
+  await refreshRetiredKeyDocument(
+    app.server,
+    app.tenant.signer(),
+    app.tenant.publicB64,
+  );
   if (!settings.nodes.length) {
     if (
       (await app.server.query('SELECT 1 FROM facade_egress_routes LIMIT 1'))
@@ -377,6 +382,11 @@ export async function startHomeLinks(
   const scan = () =>
     scanning ??= (async () => {
       try {
+        await refreshRetiredKeyDocument(
+          app.server,
+          app.tenant.signer(),
+          app.tenant.publicB64,
+        );
         for (const peer of await pairings.status()) {
           if (controller.signal.aborted) break;
           if (!settings.nodes.includes(peer.node) || jobs.has(peer.id)) {

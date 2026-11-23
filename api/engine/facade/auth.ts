@@ -158,8 +158,10 @@ export class FacadeAuth {
     const admission = await this.capture().catch(() => null);
     const prepared: PreparedIngressAuthority = {
       check: async (conn, intent) => {
+        const domain = intent.kind === 'domain' ||
+          intent.kind === 'domain-read';
         const unavailable: () => never = () => {
-          if (intent.kind !== 'domain' && intent.kind !== 'openid') {
+          if (!domain && intent.kind !== 'openid') {
             return authUnavailable();
           }
           throw new MatrixError(
@@ -223,7 +225,7 @@ export class FacadeAuth {
           !admission ||
           (intent.kind === 'password' && !this.settings.replicatecredentials)
         ) unavailable();
-        const scope = (intent.kind === 'domain' ? 'domain:@' : 'auth:@') +
+        const scope = (domain ? 'domain:@' : 'auth:@') +
           localpart + ':' + this.node.server;
         const cut = admission.scopes.find((row) => row.scope === scope);
         const current = () =>
@@ -232,16 +234,17 @@ export class FacadeAuth {
             incarnation: admission.pairing,
             stream: scope,
           });
-        // Auth may use a complete older cut in permissive mode. Domain reads
-        // require complete bootstrap and applied received facts, not a partial
-        // value that masquerades as absence or a completed whole register.
+        // Ordinary domain reads need completed bootstrap, not a drained newer
+        // suffix. The tenant owner publishes each register atomically. Mutations
+        // retain current receive/admission fences; auth retains its own policy.
         if (
           !cut ||
-          (intent.kind === 'domain'
-            ? !current() || cut.ready !== 1 || cut.pending_hash !== null ||
+          (domain
+            ? cut.ready !== 1 || cut.pending_hash !== null ||
               Number(cut.source_cut) < 1 ||
-              Number(cut.received) !== Number(cut.applied) ||
-              cut.received_hash !== cut.applied_hash ||
+              (intent.kind === 'domain' &&
+                (!current() || Number(cut.received) !== Number(cut.applied) ||
+                  cut.received_hash !== cut.applied_hash)) ||
               (intent.feature === 'filters' && cut.filters_ready !== 1) ||
               (intent.feature === 'openid' && cut.openid_ready !== 1) ||
               (intent.feature === 'backups' && cut.backups_ready !== 1) ||
@@ -261,7 +264,7 @@ export class FacadeAuth {
           !activation || activation.revision !== admission.control.revision ||
           activation.signed_json !== admission.control.signed_json
         ) unavailable();
-        if (intent.kind === 'domain') {
+        if (domain) {
           // Bootstrap completeness is independent of password replication and
           // link freshness. Recheck its account/control binding in this file.
           const [selected] = await conn.query(
@@ -272,7 +275,7 @@ export class FacadeAuth {
             selected?.pairing !== admission.pairing ||
             Number(selected.grant_revision) !== admission.grantRevision ||
             Number(selected.owner_revision) !== Number(activation.revision) ||
-            !current()
+            (intent.kind === 'domain' && !current())
           ) unavailable();
           return;
         }
