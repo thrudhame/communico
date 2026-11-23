@@ -77,3 +77,58 @@ Deno.test('PAIR503: alternate consulted dependency can settle an admission', asy
   readiness.applied(pairing, alternate);
   assertEquals(await result, 'ready');
 });
+
+Deno.test('PAIR503: receipt in flight wins over home delivery loss', async () => {
+  let canDeliver = true;
+  let received = false;
+  let applied = false;
+  const armed = Promise.withResolvers<() => void>();
+  const local = Promise.withResolvers<void>();
+  const readiness = new ReplicaReadiness({
+    canDeliver: () => canDeliver,
+    onDeliveryLoss: (_, wake) => {
+      armed.resolve(wake);
+      return () => {};
+    },
+  });
+  const result = readiness.wait(async (observe) => {
+    observe(pairing, stream);
+    await Promise.resolve();
+    if (applied) return 'current';
+    if (received) local.resolve();
+    throw new ReplicaCutPending(pairing, stream, !received, 0);
+  }, signal());
+  const disconnect = await armed.promise;
+  const settle = readiness.receiving(pairing, stream);
+  canDeliver = false;
+  disconnect();
+  await Promise.resolve();
+  received = true;
+  settle();
+  await local.promise;
+  applied = true;
+  readiness.applied(pairing, stream);
+  assertEquals(await result, 'current');
+});
+
+Deno.test('PAIR503: binding replacement and terminal refusal settle local waiters', async () => {
+  const readiness = new ReplicaReadiness(health);
+  let current = pairing;
+  const read = Promise.withResolvers<void>();
+  const swapped = Promise.withResolvers<void>();
+  const result = readiness.wait(async (observe) => {
+    const selected = current;
+    observe(selected, stream);
+    await Promise.resolve();
+    (selected === pairing ? read : swapped).resolve();
+    throw new ReplicaCutPending(selected, stream, false, 0);
+  }, signal());
+  const rejected = assertRejects(() => result, ReplicaCutPending);
+  await read.promise;
+  readiness.refused(pairing, stream, 1); // A refusal of a different head cannot settle it.
+  current = 'replacement';
+  readiness.bindingChanged();
+  await swapped.promise;
+  readiness.refused(current, stream, 0);
+  assertEquals((await rejected).pairing, current);
+});

@@ -25,6 +25,7 @@ import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
 import { startFakeServer } from './federation/fake-server.ts';
 import { serveDeps } from '#engine/federation/context.ts';
 import { serveEvent } from '#engine/federation/serve.ts';
+import { ReplicaReadiness } from '#engine/facade/readiness.ts';
 import { admit } from '#engine/federation/gate.ts';
 import { federationPolicy } from '#engine/federation/policy.ts';
 import { keyStore } from '#engine/federation/keys.ts';
@@ -4761,6 +4762,144 @@ Deno.test('replica service acquisition releases a failed composition before retr
     await access.releaseServices();
     assertEquals(delayedStops, 2);
   } finally {
+    await closeApp();
+    await f.close();
+    setConfigForTests({});
+  }
+});
+
+Deno.test('PAIR503: event lookup and ACL answer follow the current replica cut', async (t) => {
+  const f = await fixture();
+  const readiness = new ReplicaReadiness({
+    canDeliver: () => false,
+    onDeliveryLoss: () => () => {},
+  });
+  try {
+    const server = await f.edgeServer(), pairings = await f.edgePairings();
+    const journal = new Journal(
+      server,
+      LINK_CAPABILITIES,
+      (_, stream) => readiness.receiving(stream.incarnation, stream.stream),
+    );
+    const directory = new DirectoryReplicas(
+      server,
+      pairings,
+      f.tenant.serverName,
+      'f1',
+      readiness,
+    );
+    const rooms = await f.replicas();
+    const apply = async (
+      record: NonNullable<Awaited<ReturnType<typeof f.exports>>>,
+    ) => {
+      assert(await rooms.apply(journal, record));
+      readiness.applied(record.incarnation, record.stream);
+    };
+    const initial = await f.exports(), inventory = await f.directoryExport();
+    assert(initial && inventory);
+    await journal.receive('home', [initial]);
+    await apply(initial);
+    await journal.receive('home', [inventory]);
+    assert(await directory.apply(journal, inventory));
+    const tenant = await f.edgeTenant();
+    setConfigForTests({
+      server: { name: 'logical.test', role: 'facade' },
+      facade: { nodeid: 'edge_a' },
+    });
+    await openReplicaApp(f.edgeStore(), tenant, {
+      requireReadScope: (scope, absent) =>
+        directory.requireReadScope(scope, absent),
+      prepareReadRoomScope: (id, absent) =>
+        directory.prepareReadRoomScope(id, absent),
+      requireScope: (scope, absent, signal) =>
+        directory.requireScope(scope, absent, signal),
+      prepareRoomScope: (id, absent) => directory.prepareRoomScope(id, absent),
+      keys: keyStore(server, { signer: f.node.signer() }),
+      signer: f.node.signer(),
+      keyDocument: () => Promise.reject(new Error('unused')),
+      publicRooms: async () => (await directory.snapshot())!.publicRooms,
+    });
+
+    const message = await f.source.addEvent({
+      type: 'm.room.message',
+      content: { msgtype: 'm.text', body: 'new publication' },
+    });
+    await f.ingest([message]);
+    const eventId = String(message.event_id);
+    const suffix = await f.exports();
+    assert(suffix);
+    await journal.receive('home', [suffix]);
+    const entered = Promise.withResolvers<void>();
+    await t.step(
+      'a not-yet-indexed event becomes visible after apply',
+      async () => {
+        const signal = AbortSignal.timeout(5000);
+        const answer = serveEvent(eventId, f.signing.name, {
+          store: f.edgeStore(),
+          server,
+          self: f.tenant.serverName,
+          withCurrentScopes: (read) =>
+            directory.withCurrentScopes(
+              (requireScope) =>
+                read(async (scope) => {
+                  try {
+                    await requireScope(scope);
+                  } finally {
+                    if (scope === 'rooms') entered.resolve();
+                  }
+                }),
+              signal,
+            ),
+        });
+        const result = answer.then((value) => value, (error: unknown) => error);
+        await bounded(entered.promise, 1000);
+        assertEquals(await roomOf(server, eventId), null);
+        await apply(suffix);
+        const found = await result;
+        if (found instanceof Error) throw found;
+        assertEquals(
+          (found as Awaited<typeof answer>).pdus[0].content,
+          message.content,
+        );
+      },
+    );
+
+    await t.step(
+      'an ACL publication replaces a stale success before reply',
+      async () => {
+        const acl = await f.source.addEvent({
+          type: 'm.room.server_acl',
+          state_key: '',
+          content: { allow: ['*'], deny: [f.signing.name] },
+        });
+        await f.ingest([acl]);
+        const suffix = await f.exports();
+        assert(suffix);
+        let reads = 0;
+        await assertRejects(
+          () =>
+            serveEvent(eventId, f.signing.name, {
+              store: f.edgeStore(),
+              server,
+              self: f.tenant.serverName,
+              withCurrentScopes: (read) =>
+                directory.withCurrentScopes(async (requireScope) => {
+                  reads++;
+                  const value = await read(requireScope);
+                  assertEquals(reads, 1);
+                  await journal.receive('home', [suffix]);
+                  await apply(suffix);
+                  return value;
+                }, AbortSignal.timeout(5000)),
+            }),
+          MatrixError,
+          'ACL',
+        );
+        assertEquals(reads, 2);
+      },
+    );
+  } finally {
+    readiness.close();
     await closeApp();
     await f.close();
     setConfigForTests({});
