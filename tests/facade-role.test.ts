@@ -7,6 +7,60 @@ import { serverSchema } from '#engine/server/schema.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 
+Deno.test('B8 push surfaces mount only at F2 and share the domain gate without federation', () => {
+  for (
+    const [method, path] of [
+      ['GET', 'notifications'],
+      ['GET', 'pushers'],
+      ['POST', 'pushers/set'],
+    ]
+  ) {
+    const request = new Request(
+      'https://facade.test/_matrix/client/v3/' + path,
+      { method },
+    );
+    let required: string | undefined;
+    const f2 = capabilities('facade', 'f2');
+    assertEquals(
+      f2.gate(request, (scope) => {
+        required = scope;
+        return true;
+      }),
+      null,
+    );
+    assertEquals(required, 'domain');
+    assertEquals(f2.gate(request, () => false)?.status, 503);
+    assertEquals(
+      capabilities('facade', 'f1').gate(request, () => true)?.status,
+      404,
+    );
+    const wrong = new Request(request.url, { method: 'DELETE' });
+    assertEquals(f2.gate(wrong, () => true)?.status, 405);
+  }
+  assertEquals(capabilities('facade', 'f2').service('push'), true);
+  assertEquals(capabilities('facade', 'f1').service('push'), false);
+});
+
+Deno.test('B8 filters mount only their delivered methods through domain admission', async () => {
+  const own = '/_matrix/client/v3/user/%40alice%3Alogical.test/filter';
+  const f2 = capabilities('facade', 'f2');
+  for (const [method, path] of [['POST', own], ['GET', own + '/filter-id']]) {
+    const request = new Request('https://facade.test' + path, { method });
+    assertEquals(f2.gate(request, () => true), null);
+    assertEquals(f2.gate(request, () => false)?.status, 503);
+    assertEquals(
+      capabilities('facade', 'f1').gate(request, () => true)?.status,
+      404,
+    );
+  }
+  const wrong = f2.gate(
+    new Request('https://facade.test' + own, { method: 'DELETE' }),
+    () => true,
+  )!;
+  assertEquals(wrong.status, 405);
+  assertEquals((await wrong.json()).errcode, 'M_UNRECOGNIZED');
+});
+
 Deno.test('runtime identity binds role, server and node before recovery and cannot regenerate a lost signer', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'facade-role-' });
   const options = {
@@ -214,6 +268,16 @@ Deno.test('F2 manifest enables delivered auth, registers and device keys without
       ['v3/user/%40alice%3Atest/rooms/room/tags/tag', 'DELETE'],
       ['v3/rooms/room/read_markers', 'POST'],
       ['v3/rooms/room/receipt/m.read/event', 'POST'],
+      ['v3/user/%40alice%3Atest/filter', 'POST'],
+      ['v3/user/%40alice%3Atest/filter/id', 'GET'],
+      ['v3/user/%40alice%3Atest/openid/request_token', 'POST'],
+      ['v3/users/%40alice%3Atest/report', 'POST'],
+      ['v3/rooms/room/report', 'POST'],
+      ['v3/rooms/room/forget', 'POST'],
+      ['v3/rooms/room/report/event', 'POST'],
+      ['v3/notifications', 'GET'],
+      ['v3/pushers', 'GET'],
+      ['v3/pushers/set', 'POST'],
     ]
   ) assertEquals(facade.gate(request(path, method), () => true), null);
   for (
@@ -228,7 +292,6 @@ Deno.test('F2 manifest enables delivered auth, registers and device keys without
     const [path, method] of [
       ['v3/sync', 'GET'],
       ['v3/keys/changes', 'GET'],
-      ['v3/user/%40alice%3Atest/filter', 'POST'],
     ]
   ) assertEquals(facade.gate(request(path, method), () => true)?.status, 404);
   assertEquals(
@@ -239,6 +302,7 @@ Deno.test('F2 manifest enables delivered auth, registers and device keys without
   assertEquals(facade.service('deactivation'), true);
   assertEquals(facade.service('device-lists'), true);
   assertEquals(facade.service('federation-sender'), true);
+  assertEquals(facade.service('push'), true);
   const send = request('v3/sendToDevice/m.room.encrypted/client-txn', 'PUT');
   const scopes: string[] = [];
   assertEquals(
@@ -274,15 +338,60 @@ Deno.test('F2 manifest enables delivered auth, registers and device keys without
     null,
   );
   assertEquals(capabilities('facade', 'f1').service('deactivation'), false);
+  const openid = new Request(
+    'https://logical.test/_matrix/federation/v1/openid/userinfo',
+  );
+  assertEquals(facade.gate(openid, () => true), null);
+  assertEquals(
+    capabilities('facade', 'f1').gate(openid, () => true)?.status,
+    404,
+  );
+  assertEquals(
+    facade.gate(new Request(openid.url, { method: 'POST' }), () => true)
+      ?.status,
+    405,
+  );
   for (
     const service of [
-      'push',
-      'delayed',
       'media',
       'link-client',
     ]
   ) {
     assertEquals(facade.service(service), false);
+  }
+  assertEquals(facade.service('delayed'), true);
+});
+
+Deno.test('F2 backup manifest enables all replica reads while every write stays home-only', async () => {
+  const facade = capabilities('facade', 'f2');
+  for (
+    const path of [
+      'version',
+      'version/1',
+      'keys',
+      'keys/room',
+      'keys/room/session',
+    ]
+  ) {
+    const url = 'https://logical.test/_matrix/client/v3/room_keys/' + path;
+    assertEquals(facade.gate(new Request(url), () => true), null);
+    assertEquals(facade.gate(new Request(url), () => false)?.status, 503);
+    assertEquals(
+      capabilities('facade', 'f1').gate(new Request(url), () => true)?.status,
+      404,
+    );
+    for (
+      const method of path.startsWith('version')
+        ? (path === 'version' ? ['POST'] : ['PUT', 'DELETE'])
+        : ['PUT', 'DELETE']
+    ) {
+      const refusal = facade.gate(new Request(url, { method }), () => true)!;
+      assertEquals(refusal.status, 503);
+      assertEquals(await refusal.json(), {
+        errcode: 'M_UNAVAILABLE',
+        error: 'operation requires home ingress',
+      });
+    }
   }
 });
 
@@ -409,7 +518,6 @@ Deno.test('F2 membership activates only delivered methods and their independent 
       ['PUT', '/_matrix/federation/v1/3pid/onbind'],
       ['GET', '/_matrix/federation/v1/make_join/room'],
       ['POST', '/_matrix/client/v3/join/room/extra'],
-      ['POST', '/_matrix/client/v3/rooms/room/forget'],
       ['GET', '/_matrix/client/v3/joined_rooms'],
       ['GET', '/_matrix/client/v3/sync'],
     ]

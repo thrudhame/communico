@@ -54,6 +54,12 @@ export async function restoredServerWork(db: CapturedQuery) {
     'revision>MAX(sent_revision,expired_revision)',
   );
   return {
+    upgrades: await inventoryRows(
+      db,
+      'room_upgrades',
+      'old_room_id,user_id,replacement_room,phase',
+      'phase<4',
+    ),
     federation: { pdus, edus, frozen, prejoin, joins, invites },
     push: { deliveries, badges },
   };

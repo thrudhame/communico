@@ -55,7 +55,8 @@ export async function reportContent(
       const room = await lookupRoomForAdmission(target);
       if (
         room === null || eventId === undefined ||
-        (await membershipOf(app.server, target, reporter))?.membership !==
+        (await membershipOf(app.server, target, reporter, 'admission'))
+            ?.membership !==
           'join' ||
         !await canSeeEvent(reporter, room, eventId) ||
         await redactionOf(app.server, target, eventId) !== null

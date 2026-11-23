@@ -7,6 +7,8 @@ import {
 } from '#engine/facade/accounts.ts';
 import { DeviceOperations } from '#engine/facade/devices.ts';
 import { DomainOperations } from '#engine/facade/domain.ts';
+import { ToDeviceOperations } from '#engine/facade/todevice.ts';
+import { config } from '#engine/config.ts';
 import type { DomainBinding } from '#engine/facade/domain-control.ts';
 import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
 import { Journal } from '#engine/facade/journal.ts';
@@ -25,6 +27,7 @@ import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { getAccountData, putAccountData } from '#engine/tenant/accountdata.ts';
 import { upsertDevice } from '#engine/tenant/devices.ts';
 import { publicDeviceValues } from '#engine/tenant/device-operations.ts';
+import { deviceIdentity } from '#engine/tenant/txns.ts';
 
 // Retain a genuine home-authenticated selection, but deliberately do not apply
 // it. No worker timing or forged snapshot stands in for this dependency cut.
@@ -97,6 +100,7 @@ async function fixture() {
       auth: new AccountSnapshots(edge, et, fp, owners),
       domain: new DomainOperations(edge, et, fp, node),
       devices: new DeviceOperations(edge, et, fp, node),
+      todevice: new ToDeviceOperations(edge, et, fp, node),
       authority: () =>
         exportSessionAuthority(edge, et, fp, owners, node, 'alice'),
     };
@@ -111,6 +115,7 @@ async function fixture() {
   await putAccountData(ht, 'alice', '', 'm.direct', { held: 'selection' });
   const domains = new DomainOperations(home, ht, hp);
   const devices = new DeviceOperations(home, ht, hp);
+  const todevice = new ToDeviceOperations(home, ht, hp);
   return {
     home,
     ht,
@@ -125,6 +130,22 @@ async function fixture() {
     domain: () => domains.export('alice', bundle.id),
     bootstrap: () => domains.bootstrap('alice', bundle.id),
     devices: () => devices.export('alice', bundle.id),
+    async todevice() {
+      const device = await deviceIdentity(ht, 'alice', 'LAN');
+      await ht.tx((tx) =>
+        tx.toDevice.send(
+          device,
+          ht.serverName,
+          'm.room_key_request',
+          'held-selection',
+          'held-body',
+          [{ user: '@alice:logical.test', id: 'LAN', content: { held: true } }],
+          config().e2ee,
+          { enabled: true, maxBytes: 1048576 },
+        )
+      );
+      return await todevice.export('alice', bundle.id);
+    },
     homeAuthority: new AccountSnapshots(home, ht, hp),
     homeJournal: new Journal(await home.server(), LINK_SUPPORTED),
     async reopen() {
@@ -268,26 +289,43 @@ Deno.test('account selection: tenant domain transaction shares the readiness fen
 });
 
 for (
-  const kind of ['domain', 'bootstrap', 'devices', 'authority', 'cold'] as const
+  const kind of [
+    'domain',
+    'bootstrap',
+    'devices',
+    'todevice',
+    'todevice-cold',
+    'authority',
+    'cold',
+  ] as const
 ) {
   Deno.test(`account selection: held auth blocks ${kind} until applied`, async () => {
     const f = await fixture();
     try {
-      const records = kind === 'authority'
-        ? []
-        : await f[kind === 'cold' ? 'bootstrap' : kind]();
+      const records = kind === 'authority' ? [] : await f[
+        kind === 'cold'
+          ? 'bootstrap'
+          : kind === 'todevice-cold'
+          ? 'todevice'
+          : kind
+      ]();
       for (const record of records) {
         await f.consumer.journal.receive('home', [record]);
       }
-      if (kind === 'cold') await f.reopen();
+      if (kind === 'cold' || kind === 'todevice-cold') await f.reopen();
       const c = f.consumer;
+      const owner = kind === 'todevice' || kind === 'todevice-cold'
+        ? c.todevice
+        : kind === 'devices'
+        ? c.devices
+        : c.domain;
       const before = await (await f.edge.server()).query(
         'SELECT * FROM facade_streams ORDER BY stream',
       );
       const attempt = async () => {
         if (kind === 'authority') return await c.authority();
         const record = records[0];
-        return await (kind === 'devices' ? c.devices : c.domain).apply(
+        return await owner.apply(
           c.journal,
           record,
         );
@@ -295,9 +333,7 @@ for (
       await unavailable(attempt);
       await unavailable(attempt);
       if (kind !== 'authority') {
-        await unavailable(() =>
-          (kind === 'devices' ? c.devices : c.domain).export('alice')
-        );
+        await unavailable(() => owner.export('alice'));
       }
       assertEquals(
         await (await f.edge.server()).query(
@@ -311,6 +347,14 @@ for (
         ),
         [],
       );
+      if (kind === 'todevice' || kind === 'todevice-cold') {
+        assertEquals(
+          await (await f.edge.tenant('logical.test')).query(
+            'SELECT operation_id FROM to_device_operations',
+          ),
+          [],
+        );
+      }
       assertEquals(await c.journal.next('home', f.auth), f.auth);
       await c.auth.apply(c.journal, f.auth);
       if (kind === 'authority') {
@@ -320,7 +364,7 @@ for (
       } else {
         for (const record of records) {
           assertEquals(
-            await (kind === 'devices' ? c.devices : c.domain).apply(
+            await owner.apply(
               c.journal,
               record,
             ),
@@ -340,6 +384,18 @@ for (
             ),
             [['LAN', 'home device']],
           );
+        } else if (kind === 'todevice' || kind === 'todevice-cold') {
+          assertEquals(
+            await (await f.edge.tenant('logical.test')).query(
+              "SELECT operation_id FROM to_device_operations WHERE source='home' ORDER BY operation_id",
+            ),
+            records.map((record) => {
+              const signed = record.payload as {
+                body: { operation: { operationId: string } };
+              };
+              return { operation_id: signed.body.operation.operationId };
+            }).sort((a, b) => a.operation_id.localeCompare(b.operation_id)),
+          );
         } else {
           assertEquals(await getAccountData(c.et, 'alice', '', 'm.direct'), {
             held: 'selection',
@@ -352,7 +408,7 @@ for (
   });
 }
 
-for (const kind of ['domain', 'devices', 'authority'] as const) {
+for (const kind of ['domain', 'devices', 'todevice', 'authority'] as const) {
   Deno.test(`account selection: conflicting snapshot stays hard for ${kind}`, async (t) => {
     for (const fault of ['pairing', 'revision']) {
       await t.step(fault, async () => {
@@ -374,12 +430,10 @@ for (const kind of ['domain', 'devices', 'authority'] as const) {
           );
           const error = await assertRejects(
             () =>
-              kind === 'authority'
-                ? c.authority()
-                : (kind === 'devices' ? c.devices : c.domain).apply(
-                  c.journal,
-                  records[0],
-                ),
+              kind === 'authority' ? c.authority() : c[kind].apply(
+                c.journal,
+                records[0],
+              ),
             LinkError,
           );
           assertEquals(error.code, 'LINK_IDENTITY_MISMATCH');
@@ -398,7 +452,7 @@ for (const kind of ['domain', 'devices', 'authority'] as const) {
   });
 }
 
-for (const kind of ['domain', 'devices'] as const) {
+for (const kind of ['domain', 'devices', 'todevice'] as const) {
   Deno.test(`account selection: missing auth cannot soften invalid ${kind} authority`, async (t) => {
     for (const fault of ['signature', 'account', 'pairing', 'grant']) {
       await t.step(fault, async () => {

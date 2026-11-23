@@ -25,6 +25,7 @@ import { roomSource } from '#engine/store/projection-sources.ts';
 import { queueBadge } from '#engine/server/push-queue.ts';
 import { advance, advanceAll, get, getAll } from '#engine/store/watermark.ts';
 import { changedColumns } from '#engine/store/changed.ts';
+import { domainOf } from '#engine/ids.ts';
 import {
   eventStreamTx,
   nextEventSeq,
@@ -44,6 +45,7 @@ import {
   receiptMembership,
 } from '#engine/server/receipt-frontier.ts';
 import { reconcileReceiptMarks } from '#engine/server/ephemeral.ts';
+import { projectRejoin, type RejoinObservation } from './membership.ts';
 import {
   capturePushesAt,
   prepareCapturedPush,
@@ -976,8 +978,20 @@ type Prepared =
     | { kind: 'redaction'; target: string }
     | { kind: 'delivery'; destinations: string[] }
     | { kind: 'signature' }
-    | { kind: 'local-participation'; user: string }
+    // Retained evidence of a join that is no longer current is inert.
+    | { kind: 'local-participation'; user: string; current: boolean }
+    | {
+      kind: 'rejoin-observation';
+      observation: RejoinObservation;
+      current: boolean;
+    }
   );
+
+// Standing is mutable room evidence, not a self-join change's identity: a
+// join no longer accepted and grounded must not hold the room cursor.
+function currentJoin(status: { standing: string; grounding: string } | null) {
+  return status?.standing === 'accepted' && status.grounding === 'grounded';
+}
 
 function eventPayloadOf(change: Change): EventPayload {
   const data = JSON.parse(change.data) as EventPayload;
@@ -1172,6 +1186,30 @@ async function prepare(
           });
           break;
         }
+        case 'rejoin-observation': {
+          const observation = JSON.parse(change.data) as RejoinObservation;
+          const row = change.event === null
+            ? null
+            : await tx.events.get(change.event);
+          const status = change.event === null
+            ? null
+            : await tx.events.getStatus(change.event);
+          const pdu = row === null ? null : JSON.parse(row.pdu) as Pdu;
+          if (
+            pdu?.type !== 'm.room.member' ||
+            pdu.state_key !== observation.user ||
+            !(pdu.content?.membership === 'invite' ||
+              (pdu.content?.membership === 'join' &&
+                pdu.sender === observation.user))
+          ) throw new Error('invalid rejoin observation');
+          out.push({
+            change,
+            kind: 'rejoin-observation',
+            observation,
+            current: currentJoin(status),
+          });
+          break;
+        }
         case 'local-participation': {
           const data = JSON.parse(change.data) as { user?: unknown };
           const row = change.event === null
@@ -1184,10 +1222,14 @@ async function prepare(
           if (
             typeof data.user !== 'string' || pdu?.type !== 'm.room.member' ||
             pdu.sender !== data.user || pdu.state_key !== data.user ||
-            pdu.content?.membership !== 'join' ||
-            status?.standing !== 'accepted' || status.grounding !== 'grounded'
+            pdu.content?.membership !== 'join'
           ) throw new Error('E_LOCAL_PARTICIPATION_IDENTITY');
-          out.push({ change, kind: 'local-participation', user: data.user });
+          out.push({
+            change,
+            kind: 'local-participation',
+            user: data.user,
+            current: currentJoin(status),
+          });
           break;
         }
         case 'signature': {
@@ -1413,7 +1455,22 @@ async function apply(
 ): Promise<void> {
   const { change } = item;
   switch (item.kind) {
+    case 'rejoin-observation':
+      if (!item.current) return;
+      for (const self of localServers) {
+        if (item.observation.user.endsWith(':' + self)) {
+          await projectRejoin(
+            tx,
+            roomId,
+            change.event!,
+            item.observation,
+            self,
+          );
+        }
+      }
+      return;
     case 'local-participation':
+      if (!item.current) return;
       await tx.execute(
         'UPDATE event_index SET local_join_user=? WHERE room=? AND event=? AND local_join_user IS NOT ?',
         [item.user, roomId, change.event, item.user],
@@ -1547,7 +1604,15 @@ async function apply(
       const eventId = item.toId ?? change.event!;
       const seq = (await seqOf(tx, roomId, eventId)) ??
         (await feedSeqOf(tx, roomId, change.event!));
-      await applyMember(tx, roomId, item.user, item.to, eventId, seq);
+      await applyMember(
+        tx,
+        roomId,
+        item.user,
+        item.to,
+        eventId,
+        seq,
+        localServers,
+      );
       return;
     }
     case 'redaction': {
@@ -1652,7 +1717,15 @@ async function applyPublication(
       continue;
     }
     const seq = first ? cut : (await seqOf(tx, roomId, member.toId)) ?? cut;
-    await applyMember(tx, roomId, member.user, member.to, member.toId, seq);
+    await applyMember(
+      tx,
+      roomId,
+      member.user,
+      member.to,
+      member.toId,
+      seq,
+      localServers,
+    );
   }
   await applyDevicePublication(tx, roomId, publication, pos, localServers);
 }
@@ -1688,6 +1761,7 @@ async function applyMember(
   membership: string,
   eventId: string,
   seq: number | null,
+  localServers: string[],
 ): Promise<void> {
   const changed = await tx.execute(
     `INSERT INTO memberships(user, room, membership, event, seq)
@@ -1698,6 +1772,13 @@ async function applyMember(
     [user, roomId, membership, eventId, seq],
   );
   if (changed) await queueBadge(tx, user);
+  // Participation protects the room even when a concurrent forget still hides
+  // it from this user. Only retained local admission can remove that intent.
+  if (membership === 'join' && localServers.includes(domainOf(user))) {
+    await tx.execute('UPDATE directory SET purgeable_ms=NULL WHERE room_id=?', [
+      roomId,
+    ]);
+  }
 }
 
 async function feedSeqAtPos(

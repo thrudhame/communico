@@ -15,7 +15,9 @@ import { ingestInTx } from '#engine/room/ingest.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
 import {
   admitLocalJoin,
+  type LocalJoinObservation,
   type MembershipAdmission,
+  prepareJoinObservation,
   prepareMembershipAdmission,
   withMembershipFence,
 } from '#engine/room/hooks.ts';
@@ -125,6 +127,7 @@ async function admitJoin(
 ): Promise<MembershipOpResult | null> {
   let prepared = signer;
   let admission: MembershipAdmission | undefined;
+  let observation: LocalJoinObservation | undefined;
   const result = await withRestrictedAdmission(
     room,
     userId,
@@ -159,11 +162,13 @@ async function admitJoin(
             `membership rejected (${res.rule})`,
           );
         }
+        await tx.joinObservations.complete(res.eventId, observation);
         return { roomId: room.id, eventId: res.eventId, created: true };
       }),
     undefined,
     async (resident) => {
       await admitLocalJoin(room.store, room.id, userId);
+      observation = await prepareJoinObservation(room.store, room.id, userId);
       admission = await prepareMembershipAdmission(
         room.store,
         room.id,
@@ -179,11 +184,13 @@ async function admitJoin(
     },
     absent
       ? (tx) =>
-        withMembershipFence(
-          admission,
-          tx,
-          async () => await absent(tx, prepared),
-        )
+        withMembershipFence(admission, tx, async () => {
+          const result = await absent(tx, prepared);
+          if (result?.created) {
+            await tx.joinObservations.complete(result.eventId, observation);
+          }
+          return result;
+        })
       : undefined,
   );
   if (result !== null) {

@@ -1,7 +1,14 @@
-import { assertEquals, assertRejects, assertThrows } from '@std/assert';
+import { assert, assertEquals, assertRejects, assertThrows } from '@std/assert';
 import { createHash } from 'node:crypto';
 import { canonicalJson } from '#engine/canonical.ts';
 import { setConfigForTests } from '#engine/config.ts';
+import {
+  importReportOperation,
+  listReports,
+  reportOperations,
+  resolveReport,
+  storeReport,
+} from '#engine/server/reports.ts';
 import {
   AccountSnapshots,
   exportAccountAuth,
@@ -11,13 +18,69 @@ import {
   type DomainOperation,
   DomainOperations,
 } from '#engine/facade/domain.ts';
-import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
+import {
+  enrolledTenant,
+  initializeNode,
+  loadNode,
+} from '#engine/facade/identity.ts';
 import { AuthLinkHealth, FacadeAuth } from '#engine/facade/auth.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import {
+  clearPurgeable,
+  forget,
+  forgetOperations,
+  importForgetOperation,
+  prepareRejoin,
+  projectRejoin,
+  type RejoinObservation,
+} from '#engine/server/membership.ts';
+import {
+  membershipOf,
+  roomsFor,
+  slidingListSnapshot,
+} from '#engine/server/read.ts';
+import { installDirectoryFacts } from '#engine/server/public-replica.ts';
+import { installJoinAdmission } from '#engine/server/join-attempts.ts';
+import { setJoinObservation } from '#engine/room/hooks.ts';
+import {
+  join as joinLocal,
+  leave as leaveLocal,
+} from '#engine/room/membership.ts';
+import { project } from '#engine/server/project.ts';
+import {
+  ingestLocal,
+  type PreparedSubmission,
+  sendLocal,
+} from '#engine/room/ingest.ts';
+import { buildInTx } from '#engine/room/build.ts';
+import { loadFilter, storeFilter } from '#engine/tenant/filters.ts';
+import { issueOpenIdToken, openIdUserInfo } from '#engine/tenant/openid.ts';
+import {
+  hashToken,
+  insertAccessToken,
+  issueToken,
+  lookupToken,
+} from '#engine/tenant/auth.ts';
+import {
+  listPushers,
+  recordPusherChange,
+  setPusher,
+  upsertPusherRow,
+} from '#engine/tenant/pushers.ts';
+import { projectTenant } from '#engine/server/project-tenant.ts';
+import {
+  captureSessionAuthority,
+  installSessionAuthority,
+} from '#engine/tenant/session-authority.ts';
+import { queueBadge } from '#engine/server/push-queue.ts';
+import { applyPushPublication } from '#engine/server/notifications.ts';
+import { notificationOperations } from '#engine/server/notification-operations.ts';
+import { onEventStream } from '#engine/server/stream.ts';
+import { DelayedEvents } from '#engine/delayed-events.ts';
+import { startPushSender } from '#engine/push/sender.ts';
 import { drainResources } from '#engine/lifetime.ts';
 import { closeApp, openReplicaApp } from '#engine/app.ts';
 import { keyStore } from '#engine/federation/keys.ts';
-import { hashToken, insertAccessToken } from '#engine/tenant/auth.ts';
 import { ignoredSenders } from '#engine/client/ignored.ts';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { setAvatarUrl, setDisplayName } from '#engine/tenant/users.ts';
@@ -86,7 +149,9 @@ import {
   recordReceiptOperation,
 } from '#engine/server/receipt-operations.ts';
 
-async function fixture(token?: string) {
+async function fixture(option: boolean | string = true) {
+  const applyAuth = option !== false;
+  const token = typeof option === 'string' ? option : undefined;
   const dir = await Deno.makeTempDir({ prefix: 'facade-domain-link-' });
   const open = (side: string) =>
     openStore({
@@ -161,7 +226,9 @@ async function fixture(token?: string) {
   await owners.apply(ej, control);
   const auth = await exportAccountAuth(home, ht, hp, bundle.id, 'alice', false);
   await ej.receive('home', [auth]);
-  await new AccountSnapshots(edge, et, fp, owners).apply(ej, auth);
+  if (applyAuth) {
+    await new AccountSnapshots(edge, et, fp, owners).apply(ej, auth);
+  }
   const hs = new DomainOperations(home, ht, hp),
     es = new DomainOperations(edge, et, fp, node);
   if (token) {
@@ -182,6 +249,7 @@ async function fixture(token?: string) {
     hj,
     ej,
     owners,
+    auth,
     node,
     bundle,
     hs,
@@ -207,6 +275,1933 @@ async function fixture(token?: string) {
     },
   };
 }
+
+Deno.test('domain bootstrap waits for its retained auth dependency without an identity rejection', async () => {
+  const f = await fixture(false);
+  try {
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    assert(records.length > 0);
+    await f.ej.receive('home', records);
+    const refusal = await assertRejects(
+      () => f.es.apply(f.ej, records[0]),
+      LinkError,
+      'account not selected',
+    );
+    assertEquals(refusal.code, 'LINK_UNAVAILABLE');
+    assertEquals(
+      (await f.ej.heads('home', 'in', records[0])).applied.sequence,
+      0,
+    );
+    await new AccountSnapshots(f.edge, f.et, f.fp, f.owners).apply(
+      f.ej,
+      f.auth,
+    );
+    for (const record of records) assert(await f.es.apply(f.ej, record));
+    assertEquals(
+      (await f.ej.heads('home', 'in', records[0])).applied.sequence,
+      records.at(-1)!.sequence,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain schedules: signed inventory and suffix retain account-wide replicas without executable jobs', async () => {
+  const f = await fixture();
+  try {
+    const event = {
+      id: 'legacy-home-schedule',
+      localpart: 'alice',
+      roomId: '!not-held:logical.test',
+      type: 'm.room.encrypted',
+      stateKey: '',
+      content: { ciphertext: 'original' },
+      delay: 60000,
+      since: 1000,
+      due: 61000,
+      roomPos: 999999,
+      stateEvent: '$source-state',
+      phase: 'pending',
+    };
+    await f.ht.tx((tx) =>
+      tx.delayedEvents.add({
+        ...event,
+        id: 'bob-private-schedule',
+        localpart: 'bob',
+        content: { ciphertext: 'unselected-bob-secret' },
+      }, 10)
+    );
+    // An existing standalone schedule has no semantic fact until enrollment.
+    const homeDb = await f.home.tenant('logical.test');
+    for (const id of ['quarantined-legacy', event.id]) {
+      await homeDb.execute(
+        'INSERT INTO delayed_events(id,localpart,room_id,type,state_key,content,delay_ms,since_ms,due_ms,room_pos,state_event) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+        [
+          id,
+          event.localpart,
+          event.roomId,
+          event.type,
+          event.stateKey,
+          JSON.stringify(event.content),
+          event.delay,
+          event.since,
+          event.due,
+          event.roomPos,
+          event.stateEvent,
+        ],
+      );
+      if (id === 'quarantined-legacy') await homeDb.tx(sanitizeRestoredTenant);
+    }
+    // The same account may contain a restored factless legacy schedule. It is
+    // private quarantine evidence, not permission to reconstruct source history.
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    assertEquals(
+      await homeDb.query(
+        "SELECT phase FROM delayed_events WHERE id='quarantined-legacy'",
+      ),
+      [{ phase: 'quarantined' }],
+    );
+    const body =
+      (records.at(-1)!.payload as { body: Record<string, unknown> }).body;
+    assertEquals(
+      (body.schedules as unknown[])?.length,
+      1,
+      'missing schedule inventory',
+    );
+    assert(!JSON.stringify(records).includes('unselected-bob-secret'));
+    await f.toEdge(records);
+    const worker = new DelayedEvents({ tenant: f.et, store: f.edge });
+    try {
+      const listed = await worker.list('@alice:logical.test');
+      assertEquals('delayed_events' in listed ? listed.delayed_events : [], [{
+        delay_id: event.id,
+        room_id: event.roomId,
+        type: event.type,
+        state_key: '',
+        content: event.content,
+        delay_ms: event.delay,
+        delayed_since_ts: event.since,
+        delay: event.delay,
+        running_since: event.since,
+      }]);
+      const ed = await f.edge.tenant('logical.test');
+      assertEquals(await ed.query('SELECT * FROM delayed_events'), []);
+      assertEquals(await ed.query('SELECT * FROM delayed_event_receipts'), []);
+      assertEquals(await f.et.tx((tx) => tx.delayedEvents.due(999999)), []);
+      assertEquals(await f.es.export('alice'), []);
+      await assertRejects(
+        () => worker.list('@alice:logical.test', event.id),
+        MatrixError,
+        'operation owner unavailable',
+      );
+      await assertRejects(
+        () => worker.action(event.id, 'cancel'),
+        MatrixError,
+        'operation owner unavailable',
+      );
+      await f.ht.tx((tx) => tx.delayedEvents.action(event.id, 'cancel', 2000));
+      await f.toEdge(await f.hs.export('alice', f.bundle.id));
+      assertEquals(await worker.list('@alice:logical.test'), {
+        delayed_events: [],
+      });
+      const homeFacts = await f.ht.tx((tx) =>
+        tx.delayedEvents.operations('alice')
+      );
+      assertEquals(
+        (await ed.query(
+          "SELECT operation_id FROM domain_operations WHERE kind='delayed-event'",
+        )).length,
+        homeFacts.length,
+      );
+      const edgeId = await f.et.tx((tx) => tx.delayedEvents.newId());
+      await f.et.tx((tx) => tx.delayedEvents.add({ ...event, id: edgeId }, 10));
+      const reverse = await f.es.export('alice');
+      assertEquals(reverse.length, 1);
+      for (const record of reverse) {
+        await f.hj.receive('edge_a', [record]);
+        await f.hs.apply(f.hj, record, f.bundle.id);
+      }
+      const homeWorker = new DelayedEvents({ tenant: f.ht, store: f.home });
+      try {
+        const homeList = await homeWorker.list('@alice:logical.test');
+        assertEquals(
+          'delayed_events' in homeList
+            ? homeList.delayed_events.map((e) => e.delay_id)
+            : [],
+          // Quarantined local evidence stays listed, like any restored row.
+          ['quarantined-legacy', edgeId],
+        );
+        await assertRejects(
+          () => homeWorker.action(edgeId, 'send'),
+          MatrixError,
+          'operation owner unavailable',
+        );
+      } finally {
+        await homeWorker.stop();
+      }
+      assertEquals(
+        await homeDb.query('SELECT id FROM delayed_events WHERE localpart=?', [
+          'alice',
+        ]),
+        [{ id: 'quarantined-legacy' }],
+      );
+      const homeExport = await f.hs.export('alice', f.bundle.id);
+      assert(
+        homeExport.every((r) =>
+          (r.payload as { body: DomainOperation }).body.operation.source ===
+            'home'
+        ),
+      );
+      await f.et.tx((tx) => tx.delayedEvents.remove(edgeId));
+      for (const record of await f.es.export('alice')) {
+        await f.hj.receive('edge_a', [record]);
+        await f.hs.apply(f.hj, record, f.bundle.id);
+      }
+      // Home can attest the receiver's retained originals during bootstrap;
+      // replay must not rebase them or recreate a local executable schedule.
+      await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+      const edgeFacts = await f.et.tx((tx) =>
+        tx.delayedEvents.operations('alice')
+      );
+      await f.edge.close();
+      const cold = await f.open('edge');
+      try {
+        const node = await loadNode(
+          await cold.server(),
+          'logical.test',
+          'edge_a',
+        );
+        const pairings = new Pairings(
+          await cold.server(),
+          node.signer(),
+          node.publicKey,
+          'b'.repeat(64),
+          node,
+        );
+        const tenant = await enrolledTenant(
+          cold,
+          pairings,
+          'logical.test',
+          'edge_a',
+        );
+        const restarted = new DelayedEvents({ tenant, store: cold });
+        try {
+          assertEquals(await restarted.list('@alice:logical.test'), {
+            delayed_events: [],
+          });
+          assertEquals(
+            await tenant.tx((tx) => tx.delayedEvents.operations('alice')),
+            edgeFacts,
+          );
+          assertEquals(await tenant.tx((tx) => tx.delayedEvents.next()), null);
+        } finally {
+          await restarted.stop();
+        }
+      } finally {
+        await cold.close();
+      }
+    } finally {
+      await worker.stop();
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain schedules: absent inventory differs from an explicit empty inventory', async (t) => {
+  for (const present of [false, true]) {
+    await t.step(String(present), async () => {
+      const f = await fixture();
+      try {
+        const records = structuredClone(
+          await f.hs.bootstrap('alice', f.bundle.id),
+        );
+        const last = records.at(-1)!;
+        const payload = last.payload as {
+          body: DomainBootstrap & { schedules?: unknown[] };
+          signature: string;
+        };
+        if (present) {
+          payload.body.schedules = [];
+        } else delete payload.body.schedules;
+        payload.signature = await f.ht.signer().sign(
+          canonicalJson(payload.body),
+        );
+        last.operationId = 'domain-bootstrap:' +
+          createHash('sha256').update(canonicalJson(payload.body)).digest(
+            'hex',
+          );
+        const { hash: _, ...unsigned } = last;
+        last.hash = recordHash(unsigned);
+        await f.toEdge(records);
+        assertEquals(
+          (await (await f.edge.server()).query(
+            "SELECT ready FROM facade_scopes WHERE scope='schedules:@alice:logical.test'",
+          ))[0]?.ready,
+          present ? 1 : 0,
+        );
+        const authority = new FacadeAuth(
+          await f.edge.server(),
+          f.fp,
+          f.node,
+          new AuthLinkHealth({ notify: 'poll', pollseconds: 5 }),
+          {
+            replicatecredentials: true,
+            allowstaleauth: true,
+            authmaxstalehours: 0,
+          },
+        );
+        const tenant = await enrolledTenant(
+          f.edge,
+          f.fp,
+          'logical.test',
+          'edge_a',
+          authority,
+        );
+        const worker = new DelayedEvents({ tenant, store: f.edge });
+        try {
+          if (present) {
+            assertEquals(await worker.list('@alice:logical.test'), {
+              delayed_events: [],
+            });
+          } else {await assertRejects(
+              () => worker.list('@alice:logical.test'),
+              MatrixError,
+              'domain snapshot unavailable',
+            );}
+        } finally {
+          await worker.stop();
+        }
+      } finally {
+        await f.close();
+      }
+    });
+  }
+});
+
+Deno.test('domain notifications: signed selected-account inventory and suffix preserve originals without dispatch across reopen', async () => {
+  const f = await fixture();
+  try {
+    const home = await f.home.server(), edge = await f.edge.server();
+    for (const [db, seq] of [[home, 5], [edge, 71]] as const) {
+      await db.execute(
+        "INSERT INTO event_index(event,room,pos,standing,grounding,seq) VALUES('$saved','!saved:logical.test',1,'accepted','grounded',?)",
+        [seq],
+      );
+    }
+    await home.tx((conn) =>
+      applyPushPublication(conn, '!saved:logical.test', '$saved', 5, 1, {
+        sender: '@sender:logical.test',
+        decisions: ['alice', 'bob'].map((name) => ({
+          tenant: 'logical.test',
+          user: '@' + name + ':logical.test',
+          ruleRevision: 7,
+          ignoreRevision: 3,
+          decision: {
+            kind: 'underride',
+            ruleId: 'saved-rule',
+            notify: true,
+            actions: ['notify'],
+            highlight: false,
+            tweaks: {},
+          },
+        })),
+      }, 1000)
+    );
+    const [original] = await home.tx((conn) =>
+      notificationOperations(conn, '@alice:logical.test')
+    );
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    const payload = records.at(-1)!.payload as {
+      body: { notifications?: unknown[] };
+    };
+    assertEquals(
+      payload.body.notifications?.length,
+      1,
+      'missing notification inventory',
+    );
+    assertEquals(JSON.stringify(records).includes('@bob:logical.test'), false);
+    let wakes = 0;
+    const off = onEventStream((path) => {
+      if (path === edge.path) wakes++;
+    });
+    try {
+      await f.toEdge(records);
+    } finally {
+      off();
+    }
+    assert(
+      wakes > 0,
+      'saved notification import did not wake its local consumers',
+    );
+    assertEquals(
+      await edge.tx((conn) =>
+        notificationOperations(conn, '@alice:logical.test')
+      ),
+      [original],
+    );
+    assertEquals(
+      await edge.query(
+        'SELECT event_seq,actions,created_ms FROM notifications',
+      ),
+      [{ event_seq: 71, actions: '["notify"]', created_ms: 1000 }],
+    );
+    assertEquals(await edge.query('SELECT * FROM push_delivery'), []);
+    assertEquals(await edge.query('SELECT * FROM push_badges'), []);
+    assertEquals(
+      (await edge.query(
+        "SELECT ready FROM facade_scopes WHERE scope='notifications:@alice:logical.test'",
+      ))[0]?.ready,
+      1,
+    );
+    // A second saved decision uses the same signed account stream, not another
+    // bootstrap or foreign count/position. Missing event evidence stays pending.
+    await home.tx((conn) =>
+      applyPushPublication(conn, '!saved:logical.test', '$later', 6, 2, {
+        sender: '@sender:logical.test',
+        decisions: [{
+          tenant: 'logical.test',
+          user: '@alice:logical.test',
+          ruleRevision: 8,
+          ignoreRevision: 3,
+          decision: null,
+        }],
+      }, 2000)
+    );
+    await f.toEdge(await f.hs.export('alice', f.bundle.id));
+    assertEquals(
+      (await edge.tx((conn) =>
+        notificationOperations(conn, '@alice:logical.test')
+      )).length,
+      2,
+    );
+    await edge.tx((conn) =>
+      applyPushPublication(conn, '!saved:logical.test', '$saved', 71, 1, {
+        sender: '@sender:logical.test',
+        decisions: [{
+          tenant: 'logical.test',
+          user: '@alice:logical.test',
+          ruleRevision: 9,
+          ignoreRevision: 3,
+          decision: null,
+        }],
+      }, 3000)
+    );
+    const homeExports = await f.hs.export('alice', f.bundle.id);
+    for (const record of await f.es.export('alice')) {
+      await f.hj.receive(f.node.node, [record]);
+      await f.hs.apply(f.hj, record, f.bundle.id);
+    }
+    assertEquals(
+      await f.hs.export('alice', f.bundle.id),
+      homeExports,
+      'import authored an echo',
+    );
+    assertEquals(
+      (await home.query('SELECT actions FROM notifications'))[0].actions,
+      '["notify"]',
+    );
+    assertEquals(await edge.query('SELECT * FROM notifications'), []);
+    assertEquals(
+      (await home.tx((conn) =>
+        notificationOperations(conn, '@alice:logical.test')
+      )).length,
+      3,
+    );
+    await f.edge.close();
+    const reopened = await f.open('edge');
+    try {
+      const cold = await reopened.server();
+      assertEquals(
+        (await cold.tx((conn) =>
+          notificationOperations(conn, '@alice:logical.test')
+        )).length,
+        3,
+      );
+      assertEquals(
+        (await cold.query('SELECT unread FROM notification_counts'))[0].unread,
+        0,
+      );
+      assertEquals(await cold.query('SELECT * FROM push_delivery'), []);
+      assertEquals(await cold.query('SELECT * FROM push_badges'), []);
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain notifications: absent signed inventory is not an explicit empty inventory', async (t) => {
+  for (const present of [false, true]) {
+    await t.step(String(present), async () => {
+      const f = await fixture();
+      try {
+        const records = structuredClone(
+          await f.hs.bootstrap('alice', f.bundle.id),
+        );
+        const last = records.at(-1)!;
+        const payload = last.payload as {
+          body: DomainBootstrap & { notifications?: unknown[] };
+          signature: string;
+        };
+        if (present) payload.body.notifications = [];
+        else delete payload.body.notifications;
+        payload.signature = await f.ht.signer().sign(
+          canonicalJson(payload.body),
+        );
+        last.operationId = 'domain-bootstrap:' +
+          createHash('sha256').update(canonicalJson(payload.body)).digest(
+            'hex',
+          );
+        const { hash: _, ...unsigned } = last;
+        last.hash = recordHash(unsigned);
+        await f.toEdge(records);
+        assertEquals(
+          (await (await f.edge.server()).query(
+            "SELECT ready FROM facade_scopes WHERE scope='notifications:@alice:logical.test'",
+          ))[0]?.ready,
+          present ? 1 : 0,
+        );
+        const authority = new FacadeAuth(
+          await f.edge.server(),
+          f.fp,
+          f.node,
+          new AuthLinkHealth({ notify: 'poll', pollseconds: 5 }),
+          {
+            replicatecredentials: true,
+            allowstaleauth: true,
+            authmaxstalehours: 0,
+          },
+        );
+        const tenant = await enrolledTenant(
+          f.edge,
+          f.fp,
+          'logical.test',
+          'edge_a',
+          authority,
+        );
+        const admit = () =>
+          tenant.tx((tx) =>
+            tx.ingress.check({
+              kind: 'domain',
+              localpart: 'alice',
+              feature: 'notifications',
+            })
+          );
+        if (present) await admit();
+        else {await assertRejects(
+            admit,
+            MatrixError,
+            'domain snapshot unavailable',
+          );}
+      } finally {
+        await f.close();
+      }
+    });
+  }
+});
+
+Deno.test('domain pushers: append=false reaches home and affected selected accounts without disclosing unselected registrations', async () => {
+  const f = await fixture();
+  try {
+    await f.ht.tx((tx) => tx.users.insert('charlie', 'Charlie'));
+    const input = {
+      app_id: 'shared-app',
+      pushkey: 'shared-key',
+      kind: 'http',
+      app_display_name: 'App',
+      device_display_name: 'Home',
+      lang: 'en',
+      append: true,
+      data: { url: 'https://push.test/_matrix/push/v1/notify' },
+    };
+    for (const user of ['alice', 'bob', 'charlie']) {
+      await setPusher(f.ht, user, await issueToken(f.ht, user, 'HOME'), {
+        ...input,
+        device_display_name: user + '-private-registration',
+      });
+    }
+    const token = await issueToken(f.et, 'alice', 'EDGE_PUSH');
+    await setPusher(f.et, 'alice', token, { ...input, append: false });
+    assertEquals((await listPushers(f.ht, 'bob')).length, 1, 'partition delay');
+    const hd = await f.home.tenant('logical.test');
+    const ed = await f.edge.tenant('logical.test');
+    const session = await ed.tx((conn) =>
+      captureSessionAuthority(conn, 'alice')
+    );
+    await hd.tx((conn) => installSessionAuthority(conn, 'alice', session));
+    const reverse = await f.es.export('alice');
+    for (const record of reverse) {
+      await f.hj.receive(f.node.node, [record]);
+      await f.hs.apply(f.hj, record, f.bundle.id);
+    }
+    assertEquals(
+      (await listPushers(f.ht, 'alice')).length,
+      1,
+      'same-account exemption',
+    );
+    assertEquals(
+      await listPushers(f.ht, 'bob'),
+      [],
+      'unseen Bob pusher survived home application',
+    );
+    assertEquals(await listPushers(f.ht, 'charlie'), []);
+    const aliceRecords = await f.hs.export('alice', f.bundle.id);
+    assertEquals(
+      JSON.stringify(aliceRecords).includes('bob-private-registration'),
+      false,
+    );
+    assertEquals(
+      JSON.stringify(aliceRecords).includes('charlie-private-registration'),
+      false,
+    );
+    await assertRejects(
+      () => f.hs.export('bob', f.bundle.id),
+      LinkError,
+      'account not selected: awaiting home auth export',
+    );
+    const auth = await exportAccountAuth(
+      f.home,
+      f.ht,
+      f.hp,
+      f.bundle.id,
+      'bob',
+      false,
+    );
+    await f.ej.receive('home', [auth]);
+    await new AccountSnapshots(f.edge, f.et, f.fp, f.owners).apply(f.ej, auth);
+    const records = await f.hs.bootstrap('bob', f.bundle.id);
+    assertEquals(
+      JSON.stringify(records).includes('charlie-private-registration'),
+      false,
+    );
+    await f.toEdge(records);
+    assertEquals(await listPushers(f.et, 'bob'), []);
+    assertEquals(
+      await ed.query("SELECT * FROM users WHERE localpart='charlie'"),
+      [],
+    );
+    assertEquals(
+      await ed.query(
+        "SELECT * FROM domain_operations WHERE json_extract(semantic_key,'$[1]')='charlie'",
+      ),
+      [],
+    );
+    assertEquals(
+      (await ed.query(
+        "SELECT * FROM domain_operations WHERE kind='pusher' AND json_extract(semantic_key,'$[1]')='bob' AND payload_json='null'",
+      )).length,
+      1,
+    );
+    assertEquals(
+      await ed.query("SELECT * FROM pushers WHERE localpart='bob'"),
+      [],
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain pushers: signed inventory retains registration and deletion without executable targets', async () => {
+  const f = await fixture();
+  try {
+    const token = await issueToken(f.ht, 'alice', 'PUSH_IMPORT');
+    const pusher = {
+      app_id: 'import-app',
+      pushkey: 'import-key',
+      kind: 'http',
+      app_display_name: 'App',
+      device_display_name: 'Home',
+      lang: 'en',
+      data: { url: 'https://push.test/_matrix/push/v1/notify' },
+    };
+    await setPusher(f.ht, 'alice', token, pusher);
+    const auth = await exportAccountAuth(
+      f.home,
+      f.ht,
+      f.hp,
+      f.bundle.id,
+      'alice',
+      false,
+    );
+    await f.ej.receive('home', [auth]);
+    await new AccountSnapshots(f.edge, f.et, f.fp, f.owners).apply(f.ej, auth);
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    const baseline = records.at(-1)!.payload as {
+      body: { pushers?: unknown[]; pusherChoices?: unknown[] };
+    };
+    assertEquals(
+      baseline.body.pushers?.length,
+      1,
+      'signed bootstrap omits pusher inventory',
+    );
+    assertEquals(
+      baseline.body.pusherChoices?.length,
+      1,
+      'signed bootstrap omits pusher choice inventory',
+    );
+    await f.toEdge(records);
+    const ed = await f.edge.tenant('logical.test');
+    const [put] = await ed.query(
+      "SELECT * FROM domain_operations WHERE kind='pusher'",
+    );
+    assert(put, 'signed import lost protected recovery fact');
+    assert(
+      !String(put.payload_json).includes(token),
+      'bearer leaked into recovery fact',
+    );
+    assertEquals(await ed.query('SELECT * FROM pushers'), []);
+    assertEquals(await ed.query('SELECT * FROM pusher_changes'), []);
+    assertEquals((await listPushers(f.et, 'alice'))[0]?.app_id, 'import-app');
+    await projectTenant(f.edge, 'logical.test');
+    assertEquals(
+      await (await f.edge.server()).query('SELECT * FROM push_targets'),
+      [],
+    );
+    assertEquals(
+      (await (await f.edge.server()).query(
+        "SELECT ready FROM facade_scopes WHERE scope='pushers:@alice:logical.test'",
+      ))[0]?.ready,
+      1,
+    );
+    await setPusher(f.ht, 'alice', token, { ...pusher, kind: null });
+    await f.toEdge(await f.hs.export('alice', f.bundle.id));
+    assertEquals(await listPushers(f.et, 'alice'), []);
+    assertEquals(
+      (await ed.query("SELECT * FROM domain_operations WHERE kind='pusher'"))
+        .length,
+      2,
+    );
+    assertEquals(await ed.query('SELECT * FROM pushers'), []);
+    await f.edge.close();
+    const reopened = await f.open('edge');
+    try {
+      const cold = await reopened.tenant('logical.test');
+      assertEquals(
+        (await cold.query(
+          "SELECT * FROM domain_operations WHERE kind='pusher'",
+        )).length,
+        2,
+      );
+      assertEquals(await cold.query('SELECT * FROM pushers'), []);
+      assertEquals(
+        await (await reopened.server()).query('SELECT * FROM push_targets'),
+        [],
+      );
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain pushers: old signed bootstrap leaves an empty inventory unready', async () => {
+  const f = await fixture();
+  try {
+    const records = structuredClone(await f.hs.bootstrap('alice', f.bundle.id));
+    const last = records.at(-1)!;
+    const payload = last.payload as {
+      body: DomainBootstrap & { pushers?: unknown };
+      signature: string;
+    };
+    delete payload.body.pushers;
+    payload.signature = await f.ht.signer().sign(canonicalJson(payload.body));
+    last.operationId = 'domain-bootstrap:' +
+      createHash('sha256').update(canonicalJson(payload.body)).digest('hex');
+    last.hash = recordHash({
+      source: last.source,
+      incarnation: last.incarnation,
+      stream: last.stream,
+      sequence: last.sequence,
+      type: last.type,
+      version: last.version,
+      operationId: last.operationId,
+      previous: last.previous,
+      payload: last.payload,
+    });
+    await f.toEdge(records);
+    const db = await f.edge.server();
+    assertEquals(
+      (await db.query(
+        "SELECT ready FROM facade_scopes WHERE scope='pushers:@alice:logical.test'",
+      ))[0]?.ready,
+      0,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain pushers: pusher-only signed inventory cannot enable retained public reads', async () => {
+  const f = await fixture();
+  try {
+    const records = structuredClone(await f.hs.bootstrap('alice', f.bundle.id));
+    const last = records.at(-1)!;
+    const payload = last.payload as {
+      body: DomainBootstrap & { pusherChoices?: unknown };
+      signature: string;
+    };
+    delete payload.body.pusherChoices;
+    payload.signature = await f.ht.signer().sign(canonicalJson(payload.body));
+    last.operationId = 'domain-bootstrap:' +
+      createHash('sha256').update(canonicalJson(payload.body)).digest('hex');
+    const { hash: _, ...unsigned } = last;
+    last.hash = recordHash(unsigned);
+    await f.toEdge(records);
+    assertEquals(
+      (await (await f.edge.server()).query(
+        "SELECT ready FROM facade_scopes WHERE scope='pushers:@alice:logical.test'",
+      ))[0]?.ready,
+      0,
+    );
+    const authority = new FacadeAuth(
+      await f.edge.server(),
+      f.fp,
+      f.node,
+      new AuthLinkHealth({ notify: 'poll', pollseconds: 5 }),
+      {
+        replicatecredentials: true,
+        allowstaleauth: true,
+        authmaxstalehours: 0,
+      },
+    );
+    const tenant = await enrolledTenant(
+      f.edge,
+      f.fp,
+      'logical.test',
+      'edge_a',
+      authority,
+    );
+    await assertRejects(
+      () => listPushers(tenant, 'alice'),
+      MatrixError,
+      'domain snapshot unavailable',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain pushers: a signed pending removal cannot prove complete inventory before its causal history arrives', async () => {
+  const f = await fixture();
+  try {
+    const hd = await f.home.tenant('logical.test');
+    const [identity] = await hd.query(
+      'SELECT node,incarnation FROM tenant_authority',
+    );
+    const source = {
+      source: String(identity.node),
+      incarnation: String(identity.incarnation),
+    };
+    const key = JSON.stringify([
+      'pusher',
+      'alice',
+      'app',
+      'key',
+      crypto.randomUUID(),
+    ]);
+    const first = await hd.tx((conn) =>
+      writeRegister(conn, source, key, 'pusher', 'null')
+    );
+    await hd.tx((conn) => writeRegister(conn, source, key, 'pusher', 'null'));
+    // Missing retained source history, not a skipped link hash-chain record.
+    await hd.execute('DELETE FROM domain_operations WHERE operation_id=?', [
+      first.operation.operationId,
+    ]);
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    await f.toEdge(records.slice(0, -1));
+    const baseline = records.at(-1)!;
+    await f.ej.receive('home', [baseline]);
+    await assertRejects(
+      () => f.es.apply(f.ej, baseline),
+      LinkError,
+      'awaits causal history',
+    );
+    assertEquals(
+      await (await f.edge.server()).query(
+        "SELECT * FROM facade_scopes WHERE scope='pushers:@alice:logical.test' AND ready=1",
+      ),
+      [],
+    );
+    await f.et.tx((tx) => tx.pushers.import(first.operation));
+    await f.es.apply(f.ej, baseline);
+    assertEquals(
+      (await (await f.edge.server()).query(
+        "SELECT ready FROM facade_scopes WHERE scope='pushers:@alice:logical.test'",
+      ))[0]?.ready,
+      1,
+    );
+    assertEquals(
+      await (await f.edge.tenant('logical.test')).query(
+        'SELECT * FROM pushers',
+      ),
+      [],
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade pusher authority: registration and background delivery stay at the session issuer', async (t) => {
+  for (
+    const mode of [
+      'native registration',
+      'native row upsert',
+      'background sender',
+    ]
+  ) {
+    await t.step(mode, async () => {
+      const f = await fixture();
+      try {
+        const token = await issueToken(f.ht, 'alice', 'HOME_PUSH');
+        const pusher = {
+          app_id: 'app',
+          pushkey: 'key',
+          kind: 'http',
+          app_display_name: 'App',
+          device_display_name: 'Home',
+          lang: 'en',
+          data: { url: 'https://push.test/_matrix/push/v1/notify' },
+        };
+        await setPusher(f.ht, 'alice', token, pusher);
+        const auth = await exportAccountAuth(
+          f.home,
+          f.ht,
+          f.hp,
+          f.bundle.id,
+          'alice',
+          false,
+        );
+        await f.ej.receive('home', [auth]);
+        await new AccountSnapshots(f.edge, f.et, f.fp, f.owners).apply(
+          f.ej,
+          auth,
+        );
+        const ed = await f.edge.tenant('logical.test'),
+          hd = await f.home.tenant('logical.test');
+        if (mode === 'native registration') {
+          await assertRejects(
+            () => setPusher(f.et, 'alice', token, pusher),
+            MatrixError,
+            'operation owner unavailable',
+          );
+          assertEquals(await ed.query('SELECT * FROM pushers'), []);
+          assertEquals(await ed.query('SELECT * FROM pusher_changes'), []);
+        } else if (mode === 'native row upsert') {
+          const hash = await hashToken(token);
+          await assertRejects(
+            () => ed.tx((tx) => upsertPusherRow(tx, 'alice', pusher, hash)),
+            MatrixError,
+            'operation owner unavailable',
+          );
+          assertEquals(await ed.query('SELECT * FROM pushers'), []);
+        } else {
+          // Pre-existing protected replica state must never become sender authority.
+          const [row] = await hd.query('SELECT * FROM pushers');
+          const columns = Object.keys(row);
+          await ed.tx(async (tx) => {
+            await tx.execute(
+              'INSERT INTO pushers(' + columns.join(',') + ') VALUES(' +
+                columns.map(() => '?').join(',') + ')',
+              columns.map((key) => row[key]),
+            );
+            await recordPusherChange(tx, row, false);
+          });
+          const sent = { home: 0, edge: 0 };
+          for (const side of ['home', 'edge'] as const) {
+            const store = f[side], tenant = side === 'home' ? f.ht : f.et;
+            await projectTenant(store, 'logical.test');
+            await (await store.server()).tx((tx) =>
+              queueBadge(tx, '@alice:logical.test')
+            );
+            const sender = await startPushSender({
+              store,
+              tenant,
+              automatic: false,
+              send: () => {
+                sent[side]++;
+                return Promise.resolve([]);
+              },
+            });
+            try {
+              await sender.tick();
+            } finally {
+              await sender.stop();
+            }
+          }
+          assertEquals(
+            sent.home,
+            1,
+            'issuer did not send its own registration',
+          );
+          assertEquals(
+            sent.edge,
+            0,
+            'replica independently sent the same registration',
+          );
+        }
+      } finally {
+        await f.close();
+      }
+    });
+  }
+});
+
+Deno.test('facade forget: F2 directory import preserves receiver purgeability and local-only rooms', async () => {
+  const f = await fixture();
+  try {
+    const db = await f.edge.server();
+    await db.execute(
+      'INSERT INTO directory(room_id,purgeable_ms) VALUES(?,NULL),(?,NULL)',
+      ['!active:logical.test', '!local:logical.test'],
+    );
+    await db.tx((tx) =>
+      installDirectoryFacts(tx, {
+        aliases: [],
+        publication: [{
+          roomId: '!active:logical.test',
+          visibility: 'public',
+          purgeable: 123,
+        }],
+        forgotten: [],
+      }, 'logical.test')
+    );
+    assertEquals(
+      await db.query(
+        'SELECT room_id,purgeable_ms FROM directory ORDER BY room_id',
+      ),
+      [
+        { room_id: '!active:logical.test', purgeable_ms: null },
+        { room_id: '!local:logical.test', purgeable_ms: null },
+      ],
+    );
+    assertEquals(
+      (await db.query('SELECT visibility FROM visibility WHERE room_id=?', [
+        '!active:logical.test',
+      ]))[0].visibility,
+      'public',
+    );
+    // The pre-F2 snapshot contract is unchanged.
+    await db.execute('DELETE FROM facade_owner_activation');
+    await db.tx((tx) =>
+      installDirectoryFacts(tx, {
+        aliases: [],
+        publication: [{
+          roomId: '!active:logical.test',
+          visibility: 'private',
+          purgeable: 456,
+        }],
+        forgotten: [],
+      }, 'logical.test')
+    );
+    assertEquals(await db.query('SELECT room_id,purgeable_ms FROM directory'), [
+      { room_id: '!active:logical.test', purgeable_ms: 456 },
+    ]);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade forget: imported join projection clears purgeability without clearing concurrent intent', async () => {
+  const f = await fixture();
+  try {
+    const db = await f.edge.server();
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    const received = await makeFakeRoom({
+      roomId: '!imported-forget:logical.test',
+      creator: '@alice:logical.test',
+      server: await makeRemoteServer('logical.test'),
+    });
+    const events = [...received.events.values()];
+    await db.execute(
+      "INSERT INTO memberships(user,room,membership,event,seq) VALUES(?,?,'leave',?,1)",
+      ['@alice:logical.test', received.roomId, '$prior-leave'],
+    );
+    await forget(db, received.roomId, '@alice:logical.test', 'logical.test');
+    assertEquals(
+      typeof (await db.query(
+        'SELECT purgeable_ms FROM directory WHERE room_id=?',
+        [received.roomId],
+      ))[0].purgeable_ms,
+      'number',
+    );
+    await importReplicaGenesis(f.edge, {
+      roomId: received.roomId,
+      roomVersion: received.version,
+      self: 'logical.test',
+      keys: fakeKeyResolver(received.server),
+      create: events[0],
+      join: events[1],
+    });
+    await project(f.edge, received.roomId);
+    assertEquals(
+      (await membershipOf(db, received.roomId, '@alice:logical.test'))!
+        .membership,
+      'join',
+    );
+    assertEquals(
+      (await membershipOf(db, received.roomId, '@alice:logical.test'))!
+        .forgotten,
+      true,
+    );
+    assertEquals(
+      (await db.query('SELECT purgeable_ms FROM directory WHERE room_id=?', [
+        received.roomId,
+      ]))[0].purgeable_ms,
+      null,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade forget: profile-style self joins do not observe a rejoin', async (t) => {
+  for (const mode of ['direct local', 'prepared client', 'raw local']) {
+    await t.step(mode, async () => {
+      const f = await fixture();
+      try {
+        installJoinAdmission(f.home);
+        const user = '@alice:logical.test';
+        const created = await createRoom(f.home, {
+          creator: '@bob:logical.test',
+          preset: 'public_chat',
+        }, f.ht.signer());
+        const room = await openRoom(f.home, created.roomId),
+          hd = await f.home.server(),
+          ed = await f.edge.server();
+        await joinLocal(room, user, f.ht.signer());
+        await project(f.home, room.id);
+        await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+        await ed.execute(
+          "INSERT INTO memberships(user,room,membership,event,seq) VALUES(?,?,'leave',?,1)",
+          [user, room.id, '$other-branch-leave'],
+        );
+        await forget(ed, room.id, user, 'logical.test');
+        for (const op of await ed.tx((tx) => forgetOperations(tx, user))) {
+          await importForgetOperation(hd, op, async () => {});
+        }
+        assertEquals((await membershipOf(hd, room.id, user))!.forgotten, true);
+        let retained: PreparedSubmission | null = null;
+        const event = {
+          type: 'm.room.member',
+          sender: user,
+          state_key: user,
+          content: { membership: 'join', displayname: 'Updated profile' },
+        };
+        if (mode === 'raw local') {
+          const pdu = await room.tx((tx) =>
+            buildInTx(tx, room.id, event, f.ht.signer())
+          );
+          await ingestLocal(room, pdu, 'logical.test');
+        } else {await sendLocal(
+            room,
+            event,
+            f.ht.signer(),
+            mode === 'prepared client'
+              ? {
+                lookup: () => Promise.resolve(retained),
+                prepare: (pdu) =>
+                  Promise.resolve(
+                    retained = { eventId: String(pdu.event_id), pdu },
+                  ),
+                finish: async () => {},
+              }
+              : undefined,
+          );}
+        await project(f.home, room.id);
+        assertEquals(
+          (await membershipOf(hd, room.id, user))!.forgotten,
+          true,
+          'profile update cleared concurrent forget',
+        );
+      } finally {
+        await f.close();
+      }
+    });
+  }
+});
+
+Deno.test('facade forget: acceptance retains a same-transaction export fact', async () => {
+  const f = await fixture();
+  try {
+    const db = await f.edge.server();
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    await db.execute(
+      "INSERT INTO memberships(user,room,membership,event,seq) VALUES(?,?,'leave',?,1)",
+      ['@alice:logical.test', '!forgot:logical.test', '$leave'],
+    );
+    await forget(
+      db,
+      '!forgot:logical.test',
+      '@alice:logical.test',
+      'logical.test',
+    );
+    assertEquals(
+      (await db.query("SELECT * FROM domain_operations WHERE kind='forget'"))
+        .length,
+      1,
+      'accepted forget has no durable export fact',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade forget: invite and knock housekeeping cannot erase user intent', async () => {
+  const f = await fixture();
+  try {
+    const db = await f.edge.server();
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    await db.execute(
+      "INSERT INTO memberships(user,room,membership,event,seq) VALUES(?,?,'leave',?,1)",
+      ['@alice:logical.test', '!forgot:logical.test', '$leave'],
+    );
+    await forget(
+      db,
+      '!forgot:logical.test',
+      '@alice:logical.test',
+      'logical.test',
+    );
+    await clearPurgeable(db, '!forgot:logical.test', '@alice:logical.test');
+    assertEquals(
+      (await db.query('SELECT * FROM forgotten')).length,
+      1,
+      'housekeeping erased forget without observed rejoin',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade forget: delayed rejoin clears only admission-observed facts and converges out of order', async () => {
+  const f = await fixture();
+  const room = '!forgot:logical.test', user = '@alice:logical.test';
+  try {
+    const hd = await f.home.server(), ed = await f.edge.server();
+    for (const db of [hd, ed]) {
+      await db.execute(
+        "INSERT INTO memberships(user,room,membership,event,seq) VALUES(?,?,'leave',?,1)",
+        [user, room, '$leave'],
+      );
+    }
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    await forget(ed, room, user, 'logical.test');
+    const before = await prepareRejoin(ed, room, user) as RejoinObservation;
+    await forget(hd, room, user, 'logical.test');
+    await f.toEdge(await f.hs.export('alice', f.bundle.id));
+    // Its late projection observes a newer fact, but the join itself did not.
+    await ed.tx((tx) =>
+      projectRejoin(tx, room, '$rejoin-before', before, 'logical.test')
+    );
+    assertEquals((await membershipOf(ed, room, user))!.forgotten, true);
+    const unresolved = await ed.tx((tx) => forgetOperations(tx, user));
+    for (const op of unresolved.toReversed()) {
+      await importForgetOperation(hd, op, async () => {});
+    }
+    assertEquals((await membershipOf(hd, room, user))!.forgotten, true);
+    const after = await prepareRejoin(ed, room, user) as RejoinObservation;
+    await ed.tx((tx) =>
+      projectRejoin(tx, room, '$rejoin-after', after, 'logical.test')
+    );
+    const facts = await ed.tx((tx) => forgetOperations(tx, user));
+    for (const op of facts.toReversed()) {
+      await importForgetOperation(hd, op, async () => {});
+    }
+    assertEquals((await membershipOf(hd, room, user))!.forgotten, false);
+    assertEquals((await membershipOf(ed, room, user))!.forgotten, false);
+    await ed.tx((tx) =>
+      projectRejoin(tx, room, '$rejoin-before', before, 'logical.test')
+    );
+    assertEquals(
+      (await ed.tx((tx) => forgetOperations(tx, user))).length,
+      facts.length,
+      'replay invented a new observation',
+    );
+    await forget(ed, room, user, 'logical.test');
+    await ed.tx((tx) =>
+      installDirectoryFacts(
+        tx,
+        { aliases: [], publication: [], forgotten: [] },
+        'logical.test',
+      )
+    );
+    assertEquals(
+      (await membershipOf(ed, room, user))!.forgotten,
+      true,
+      'F1 snapshot removed F2 intent',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade forget: explicit legacy inventory repairs F1 rows and guards every membership consumer', async () => {
+  const f = await fixture();
+  const room = '!forgot:logical.test', user = '@alice:logical.test';
+  try {
+    const hd = await f.home.server(), ed = await f.edge.server();
+    await hd.execute('INSERT INTO forgotten(user,room) VALUES(?,?)', [
+      user,
+      room,
+    ]);
+    await ed.execute('INSERT INTO forgotten(user,room) VALUES(?,?)', [
+      user,
+      '!stale:logical.test',
+    ]);
+    await ed.execute(
+      "INSERT INTO memberships(user,room,membership,event,seq) VALUES(?,?,'leave',?,1)",
+      [user, room, '$leave'],
+    );
+    for (
+      const read of [
+        () => membershipOf(ed, room, user),
+        () => roomsFor(ed, user),
+        () => slidingListSnapshot(ed, user),
+      ]
+    ) await assertRejects(read, MatrixError, 'forget snapshot unavailable');
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    assertEquals((await membershipOf(ed, room, user))!.forgotten, true);
+    assertEquals(
+      (await ed.query('SELECT room FROM forgotten WHERE user=?', [user])).map((
+        row,
+      ) => row.room),
+      [room],
+    );
+    const source = await hd.tx((tx) => forgetOperations(tx, user));
+    assertEquals(source.length, 1);
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    assertEquals(
+      (await hd.tx((tx) => forgetOperations(tx, user))).length,
+      1,
+      'bootstrap reauthored a legacy fact',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade forget: visibility failure rolls back the source fact and imported intent', async () => {
+  const f = await fixture();
+  const room = '!forgot:logical.test', user = '@alice:logical.test';
+  try {
+    const hd = await f.home.server(), ed = await f.edge.server();
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    for (const db of [hd, ed]) {
+      await db.execute(
+        "INSERT INTO memberships(user,room,membership,event,seq) VALUES(?,?,'leave',?,1)",
+        [user, room, '$leave'],
+      );
+    }
+    await ed.exec(
+      "CREATE TRIGGER forget_fail BEFORE INSERT ON forgotten BEGIN SELECT RAISE(ABORT,'forget rollback'); END",
+    );
+    await assertRejects(
+      () => forget(ed, room, user, 'logical.test'),
+      Error,
+      'forget rollback',
+    );
+    assertEquals(await ed.tx((tx) => forgetOperations(tx, user)), []);
+    await forget(hd, room, user, 'logical.test');
+    const [op] = await hd.tx((tx) => forgetOperations(tx, user));
+    await assertRejects(
+      () => importForgetOperation(ed, op, async () => {}),
+      Error,
+      'forget rollback',
+    );
+    assertEquals(await ed.tx((tx) => forgetOperations(tx, user)), []);
+    await ed.exec('DROP TRIGGER forget_fail');
+    await importForgetOperation(ed, op, async () => {});
+    assertEquals((await ed.query('SELECT room FROM forgotten')).length, 1);
+  } finally {
+    await f.close();
+  }
+});
+
+for (
+  const [newerForget, ingress] of [[false, 'send'], [true, 'send'], [
+    false,
+    'ingest',
+  ], [true, 'ingest']] as const
+) {
+  Deno.test(`facade forget: accepted in-room invite restores only observed visibility (${ingress}, newer forget: ${newerForget})`, async () => {
+    const f = await fixture();
+    const user = '@alice:logical.test';
+    try {
+      installJoinAdmission(f.home);
+      const created = await createRoom(f.home, {
+        creator: '@bob:logical.test',
+        preset: 'public_chat',
+      }, f.ht.signer());
+      const room = await openRoom(f.home, created.roomId),
+        db = await f.home.server();
+      await joinLocal(room, user, f.ht.signer());
+      await project(f.home, room.id);
+      await leaveLocal(room, user, f.ht.signer());
+      await project(f.home, room.id);
+      await forget(db, room.id, user, 'logical.test');
+      setJoinObservation(f.home, async (roomId, userId) => {
+        const captured = await prepareRejoin(db, roomId, userId);
+        if (newerForget) await forget(db, roomId, userId, 'logical.test');
+        return captured;
+      });
+      const partial = {
+        type: 'm.room.member',
+        sender: '@bob:logical.test',
+        state_key: user,
+        content: { membership: 'invite' },
+      };
+      const result = ingress === 'send'
+        ? await sendLocal(room, partial, f.ht.signer())
+        : await ingestLocal(
+          room,
+          await room.tx((tx) => buildInTx(tx, room.id, partial, f.ht.signer())),
+          f.ht.serverName,
+        );
+      assertEquals(result.standing, 'accepted');
+      await project(f.home, room.id);
+      assertEquals(
+        (await membershipOf(db, room.id, user))!.forgotten,
+        newerForget,
+      );
+      const operations = await db.tx((tx) => forgetOperations(tx, user));
+      const count = operations.length;
+      await project(f.home, room.id);
+      assertEquals(
+        (await db.tx((tx) => forgetOperations(tx, user))).length,
+        count,
+      );
+      assertEquals(
+        operations.some((op) =>
+          JSON.parse(op.payload).eventId === result.eventId
+        ),
+        true,
+      );
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+Deno.test('facade forget: actual local join retains admission context across cold projection and idempotent retry', async () => {
+  const f = await fixture();
+  const user = '@alice:logical.test';
+  try {
+    installJoinAdmission(f.home);
+    const created = await createRoom(f.home, {
+      creator: '@bob:logical.test',
+      preset: 'public_chat',
+    }, f.ht.signer());
+    const room = await openRoom(f.home, created.roomId),
+      db = await f.home.server();
+    await joinLocal(room, user, f.ht.signer());
+    await project(f.home, room.id);
+    await leaveLocal(room, user, f.ht.signer());
+    await project(f.home, room.id);
+    await forget(db, room.id, user, 'logical.test');
+    setJoinObservation(f.home, async (roomId, userId) => {
+      const captured = await prepareRejoin(db, roomId, userId);
+      await forget(db, roomId, userId, 'logical.test');
+      return captured;
+    });
+    const joined = await joinLocal(room, user, f.ht.signer());
+    assertEquals(joined.created, true);
+    // Explicit cold roll-forward uses room-retained context, not a fresh read.
+    await f.home.close();
+    const reopened = await f.open('home');
+    try {
+      await recoverServer(reopened);
+      const server = await reopened.server(),
+        retainedRoom = await openRoom(reopened, room.id);
+      assertEquals(
+        (await membershipOf(server, room.id, user))!.forgotten,
+        true,
+      );
+      const count = (await server.tx((tx) =>
+        forgetOperations(tx, user)
+      )).length;
+      assertEquals(
+        (await joinLocal(retainedRoom, user, f.ht.signer())).created,
+        false,
+      );
+      await project(reopened, room.id);
+      assertEquals(
+        (await server.tx((tx) => forgetOperations(tx, user))).length,
+        count,
+      );
+      assertEquals(
+        (await membershipOf(server, room.id, user))!.forgotten,
+        true,
+      );
+      await leaveLocal(retainedRoom, user, f.ht.signer());
+      await project(reopened, room.id);
+      await joinLocal(retainedRoom, user, f.ht.signer());
+      await project(reopened, room.id);
+      assertEquals(
+        (await membershipOf(server, room.id, user))!.forgotten,
+        false,
+      );
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade forget: a stale rejoin observation is inert evidence and never blocks the room cursor', async (t) => {
+  const f = await fixture();
+  const user = '@alice:logical.test';
+  try {
+    installJoinAdmission(f.home);
+    const db = await f.home.server();
+    for (
+      const [name, stale] of [
+        ['superseded authority incarnation', 'authority'],
+        ['join no longer accepted and grounded', 'standing'],
+      ] as const
+    ) {
+      await t.step(name, async () => {
+        // Each case owns its room: one wedged cursor cannot fail the other.
+        const created = await createRoom(f.home, {
+          creator: '@bob:logical.test',
+          preset: 'public_chat',
+        }, f.ht.signer());
+        const room = await openRoom(f.home, created.roomId);
+        setJoinObservation(
+          f.home,
+          (roomId, userId) => prepareRejoin(db, roomId, userId),
+        );
+        await joinLocal(room, user, f.ht.signer());
+        await leaveLocal(room, user, f.ht.signer());
+        await project(f.home, room.id);
+        await forget(db, room.id, user, 'logical.test');
+        const count = (await db.tx((tx) => forgetOperations(tx, user))).length;
+        setJoinObservation(f.home, async (roomId, userId) => {
+          const captured = await prepareRejoin(db, roomId, userId);
+          return stale === 'authority'
+            ? { ...captured, incarnation: 'superseded-incarnation' }
+            : captured;
+        });
+        const joined = await joinLocal(room, user, f.ht.signer());
+        if (stale === 'standing') {
+          await room.tx((tx) =>
+            tx.events.setStatus(joined.eventId, {
+              standing: 'rejected',
+              grounding: 'grounded',
+              origin: null,
+              received_ts: Date.now(),
+            })
+          );
+        }
+        const later = await sendLocal(room, {
+          type: 'm.room.message',
+          sender: '@bob:logical.test',
+          content: { msgtype: 'm.text', body: 'after ' + stale },
+        }, f.ht.signer());
+        await project(f.home, room.id);
+        assertEquals(
+          await db.query('SELECT room FROM feed WHERE event=?', [
+            later.eventId,
+          ]),
+          [{ room: room.id }],
+          'stale observation blocked later room projection',
+        );
+        assertEquals(
+          (await db.tx((tx) => forgetOperations(tx, user))).length,
+          count,
+          'stale observation authored a rejoin',
+        );
+        assertEquals(
+          (await membershipOf(db, room.id, user))!.forgotten,
+          true,
+        );
+      });
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade forget: producers fence an in-flight receive of the account stream', async () => {
+  const f = await fixture();
+  const room = '!fenced:logical.test', user = '@alice:logical.test';
+  try {
+    const hd = await f.home.server(), ed = await f.edge.server();
+    for (const db of [hd, ed]) {
+      await db.execute(
+        "INSERT INTO memberships(user,room,membership,event,seq) VALUES(?,?,'leave',?,1)",
+        [user, room, '$leave'],
+      );
+    }
+    const bootstrap = await f.hs.bootstrap('alice', f.bundle.id);
+    await f.toEdge(bootstrap);
+    await forget(hd, room, user, 'logical.test');
+    const suffix = (await f.hs.export('alice', f.bundle.id)).filter((record) =>
+      record.sequence > bootstrap.at(-1)!.sequence
+    );
+    assert(suffix.length > 0);
+    const held = Promise.withResolvers<void>();
+    const receiver = new Journal({
+      ...ed,
+      tx: async (fn, options) => {
+        await held.promise;
+        return await ed.tx(fn, options);
+      },
+    }, LINK_SUPPORTED);
+    const receiving = receiver.receive('home', suffix);
+    try {
+      for (
+        const produce of [
+          () => prepareRejoin(ed, room, user),
+          () => forget(ed, room, user, 'logical.test'),
+        ]
+      ) {
+        await assertRejects(
+          produce,
+          MatrixError,
+          'forget snapshot unavailable',
+        );
+      }
+    } finally {
+      held.resolve();
+      await receiving;
+    }
+    assertEquals(
+      await ed.query('SELECT room FROM forgotten WHERE user=?', [user]),
+      [],
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade forget: prepared client membership retry retains its original observation before room commit', async () => {
+  const f = await fixture();
+  const user = '@alice:logical.test';
+  try {
+    installJoinAdmission(f.home);
+    const created = await createRoom(f.home, {
+      creator: '@bob:logical.test',
+      preset: 'public_chat',
+    }, f.ht.signer());
+    const room = await openRoom(f.home, created.roomId),
+      db = await f.home.server();
+    await joinLocal(room, user, f.ht.signer());
+    await leaveLocal(room, user, f.ht.signer());
+    await project(f.home, room.id);
+    await forget(db, room.id, user, 'logical.test');
+    let retained: PreparedSubmission | null = null;
+    const event = {
+      type: 'm.room.member',
+      sender: user,
+      state_key: user,
+      content: { membership: 'join' },
+    };
+    const submission = {
+      lookup: () => Promise.resolve(retained),
+      prepare: (
+        pdu: import('#engine/pdu.ts').Pdu,
+      ): Promise<PreparedSubmission> => {
+        retained = { eventId: String(pdu.event_id), pdu };
+        return Promise.reject(new Error('prepared interruption'));
+      },
+      finish: async () => {},
+    };
+    await assertRejects(
+      () => sendLocal(room, event, f.ht.signer(), submission),
+      Error,
+      'prepared interruption',
+    );
+    await forget(db, room.id, user, 'logical.test');
+    await f.home.close();
+    const reopened = await f.open('home');
+    try {
+      installJoinAdmission(reopened);
+      const replayRoom = await openRoom(reopened, room.id);
+      const result = await sendLocal(
+        replayRoom,
+        event,
+        f.ht.signer(),
+        submission,
+      );
+      assertEquals(result.eventId, retained!.eventId);
+      await project(reopened, room.id);
+      assertEquals(
+        (await membershipOf(await reopened.server(), room.id, user))!.forgotten,
+        true,
+        'retry replaced original context with a new observation',
+      );
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade reports: accepted submission retains an atomic immutable export fact', async () => {
+  const f = await fixture();
+  try {
+    const db = await f.edge.server();
+    await storeReport(db, {
+      kind: 'user',
+      reporter: '@alice:logical.test',
+      userId: '@bob:logical.test',
+      reason: 'private report',
+    });
+    const facts = await db.query(
+      "SELECT * FROM domain_operations WHERE kind='report'",
+    );
+    assertEquals(facts.length, 1, 'accepted report has no durable export fact');
+    const [row] = (await listReports(db)).reports;
+    assertEquals(
+      JSON.parse(String(facts[0].payload_json)).receivedMs,
+      row.receivedMs,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade reports: resolution is refused by the server owner at facade ingress', async () => {
+  const f = await fixture();
+  try {
+    const db = await f.edge.server();
+    await storeReport(db, {
+      kind: 'user',
+      reporter: '@alice:logical.test',
+      userId: '@bob:logical.test',
+      reason: '',
+    });
+    const error = await assertRejects(
+      () => resolveReport(db, 1, 'illicit edge resolution'),
+      MatrixError,
+    );
+    assertEquals(error.status, 503);
+    assertEquals((await listReports(db)).reports[0].resolvedMs, null);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade reports: signed append union preserves both integer-ID collisions and home resolution', async () => {
+  const f = await fixture();
+  try {
+    const hd = await f.home.server(), ed = await f.edge.server();
+    for (
+      const [db, reason] of [[hd, 'home-private'], [
+        ed,
+        'edge-private',
+      ]] as const
+    ) {
+      await storeReport(db, {
+        kind: 'user',
+        reporter: '@alice:logical.test',
+        userId: '@bob:logical.test',
+        reason,
+      });
+    }
+    const home = (await listReports(hd)).reports[0],
+      edge = (await listReports(ed)).reports[0];
+    assertEquals(home.id, edge.id);
+    assertEquals(home.reportId === edge.reportId, false);
+    for (const record of await f.es.export('alice')) {
+      await f.hj.receive(f.node.node, [record]);
+      await f.hs.apply(f.hj, record, f.bundle.id);
+    }
+    const imported = (await listReports(hd)).reports.find((r) =>
+      r.reportId === edge.reportId
+    )!;
+    assertEquals(imported.reason, 'edge-private');
+    assertEquals(imported.receivedMs, edge.receivedMs);
+    const resolution = await resolveReport(hd, imported.id, 'home-reviewed');
+    assertEquals(
+      await resolveReport(hd, imported.id, 'ignored second resolution'),
+      resolution,
+    );
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    await f.toEdge(records);
+    await f.toEdge(records);
+    const rows = (await listReports(ed)).reports;
+    assertEquals(rows.length, 2);
+    const observed = rows.find((r) => r.reportId === edge.reportId)!;
+    assertEquals(observed.resolvedMs, resolution.resolvedMs);
+    assertEquals(observed.resolution, 'home-reviewed');
+    assertEquals(
+      (await ed.query(
+        "SELECT * FROM domain_operations WHERE kind='report-resolution'",
+      )).length,
+      1,
+    );
+    assertEquals(await ed.query('SELECT * FROM feed'), []);
+    assertEquals(await ed.query('SELECT * FROM outbox'), []);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade reports: resolution before submission, replay and protected diagnostics', async () => {
+  const f = await fixture();
+  try {
+    const hd = await f.home.server(), ed = await f.edge.server();
+    await storeReport(hd, {
+      kind: 'room',
+      reporter: '@alice:logical.test',
+      roomId: '!held:logical.test',
+      reason: 'protected',
+    });
+    await resolveReport(hd, 1, 'resolved before transmission');
+    const facts = await hd.tx((conn) =>
+      reportOperations(conn, '@alice:logical.test')
+    );
+    const submission = facts.find((o) => o.kind === 'report')!,
+      resolution = facts.find((o) => o.kind === 'report-resolution')!;
+    const check = async () => {};
+    await importReportOperation(ed, resolution, check);
+    assertEquals((await listReports(ed)).reports, []);
+    await importReportOperation(ed, submission, check);
+    await importReportOperation(ed, resolution, check);
+    assertEquals(
+      (await listReports(ed)).reports[0].resolution,
+      'resolved before transmission',
+    );
+    for (
+      const invalid of [{
+        ...submission,
+        payload: '{"reason":"PRIVATE_REPORT_MARKER",',
+      }, { ...submission, semanticKey: '["report","PRIVATE_REPORT_MARKER",' }]
+    ) {
+      const error = await assertRejects(
+        () => importReportOperation(ed, invalid, check),
+        Error,
+      );
+      assertEquals(error.message, 'invalid report fact');
+    }
+    const forged = {
+      ...resolution,
+      source: f.node.node,
+      incarnation: f.node.incarnation,
+    };
+    await assertRejects(
+      () => importReportOperation(ed, forged, check),
+      Error,
+      'invalid report resolution',
+    );
+    assertEquals((await listReports(ed)).reports.length, 1);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade reports: source and import roll back their facts with the owned row', async () => {
+  const f = await fixture();
+  try {
+    const hd = await f.home.server(), ed = await f.edge.server();
+    await ed.exec(
+      "CREATE TRIGGER report_fail BEFORE INSERT ON reports BEGIN SELECT RAISE(ABORT,'report rollback'); END",
+    );
+    await assertRejects(() =>
+      storeReport(ed, {
+        kind: 'room',
+        reporter: '@alice:logical.test',
+        roomId: '!r:logical.test',
+        reason: '',
+      })
+    );
+    assertEquals(
+      await ed.query("SELECT * FROM domain_operations WHERE kind='report'"),
+      [],
+    );
+    await storeReport(hd, {
+      kind: 'room',
+      reporter: '@alice:logical.test',
+      roomId: '!r:logical.test',
+      reason: '',
+    });
+    const fact = (await hd.tx((conn) =>
+      reportOperations(conn, '@alice:logical.test')
+    ))[0];
+    await assertRejects(() => importReportOperation(ed, fact, async () => {}));
+    assertEquals(
+      await ed.query("SELECT * FROM domain_operations WHERE kind='report'"),
+      [],
+    );
+    await ed.exec('DROP TRIGGER report_fail');
+    await importReportOperation(ed, fact, async () => {});
+    assertEquals((await listReports(ed)).reports.length, 1);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade reports: legacy home capture keeps original received and resolution cuts', async () => {
+  const f = await fixture();
+  try {
+    const hd = await f.home.server();
+    await hd.execute(
+      "INSERT INTO reports(kind,reporter,user_id,reason,received_ms,resolved_ms,resolution) VALUES('user',?,?,?,?,?,?)",
+      [
+        '@alice:logical.test',
+        '@bob:logical.test',
+        'old private reason',
+        10,
+        20,
+        'old resolution',
+      ],
+    );
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    await f.toEdge(records);
+    const row = (await listReports(await f.edge.server())).reports[0];
+    assertEquals([row.receivedMs, row.resolvedMs, row.resolution], [
+      10,
+      20,
+      'old resolution',
+    ]);
+    const before = await hd.tx((conn) =>
+      reportOperations(conn, '@alice:logical.test')
+    );
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    assertEquals(
+      await hd.tx((conn) => reportOperations(conn, '@alice:logical.test')),
+      before,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade reports: resolution export failure rolls back its local result', async () => {
+  const f = await fixture();
+  try {
+    const db = await f.home.server();
+    await storeReport(db, {
+      kind: 'room',
+      reporter: '@alice:logical.test',
+      roomId: '!r:logical.test',
+      reason: 'retained',
+    });
+    await db.exec(
+      "CREATE TRIGGER resolution_fail BEFORE INSERT ON domain_operations WHEN NEW.kind='report-resolution' BEGIN SELECT RAISE(ABORT,'resolution rollback'); END",
+    );
+    await assertRejects(() => resolveReport(db, 1, 'must roll back'));
+    assertEquals((await listReports(db)).reports[0].resolvedMs, null);
+    assertEquals(
+      await db.query(
+        "SELECT * FROM domain_operations WHERE kind='report-resolution'",
+      ),
+      [],
+    );
+    await db.exec('DROP TRIGGER resolution_fail');
+    assertEquals(
+      (await resolveReport(db, 1, 'committed')).resolution,
+      'committed',
+    );
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('directory scope retains selected local initiation without hiding unapplied home cuts', async (t) => {
   for (const mode of ['create', 'stock join']) {
@@ -470,6 +2465,630 @@ Deno.test('directory scope retains selected local initiation without hiding unap
     });
   }
 });
+
+Deno.test('domain filters: signed bootstrap and suffix preserve immutable objects in both directions', async () => {
+  const f = await fixture();
+  try {
+    await f.ht.tx((tx) =>
+      tx.filters.insert('alice', '7', '{"room":{"timeline":{"limit":7}}}')
+    );
+    const id = await storeFilter(f.ht, 'alice', {
+      room: { timeline: { limit: 1 } },
+    });
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    await f.toEdge(records);
+    assertEquals(await loadFilter(f.et, 'alice', '7'), {
+      room: { timeline: { limit: 7 } },
+    });
+    assertEquals(await loadFilter(f.et, 'alice', id), {
+      room: { timeline: { limit: 1 } },
+    });
+    const edgeId = await storeFilter(f.et, 'alice', {
+      room: { timeline: { limit: 2 } },
+    });
+    for (const record of await f.es.export('alice')) {
+      await f.hj.receive(f.node.node, [record]);
+      await f.hs.apply(f.hj, record, f.bundle.id);
+    }
+    assertEquals(await loadFilter(f.ht, 'alice', edgeId), {
+      room: { timeline: { limit: 2 } },
+    });
+    const before = await f.et.tx((tx) => tx.streams.heads());
+    const homeCut = Math.max(...records.map((record) => record.sequence));
+    const suffixId = await storeFilter(f.ht, 'alice', {
+      account_data: { types: ['m.direct'] },
+    });
+    const suffix = (await f.hs.export('alice', f.bundle.id)).filter((record) =>
+      record.sequence > homeCut
+    );
+    await f.toEdge(suffix);
+    await f.toEdge(suffix);
+    assertEquals(await loadFilter(f.et, 'alice', suffixId), {
+      account_data: { types: ['m.direct'] },
+    });
+    assertEquals(await f.et.tx((tx) => tx.streams.heads()), before);
+    await f.edge.close();
+    const reopened = await f.open('edge');
+    try {
+      const server = await reopened.server();
+      const node = await loadNode(server, 'logical.test', 'edge_a');
+      const pairings = new Pairings(
+        server,
+        node.signer(),
+        node.publicKey,
+        'b'.repeat(64),
+        node,
+      );
+      const tenant = await enrolledTenant(
+        reopened,
+        pairings,
+        'logical.test',
+        'edge_a',
+      );
+      assertEquals(await loadFilter(tenant, 'alice', suffixId), {
+        account_data: { types: ['m.direct'] },
+      });
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain filters: old signed domain bootstrap cannot prove the new filter scope complete', async () => {
+  const f = await fixture();
+  try {
+    const records = structuredClone(await f.hs.bootstrap('alice', f.bundle.id));
+    const last = records.at(-1)!;
+    const payload = last.payload as {
+      body: DomainBootstrap & { filters?: unknown };
+      signature: string;
+    };
+    delete payload.body.filters;
+    payload.signature = await f.ht.signer().sign(canonicalJson(payload.body));
+    last.operationId = 'domain-bootstrap:' +
+      createHash('sha256').update(canonicalJson(payload.body)).digest('hex');
+    last.hash = recordHash({
+      source: last.source,
+      incarnation: last.incarnation,
+      stream: last.stream,
+      sequence: last.sequence,
+      type: last.type,
+      version: last.version,
+      operationId: last.operationId,
+      previous: last.previous,
+      payload: last.payload,
+    });
+    await f.toEdge(records);
+    const tenant = await enrolledTenant(
+      f.edge,
+      f.fp,
+      'logical.test',
+      'edge_a',
+      new FacadeAuth(
+        await f.edge.server(),
+        f.fp,
+        f.node,
+        new AuthLinkHealth({ notify: 'websocket', pollseconds: 1 }),
+        {
+          replicatecredentials: false,
+          allowstaleauth: false,
+          authmaxstalehours: 1,
+        },
+      ),
+    );
+    assertEquals(await getAccountData(tenant, 'alice', '', 'm.direct'), null);
+    await assertRejects(
+      () => loadFilter(tenant, 'alice', '7'),
+      MatrixError,
+      'domain snapshot unavailable',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+async function completeOpenIdInventory(f: Awaited<ReturnType<typeof fixture>>) {
+  const auth = await exportAccountAuth(
+    f.home,
+    f.ht,
+    f.hp,
+    f.bundle.id,
+    'bob',
+    false,
+  );
+  await f.ej.receive('home', [auth]);
+  await new AccountSnapshots(f.edge, f.et, f.fp, f.owners).apply(f.ej, auth);
+  await f.toEdge(await f.hs.bootstrap('bob', f.bundle.id));
+  const directory = await exportDirectoryReplica(
+    f.home,
+    f.ht,
+    f.node.node,
+    f.bundle.id,
+  );
+  if (!directory) throw new Error('missing initial directory');
+  await f.ej.receive('home', [directory]);
+  await new DirectoryReplicas(await f.edge.server(), f.fp, 'logical.test')
+    .apply(f.ej, directory);
+}
+
+Deno.test('domain OpenID: signed bootstrap captures legacy digests and suffix imports keep the original issuer', async () => {
+  const f = await fixture();
+  try {
+    const now = Date.now(), legacy = '7'.repeat(64);
+    const legacyHash = await hashToken(legacy);
+    await f.ht.tx((tx) => tx.openid.insert(legacyHash, 'alice', now + 3600000));
+    const issued = await issueOpenIdToken(f.ht, 'alice', now);
+    const baseline = await f.hs.bootstrap('alice', f.bundle.id);
+    await f.toEdge(baseline);
+    const tenant = await enrolledTenant(
+      f.edge,
+      f.fp,
+      'logical.test',
+      'edge_a',
+      new FacadeAuth(
+        await f.edge.server(),
+        f.fp,
+        f.node,
+        new AuthLinkHealth({ notify: 'websocket', pollseconds: 1 }),
+        {
+          replicatecredentials: false,
+          allowstaleauth: false,
+          authmaxstalehours: 1,
+        },
+      ),
+    );
+    for (const token of [legacy, issued.access_token]) {
+      assertEquals(await openIdUserInfo(tenant, token, now), {
+        sub: '@alice:logical.test',
+      });
+      assertEquals(await lookupToken(f.et, token), null);
+    }
+    const edgeToken = await issueOpenIdToken(tenant, 'alice', now);
+    const before = await f.et.tx((tx) => tx.streams.heads());
+    for (const record of await f.es.export('alice')) {
+      await f.hj.receive(f.node.node, [record]);
+      await f.hs.apply(f.hj, record, f.bundle.id);
+    }
+    assertEquals(await openIdUserInfo(f.ht, edgeToken.access_token, now), {
+      sub: '@alice:logical.test',
+    });
+    const homeCut = Math.max(...baseline.map((record) => record.sequence));
+    const suffix = await issueOpenIdToken(f.ht, 'alice', now);
+    const records = (await f.hs.export('alice', f.bundle.id)).filter((record) =>
+      record.sequence > homeCut
+    );
+    await f.toEdge(records);
+    await f.toEdge(records);
+    assertEquals(await openIdUserInfo(tenant, suffix.access_token, now), {
+      sub: '@alice:logical.test',
+    });
+    assertEquals(await f.et.tx((tx) => tx.streams.heads()), before);
+    await completeOpenIdInventory(f);
+    const unknown = await assertRejects(
+      () => openIdUserInfo(tenant, 'not-a-token'),
+      MatrixError,
+    );
+    assertEquals(unknown.errcode, 'M_UNKNOWN_TOKEN');
+    const exported = await f.hs.export('alice', f.bundle.id);
+    assertEquals(
+      exported.some((record) => {
+        const body = (record.payload as { body: DomainOperation }).body;
+        return body.kind === 'domain-operation' &&
+          body.operation.source === f.node.node;
+      }),
+      false,
+    );
+    await f.edge.close();
+    const reopened = await f.open('edge');
+    try {
+      const coldNode = await loadNode(
+        await reopened.server(),
+        'logical.test',
+        'edge_a',
+      );
+      const pairings = new Pairings(
+        await reopened.server(),
+        coldNode.signer(),
+        coldNode.publicKey,
+        'b'.repeat(64),
+        coldNode,
+      );
+      const cold = await enrolledTenant(
+        reopened,
+        pairings,
+        'logical.test',
+        'edge_a',
+      );
+      for (
+        const token of [
+          legacy,
+          issued.access_token,
+          edgeToken.access_token,
+          suffix.access_token,
+        ]
+      ) {
+        assertEquals(await openIdUserInfo(cold, token, now), {
+          sub: '@alice:logical.test',
+        });
+      }
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain OpenID: older bootstrap does not prove missing legacy credentials absent or enable issuance', async () => {
+  const f = await fixture();
+  try {
+    await completeOpenIdInventory(f);
+    const records = structuredClone(await f.hs.bootstrap('alice', f.bundle.id));
+    const last = records.at(-1)!;
+    const payload = last.payload as {
+      body: DomainBootstrap;
+      signature: string;
+    };
+    delete payload.body.openid;
+    payload.signature = await f.ht.signer().sign(canonicalJson(payload.body));
+    last.operationId = 'domain-bootstrap:' +
+      createHash('sha256').update(canonicalJson(payload.body)).digest('hex');
+    last.hash = recordHash({
+      source: last.source,
+      incarnation: last.incarnation,
+      stream: last.stream,
+      sequence: last.sequence,
+      type: last.type,
+      version: last.version,
+      operationId: last.operationId,
+      previous: last.previous,
+      payload: last.payload,
+    });
+    await f.toEdge(records);
+    const tenant = await enrolledTenant(
+      f.edge,
+      f.fp,
+      'logical.test',
+      'edge_a',
+      new FacadeAuth(
+        await f.edge.server(),
+        f.fp,
+        f.node,
+        new AuthLinkHealth({ notify: 'websocket', pollseconds: 1 }),
+        {
+          replicatecredentials: false,
+          allowstaleauth: false,
+          authmaxstalehours: 1,
+        },
+      ),
+    );
+    for (
+      const operation of [
+        () => openIdUserInfo(tenant, '7'.repeat(64)),
+        () => issueOpenIdToken(tenant, 'alice'),
+      ]
+    ) {
+      const error = await assertRejects(operation, MatrixError);
+      assertEquals(error.status, 503);
+      assertEquals(error.errcode, 'M_UNAVAILABLE');
+    }
+    assertEquals(await f.et.tx((tx) => tx.openid.operations('alice')), []);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain OpenID: unseen selected account and later inventory receipt cannot prove bearer absence', async () => {
+  const f = await fixture();
+  try {
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    const directory = await exportDirectoryReplica(
+      f.home,
+      f.ht,
+      f.node.node,
+      f.bundle.id,
+    );
+    if (!directory) throw new Error('missing initial directory');
+    await f.ej.receive('home', [directory]);
+    await new DirectoryReplicas(await f.edge.server(), f.fp, 'logical.test')
+      .apply(f.ej, directory);
+    const authority = new FacadeAuth(
+      await f.edge.server(),
+      f.fp,
+      f.node,
+      new AuthLinkHealth({ notify: 'websocket', pollseconds: 1 }),
+      {
+        replicatecredentials: false,
+        allowstaleauth: false,
+        authmaxstalehours: 1,
+      },
+    );
+    const tenant = await enrolledTenant(
+      f.edge,
+      f.fp,
+      'logical.test',
+      'edge_a',
+      authority,
+    );
+    const legacy = '6'.repeat(64),
+      hash = await hashToken(legacy),
+      now = Date.now();
+    await f.ht.tx((tx) => tx.openid.insert(hash, 'bob', now + 3600000));
+    const pending = await assertRejects(
+      () => openIdUserInfo(tenant, legacy, now),
+      MatrixError,
+    );
+    assertEquals(
+      pending.status,
+      503,
+      'selected Bob has not supplied his private inventory',
+    );
+    const auth = await exportAccountAuth(
+      f.home,
+      f.ht,
+      f.hp,
+      f.bundle.id,
+      'bob',
+      false,
+    );
+    await f.ej.receive('home', [auth]);
+    await new AccountSnapshots(f.edge, f.et, f.fp, f.owners).apply(f.ej, auth);
+    await f.toEdge(await f.hs.bootstrap('bob', f.bundle.id));
+    assertEquals(await openIdUserInfo(tenant, legacy, now), {
+      sub: '@bob:logical.test',
+    });
+    const unknown = await assertRejects(
+      () => openIdUserInfo(tenant, 'not-a-token'),
+      MatrixError,
+    );
+    assertEquals(unknown.errcode, 'M_UNKNOWN_TOKEN');
+    const prepared = await authority.prepare();
+    const received = await (await f.home.server()).tx((conn) =>
+      appendRecord(conn, f.node.node, {
+        source: directory.source,
+        incarnation: directory.incarnation,
+        stream: directory.stream,
+        type: directory.type,
+        version: directory.version,
+        operationId: 'openid-inventory-receive',
+        payload: directory.payload,
+      })
+    );
+    await f.ej.receive('home', [received]);
+    const invalidated = await assertRejects(
+      () =>
+        (f.edge.tenant('logical.test')).then((db) =>
+          db.tx((conn) =>
+            prepared.check(conn, { kind: 'openid', hash: '0'.repeat(64) })
+          )
+        ),
+      MatrixError,
+    );
+    assertEquals(
+      invalidated.status,
+      503,
+      'a newly received directory invalidates prepared absence',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain backup: signed home revisions retain ciphertext, exact etags, deletes and consumer availability', async () => {
+  const f = await fixture();
+  const metadata = {
+    algorithm: 'opaque',
+    auth_data: { key: 'public', extension: 0.5 },
+  };
+  const data = {
+    first_message_index: 2,
+    forwarded_count: 0,
+    is_verified: false,
+    session_data: { ciphertext: 'private-ciphertext' },
+  };
+  try {
+    await f.ht.tx((tx) =>
+      tx.keyBackup.version('alice', 'post', undefined, metadata)
+    );
+    await f.ht.tx((tx) =>
+      tx.keyBackup.keys('alice', 'put', '1', '!backup:logical.test', 's', data)
+    );
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    const tenant = await enrolledTenant(
+      f.edge,
+      f.fp,
+      'logical.test',
+      'edge_a',
+      new FacadeAuth(
+        await f.edge.server(),
+        f.fp,
+        f.node,
+        new AuthLinkHealth({ notify: 'websocket', pollseconds: 1 }),
+        {
+          replicatecredentials: false,
+          allowstaleauth: false,
+          authmaxstalehours: 1,
+        },
+      ),
+    );
+    assertEquals(
+      await tenant.tx((tx) => tx.keyBackup.version('alice', 'get')),
+      { ...metadata, version: '1', count: 1, etag: '1' },
+    );
+    assertEquals(
+      await tenant.tx((tx) =>
+        tx.keyBackup.keys('alice', 'get', '1', '!backup:logical.test', 's')
+      ),
+      data,
+    );
+    const absent = await assertRejects(
+      () => tenant.tx((tx) => tx.keyBackup.version('alice', 'get', '999')),
+      MatrixError,
+    );
+    assertEquals(absent.status, 404);
+    const before = await tenant.tx((tx) => tx.streams.heads());
+    const previous = Math.max(
+      ...(await f.hs.export('alice', f.bundle.id)).map((record) =>
+        record.sequence
+      ),
+    );
+    await f.ht.tx((tx) =>
+      tx.keyBackup.keys('alice', 'delete', '1', '!backup:logical.test', 's')
+    );
+    const suffix = (await f.hs.export('alice', f.bundle.id)).filter((record) =>
+      record.sequence > previous
+    );
+    await f.ej.receive('home', suffix);
+    // Pure reads retain the complete applied backup while the newer deletion
+    // is received but unapplied; receiving alone grants no mutation authority.
+    assertEquals(
+      await tenant.tx((tx) => tx.keyBackup.version('alice', 'get')),
+      { ...metadata, version: '1', count: 1, etag: '1' },
+    );
+    assertEquals(
+      await tenant.tx((tx) =>
+        tx.keyBackup.keys('alice', 'get', '1', '!backup:logical.test', 's')
+      ),
+      data,
+    );
+    const pending = await assertRejects(
+      () =>
+        tenant.tx((tx) =>
+          tx.keyBackup.version('alice', 'post', undefined, metadata)
+        ),
+      MatrixError,
+    );
+    assertEquals(pending.status, 503);
+    assertEquals(await tenant.tx((tx) => tx.streams.heads()), before);
+    for (const record of suffix) await f.es.apply(f.ej, record);
+    assertEquals(
+      await tenant.tx((tx) => tx.keyBackup.version('alice', 'get')),
+      { ...metadata, version: '1', count: 0, etag: '2' },
+    );
+    assertEquals(
+      await tenant.tx((tx) => tx.keyBackup.keys('alice', 'get', '1')),
+      { rooms: {} },
+    );
+    await f.toEdge(suffix);
+    assertEquals(await tenant.tx((tx) => tx.streams.heads()), before);
+    // Original home dots are retained, never echoed as facade authorship.
+    assertEquals(
+      (await f.es.export('alice')).filter((record) =>
+        (record.payload as { body: DomainOperation }).body.operation.kind ===
+          'backup'
+      ),
+      [],
+    );
+    await f.edge.close();
+    const reopened = await f.open('edge');
+    try {
+      const node = await loadNode(
+        await reopened.server(),
+        'logical.test',
+        'edge_a',
+      );
+      const pairing = new Pairings(
+        await reopened.server(),
+        node.signer(),
+        node.publicKey,
+        'b'.repeat(64),
+        node,
+      );
+      const reopenedTenant = await enrolledTenant(
+        reopened,
+        pairing,
+        'logical.test',
+        'edge_a',
+      );
+      assertEquals(
+        await reopenedTenant.tx((tx) => tx.keyBackup.version('alice', 'get')),
+        { ...metadata, version: '1', count: 0, etag: '2' },
+      );
+    } finally {
+      await reopened.close();
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain backup: legacy home versions are captured but older signed manifests cannot prove inventory', async () => {
+  const f = await fixture();
+  try {
+    await (await f.home.tenant('logical.test')).tx((conn) =>
+      conn.execute(
+        'INSERT INTO backup_versions(localpart,version_no,algorithm,auth_data,etag,deleted) VALUES(?,?,?,?,?,0)',
+        ['alice', 7, 'legacy', '{"key":"legacy-public"}', 4],
+      )
+    );
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    await f.toEdge(records);
+    const tenant = await enrolledTenant(
+      f.edge,
+      f.fp,
+      'logical.test',
+      'edge_a',
+      new FacadeAuth(
+        await f.edge.server(),
+        f.fp,
+        f.node,
+        new AuthLinkHealth({ notify: 'websocket', pollseconds: 1 }),
+        {
+          replicatecredentials: false,
+          allowstaleauth: false,
+          authmaxstalehours: 1,
+        },
+      ),
+    );
+    assertEquals(
+      await tenant.tx((tx) => tx.keyBackup.version('alice', 'get')),
+      {
+        version: '7',
+        algorithm: 'legacy',
+        auth_data: { key: 'legacy-public' },
+        etag: '4',
+        count: 0,
+      },
+    );
+    const original = records.at(-1)!;
+    const payload = structuredClone(original.payload) as {
+      body: DomainBootstrap;
+      signature: string;
+    };
+    delete payload.body.backups;
+    payload.signature = await f.ht.signer().sign(canonicalJson(payload.body));
+    const legacy = await appendRecordForBackup(f, payload);
+    await f.toEdge([legacy]);
+    const unavailable = await assertRejects(
+      () => tenant.tx((tx) => tx.keyBackup.version('alice', 'get')),
+      MatrixError,
+    );
+    assertEquals(unavailable.status, 503);
+    assertEquals(await getAccountData(tenant, 'alice', '', 'm.direct'), null);
+  } finally {
+    await f.close();
+  }
+});
+
+async function appendRecordForBackup(
+  f: Awaited<ReturnType<typeof fixture>>,
+  payload: { body: DomainBootstrap; signature: string },
+) {
+  return await (await f.home.server()).tx((conn) =>
+    appendRecord(conn, f.node.node, {
+      source: 'home',
+      incarnation: f.bundle.id,
+      stream: 'domain:@alice:logical.test',
+      type: 'domain-operation',
+      version: 1,
+      operationId: 'domain-bootstrap:' +
+        createHash('sha256').update(canonicalJson(payload.body)).digest('hex'),
+      payload,
+    })
+  );
+}
 
 Deno.test('domain link: semantic operations have an explicitly negotiated reader', () => {
   assertEquals(
@@ -880,6 +3499,164 @@ Deno.test('domain applied reads: every register owner serves HTTP during suffix 
         ]);
       }
     });
+  }
+});
+
+Deno.test('domain feature reads: private consumers retain applied values without admitting newer-suffix mutations', async (t) => {
+  const token = 'feature-applied-read-token';
+  const f = await fixture(token);
+  let http: Deno.HttpServer<Deno.NetAddr> | undefined;
+  try {
+    const filter = { room: { timeline: { limit: 3 } } };
+    await (await f.home.server()).execute(
+      'INSERT INTO forgotten(user,room) VALUES(?,?)',
+      ['@alice:logical.test', '!feature:logical.test'],
+    );
+    await (await f.edge.server()).execute(
+      "INSERT INTO memberships(user,room,membership,event,seq) VALUES(?,?,'leave',?,1)",
+      ['@alice:logical.test', '!feature:logical.test', '$feature-leave'],
+    );
+    const filterId = await storeFilter(f.ht, 'alice', filter);
+    await f.ht.tx((tx) =>
+      tx.keyBackup.version('alice', 'post', undefined, {
+        algorithm: 'm.megolm_backup.v1.curve25519-aes-sha2',
+        auth_data: { public_key: 'opaque' },
+      })
+    );
+    const bootstrap = await f.hs.bootstrap('alice', f.bundle.id);
+    await f.toEdge(bootstrap);
+    const authority = new FacadeAuth(
+      await f.edge.server(),
+      f.fp,
+      f.node,
+      new AuthLinkHealth({ notify: 'websocket', pollseconds: 1 }),
+      {
+        replicatecredentials: false,
+        allowstaleauth: true,
+        authmaxstalehours: 1,
+      },
+    );
+    const tenant = await enrolledTenant(
+      f.edge,
+      f.fp,
+      'logical.test',
+      'edge_a',
+      authority,
+    );
+    setConfigForTests({ server: { name: 'logical.test', role: 'facade' } });
+    const unused = () => Promise.reject(new Error('unused replica service'));
+    await openReplicaApp(f.edge, tenant, {
+      requireReadScope: unused,
+      prepareReadRoomScope: unused,
+      requireScope: unused,
+      prepareRoomScope: unused,
+      keyDocument: unused,
+      publicRooms: unused,
+      keys: keyStore(await f.edge.server(), { signer: f.node.signer() }),
+      signer: f.node.signer(),
+    });
+    http = Deno.serve(
+      { hostname: '127.0.0.1', port: 0, onListen: () => {} },
+      await pathfinder({ roots: ['api/endpoints/matrix/'] }),
+    );
+    const notifications = async () => {
+      const response = await fetch(
+        `http://127.0.0.1:${http!.addr.port}/_matrix/client/v3/notifications`,
+        { headers: { authorization: 'Bearer ' + token } },
+      );
+      assertEquals(response.status, 200, await response.clone().text());
+      return await response.json();
+    };
+    const reads = {
+      filters: () => loadFilter(tenant, 'alice', filterId),
+      pushers: () => listPushers(tenant, 'alice'),
+      backups: () => tenant.tx((tx) => tx.keyBackup.version('alice', 'get')),
+      schedules: () => tenant.tx((tx) => tx.delayedEvents.list('alice')),
+      notifications,
+      rooms: async () => roomsFor(await f.edge.server(), '@alice:logical.test'),
+      sliding: async () =>
+        slidingListSnapshot(await f.edge.server(), '@alice:logical.test'),
+      membership: async () =>
+        membershipOf(
+          await f.edge.server(),
+          '!feature:logical.test',
+          '@alice:logical.test',
+        ),
+    };
+    const baseline = new Map<string, unknown>();
+    for (const [name, read] of Object.entries(reads)) {
+      baseline.set(name, await read());
+    }
+    assertEquals(baseline.get('filters'), filter);
+    assertEquals(baseline.get('membership'), {
+      roomId: '!feature:logical.test',
+      membership: 'leave',
+      eventId: '$feature-leave',
+      seq: 1,
+      forgotten: true,
+    });
+    await putAccountData(f.ht, 'alice', '', 'm.pending-feature-tail', {
+      pending: true,
+    });
+    const suffix = (await f.hs.export('alice', f.bundle.id)).filter((record) =>
+      record.sequence > bootstrap.at(-1)!.sequence
+    );
+    assert(suffix.length > 0);
+    await f.ej.receive('home', suffix);
+    const before = await f.ej.heads('home', 'in', suffix[0]);
+    const news = await f.et.tx((tx) => tx.streams.heads());
+    for (const [name, read] of Object.entries(reads)) {
+      await t.step(
+        name,
+        async () => assertEquals(await read(), baseline.get(name)),
+      );
+    }
+    await assertRejects(
+      () => storeFilter(tenant, 'alice', {}),
+      MatrixError,
+      'domain snapshot unavailable',
+    );
+    await assertRejects(
+      () => issueOpenIdToken(tenant, 'alice'),
+      MatrixError,
+      'domain snapshot unavailable',
+    );
+    await assertRejects(
+      async () =>
+        prepareRejoin(
+          await f.edge.server(),
+          '!feature:logical.test',
+          '@alice:logical.test',
+        ),
+      MatrixError,
+      'forget snapshot unavailable',
+    );
+    await assertRejects(
+      async () =>
+        roomsFor(await f.edge.server(), '@alice:logical.test', 'admission'),
+      MatrixError,
+      'forget snapshot unavailable',
+    );
+    await assertRejects(
+      async () =>
+        membershipOf(
+          await f.edge.server(),
+          '!feature:logical.test',
+          '@alice:logical.test',
+          'admission',
+        ),
+      MatrixError,
+      'forget snapshot unavailable',
+    );
+    assertEquals(await f.ej.heads('home', 'in', suffix[0]), before);
+    assertEquals(await f.et.tx((tx) => tx.streams.heads()), news);
+  } finally {
+    await drainResources([
+      () => http?.shutdown(),
+      closeApp,
+      () => f.close(),
+      () => setConfigForTests({}),
+    ]);
   }
 });
 
@@ -1577,3 +4354,4 @@ Deno.test('domain history: authenticated current home, account and control bindi
     });
   }
 });
+import { sanitizeRestoredTenant } from '#engine/tenant/restore.ts';

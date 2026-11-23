@@ -1078,7 +1078,17 @@ async function exportSuccessor(
 Deno.test('membership upgrade: an enrolled historical installation freezes local work and never promotes foreign display into a job', async () => {
   const f = await fixture(true);
   try {
-    const { record, state: foreign, keys, operation } = await incoming(f);
+    // Seed the historical retraction state without publishing a new pending
+    // invite through today's notification schema before the jobs migration.
+    const { record, state: foreign, keys, operation } = await incoming(
+      f,
+      'edge',
+      'invite',
+      undefined,
+      {},
+      undefined,
+      'rejecting',
+    );
     const db = await f.home.server();
     const journal = new Journal(db, [...LINK_SUPPORTED, {
       type: 'membership-operation',

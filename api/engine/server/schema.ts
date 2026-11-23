@@ -43,6 +43,11 @@ CREATE TABLE federation_invite_attempts(room_id TEXT NOT NULL,sender TEXT NOT NU
 CREATE INDEX federation_invite_attempts_destination ON federation_invite_attempts(destination,status,added_ms);
 `;
 
+const REPORT_IDENTITY_SQL = `
+ALTER TABLE reports ADD COLUMN report_id TEXT;
+CREATE UNIQUE INDEX reports_identity ON reports(report_id);
+`;
+
 const INVITE_DISPATCH_SQL = `
 ALTER TABLE federation_invite_attempts ADD COLUMN may_have_applied INTEGER NOT NULL DEFAULT 0 CHECK(may_have_applied IN (0,1));
 -- Older outstanding attempts did not retain dispatch certainty. Preserve their
@@ -447,6 +452,13 @@ ALTER TABLE event_index ADD COLUMN local_join_user TEXT;
 CREATE INDEX event_index_local_participation ON event_index(room,local_join_user) WHERE local_join_user IS NOT NULL;
 `;
 
+const NOTIFICATION_CONTEXT_SQL = `
+ALTER TABLE push_evaluations ADD COLUMN operation_id TEXT;
+ALTER TABLE push_evaluations ADD COLUMN native INTEGER NOT NULL DEFAULT 1;
+CREATE TABLE notification_retired_users(user TEXT PRIMARY KEY NOT NULL);
+CREATE INDEX notification_operations_event ON domain_operations(json_extract(payload_json,'$.room'),json_extract(payload_json,'$.event')) WHERE kind='notification';
+`;
+
 // Publication captures probe the input event/room sets, including references
 // recorded against another room. Existing composite keys have other prefixes.
 const PUBLICATION_CAPTURE_SQL = `
@@ -457,11 +469,18 @@ CREATE INDEX notification_own_events_event ON notification_own_events(event);
 CREATE INDEX notification_horizons_room ON notification_horizons(room);
 `;
 
+const ROOM_UPGRADES_SQL = `
+CREATE TABLE room_upgrades(old_room_id TEXT PRIMARY KEY NOT NULL,user_id TEXT NOT NULL,replacement_room TEXT NOT NULL,plan_json TEXT NOT NULL,phase INTEGER NOT NULL DEFAULT 0 CHECK(phase BETWEEN 0 AND 4));
+`;
+
 const JOIN_REFUSAL_SQL =
   'ALTER TABLE federation_join_attempts ADD COLUMN remote_refused INTEGER NOT NULL DEFAULT 0 CHECK(remote_refused IN (0,1))';
 
+const NOTIFICATION_ROOM_RETIREMENT_SQL =
+  'CREATE TABLE notification_retired_rooms(room TEXT PRIMARY KEY NOT NULL)';
+
 export const serverSchema: SchemaProvider = {
-  version: 54,
+  version: 58,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -483,6 +502,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(PREJOIN_SQL);
     await db.exec(MEDIA_CACHE_SQL);
     await db.exec(REPORTS_SQL);
+    await db.exec(REPORT_IDENTITY_SQL);
     await db.exec(
       'ALTER TABLE prejoin_memberships ADD COLUMN local_leave_json TEXT',
     );
@@ -522,6 +542,9 @@ export const serverSchema: SchemaProvider = {
     await db.exec(PREJOIN_JOBS_SQL);
     await db.exec(JOIN_REFUSAL_SQL);
     await db.exec(INVITE_DISPATCH_SQL);
+    await db.exec(NOTIFICATION_CONTEXT_SQL);
+    await db.exec(ROOM_UPGRADES_SQL);
+    await db.exec(NOTIFICATION_ROOM_RETIREMENT_SQL);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -607,5 +630,9 @@ INSERT INTO device_publication_predecessors SELECT DISTINCT p.subject,p.destinat
     },
     52: (conn) => conn.exec(JOIN_REFUSAL_SQL),
     53: (conn) => conn.exec(INVITE_DISPATCH_SQL),
+    54: (conn) => conn.exec(REPORT_IDENTITY_SQL),
+    55: (conn) => conn.exec(NOTIFICATION_CONTEXT_SQL),
+    56: (conn) => conn.exec(ROOM_UPGRADES_SQL),
+    57: (conn) => conn.exec(NOTIFICATION_ROOM_RETIREMENT_SQL),
   },
 };

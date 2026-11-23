@@ -7,7 +7,14 @@ import {
 import { openStore, type Store } from '#engine/store/index.ts';
 import { Turso } from '#engine/store/ffi.ts';
 import { openTenant, type Tenant, tenantSchema } from '#engine/tenant/index.ts';
-import { localpartOf } from '#engine/tenant/auth.ts';
+import { hashToken, localpartOf } from '#engine/tenant/auth.ts';
+import {
+  activateTenantAuthority,
+  recordLogoutBarrier,
+  recordRevocation,
+} from '#engine/tenant/session-authority.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
+import { writeRegister } from '#engine/facade/registers.ts';
 import {
   PUSH_KINDS,
   putRule,
@@ -62,8 +69,10 @@ function capture(users: string[], sender = '@author:remote'): PushCapture {
   };
 }
 async function pusher(tenant: Tenant, lp: string) {
-  await tenant.tx((tx) =>
-    tx.pushers.upsert(lp, {
+  await tenant.tx(async (tx) => {
+    const hash = await hashToken('policy-access-' + lp);
+    await tx.tokens.insert(hash, lp, null, null);
+    await tx.pushers.upsert(lp, {
       app_id: 'policy-app',
       pushkey: 'key-' + lp,
       kind: 'http',
@@ -71,8 +80,8 @@ async function pusher(tenant: Tenant, lp: string) {
       device_display_name: 'Policy',
       lang: 'en',
       data: { url: 'https://push.example/_matrix/push/v1/notify' },
-    }, 'policy-access-hash')
-  );
+    }, hash);
+  });
 }
 async function ignored(tenant: Tenant, sender: string | null) {
   await tenant.tx(async (tx) => {
@@ -129,38 +138,52 @@ async function scalar(
   });
 }
 
-Deno.test('push policy work: statements per notifying event do not scale with selected recipients', async () => {
-  const samples: { recipients: number; statements: number }[] = [];
-  for (const count of [1, 8]) {
-    await fixture(async (store, tenant) => {
-      const users = Array.from({ length: count }, (_, i) => 'u' + i);
-      await tenant.tx(async (tx) => {
-        for (const lp of users) await tx.users.insert(lp, lp);
+for (const enrolled of [false, true]) {
+  Deno.test(`push policy work: ${enrolled ? 'enrolled' : 'standalone'} statement count is recipient-independent`, async () => {
+    const samples: { recipients: number; statements: number }[] = [];
+    for (const count of [1, 8]) {
+      await fixture(async (store, tenant) => {
+        const users = Array.from({ length: count }, (_, i) => 'u' + i);
+        await tenant.tx(async (tx) => {
+          for (const lp of users) await tx.users.insert(lp, lp);
+        });
+        if (enrolled) {
+          await (await store.tenant(name)).tx((conn) =>
+            activateTenantAuthority(conn, {
+              node: 'home',
+              incarnation: 'home-store',
+              homeIncarnation: 'home-store',
+              edgeNode: 'edge',
+              edgeIncarnation: 'edge-store',
+            })
+          );
+        }
+        for (const lp of users) await pusher(tenant, lp);
+        const original = Turso.prototype.query;
+        let statements = 0;
+        Turso.prototype.query = function (...args) {
+          statements++;
+          return original.apply(this, args);
+        };
+        let result: PushPublication[];
+        try {
+          result = await prepareCapturedPushes(store, [capture(users)]);
+        } finally {
+          Turso.prototype.query = original;
+        }
+        assertEquals(result[0].decisions.length, count);
+        assertEquals(
+          result[0].decisions.filter((d) => d.decision?.notify).length,
+          count,
+        );
+        assert(statements > 0);
+        samples.push({ recipients: count, statements });
       });
-      const original = Turso.prototype.query;
-      let statements = 0;
-      Turso.prototype.query = function (...args) {
-        statements++;
-        return original.apply(this, args);
-      };
-      let result: PushPublication[];
-      try {
-        result = await prepareCapturedPushes(store, [capture(users)]);
-      } finally {
-        Turso.prototype.query = original;
-      }
-      assertEquals(result[0].decisions.length, count);
-      assertEquals(
-        result[0].decisions.filter((d) => d.decision?.notify).length,
-        count,
-      );
-      assert(statements > 0);
-      samples.push({ recipients: count, statements });
-    });
-  }
-  console.log(JSON.stringify(samples));
-  assertEquals(samples[0].statements, samples[1].statements);
-});
+    }
+    console.log(JSON.stringify(samples));
+    assertEquals(samples[0].statements, samples[1].statements);
+  });
+}
 
 Deno.test('push policy snapshot: scalar and grouped publication preserve account, ignore, rule and pusher values', async () => {
   await fixture(async (store, tenant) => {
@@ -191,6 +214,116 @@ Deno.test('push policy snapshot: scalar and grouped publication preserve account
     assertEquals(expected[0].decisions[0].decision?.highlight, true);
     assertEquals(expected[0].decisions[0].pusherIncarnations?.length, 1);
     assertEquals(expected[1].decisions[0].decision, null);
+  });
+});
+
+Deno.test('push policy snapshot: enrolled batch preserves unresolved candidates and every scalar terminal verdict', async () => {
+  await fixture(async (store, tenant) => {
+    const users = [
+      'ready',
+      'missing',
+      'revoked',
+      'barrier',
+      'foreign',
+      'removed',
+      'unresolved',
+      'terminal',
+    ];
+    await tenant.tx(async (tx) => {
+      for (const lp of users) await tx.users.insert(lp, lp);
+    });
+    const db = await store.tenant(name);
+    await db.tx((conn) =>
+      activateTenantAuthority(conn, {
+        node: 'home',
+        incarnation: 'home-store',
+        homeIncarnation: 'home-store',
+        edgeNode: 'edge',
+        edgeIncarnation: 'edge-store',
+      })
+    );
+    for (const lp of users) await pusher(tenant, lp);
+    const native = await db.query('SELECT * FROM pushers');
+    await db.tx(async (conn) => {
+      await conn.execute('DELETE FROM session_authority WHERE localpart=?', [
+        'missing',
+      ]);
+      await recordRevocation(conn, await hashToken('policy-access-revoked'));
+      await recordLogoutBarrier(conn, 'barrier');
+      await conn.execute(
+        "UPDATE session_authority SET node='edge',incarnation='edge-store' WHERE localpart='foreign'",
+      );
+      for (const lp of ['removed', 'unresolved', 'terminal']) {
+        const row = native.find((row) => row.localpart === lp)!;
+        const key = JSON.stringify([
+          'pusher',
+          lp,
+          row.app_id,
+          row.pushkey,
+          row.incarnation,
+        ]);
+        const choice = JSON.stringify([
+          'pusher-choice',
+          lp,
+          row.app_id,
+          row.pushkey,
+        ]);
+        await writeRegister(
+          conn,
+          { source: 'home', incarnation: 'home-store' },
+          lp === 'terminal' ? key : choice,
+          lp === 'terminal' ? 'pusher' : 'pusher-choice',
+          lp === 'unresolved'
+            ? JSON.stringify(
+              JSON.stringify(['home', 'home-store', 'register:' + key, 99]),
+            )
+            : 'null',
+        );
+      }
+    });
+    const publication = await prepareCapturedPush(store, capture(users));
+    for (const row of native) {
+      const lp = String(row.localpart);
+      const captured = publication.decisions.find((decision) =>
+        decision.user === `@${lp}:${name}`
+      )!.pusherIncarnations!;
+      assertEquals(
+        captured,
+        ['ready', 'missing', 'unresolved'].includes(lp)
+          ? [String(row.incarnation)]
+          : [],
+      );
+      let eligible: boolean;
+      try {
+        eligible = await tenant.tx((tx) =>
+          tx.pushers.isCurrent(
+            lp,
+            String(row.app_id),
+            String(row.pushkey),
+            String(row.incarnation),
+          )
+        );
+      } catch (error) {
+        if (!(error instanceof MatrixError) || error.status !== 503) {
+          throw error;
+        }
+        eligible = true;
+      }
+      assertEquals(captured.length !== 0, eligible, lp);
+    }
+  });
+});
+
+Deno.test('push policy snapshot: raw registrations without session admission never enter publication', async () => {
+  await fixture(async (store, tenant) => {
+    await tenant.tx((tx) => tx.users.insert('alice', 'alice'));
+    await pusher(tenant, 'alice');
+    const db = await store.tenant(name);
+    await db.execute('DELETE FROM access_tokens');
+    const input = capture(['alice']);
+    const publication = await prepareCapturedPush(store, input);
+    assertEquals(publication.decisions[0].pusherIncarnations, []);
+    assertEquals(publication, await scalar(tenant, input));
   });
 });
 

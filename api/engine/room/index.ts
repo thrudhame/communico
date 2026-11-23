@@ -17,6 +17,9 @@ import * as state from '#engine/room/state.ts';
 import * as waits from '#engine/room/waits.ts';
 import * as remoteBatches from '#engine/room/remote-batches.ts';
 import * as membershipReceipts from '#engine/room/membership-receipts.ts';
+import * as joinObservations from '#engine/room/join-observations.ts';
+import * as creationReceipt from '#engine/room/creation-receipt.ts';
+import type { LocalJoinObservation } from '#engine/room/hooks.ts';
 import * as completion from '#engine/room/completion.ts';
 import type { RemoteOutcome } from '#engine/room/remote.ts';
 import { orderKeys } from '#engine/room/topology.ts';
@@ -43,6 +46,25 @@ function bind(
   return {
     admit: (check: CommitCheck) => conn.admit(check),
     diagnostics: { resolutions: 0 },
+    creationReceipt: {
+      require: (identity: string) =>
+        creationReceipt.requireCreationReceipt(conn, identity),
+      record: (identity: string) =>
+        creationReceipt.recordCreationReceipt(conn, identity),
+    },
+    joinObservations: {
+      transition: (
+        user: string | undefined,
+        data: LocalJoinObservation | undefined,
+      ) => joinObservations.transitionObservation(conn, user, data),
+      retain: (
+        event: string,
+        user: string | undefined,
+        data: LocalJoinObservation | undefined,
+      ) => joinObservations.retainJoinObservation(conn, event, user, data),
+      complete: (event: string, data?: LocalJoinObservation) =>
+        joinObservations.completeJoinObservation(conn, event, data),
+    },
     completion: {
       state: () => completion.completionState(conn),
       capture: () => completion.captureCompletionCut(conn, roomId),
@@ -129,6 +151,11 @@ function bind(
       setStatus: async (event: string, status: events.Status) => {
         await events.setStatus(conn, event, status);
         await waits.readyFor(conn, event);
+        // Whichever path grounds a retained local join completes its exact
+        // admission context in that same transaction; it is idempotent.
+        if (status.standing === 'accepted' && status.grounding === 'grounded') {
+          await joinObservations.completeJoinObservation(conn, event);
+        }
       },
       statuses: (ids: readonly string[]) => events.statuses(conn, ids),
       missingCandidates: (

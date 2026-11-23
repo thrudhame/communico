@@ -14,6 +14,8 @@ import type { Pdu } from '#engine/pdu.ts';
 import type { RemoteDeps } from '#engine/room/deps.ts';
 import { type Room, roomSchema } from '#engine/room/index.ts';
 import { ingestRemote } from '#engine/room/remote.ts';
+import { ingestInTx } from '#engine/room/ingest.ts';
+import { buildInTx } from '#engine/room/build.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { genesis } from './fixtures/genesis.ts';
 import { authAt } from './fixtures/auth.ts';
@@ -757,6 +759,121 @@ Deno.test('missing: budget exhausted → pending + wait; the later arrival resum
       assertEquals(data.grounding, 'grounded');
     });
     assertEquals(await frontierOf(s.g.room), [String(orphan.event_id)]);
+  });
+});
+
+for (const ordinaryFirst of [false, true]) {
+  Deno.test(`missing: a pending resident join completes its retained observation (ordinary first: ${ordinaryFirst})`, async () => {
+    await withStore(async (store) => {
+      const s = await setup(store, {
+        roomId: '!m-join:test',
+        deps: { limits: { waitMs: 0, limit: 10, budgetMs: 0 } },
+      });
+      const parent = await msg(s, 'parent', [s.joinId], 50);
+      const local = '@lena:remote.test';
+      const member = {
+        type: 'm.room.member',
+        sender: local,
+        state_key: local,
+        content: { membership: 'join' },
+      };
+      const join = await remoteEvent(s.g.roomId, s.server, '11', {
+        ...member,
+        prev_events: [String(parent.event_id)],
+        auth_events: await authAt(s.g.room, member, s.joinId),
+        depth: 51,
+        origin_server_ts: 1051,
+      });
+      const eventId = String(join.event_id);
+      const observation = {
+        user: local,
+        source: null,
+        incarnation: null,
+        observed: [],
+      };
+      const observed = () =>
+        s.g.room.tx(async (tx) =>
+          (await tx.changes.after(0, 500)).filter((c) =>
+            c.kind === 'rejoin-observation' && c.event === eventId
+          ).map((c) => JSON.parse(c.data))
+        );
+      if (ordinaryFirst) {
+        const ordinary = await ingestRemote(
+          s.g.room,
+          [join],
+          s.server.name,
+          s.deps,
+        );
+        assertEquals(ordinary[0].outcome, 'pending');
+      }
+      const first = await ingestRemote(s.g.room, [join], s.server.name, {
+        ...s.deps,
+        localJoin: { eventId, userId: local, observation },
+      });
+      assertEquals(first[0].outcome, 'pending');
+      assertEquals(await observed(), []);
+      // The resume driver grounds it without the resident call's context.
+      const second = await ingestRemote(
+        s.g.room,
+        [parent],
+        s.server.name,
+        s.deps,
+      );
+      assertEquals(second[0].outcome, 'accepted');
+      await s.g.room.tx(async (tx) =>
+        assertEquals(await tx.events.getStatus(eventId), {
+          ...(await tx.events.getStatus(eventId))!,
+          standing: 'accepted',
+          grounding: 'grounded',
+        })
+      );
+      assertEquals(await observed(), [observation]);
+    });
+  });
+}
+
+Deno.test('missing: a retained local join completes its observation when another path stores it first', async () => {
+  await withStore(async (store) => {
+    const g = await genesis(store, {
+      roomId: '!m-race:test',
+      joinRule: 'public',
+    });
+    const user = '@lena:' + g.signer.serverName;
+    const observation = { user, source: null, incarnation: null, observed: [] };
+    const pdu = await g.room.tx(async (tx) => {
+      const built = await buildInTx(tx, g.roomId, {
+        type: 'm.room.member',
+        sender: user,
+        state_key: user,
+        content: { membership: 'join' },
+      }, g.signer);
+      await tx.joinObservations.retain(
+        String(built.event_id),
+        user,
+        observation,
+      );
+      return built;
+    });
+    // A receipt-return race: a non-submission path commits the prepared join.
+    const result = await g.room.tx((tx) =>
+      ingestInTx(tx, g.roomId, pdu, {
+        remote: {
+          origin: g.signer.serverName,
+          self: g.signer.serverName,
+          oversized: false,
+          ungroundedMs: 0,
+        },
+      })
+    );
+    assertEquals([result.standing, result.grounding], ['accepted', 'grounded']);
+    assertEquals(
+      await g.room.tx(async (tx) =>
+        (await tx.changes.after(0, 500)).filter((c) =>
+          c.kind === 'rejoin-observation' && c.event === result.eventId
+        ).map((c) => JSON.parse(c.data))
+      ),
+      [observation],
+    );
   });
 });
 

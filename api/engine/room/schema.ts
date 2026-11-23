@@ -10,6 +10,7 @@ import { REMOTE_BATCHES_SQL } from './remote-batches.ts';
 import { EVENT_SIGNATURES_SQL } from './signatures.ts';
 import { initializeCompletion } from './completion.ts';
 import { MEMBERSHIP_RECEIPTS_SQL } from './membership-receipts.ts';
+import { JOIN_OBSERVATIONS_SQL } from './join-observations.ts';
 
 export const ROOM_SCHEMA_SQL = `
 CREATE TABLE events(
@@ -164,17 +165,18 @@ const HASH_REDACTION_SQL =
 const HOME_PDU_SQL = 'ALTER TABLE event_signatures ADD COLUMN home_pdu TEXT';
 
 export const roomSchema: SchemaProvider = {
-  version: 12,
+  version: 13,
   apply: async (db) => {
     await db.exec(
       ROOM_SCHEMA_SQL + TOPOLOGY_SQL + CHANGE_INDEX_SQL + PUBLICATION_KEYS_SQL +
         ANNOTATION_INDEX_SQL + REMOTE_BATCHES_SQL + WAIT_READY_SQL +
         EVENT_SIGNATURES_SQL + HASH_REDACTION_SQL + HOME_PDU_SQL + ';' +
-        MEMBERSHIP_RECEIPTS_SQL,
+        MEMBERSHIP_RECEIPTS_SQL + JOIN_OBSERVATIONS_SQL,
     );
     await db.tx(initializeCompletion, { mode: 'deferred' });
   },
   migrations: {
+    12: (conn) => conn.exec(JOIN_OBSERVATIONS_SQL),
     11: (conn) => conn.exec(MEMBERSHIP_RECEIPTS_SQL),
     10: (conn) => conn.exec(HOME_PDU_SQL),
     9: (conn) => conn.exec(HASH_REDACTION_SQL),

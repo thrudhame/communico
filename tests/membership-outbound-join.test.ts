@@ -410,7 +410,7 @@ Deno.test('outbound join schema upgrade preserves old compensation without inven
     idleseconds: 300,
   };
   let store = await openStore(settings, {
-    schemas: { server: historicalServerSchema(46) },
+    schemas: { server: historicalServerSchema(47) },
   });
   try {
     await (await store.server()).execute(

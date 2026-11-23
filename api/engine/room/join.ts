@@ -32,6 +32,7 @@ import {
 } from '#engine/room/deps.ts';
 import {
   admitLocalJoin,
+  prepareJoinObservation,
   prepareMembershipAdmission,
   registerCreatedRoom,
   withMembershipFence,
@@ -144,6 +145,11 @@ async function joinVia(
   candidate: string,
 ): Promise<JoinResult> {
   const { deps } = args;
+  const observation = await prepareJoinObservation(
+    store,
+    args.roomId,
+    args.user,
+  );
   const admission = await prepareMembershipAdmission(
     store,
     args.roomId,
@@ -363,7 +369,7 @@ async function joinVia(
           budgetMs: config().federation.missingbudgetms,
         },
         ungroundedMs: 0,
-        localJoin: { eventId, userId: args.user },
+        localJoin: { eventId, userId: args.user, observation },
       }, 'pulled');
       const landed = await held.tx(async (tx) => {
         const status = await tx.events.getStatus(eventId);
@@ -399,6 +405,7 @@ async function joinVia(
                 existing.grounding === 'grounded'
               ) {
                 await tx.changes.localParticipation(eventId, args.user);
+                await tx.joinObservations.complete(eventId, observation);
                 return;
               }
               throw new MatrixError(
@@ -427,6 +434,7 @@ async function joinVia(
               previousStay: prevStay?.id ?? null,
               localInitiator: args.user,
             });
+            await tx.joinObservations.complete(eventId, observation);
           })
         ),
     );

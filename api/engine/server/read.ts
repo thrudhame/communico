@@ -8,6 +8,7 @@
 import type { Database as Db } from '#engine/store/db.ts';
 import type { Row } from '#engine/store/ffi.ts';
 import { visiblePrejoin, visibleRoomMembership } from './prejoin.ts';
+import { type ForgetAccess, requireForgetKnowledge } from './membership.ts';
 
 export async function redactionOf(
   db: Db,
@@ -157,7 +158,9 @@ const MEMBERSHIP_SELECT =
 export async function roomsFor(
   db: Pick<Db, 'query'>,
   userId: string,
+  access: ForgetAccess = 'read',
 ): Promise<MembershipRow[]> {
+  await requireForgetKnowledge(db, userId, access);
   const rows = await db.query(`${MEMBERSHIP_SELECT} WHERE m.user = ?`, [
     userId,
   ]);
@@ -170,6 +173,7 @@ export async function slidingListSnapshot(
   db: Pick<Db, 'query'>,
   userId: string,
 ) {
+  await requireForgetKnowledge(db, userId, 'read');
   const counters = new Map((await db.query('SELECT name,value FROM counters'))
     .map((r) => [String(r.name), Number(r.value)]));
   const eventCut = counters.get('events') ?? 0;
@@ -205,7 +209,9 @@ export async function membershipOf(
   db: Db,
   roomId: string,
   userId: string,
+  access: ForgetAccess = 'read',
 ): Promise<MembershipRow | null> {
+  await requireForgetKnowledge(db, userId, access);
   const rows = await db.query(
     `${MEMBERSHIP_SELECT} WHERE m.room = ? AND m.user = ?`,
     [roomId, userId],

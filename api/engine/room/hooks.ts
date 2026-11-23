@@ -28,6 +28,26 @@ export type RoomHooks = {
 };
 
 let hooks: RoomHooks | null = null;
+// Visibility-restoring membership transitions (self join or a local invite)
+// retain the same exact remove-wins forget context before room publication.
+export type LocalJoinObservation = Record<string, unknown>;
+const joinObservations = new WeakMap<
+  Store,
+  (roomId: string, userId: string) => Promise<LocalJoinObservation>
+>();
+export function setJoinObservation(
+  store: Store,
+  prepare: (roomId: string, userId: string) => Promise<LocalJoinObservation>,
+) {
+  joinObservations.set(store, prepare);
+}
+export async function prepareJoinObservation(
+  store: Store,
+  roomId: string,
+  userId: string,
+) {
+  return await joinObservations.get(store)?.(roomId, userId);
+}
 const joinAdmissions = new WeakMap<
   Store,
   (roomId: string, userId: string, eventId?: string) => Promise<void>

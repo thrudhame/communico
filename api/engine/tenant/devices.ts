@@ -185,7 +185,7 @@ export async function deleteDevice(
     }
   }
   for (const row of tokens) {
-    await deletePushersForToken(conn, String(row.token));
+    await deletePushersForToken(conn, String(row.token), record);
     await conn.execute('DELETE FROM refresh_tokens WHERE access_token = ?', [
       row.token,
     ]);

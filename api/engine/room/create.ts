@@ -10,6 +10,8 @@
 import { MatrixError } from '#engine/matrix-error.ts';
 import { splitId, validEventUserId } from '#engine/ids.ts';
 import { assertCanonicalNumbers } from '#engine/canonical.ts';
+import { canonicalJson } from '#engine/canonical.ts';
+import type { Pdu } from '#engine/pdu.ts';
 import { creationCreators, creationVersion } from './creation-input.ts';
 import {
   parsePowerLevels,
@@ -26,6 +28,7 @@ import {
 } from '#engine/room/encryption-policy.ts';
 import { prepareSigner, type Signer } from '#engine/room/signer.ts';
 import type { Store } from '#engine/store/index.ts';
+import { createHash } from 'node:crypto';
 
 export type CreateRoomOptions = {
   creator: string;
@@ -49,6 +52,19 @@ export type CreateRoomResult = {
   createEventId: string;
   memberEventId: string;
   roomAlias?: string;
+};
+
+/** One validated creation plan, with its identity fixed before publication.
+ * Contains no signer/key or live storage capability; workflow owners may retain
+ * it durably and replay initialization after an uncertain publication. */
+export type PreparedRoom = {
+  roomId: string;
+  createPdu: Pdu;
+  options: CreateRoomOptions;
+  preset: string;
+  powerLevels: Record<string, unknown>;
+  initialState: NonNullable<CreateRoomOptions['initial_state']>;
+  alias?: string;
 };
 
 function deepMerge(
@@ -83,6 +99,23 @@ export async function createRoom(
   opts: CreateRoomOptions,
   signer: Signer,
 ): Promise<CreateRoomResult> {
+  for (;;) {
+    const prepared = await prepareRoom(store, opts, signer);
+    try {
+      return await initializePlan(store, prepared, signer, false);
+    } catch (error) {
+      if (!(error instanceof CreationCollision)) throw error;
+    }
+  }
+}
+
+class CreationCollision extends Error {}
+
+export async function prepareRoom(
+  store: Store,
+  opts: CreateRoomOptions,
+  signer: Signer,
+): Promise<PreparedRoom> {
   const creator = opts.creator;
   const object = (value: unknown): value is Record<string, unknown> =>
     value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -335,10 +368,99 @@ export async function createRoom(
     );
   }
 
+  return JSON.parse(JSON.stringify({
+    roomId: finalRoomId,
+    createPdu,
+    options: opts,
+    preset,
+    powerLevels: pl,
+    initialState,
+    ...(alias === undefined ? {} : { alias }),
+  }));
+}
+
+export async function initializePreparedRoom(
+  store: Store,
+  prepared: PreparedRoom,
+  signer: Signer,
+): Promise<CreateRoomResult> {
+  return await initializePlan(store, prepared, signer, true);
+}
+
+async function initializePlan(
+  store: Store,
+  prepared: PreparedRoom,
+  signer: Signer,
+  replay: boolean,
+): Promise<CreateRoomResult> {
+  // Capture the immutable workflow input before any await. Signature enrichment
+  // does not change a plan; every requested initial effect does.
+  prepared = JSON.parse(JSON.stringify(prepared));
+  const { signatures: _signatures, unsigned: _unsigned, ...material } =
+    prepared.createPdu;
+  const identity = createHash('sha256').update(canonicalJson({
+    ...prepared,
+    createPdu: material,
+  })).digest('hex');
+  const {
+    roomId: finalRoomId,
+    createPdu,
+    options: opts,
+    preset,
+    powerLevels: pl,
+    initialState,
+    alias,
+  } = prepared;
+  const creator = opts.creator;
+  signer = await prepareSigner(signer);
+  if (createPdu.sender !== creator || createPdu.origin !== signer.serverName) {
+    throw new Error('E_CREATE_ROOM_IDENTITY: prepared creation signer differs');
+  }
   const created = await withRoomLock(
     finalRoomId,
-    () =>
-      initializeRoom(store, finalRoomId, async (tx) => {
+    async () => {
+      let existing;
+      try {
+        existing = await openRoom(store, finalRoomId);
+      } catch (error) {
+        if (!(error instanceof Deno.errors.NotFound)) throw error;
+      }
+      if (existing) {
+        if (!replay) throw new CreationCollision();
+        return await existing.tx(async (tx) => {
+          await tx.creationReceipt.require(identity);
+          const row = await tx.events.get(String(createPdu.event_id));
+          const material = (pdu: Pdu) => {
+            const { signatures: _signatures, unsigned: _unsigned, ...value } =
+              pdu;
+            return canonicalJson(value);
+          };
+          if (!row || material(JSON.parse(row.pdu)) !== material(createPdu)) {
+            throw new Error('E_CREATE_ROOM_IDENTITY: existing room differs');
+          }
+          for (const id of await tx.events.childrenOf(row.id)) {
+            const child = await tx.events.get(id);
+            if (
+              !child || child.type !== 'm.room.member' ||
+              child.state_key !== creator
+            ) continue;
+            const pdu = JSON.parse(child.pdu);
+            if (pdu.sender === creator && pdu.content.membership === 'join') {
+              return {
+                roomId: finalRoomId,
+                createEventId: row.id,
+                memberEventId: id,
+                roomAlias: alias,
+              };
+            }
+          }
+          throw new Error(
+            'E_CREATE_ROOM_IDENTITY: initial creator join missing',
+          );
+        });
+      }
+      return await initializeRoom(store, finalRoomId, async (tx) => {
+        await tx.creationReceipt.record(identity);
         const send = async (
           type: string,
           stateKey: string,
@@ -431,7 +553,7 @@ export async function createRoom(
 
         // 8. invites (sender: the creator); is_direct rides along when set.
         //    LOCAL invitees only — remote invitee transport is the caller's work.
-        for (const u of invite) {
+        for (const u of opts.invite ?? []) {
           if (
             splitId(u).server !== null && !u.endsWith(':' + signer.serverName)
           ) {
@@ -449,7 +571,8 @@ export async function createRoom(
           memberEventId,
           roomAlias: alias,
         };
-      }),
+      });
+    },
   );
   // Only the complete committed file is discoverable. Registry and feed
   // projection follow it; startup can recover an interrupted projection.

@@ -145,6 +145,10 @@ test('forget: joined/no membership reject, forget persists across traffic, reinv
     403,
   );
   await call(base + '/invite', a.access_token, { user_id: b.user_id });
+  assertEquals(
+    (await call(base + '/state', b.access_token, undefined, 'GET')).status,
+    200,
+  );
   await call(base + '/join', b.access_token);
   assertEquals(
     (await call(base + '/state', b.access_token, undefined, 'GET')).status,

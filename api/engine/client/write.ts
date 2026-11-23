@@ -7,14 +7,18 @@ import { inviteRemote } from '#engine/federation/invites.ts';
 import { domainOf } from '#engine/federation/pdu.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Pdu } from '#engine/pdu.ts';
+import type { Room } from '#engine/room/index.ts';
 import {
   createRoom as create,
   type CreateRoomOptions,
 } from '#engine/room/create.ts';
 import {
   acceptLocal,
+  type IngestLocalResult,
   redactEvent as redact,
   sendLocal,
+  type StateUpdate,
+  updateLocalState,
 } from '#engine/room/ingest.ts';
 import { getRulebook } from '#engine/rulebook/index.ts';
 import { ruleId } from '#engine/rulebook/rule-ids.ts';
@@ -126,19 +130,7 @@ export async function writeStateKey(
   stateKey: string,
   content: Record<string, unknown>,
 ) {
-  const room = await requireRoomForAdmission(roomId);
-  if (type === 'm.room.create') {
-    throw new MatrixError(
-      400,
-      'M_INVALID_PARAM',
-      'm.room.create cannot be sent after creation',
-    );
-  }
-  if (
-    (await membershipOf(theApp().server, roomId, userId))?.membership !== 'join'
-  ) {
-    throw new MatrixError(403, 'M_FORBIDDEN', 'not joined to ' + roomId);
-  }
+  const room = await stateWriteRoom(roomId, userId, type);
   assertCanonicalNumbers(content);
   const cur = (await stateAtSeq(roomId, null, undefined, 'admission')).find((
     r,
@@ -158,6 +150,47 @@ export async function writeStateKey(
     content,
     origin_server_ts: Date.now(),
   }, theApp().tenant.signer());
+  return await stateWriteResult(room, res);
+}
+
+export async function updateStateKey(
+  roomId: string,
+  userId: string,
+  type: string,
+  stateKey: string,
+  update: StateUpdate,
+) {
+  const room = await stateWriteRoom(roomId, userId, type);
+  const res = await updateLocalState(
+    room,
+    userId,
+    type,
+    stateKey,
+    update,
+    theApp().tenant.signer(),
+  );
+  return res === null ? null : await stateWriteResult(room, res);
+}
+
+async function stateWriteRoom(roomId: string, userId: string, type: string) {
+  const room = await requireRoomForAdmission(roomId);
+  if (type === 'm.room.create') {
+    throw new MatrixError(
+      400,
+      'M_INVALID_PARAM',
+      'm.room.create cannot be sent after creation',
+    );
+  }
+  if (
+    (await membershipOf(theApp().server, roomId, userId, 'admission'))
+      ?.membership !== 'join'
+  ) {
+    throw new MatrixError(403, 'M_FORBIDDEN', 'not joined to ' + roomId);
+  }
+  return room;
+}
+
+async function stateWriteResult(room: Room, res: IngestLocalResult) {
   if (res.standing === 'rejected') {
     const spec = getRulebook(await versionOf(room)).spec;
     const msg = `M_${

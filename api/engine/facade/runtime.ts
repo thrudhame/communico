@@ -44,6 +44,9 @@ import {
   startSender,
 } from '#engine/federation/sender.ts';
 import { projectTenant } from '#engine/server/project-tenant.ts';
+import { startNotificationHistory } from '#engine/server/notification-history.ts';
+import { type PushSender, startPushSender } from '#engine/push/sender.ts';
+import { DelayedEvents } from '#engine/delayed-events.ts';
 import {
   AccountSnapshots,
   exportSessionAuthority,
@@ -110,6 +113,8 @@ export async function openFacadeRuntime(
   let deviceLists: DeviceListService | undefined;
   let deviceEdus: EduState | undefined;
   let sender: Sender | undefined;
+  let pushSender: Promise<PushSender> | undefined;
+  let delayedEvents: DelayedEvents | undefined;
   let closed: Promise<void> | undefined;
   let refreshing = Promise.resolve();
   let roomExports: ReturnType<typeof startRoomExports> | undefined;
@@ -474,11 +479,29 @@ export async function openFacadeRuntime(
     });
   }
   const releaseServices = async () => {
-    await sender?.stop();
-    sender = undefined;
-    await deviceLists?.stop();
-    deviceLists = undefined;
-    deviceEdus = undefined;
+    await drainResources([
+      async () => {
+        const service = delayedEvents;
+        delayedEvents = undefined;
+        await service?.stop();
+      },
+      async () => {
+        const pending = pushSender;
+        pushSender = undefined;
+        await (await pending)?.stop();
+      },
+      async () => {
+        const service = sender;
+        sender = undefined;
+        await service?.stop();
+      },
+      async () => {
+        const service = deviceLists;
+        deviceLists = undefined;
+        deviceEdus = undefined;
+        await service?.stop();
+      },
+    ]);
   };
   return {
     store,
@@ -492,6 +515,55 @@ export async function openFacadeRuntime(
     requestSigner: async () => (await keyOwner()).requestSigner(),
     prepareSigner: async () => (await keyOwner()).prepareSigner(),
     releaseServices,
+    async delayedEvents(granted: Tenant) {
+      if (!caps.service('delayed')) return undefined;
+      await (await pairings()).active();
+      if (closed || !tenant) {
+        throw new MatrixError(
+          503,
+          'M_UNAVAILABLE',
+          'delayed service requires enrollment',
+        );
+      }
+      return delayedEvents ??= new DelayedEvents({ store, tenant: granted }, {
+        admitRoom: async (roomId) => {
+          await new DirectoryReplicas(server, await pairings(), identity.server)
+            .requireScope('room:' + roomId);
+        },
+      });
+    },
+    async pushSender() {
+      if (!caps.service('push')) return undefined;
+      if (closed || !tenant) {
+        throw new MatrixError(
+          503,
+          'M_UNAVAILABLE',
+          'push service requires enrollment',
+        );
+      }
+      if (pushSender) return await pushSender;
+      const granted = tenant;
+      const starting = (async () => {
+        const stopHistory = await startNotificationHistory(server);
+        try {
+          const service = await startPushSender({ store, tenant: granted });
+          return {
+            tick: () => service.tick(),
+            stop: () => drainResources([() => service.stop(), stopHistory]),
+          };
+        } catch (error) {
+          await drainResources([stopHistory], [error]);
+          throw error;
+        }
+      })();
+      pushSender = starting;
+      try {
+        return await starting;
+      } catch (error) {
+        if (pushSender === starting) pushSender = undefined;
+        throw error;
+      }
+    },
     async sender() {
       if (!caps.service('federation-sender') || !config().federation.enabled) {
         return undefined;

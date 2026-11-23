@@ -34,10 +34,15 @@ export type Genesis = {
 
 export async function genesis(
   store: Store,
-  opts: { version?: string; joinRule?: string; roomId?: string } = {},
+  opts: {
+    version?: string;
+    joinRule?: string;
+    roomId?: string;
+    signer?: Signer;
+  } = {},
 ): Promise<Genesis> {
   const version = opts.version ?? '11';
-  const signer = await testSigner();
+  const signer = opts.signer ?? await testSigner();
   const creator = '@dev:' + signer.serverName;
   const create = await buildCreate(
     {

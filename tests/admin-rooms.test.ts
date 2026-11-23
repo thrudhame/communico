@@ -21,6 +21,7 @@ import { fakeKeyResolver } from '#tests/fixtures/remote.ts';
 import { latch, watchdog } from '#tests/support/ordering.ts';
 
 Deno.test('admin rooms offered list, age filter, drop cleanup and lease retirement', async () => {
+  setConfigForTests({ server: { name: 'test' } });
   const dir = await Deno.makeTempDir();
   const http = await startHttp();
   const app = http.app;
@@ -31,9 +32,13 @@ Deno.test('admin rooms offered list, age filter, drop cleanup and lease retireme
     return r.body.result;
   };
   try {
-    const old = await genesis(app.store, { roomId: '!old:test' });
-    const young = await genesis(app.store, { roomId: '!young:test' });
-    const occupied = await genesis(app.store, { roomId: '!occupied:test' });
+    const signer = app.tenant.signer();
+    const old = await genesis(app.store, { roomId: '!old:test', signer });
+    const young = await genesis(app.store, { roomId: '!young:test', signer });
+    const occupied = await genesis(app.store, {
+      roomId: '!occupied:test',
+      signer,
+    });
     for (const g of [old, young, occupied]) {
       await registerRoom(app.store, g.roomId);
     }
@@ -179,11 +184,13 @@ Deno.test('admin rooms offered list, age filter, drop cleanup and lease retireme
     await admin.shutdown();
     await http.close();
     await Deno.remove(dir, { recursive: true });
+    setConfigForTests({});
   }
 });
 
 for (const boundary of ['unlink', 'server cleanup'] as const) {
   Deno.test(`admin room removal fences and recovers failed ${boundary} without duplicate refusals`, async () => {
+    setConfigForTests({ server: { name: 'test' } });
     const dir = await Deno.makeTempDir();
     const cfg = {
       dir: `${dir}/store`,
@@ -195,7 +202,10 @@ for (const boundary of ['unlink', 'server cleanup'] as const) {
     let app = await openApp(cfg);
     let admin = await startAdmin(app, `${dir}/a.sock`);
     try {
-      const g = await genesis(app.store, { roomId: '!recover-drop:test' });
+      const g = await genesis(app.store, {
+        roomId: '!recover-drop:test',
+        signer: app.tenant.signer(),
+      });
       if (boundary === 'server cleanup') {
         await app.server.execute(
           `INSERT INTO prejoin_memberships(room_id,user_id,event_id,room_version,event_json,invite_room_state,origin,received_ms,status,seq)
@@ -316,12 +326,14 @@ for (const boundary of ['unlink', 'server cleanup'] as const) {
       await admin.shutdown();
       await closeApp();
       await Deno.remove(dir, { recursive: true });
+      setConfigForTests({});
     }
   });
 }
 
 for (const race of ['new rejection', 'candidate failover'] as const) {
   Deno.test(`admin room removal owns the invite cut against ${race} and startup reopens`, async () => {
+    setConfigForTests({ server: { name: 'test' } });
     const dir = await Deno.makeTempDir();
     const cfg = {
       dir: `${dir}/store`,
@@ -338,7 +350,10 @@ for (const race of ['new rejection', 'candidate failover'] as const) {
     let retiring!: () => void;
     const cut = new Promise<void>((resolve) => retiring = resolve);
     try {
-      const g = await genesis(app.store, { roomId: '!invite-drop:test' });
+      const g = await genesis(app.store, {
+        roomId: '!invite-drop:test',
+        signer: app.tenant.signer(),
+      });
       const user = '@invitee:' + app.tenant.serverName;
       await app.server.execute(
         `INSERT INTO prejoin_memberships(room_id,user_id,event_id,room_version,event_json,invite_room_state,origin,received_ms,status,seq)
@@ -486,6 +501,7 @@ for (const race of ['new rejection', 'candidate failover'] as const) {
       await admin.shutdown();
       await closeApp();
       await Deno.remove(dir, { recursive: true });
+      setConfigForTests({});
     }
   });
 }

@@ -374,8 +374,7 @@ export class InboxWorker {
     return this.options.peer;
   }
 
-  /** One failure boundary includes domain validation before Journal.apply as
-   * well as transaction failures. Callers must not infer failure from logging. */
+  /** Includes domain validation before Journal.apply and transaction failures. */
   failed(error: unknown, stream?: Stream, after?: number): void {
     this.options.failed(error, stream, after);
   }

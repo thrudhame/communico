@@ -8,6 +8,7 @@ import {
   type MembershipAdmission,
   prepareMembershipAdmission,
   setJoinAdmission,
+  setJoinObservation,
   withMembershipFence,
 } from '#engine/room/hooks.ts';
 import type { Store } from '#engine/store/index.ts';
@@ -16,6 +17,7 @@ import type { Pdu } from '#engine/pdu.ts';
 import { prejoinLeaveActive, settleSupersededPrejoin } from './prejoin.ts';
 import { withProjectionLock } from './project.ts';
 import { eventStreamTx } from './stream.ts';
+import { prepareRejoin } from './membership.ts';
 
 export type JoinAttempt = {
   roomId: string;
@@ -68,6 +70,11 @@ async function assertNoJoinCleanup(
   }
 }
 export function installJoinAdmission(store: Store): void {
+  setJoinObservation(
+    store,
+    async (roomId, userId) =>
+      prepareRejoin(await store.server(), roomId, userId),
+  );
   setJoinAdmission(
     store,
     (roomId, userId, eventId) =>

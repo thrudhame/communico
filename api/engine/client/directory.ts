@@ -206,7 +206,8 @@ export async function setVisibility(
     );
   }
   if (
-    (await membershipOf(theApp().server, roomId, user))?.membership !== 'join'
+    (await membershipOf(theApp().server, roomId, user, 'admission'))
+      ?.membership !== 'join'
   ) {
     throw new MatrixError(
       403,

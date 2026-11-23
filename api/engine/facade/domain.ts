@@ -19,7 +19,32 @@ import {
 import { captureAccountDataOperations } from '#engine/tenant/accountdata.ts';
 import { captureProfileOperations } from '#engine/tenant/profiles.ts';
 import { capturePushRuleOperations } from '#engine/tenant/pushrules.ts';
+import { captureFilterOperations } from '#engine/tenant/filters.ts';
+import { captureOpenIdOperations } from '#engine/tenant/openid.ts';
+import { captureBackupOperations } from '#engine/tenant/key-backup.ts';
+import { captureOperations as captureDelayedOperations } from '#engine/tenant/delayed-events.ts';
+import {
+  capturePusherOperations,
+  pusherChoiceOperations,
+  requirePusherChoices,
+} from '#engine/tenant/pushers.ts';
+import {
+  captureReportOperations,
+  importReportOperation,
+  reportOperations,
+} from '#engine/server/reports.ts';
 import { importReceiptOperation } from '#engine/server/ephemeral.ts';
+import {
+  captureNotificationOperations,
+  notificationOperations,
+} from '#engine/server/notification-operations.ts';
+import { receiveNotificationOperation } from '#engine/server/notifications.ts';
+import {
+  captureForgetOperations,
+  forgetOperations,
+  importForgetOperation,
+  installForgetInventory,
+} from '#engine/server/membership.ts';
 import type { NodeIdentity } from './identity.ts';
 import { appendRecord, type Journal } from './journal.ts';
 import type { OwnerControl } from './ownership.ts';
@@ -44,6 +69,17 @@ export type DomainBootstrap = DomainBinding & {
   kind: 'domain-bootstrap';
   tenant: Fact[];
   receipts: Fact[];
+  // Absent on older F2 writers: those bootstraps remain valid for their
+  // original types, but cannot enable reads of an unproved filter inventory.
+  filters?: Fact[];
+  openid?: Fact[];
+  backups?: Fact[];
+  reports?: Fact[];
+  forget?: Fact[];
+  pushers?: Fact[];
+  pusherChoices?: Fact[];
+  notifications?: Fact[];
+  schedules?: Fact[];
 };
 
 function facts(operations: Fact[]): Fact[] {
@@ -89,6 +125,19 @@ function bootstrapOf(raw: unknown): DomainBootstrap {
     incarnation: text(row.incarnation),
     tenant: refs(row.tenant),
     receipts: refs(row.receipts),
+    ...(row.filters !== undefined ? { filters: refs(row.filters) } : {}),
+    ...(row.openid !== undefined ? { openid: refs(row.openid) } : {}),
+    ...(row.backups !== undefined ? { backups: refs(row.backups) } : {}),
+    ...(row.reports !== undefined ? { reports: refs(row.reports) } : {}),
+    ...(row.forget !== undefined ? { forget: refs(row.forget) } : {}),
+    ...(row.pushers !== undefined ? { pushers: refs(row.pushers) } : {}),
+    ...(row.pusherChoices !== undefined
+      ? { pusherChoices: refs(row.pusherChoices) }
+      : {}),
+    ...(row.notifications !== undefined
+      ? { notifications: refs(row.notifications) }
+      : {}),
+    ...(row.schedules !== undefined ? { schedules: refs(row.schedules) } : {}),
   };
   if (canonicalJson(view) !== canonicalJson(raw) || view.source !== 'home') {
     mismatch('unexpected domain bootstrap material');
@@ -102,10 +151,21 @@ function bootstrapOf(raw: unknown): DomainBootstrap {
 async function requireFacts(
   conn: Conn,
   view: DomainBootstrap,
-  file: 'tenant' | 'receipts',
+  file:
+    | 'tenant'
+    | 'receipts'
+    | 'filters'
+    | 'openid'
+    | 'backups'
+    | 'reports'
+    | 'forget'
+    | 'pushers'
+    | 'pusherChoices'
+    | 'notifications'
+    | 'schedules',
 ) {
   const keys = new Set<string>();
-  for (const fact of view[file]) {
+  for (const fact of view[file] ?? []) {
     const [row] = await conn.query(
       'SELECT semantic_key,kind,payload_hash,payload_json FROM domain_operations WHERE operation_id=?',
       [fact.operationId],
@@ -130,14 +190,32 @@ async function requireFacts(
       const key = JSON.parse(String(row.semantic_key));
       if (
         !Array.isArray(key) || key[1] !== view.localpart ||
-        !['account-data', 'tags', 'profile', 'push-rules'].includes(
-          String(row.kind),
-        )
+        !(file === 'filters'
+          ? ['filter']
+          : file === 'openid'
+          ? ['openid']
+          : file === 'backups'
+          ? ['backup']
+          : file === 'reports'
+          ? ['report', 'report-resolution']
+          : file === 'forget'
+          ? ['forget']
+          : file === 'pushers'
+          ? ['pusher']
+          : file === 'pusherChoices'
+          ? ['pusher-choice']
+          : file === 'notifications'
+          ? ['notification']
+          : file === 'schedules'
+          ? ['delayed-event']
+          : ['account-data', 'tags', 'profile', 'push-rules']).includes(
+            String(row.kind),
+          )
       ) mismatch('bootstrap tenant account differs');
       keys.add(String(row.semantic_key));
     }
   }
-  const retained = new Set(view[file].map((fact) => fact.operationId));
+  const retained = new Set((view[file] ?? []).map((fact) => fact.operationId));
   for (const key of keys) {
     if (
       (await readRegister(conn, key)).pending.some((op) =>
@@ -221,7 +299,24 @@ function viewOf(raw: unknown): DomainOperation | DomainHistory {
       ? 'account-data'
       : operation.kind;
     if (
-      !['account-data', 'profile', 'push-rules'].includes(String(expected)) ||
+      ![
+        'account-data',
+        'profile',
+        'push-rules',
+        'filter',
+        'openid',
+        'backup',
+        'report',
+        'report-resolution',
+        'forget',
+        'pusher',
+        'pusher-choice',
+        'notification',
+        'delayed-event',
+      ]
+        .includes(
+          String(expected),
+        ) ||
       !Array.isArray(key) || key[0] !== expected || key[1] !== localpart
     ) {
       mismatch('domain account not selected');
@@ -369,11 +464,26 @@ export class DomainOperations {
         ...await tx.accountData.operations(localpart),
         ...await tx.profiles.operations(localpart),
         ...await tx.pushRules.operations(localpart),
+        ...await tx.filters.operations(localpart),
+        ...await tx.openid.operations(localpart),
+        ...await tx.keyBackup.operations(localpart),
+        ...await tx.pushers.operations(localpart),
+        ...await tx.pushers.choices(localpart),
+        ...await tx.delayedEvents.operations(localpart),
       ];
     });
     operations.push(
       ...await db.tx((conn) =>
         receiptOperations(conn, '@' + localpart + ':' + context.server)
+      ),
+      ...await db.tx((conn) =>
+        reportOperations(conn, '@' + localpart + ':' + context.server)
+      ),
+      ...await db.tx((conn) =>
+        forgetOperations(conn, '@' + localpart + ':' + context.server)
+      ),
+      ...await db.tx((conn) =>
+        notificationOperations(conn, '@' + localpart + ':' + context.server)
       ),
     );
     const records = [];
@@ -446,6 +556,12 @@ export class DomainOperations {
           ...await captureAccountDataOperations(conn, localpart),
           ...await captureProfileOperations(conn, localpart),
           ...await capturePushRuleOperations(conn, localpart, context.server),
+          ...await captureFilterOperations(conn, localpart),
+          ...await captureOpenIdOperations(conn, localpart),
+          ...await captureBackupOperations(conn, localpart),
+          ...await capturePusherOperations(conn, localpart),
+          ...await pusherChoiceOperations(conn, localpart),
+          ...await captureDelayedOperations(conn, localpart),
         ];
       },
     );
@@ -457,11 +573,46 @@ export class DomainOperations {
         '@' + localpart + ':' + context.server,
       );
     });
+    const reportFacts = await server.tx(async (conn) => {
+      await this.selected(conn, grant, localpart);
+      await requireDomainControl(conn, binding);
+      return await captureReportOperations(
+        conn,
+        '@' + localpart + ':' + context.server,
+      );
+    });
+    // Legacy capture must precede export, otherwise the completeness declaration
+    const forgetFacts = await server.tx(async (conn) => {
+      await this.selected(conn, grant, localpart);
+      await requireDomainControl(conn, binding);
+      return await captureForgetOperations(
+        conn,
+        '@' + localpart + ':' + context.server,
+      );
+    });
+    // Legacy capture must precede export, otherwise the completeness declaration
+    // could overtake the source records it names.
+    const notificationFacts = await server.tx(async (conn) => {
+      await this.selected(conn, grant, localpart);
+      await requireDomainControl(conn, binding);
+      return await captureNotificationOperations(
+        conn,
+        '@' + localpart + ':' + context.server,
+      );
+    });
     const records = await this.export(localpart, pairing);
     // Ordinary export never echoes replica intent. Bootstrap separately attests
     // exactly the authentic history home retained, including a receiver's own
     // prior dots and prior incarnations. No dot, payload or context is rebased.
-    for (const operation of [...tenantFacts, ...receiptFacts]) {
+    for (
+      const operation of [
+        ...tenantFacts,
+        ...receiptFacts,
+        ...reportFacts,
+        ...forgetFacts,
+        ...notificationFacts,
+      ]
+    ) {
       if (
         operation.source === source.node &&
         operation.incarnation === source.incarnation
@@ -480,8 +631,32 @@ export class DomainOperations {
     const body = bootstrapOf({
       ...binding,
       kind: 'domain-bootstrap',
-      tenant: facts(tenantFacts),
+      tenant: facts(
+        tenantFacts.filter((op) =>
+          ![
+            'filter',
+            'openid',
+            'backup',
+            'pusher',
+            'pusher-choice',
+            'delayed-event',
+          ].includes(
+            op.kind,
+          )
+        ),
+      ),
       receipts: facts(receiptFacts),
+      filters: facts(tenantFacts.filter((op) => op.kind === 'filter')),
+      openid: facts(tenantFacts.filter((op) => op.kind === 'openid')),
+      backups: facts(tenantFacts.filter((op) => op.kind === 'backup')),
+      reports: facts(reportFacts),
+      forget: facts(forgetFacts),
+      pushers: facts(tenantFacts.filter((op) => op.kind === 'pusher')),
+      pusherChoices: facts(
+        tenantFacts.filter((op) => op.kind === 'pusher-choice'),
+      ),
+      notifications: facts(notificationFacts),
+      schedules: facts(tenantFacts.filter((op) => op.kind === 'delayed-event')),
     });
     records.push(await this.publish(body, grant));
     return records;
@@ -546,6 +721,15 @@ export class DomainOperations {
         await requireDomainControl(conn, view);
         await requireAccountSelection(conn, view);
         await requireFacts(conn, view, 'tenant');
+        await requireFacts(conn, view, 'filters');
+        await requireFacts(conn, view, 'openid');
+        await requireFacts(conn, view, 'backups');
+        await requireFacts(conn, view, 'pushers');
+        await requireFacts(conn, view, 'pusherChoices');
+        await requireFacts(conn, view, 'schedules');
+        if (view.pusherChoices !== undefined) {
+          await requirePusherChoices(conn, view.localpart);
+        }
       });
       return await journal.apply(peer, stream, async (conn, current) => {
         await check(conn);
@@ -556,9 +740,84 @@ export class DomainOperations {
           );
         }
         await requireFacts(conn, view, 'receipts');
+        await requireFacts(conn, view, 'reports');
+        await requireFacts(conn, view, 'forget');
+        await requireFacts(conn, view, 'notifications');
+        await conn.execute(
+          'INSERT INTO facade_scopes(incarnation,scope,source_cut,ready,pending_hash) VALUES(?,?,?,?,NULL) ON CONFLICT(incarnation,scope) DO UPDATE SET source_cut=excluded.source_cut,ready=excluded.ready,pending_hash=NULL',
+          [
+            view.pairing,
+            'notifications:@' + view.localpart + ':' + view.server,
+            record.sequence,
+            view.notifications !== undefined ? 1 : 0,
+          ],
+        );
+        if (view.forget !== undefined) {
+          await installForgetInventory(
+            conn,
+            '@' + view.localpart + ':' + view.server,
+            view.server,
+          );
+        }
+        await conn.execute(
+          'INSERT INTO facade_scopes(incarnation,scope,source_cut,ready,pending_hash) VALUES(?,?,?,?,NULL) ON CONFLICT(incarnation,scope) DO UPDATE SET source_cut=excluded.source_cut,ready=excluded.ready,pending_hash=NULL',
+          [
+            view.pairing,
+            'forget:@' + view.localpart + ':' + view.server,
+            record.sequence,
+            view.forget !== undefined ? 1 : 0,
+          ],
+        );
         await conn.execute(
           'INSERT INTO facade_scopes(incarnation,scope,source_cut,ready,pending_hash) VALUES(?,?,?,1,NULL) ON CONFLICT(incarnation,scope) DO UPDATE SET source_cut=excluded.source_cut,ready=1,pending_hash=NULL',
           [view.pairing, record.stream, record.sequence],
+        );
+        await conn.execute(
+          'INSERT INTO facade_scopes(incarnation,scope,source_cut,ready,pending_hash) VALUES(?,?,?,?,NULL) ON CONFLICT(incarnation,scope) DO UPDATE SET source_cut=excluded.source_cut,ready=excluded.ready,pending_hash=NULL',
+          [
+            view.pairing,
+            'filters:@' + view.localpart + ':' + view.server,
+            record.sequence,
+            view.filters !== undefined ? 1 : 0,
+          ],
+        );
+        await conn.execute(
+          'INSERT INTO facade_scopes(incarnation,scope,source_cut,ready,pending_hash) VALUES(?,?,?,?,NULL) ON CONFLICT(incarnation,scope) DO UPDATE SET source_cut=excluded.source_cut,ready=excluded.ready,pending_hash=NULL',
+          [
+            view.pairing,
+            'openid:@' + view.localpart + ':' + view.server,
+            record.sequence,
+            view.openid !== undefined ? 1 : 0,
+          ],
+        );
+        await conn.execute(
+          'INSERT INTO facade_scopes(incarnation,scope,source_cut,ready,pending_hash) VALUES(?,?,?,?,NULL) ON CONFLICT(incarnation,scope) DO UPDATE SET source_cut=excluded.source_cut,ready=excluded.ready,pending_hash=NULL',
+          [
+            view.pairing,
+            'backups:@' + view.localpart + ':' + view.server,
+            record.sequence,
+            view.backups !== undefined ? 1 : 0,
+          ],
+        );
+        await conn.execute(
+          'INSERT INTO facade_scopes(incarnation,scope,source_cut,ready,pending_hash) VALUES(?,?,?,?,NULL) ON CONFLICT(incarnation,scope) DO UPDATE SET source_cut=excluded.source_cut,ready=excluded.ready,pending_hash=NULL',
+          [
+            view.pairing,
+            'pushers:@' + view.localpart + ':' + view.server,
+            record.sequence,
+            view.pushers !== undefined && view.pusherChoices !== undefined
+              ? 1
+              : 0,
+          ],
+        );
+        await conn.execute(
+          'INSERT INTO facade_scopes(incarnation,scope,source_cut,ready,pending_hash) VALUES(?,?,?,?,NULL) ON CONFLICT(incarnation,scope) DO UPDATE SET source_cut=excluded.source_cut,ready=excluded.ready,pending_hash=NULL',
+          [
+            view.pairing,
+            'schedules:@' + view.localpart + ':' + view.server,
+            record.sequence,
+            view.schedules !== undefined ? 1 : 0,
+          ],
         );
         return { kind: 'domain-bootstrap', localpart: view.localpart };
       });
@@ -570,7 +829,21 @@ export class DomainOperations {
         context.home.publicKey,
       )
       : undefined;
-    if (view.operation.kind === 'receipt') {
+    if (view.operation.kind === 'notification') {
+      await receiveNotificationOperation(
+        await this.store.server(),
+        view.operation,
+        check,
+        history,
+      );
+    } else if (view.operation.kind === 'forget') {
+      await importForgetOperation(
+        await this.store.server(),
+        view.operation,
+        check,
+        history,
+      );
+    } else if (view.operation.kind === 'receipt') {
       await importReceiptOperation(
         await this.store.server(),
         view.operation as RegisterOperation & { kind: 'receipt' },
@@ -579,6 +852,16 @@ export class DomainOperations {
           incarnation: history ? view.operation.incarnation : view.incarnation,
           userId: '@' + view.localpart + ':' + view.server,
         },
+        check,
+        history,
+      );
+    } else if (
+      view.operation.kind === 'report' ||
+      view.operation.kind === 'report-resolution'
+    ) {
+      await importReportOperation(
+        await this.store.server(),
+        view.operation,
         check,
         history,
       );
@@ -594,6 +877,16 @@ export class DomainOperations {
           await tx.profiles.import(view.operation, history);
         } else if (view.operation.kind === 'push-rules') {
           await tx.pushRules.import(view.operation, history);
+        } else if (view.operation.kind === 'filter') {
+          await tx.filters.import(view.operation, history);
+        } else if (view.operation.kind === 'openid') {
+          await tx.openid.import(view.operation, history);
+        } else if (view.operation.kind === 'backup') {
+          await tx.keyBackup.import(view.operation, history);
+        } else if (['pusher', 'pusher-choice'].includes(view.operation.kind)) {
+          await tx.pushers.import(view.operation, history);
+        } else if (view.operation.kind === 'delayed-event') {
+          await tx.delayedEvents.import(view.operation, history);
         } else await tx.accountData.import(view.operation, history);
       });
     }

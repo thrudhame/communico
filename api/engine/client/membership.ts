@@ -205,7 +205,7 @@ export async function leave(roomId: string, userId: string, reason?: string) {
   const deps = inviteDeps();
   const invitation = await inviteFor(roomId, userId, deps);
   const room = await lookupRoomForAdmission(roomId);
-  const current = await membershipOf(app.server, roomId, userId);
+  const current = await membershipOf(app.server, roomId, userId, 'admission');
   if (
     (current === null || current.seq < (invitation?.seq ?? 0)) &&
     invitation !== null && invitation.status !== 'joined'
@@ -235,7 +235,8 @@ export async function memberOperation(
     }
     if (
       target === userId ||
-      (await membershipOf(app.server, roomId, target))?.membership === 'join'
+      (await membershipOf(app.server, roomId, target, 'admission'))
+          ?.membership === 'join'
     ) throw new MatrixError(403, 'M_FORBIDDEN', 'cannot invite this user');
     result = await inviteRemote(
       roomId,

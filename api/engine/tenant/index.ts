@@ -143,6 +143,17 @@ function bind(
       await requireSessionAuthority(conn, intent.hash, intent.refresh);
     }
   };
+  const admittedDelay = async (id: string) => {
+    const event = await delayedEvents.get(conn, id);
+    if (event) {
+      await authorize({
+        kind: 'domain',
+        localpart: event.localpart,
+        feature: 'schedules',
+      });
+    }
+    return event;
+  };
   const mutation = async <T>(operation: () => Promise<T>): Promise<T> => {
     const before = conn.writes;
     const value = await operation();
@@ -186,29 +197,50 @@ function bind(
     },
     keyBackup: {
       clear: (localpart: string) => keyBackup.clearBackup(conn, localpart),
-      version: (
+      operations: (localpart: string) =>
+        keyBackup.backupOperations(conn, localpart),
+      import: (
+        operation: import('#engine/facade/registers.ts').RegisterOperation,
+        history?: import('#engine/facade/domain-control.ts').DomainHistoryProof,
+      ) => keyBackup.importBackup(conn, operation, config().e2ee, history),
+      version: async (
         localpart: string,
         action: keyBackup.Action,
         version?: string,
         input?: unknown,
-      ) =>
-        keyBackup.backupVersion(
+      ) => {
+        if (action === 'get') {
+          await authorize({
+            kind: 'domain-read',
+            localpart,
+            feature: 'backups',
+          });
+        }
+        return await keyBackup.backupVersion(
           conn,
           localpart,
           action,
           version,
           input,
           config().e2ee,
-        ),
-      keys: (
+        );
+      },
+      keys: async (
         localpart: string,
         action: keyBackup.Action,
         version: string | null,
         room?: string,
         session?: string,
         input?: unknown,
-      ) =>
-        keyBackup.backupKeys(
+      ) => {
+        if (action === 'get') {
+          await authorize({
+            kind: 'domain-read',
+            localpart,
+            feature: 'backups',
+          });
+        }
+        return await keyBackup.backupKeys(
           conn,
           localpart,
           action,
@@ -217,7 +249,8 @@ function bind(
           session,
           input,
           config().e2ee,
-        ),
+        );
+      },
     },
     keySignatures: {
       basis: async (localpart: string) => {
@@ -615,13 +648,36 @@ function bind(
       drop: (session: string) => uia.deleteUiaSession(conn, session),
     },
     pushers: {
-      isCurrent: (
+      operations: (localpart: string) =>
+        pushers.pusherOperations(conn, localpart),
+      choices: (localpart: string) =>
+        pushers.pusherChoiceOperations(conn, localpart),
+      import: async (
+        operation: import('#engine/facade/registers.ts').RegisterOperation,
+        history?: import('#engine/facade/domain-control.ts').DomainHistoryProof,
+      ) => {
+        const canceled = operation.kind === 'pusher-choice'
+          ? await pushers.importPusherChoice(conn, operation, history)
+          : await pushers.importPusherOperation(conn, operation, history);
+        if (canceled) {
+          changed();
+        }
+      },
+      isCurrent: async (
         localpart: string,
         appId: string,
         pushkey: string,
         incarnation: string,
-      ) =>
-        pushers.pusherIsCurrent(conn, localpart, appId, pushkey, incarnation),
+      ) => {
+        await authorize({ kind: 'domain', localpart, feature: 'pushers' });
+        return await pushers.pusherIsCurrent(
+          conn,
+          localpart,
+          appId,
+          pushkey,
+          incarnation,
+        );
+      },
       moveToken: (oldHash: string, newHash: string) =>
         pushers.movePusherToken(conn, oldHash, newHash),
       deleteForToken: (accessHash: string) =>
@@ -729,6 +785,16 @@ function bind(
         accountdata.accountDataMaxSeq(conn, localpart),
     },
     openid: {
+      issue: (localpart: string, now: number, expires: number) =>
+        openid.createOpenIdToken(conn, localpart, now, expires),
+      read: (token: string, hash: string, now: number) =>
+        openid.readOpenIdUser(conn, token, hash, now),
+      operations: (localpart: string) =>
+        openid.openIdOperations(conn, localpart),
+      import: (
+        operation: import('#engine/facade/registers.ts').RegisterOperation,
+        history?: import('#engine/facade/domain-control.ts').DomainHistoryProof,
+      ) => openid.importOpenId(conn, operation, history),
       insert: (hash: string, localpart: string, expires: number) =>
         openid.insertOpenId(conn, hash, localpart, expires),
       user: (hash: string, now: number) => openid.openIdUser(conn, hash, now),
@@ -822,6 +888,19 @@ function bind(
     },
     filters: {
       clear: (localpart: string) => filters.clearFilters(conn, localpart),
+      create: async (localpart: string, filter: unknown) => {
+        const id = await filters.createFilter(conn, localpart, filter);
+        changed();
+        return id;
+      },
+      read: (localpart: string, filterId: string) =>
+        filters.readFilter(conn, localpart, filterId),
+      operations: (localpart: string) =>
+        filters.filterOperations(conn, localpart),
+      import: (
+        operation: import('#engine/facade/registers.ts').RegisterOperation,
+        history?: import('#engine/facade/domain-control.ts').DomainHistoryProof,
+      ) => filters.importFilter(conn, operation, history),
       count: (localpart: string) => filters.countFilters(conn, localpart),
       insert: (localpart: string, filterId: string, filter: string) =>
         filters.insertFilter(conn, localpart, filterId, filter),
@@ -840,29 +919,103 @@ function bind(
         media.markMediaUploaded(conn, mediaId, meta),
     },
     delayedEvents: {
-      get: (id: string) => delayedEvents.get(conn, id),
-      list: (localpart: string) => delayedEvents.list(conn, localpart),
-      receipt: (receipt: delayedEvents.DelayReceipt) =>
-        delayedEvents.receipt(conn, receipt),
-      add: (
+      newId: () => delayedEvents.newId(conn),
+      requireOwner: (id: string) => delayedEvents.requireOwner(conn, id),
+      operations: (localpart: string) =>
+        delayedEvents.operations(conn, localpart),
+      import: (
+        operation: import('#engine/facade/registers.ts').RegisterOperation,
+        history?: import('#engine/facade/domain-control.ts').DomainHistoryProof,
+      ) => delayedEvents.importOperation(conn, operation, history),
+      replicas: async (localpart: string) => {
+        await authorize({
+          kind: 'domain-read',
+          localpart,
+          feature: 'schedules',
+        });
+        return await delayedEvents.replicas(conn, localpart);
+      },
+      get: admittedDelay,
+      list: async (localpart: string) => {
+        await authorize({
+          kind: 'domain-read',
+          localpart,
+          feature: 'schedules',
+        });
+        return await delayedEvents.list(conn, localpart);
+      },
+      receipt: async (receipt: delayedEvents.DelayReceipt) => {
+        await authorize({
+          kind: 'domain',
+          localpart: receipt.device.localpart,
+          feature: 'schedules',
+        });
+        return await delayedEvents.receipt(conn, receipt);
+      },
+      add: async (
         event: delayedEvents.DelayedEvent,
         limit: number,
         receipt?: delayedEvents.DelayReceipt,
-      ) => delayedEvents.add(conn, event, limit, receipt),
-      remove: (id: string) => delayedEvents.remove(conn, id),
-      action: (
+      ) => {
+        await authorize({
+          kind: 'domain',
+          localpart: event.localpart,
+          feature: 'schedules',
+        });
+        const id = await delayedEvents.add(conn, event, limit, receipt);
+        changed();
+        return id;
+      },
+      remove: async (
+        id: string,
+        standing?: import('#engine/room/events.ts').Standing,
+      ) => {
+        await admittedDelay(id);
+        await delayedEvents.remove(conn, id, standing);
+        changed();
+      },
+      action: async (
         id: string,
         action: 'cancel' | 'restart' | 'send',
         now: number,
-      ) => delayedEvents.action(conn, id, action, now),
+      ) => {
+        await admittedDelay(id);
+        await delayedEvents.action(conn, id, action, now);
+        changed();
+      },
       next: () => delayedEvents.next(conn),
-      retry: (ids: readonly string[], due: number) =>
-        delayedEvents.retry(conn, ids, due),
+      retry: async (
+        ids: readonly string[],
+        due: number,
+        observed?: readonly Pick<
+          delayedEvents.DelayedEvent,
+          'id' | 'due' | 'since'
+        >[],
+      ) => {
+        await delayedEvents.retry(conn, ids, due, observed);
+      },
       due: (now: number) => delayedEvents.due(conn, now),
-      claim: (id: string, now: number) => delayedEvents.claim(conn, id, now),
-      submission: (id: string) => delayedEvents.submission(conn, id),
-      prepare: (id: string, pdu: Pdu) => delayedEvents.prepare(conn, id, pdu),
-      finish: (id: string) => delayedEvents.finish(conn, id),
+      claim: async (id: string, now: number) => {
+        await admittedDelay(id);
+        const event = await delayedEvents.claim(conn, id, now);
+        if (event) changed();
+        return event;
+      },
+      submission: async (id: string) => {
+        await admittedDelay(id);
+        return await delayedEvents.submission(conn, id);
+      },
+      prepare: async (id: string, pdu: Pdu) => {
+        await admittedDelay(id);
+        const submission = await delayedEvents.prepare(conn, id, pdu);
+        changed();
+        return submission;
+      },
+      finish: async (id: string) => {
+        await admittedDelay(id);
+        await delayedEvents.finish(conn, id);
+        changed();
+      },
     },
     completion: {
       pending: (device: devices.DeviceIdentity) =>

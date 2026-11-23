@@ -1,6 +1,7 @@
 import { assertEquals, assertRejects } from '@std/assert';
 import { dropOperatorRoom } from '#engine/room/operator.ts';
 import { startHttp } from '#tests/http-app.ts';
+import { setConfigForTests } from '#engine/config.ts';
 import { genesis } from '#tests/fixtures/genesis.ts';
 
 // Independent of removal.ts: a new room-keyed server table must choose its
@@ -42,19 +43,24 @@ const cleared = [
 // cancelled by the notification owner, not erased with the room projection.
 // Membership protocol receipts retain exact authenticated retry responses after
 // removal; disposable sender attempts/jobs are cleared with the room instead.
+// Notification retirement markers keep late facts from rebuilding a dropped
+// projection or blocking unrelated history after the room file is gone.
 const retained = [
   'federation_join_attempts',
   'membership_operations',
+  'notification_retired_rooms',
   'push_delivery',
   'reports',
 ];
 
 Deno.test('operator unlink clears every registered per-room server table', async () => {
+  setConfigForTests({ server: { name: 'test' } });
   const http = await startHttp();
   try {
     const app = http.app;
-    const gone = await genesis(app.store, { roomId: '!gone:test' });
-    const kept = await genesis(app.store, { roomId: '!kept:test' });
+    const signer = app.tenant.signer();
+    const gone = await genesis(app.store, { roomId: '!gone:test', signer });
+    const kept = await genesis(app.store, { roomId: '!kept:test', signer });
     const tables = new Map<
       string,
       { name: string; type: string; notnull: number; dflt_value: unknown }[]
@@ -165,5 +171,6 @@ Deno.test('operator unlink clears every registered per-room server table', async
     }
   } finally {
     await http.close();
+    setConfigForTests({});
   }
 });

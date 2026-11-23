@@ -34,6 +34,7 @@ const TABLES = [
   'completion_state',
   'completion_receipts',
   'membership_receipts',
+  'local_join_observations',
   'membership_receipt_wires',
 ];
 

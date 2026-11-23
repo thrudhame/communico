@@ -419,6 +419,14 @@ zero to clear badges. Logout, device/token revocation, account deactivation and
 matching gateway `rejected` verdicts cancel the corresponding registration's
 work. Invalid responses and HTTP/TLS errors retry; they never delete a pusher.
 
+With F2 facades, `append=false` immediately removes matching app ID/pushkey
+registrations for other accounts held at that ingress. Home applies the same
+cross-account removal when it receives the original registration; its removals
+return through each affected selected account's signed stream. An unseen old
+pusher can still receive notifications during a partition until that exchange
+finishes. Same-account registrations are exempt, and refresh/replay is not a new
+replacement request. No unselected account's registration is sent to the facade.
+
 Account deactivation accepts `erase: true`: local readers who gained visibility
 only afterward receive room-version-pruned copies, while earlier visibility is
 preserved. This is not physical deletion, a federation erasure request or a set
@@ -436,6 +444,43 @@ Avatar and timezone values must be strings but are otherwise accepted verbatim,
 matching Synapse's permissive default. Use DELETE to remove an avatar field.
 
 ## Facade replication progress
+
+Encrypted key backup is home-owned. F2 facade reads retain selected complete
+home version revisions, including their original etags and encrypted sessions;
+every backup mutation still requires home ingress, even while home is online.
+Reads require a signed backup inventory and the applied domain prefix. Missing
+inventory or received-but-unapplied changes are 503, not false missing backups.
+Imports never re-run quality selection or allocate versions/etags. Deactivation
+cannot restore cleared ciphertext. Changed enrolled versions retain complete
+version facts, so replication/storage cost includes that version's ciphertext;
+unchanged uploads do not add a fact. Old protected journal facts remain subject
+to the deployment's backup/retention protection.
+
+Content reports accepted at either ingress retain immutable node-namespaced
+identity and original receive metadata. The home-initiated signed link unions
+them without duplicating reports or creating room/sync/federation events. Local
+admin pagination numbers are not cross-node identities; `reportId` is. Only
+home can resolve a report, including through the private admin socket. Original
+home resolution metadata replicates independently and is safe to replay before
+its report. Unknown/nonlocal user reports retain the no-disclosure success
+response; that response does not imply a stored report or moderation action.
+
+Distributed OpenID credentials retain only digest/expiry facts in the signed
+semantic journal. Issuance commits that intent with the credential; imports
+preserve its original issuer and expiry, never create client sessions, and
+cannot resurrect a deactivated account. Userinfo requires a complete selected
+OpenID inventory, independently of password replication or client device
+ownership. Missing other-issuer credentials return unavailable until replicated;
+known expired credentials remain unknown. Existing home bearers survive bootstrap
+unchanged. No bearer is exported.
+
+Distributed stored filters have immutable node/incarnation-namespaced IDs.
+Existing home numeric IDs keep their meaning. Filters replicate as protected
+per-user semantic facts; a missing foreign ID returns retryable 503 until its
+material is held, rather than pretending it is known absent. Filter admission
+requires the signed filter inventory and completed received domain prefix.
+An older domain bootstrap cannot enable that new scope. Import and retry do
+not create account-data news, and deactivation cannot resurrect cleared filters.
 
 Operators can inspect lag over the private admin Unix socket:
 

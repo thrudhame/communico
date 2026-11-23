@@ -2,6 +2,20 @@
 // connection, committing with live publication or the receipt that caused them.
 import type { Conn, Database } from '#engine/store/db.ts';
 import type { PushPublication } from '#engine/server/push-project.ts';
+import type { RegisterOperation } from '#engine/facade/registers.ts';
+import type { DomainHistoryProof } from '#engine/facade/domain-control.ts';
+import {
+  acceptNotificationOperation,
+  captureNotificationOperations,
+  notificationAuthority,
+  recordNotificationOperation,
+  savedNotification,
+  selectedNotificationOperation,
+} from './notification-operations.ts';
+import type { PublicationDecision } from './push-project.ts';
+import type { PushKind } from '#engine/push/defaults.ts';
+import { eventStreamTx } from './stream.ts';
+import { MatrixError } from '#engine/matrix-error.ts';
 import {
   graphNotificationRead,
   graphReadClosure,
@@ -41,6 +55,23 @@ export async function removeNotificationFacts(
 ): Promise<void> {
   const column = 'room' in scope ? 'room' : 'user';
   const value = 'room' in scope ? scope.room : scope.user;
+  if ('user' in scope) {
+    // The existing account lifecycle owner calls this once deactivation is
+    // durable. Retained facts may still arrive, but cannot recreate its view.
+    await tx.execute(
+      'INSERT INTO notification_retired_users(user) VALUES(?) ON CONFLICT DO NOTHING',
+      [scope.user],
+    );
+  } else {
+    await tx.execute(
+      'INSERT INTO notification_retired_rooms(room) VALUES(?) ON CONFLICT DO NOTHING',
+      [scope.room],
+    );
+  }
+  await tx.execute(
+    `UPDATE domain_operations SET applied=-1 WHERE kind='notification' AND json_extract(payload_json,'$.${column}')=?`,
+    [value],
+  );
   await removePushWork(tx, scope);
   for (
     const table of [
@@ -79,6 +110,7 @@ async function delta(
   thread: string,
   unread: number,
   highlight: number,
+  dispatch = true,
 ): Promise<void> {
   await tx.execute(
     'INSERT INTO notification_counts(user,room,thread,unread,highlight) VALUES(?,?,?,0,0) ON CONFLICT DO NOTHING',
@@ -92,7 +124,7 @@ async function delta(
     'INSERT INTO notification_changes(seq,user,room,thread) VALUES(?,?,?,?)',
     [await next(tx), user, room, thread],
   );
-  await queueBadge(tx, user);
+  if (dispatch) await queueBadge(tx, user);
 }
 
 /** Effective read positions never move backwards, regardless of wire echo.
@@ -674,6 +706,9 @@ export async function reconcileNotificationEvent(
         now,
       );
     }
+    // Read markers and local own-event reads are authoritative before a saved
+    // imported decision is materialized. No transient unread row may dispatch.
+    await projectImportedNotificationEvent(tx, room, target, now);
     const redacted = (await tx.query(
       'SELECT 1 FROM redactions WHERE room=? AND target=?',
       [room, target],
@@ -775,29 +810,134 @@ async function applyDecisions(
   publication: PushPublication,
   now: number,
   thread: string,
-  source: string,
+  source: 'room' | 'invite',
 ): Promise<void> {
   for (const input of publication.decisions) {
-    const inserted = await tx.execute(
-      `INSERT INTO push_evaluations(tenant,user,event,room,event_seq,source,source_pos,rule_revision,ignore_revision,version,rule_id,rule_kind)
-      VALUES(?,?,?,?,?,?,?,?,?,1,?,?) ON CONFLICT DO NOTHING`,
-      [
+    if (
+      (await tx.query('SELECT 1 FROM notification_retired_users WHERE user=?', [
+        input.user,
+      ])).length
+    ) continue;
+    const [prior] = await tx.query(
+      'SELECT operation_id,native FROM push_evaluations WHERE tenant=? AND user=? AND event=?',
+      [input.tenant, input.user, event],
+    );
+    const authority = await notificationAuthority(tx);
+    if (
+      prior &&
+      Number(prior.native) === 1
+    ) {
+      if (authority && prior.operation_id === null) {
+        await captureNotificationOperations(tx, input.user);
+      }
+      continue;
+    }
+    const recorded = await recordNotificationOperation(
+      tx,
+      room,
+      event,
+      source,
+      input,
+      now,
+    );
+    if (
+      recorded &&
+      (await tx.query(
+        'SELECT 1 FROM domain_operations WHERE operation_id=? AND applied=-1',
+        [recorded.operation.operationId],
+      )).length
+    ) continue;
+    if (prior) {
+      await removeDecisionProjection(
+        tx,
         input.tenant,
         input.user,
         event,
-        room,
-        eventSeq,
-        source,
-        pos,
-        input.ruleRevision,
-        input.ignoreRevision,
-        input.decision?.ruleId ?? null,
-        input.decision?.kind ?? null,
-      ],
+        false,
+      );
+    }
+    await projectDecision(
+      tx,
+      room,
+      event,
+      eventSeq,
+      pos,
+      recorded
+        ? savedDecisionInput(
+          savedNotification(recorded.operation),
+          input.pusherIncarnations,
+        )
+        : input,
+      now,
+      thread,
+      source,
+      recorded?.operation.operationId ?? null,
+      recorded?.created ?? true,
+      recorded ? savedNotification(recorded.operation).createdMs : now,
+      true,
     );
-    if (!inserted || !input.decision?.notify) continue;
-    // Only missing durable read facts seed an upgrade. Later notifications use
-    // those read markers; event arrival owns pending/late-target reconciliation.
+  }
+}
+
+function savedDecisionInput(
+  value: ReturnType<typeof savedNotification>,
+  pusherIncarnations?: string[],
+): PublicationDecision {
+  return {
+    tenant: value.tenant,
+    user: value.user,
+    ruleRevision: value.ruleRevision,
+    ignoreRevision: value.ignoreRevision,
+    pusherIncarnations,
+    decision: value.ruleId === null ? null : {
+      ruleId: value.ruleId,
+      kind: value.ruleKind as PushKind,
+      notify: value.notify,
+      actions: value.actions,
+      highlight: value.highlight,
+      tweaks: {},
+    },
+  };
+}
+
+async function projectDecision(
+  tx: Conn,
+  room: string,
+  event: string,
+  eventSeq: number,
+  pos: number,
+  input: PublicationDecision,
+  now: number,
+  thread: string,
+  source: string,
+  operationId: string | null,
+  dispatch: boolean,
+  createdMs = now,
+  native = dispatch,
+): Promise<void> {
+  const inserted = await tx.execute(
+    `INSERT INTO push_evaluations(tenant,user,event,room,event_seq,source,source_pos,rule_revision,ignore_revision,version,rule_id,rule_kind,operation_id,native)
+       VALUES(?,?,?,?,?,?,?,?,?,1,?,?,?,?) ON CONFLICT DO NOTHING`,
+    [
+      input.tenant,
+      input.user,
+      event,
+      room,
+      eventSeq,
+      source,
+      pos,
+      input.ruleRevision,
+      input.ignoreRevision,
+      input.decision?.ruleId ?? null,
+      input.decision?.kind ?? null,
+      operationId,
+      native ? 1 : 0,
+    ],
+  );
+  if (!inserted || !input.decision?.notify) return;
+  // Native publication seeds only missing durable read facts. Imported saved
+  // notifications never advance local read markers or dispatch pushes.
+  if (dispatch) {
     for (
       const seed of await notificationReceiptSeeds(
         tx,
@@ -814,60 +954,257 @@ async function applyDecisions(
         now,
       );
     }
-    const read = await notificationIsRead(
+  }
+  const read = await notificationIsRead(
+    tx,
+    input.user,
+    room,
+    thread,
+    event,
+    eventSeq,
+  );
+  const withdrawn = (await tx.query(
+    'SELECT 1 FROM redactions WHERE room=? AND target=?',
+    [room, event],
+  )).length > 0;
+  const notificationSeq = await next(tx);
+  await tx.execute(
+    `INSERT INTO notifications(seq,tenant,user,event,room,event_seq,thread,actions,highlight,created_ms,read_ms,withdrawn) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+    [
+      notificationSeq,
+      input.tenant,
+      input.user,
+      event,
+      room,
+      eventSeq,
+      thread,
+      JSON.stringify(input.decision.actions),
+      input.decision.highlight ? 1 : 0,
+      createdMs,
+      read ? now : null,
+      withdrawn ? 1 : 0,
+    ],
+  );
+  if (!read && !withdrawn) {
+    await delta(
       tx,
       input.user,
       room,
       thread,
-      event,
-      eventSeq,
+      1,
+      input.decision.highlight ? 1 : 0,
+      dispatch,
     );
-    const withdrawn = (await tx.query(
-      'SELECT 1 FROM redactions WHERE room=? AND target=?',
-      [room, event],
-    )).length > 0;
-    const notificationSeq = await next(tx);
-    await tx.execute(
-      `INSERT INTO notifications(seq,tenant,user,event,room,event_seq,thread,actions,highlight,created_ms,read_ms,withdrawn) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
-      [
-        notificationSeq,
-        input.tenant,
-        input.user,
-        event,
-        room,
-        eventSeq,
-        thread,
-        JSON.stringify(input.decision.actions),
-        input.decision.highlight ? 1 : 0,
-        now,
-        read ? now : null,
-        withdrawn ? 1 : 0,
-      ],
-    );
-    if (!read && !withdrawn) {
-      await delta(
+  }
+  await syncNotificationHistory(tx, notificationSeq, now);
+  if (dispatch && !read && !withdrawn) {
+    for (const incarnation of input.pusherIncarnations ?? []) {
+      await enqueuePush(
         tx,
+        incarnation,
+        notificationSeq,
         input.user,
         room,
-        thread,
-        1,
-        input.decision.highlight ? 1 : 0,
+        event,
+        now,
       );
     }
-    await syncNotificationHistory(tx, notificationSeq, now);
-    if (!read && !withdrawn) {
-      for (const incarnation of input.pusherIncarnations ?? []) {
-        await enqueuePush(
-          tx,
-          incarnation,
-          notificationSeq,
-          input.user,
-          room,
-          event,
-          now,
+  }
+}
+
+/** Replacing a fallback changes only this ingress's projection, never its
+ * original facts or gateway work. Native evaluations are never removed here. */
+async function removeDecisionProjection(
+  tx: Conn,
+  tenant: string,
+  user: string,
+  event: string,
+  dispatch: boolean,
+) {
+  const [row] = await tx.query(
+    'SELECT * FROM notifications WHERE tenant=? AND user=? AND event=?',
+    [tenant, user, event],
+  );
+  if (row) {
+    if (row.read_ms === null && Number(row.withdrawn) === 0) {
+      await delta(
+        tx,
+        user,
+        String(row.room),
+        String(row.thread),
+        -1,
+        -Number(row.highlight),
+        dispatch,
+      );
+    }
+    await tx.execute('DELETE FROM notification_history WHERE seq=?', [
+      Number(row.seq),
+    ]);
+    await tx.execute('DELETE FROM notifications WHERE seq=?', [
+      Number(row.seq),
+    ]);
+  }
+  await tx.execute(
+    'DELETE FROM push_evaluations WHERE tenant=? AND user=? AND event=?',
+    [tenant, user, event],
+  );
+}
+
+export async function importNotificationOperation(
+  tx: Conn,
+  operation: RegisterOperation,
+  now: number,
+  history?: DomainHistoryProof,
+) {
+  const value = await acceptNotificationOperation(tx, operation, history);
+  await reconcileNotificationEvent(tx, value.room, value.event, now);
+}
+
+/** The existing server stream owns post-commit consumer wakes, as for imported
+ * receipts. Authorization and all retained/projection facts share its attempt. */
+export async function receiveNotificationOperation(
+  server: Database,
+  operation: RegisterOperation,
+  authorize: (conn: Conn) => Promise<void>,
+  history?: DomainHistoryProof,
+) {
+  await eventStreamTx(server, async (conn) => {
+    await authorize(conn);
+    await importNotificationOperation(conn, operation, Date.now(), history);
+  });
+}
+
+/** Inventory presence cannot prove an empty public history while the selected
+ * saved notifying context still awaits receiver evidence. Native evaluations,
+ * suppressions and deliberately retired facts keep their ordinary meanings. */
+export async function requireNotificationHistory(
+  server: Database,
+  user: string,
+) {
+  await server.tx(async (conn) => {
+    const keys = await conn.query(
+      `SELECT DISTINCT o.semantic_key FROM domain_operations o
+       WHERE o.kind='notification' AND o.applied<>-1
+       AND json_extract(o.payload_json,'$.user')=?
+       AND json_extract(o.payload_json,'$.notify')=1
+       AND NOT EXISTS (SELECT 1 FROM notification_retired_users r WHERE r.user=?)
+       AND NOT EXISTS (SELECT 1 FROM push_evaluations e
+         WHERE e.tenant=json_extract(o.payload_json,'$.tenant')
+         AND e.user=? AND e.event=json_extract(o.payload_json,'$.event'))`,
+      [user, user, user],
+    );
+    for (const row of keys) {
+      const selected = await selectedNotificationOperation(
+        conn,
+        String(row.semantic_key),
+      );
+      if (selected && savedNotification(selected).notify) {
+        const value = savedNotification(selected);
+        // OOB display is transient. An invite fact without a current display
+        // or accepted room event is retained evidence, not a history dependency.
+        if (
+          value.source === 'invite' && !await notificationTarget(conn, value)
+        ) continue;
+        throw new MatrixError(
+          503,
+          'M_UNAVAILABLE',
+          'saved notification evidence unavailable',
         );
       }
     }
+  });
+}
+
+async function notificationTarget(
+  tx: Conn,
+  value: ReturnType<typeof savedNotification>,
+) {
+  const [target] = await tx.query(
+    "SELECT seq,pos FROM event_index WHERE event=? AND room=? AND standing='accepted' AND grounding='grounded' AND seq IS NOT NULL",
+    [value.event, value.room],
+  );
+  if (target) return target;
+  if (value.source !== 'invite') return undefined;
+  const [invite] = await tx.query(
+    "SELECT seq,seq AS pos FROM prejoin_memberships WHERE room_id=? AND user_id=? AND event_id=? AND kind='invite' AND status='pending'",
+    [value.room, value.user, value.event],
+  );
+  return invite;
+}
+
+/** Source facts may precede room evidence. Event projection revisits only the
+ * affected identities and assigns local positions; no foreign seq is copied. */
+async function projectImportedNotificationEvent(
+  tx: Conn,
+  room: string,
+  event: string,
+  now: number,
+) {
+  const keys = await tx.query(
+    "SELECT DISTINCT semantic_key FROM domain_operations WHERE kind='notification' AND json_extract(payload_json,'$.room')=? AND json_extract(payload_json,'$.event')=?",
+    [room, event],
+  );
+  for (const row of keys) {
+    const selected = await selectedNotificationOperation(
+      tx,
+      String(row.semantic_key),
+    );
+    if (!selected) continue;
+    const value = savedNotification(selected);
+    if (
+      (await tx.query('SELECT 1 FROM notification_retired_users WHERE user=?', [
+        value.user,
+      ])).length
+    ) continue;
+    const [prior] = await tx.query(
+      'SELECT operation_id,native FROM push_evaluations WHERE tenant=? AND user=? AND event=?',
+      [value.tenant, value.user, event],
+    );
+    // A legacy row is native, not an unproved imported fallback.
+    if (
+      prior &&
+      (Number(prior.native) === 1 ||
+        prior.operation_id === selected.operationId)
+    ) continue;
+    const target = await notificationTarget(tx, value);
+    if (!target) continue;
+    if (prior) {
+      await removeDecisionProjection(
+        tx,
+        value.tenant,
+        value.user,
+        event,
+        false,
+      );
+    }
+    const seq = Number(target.seq);
+    await projectDecision(
+      tx,
+      room,
+      event,
+      seq,
+      Number(target.pos ?? seq),
+      {
+        tenant: value.tenant,
+        user: value.user,
+        ruleRevision: value.ruleRevision,
+        ignoreRevision: value.ignoreRevision,
+        decision: value.ruleId === null ? null : {
+          ruleId: value.ruleId,
+          kind: value.ruleKind as PushKind,
+          notify: value.notify,
+          actions: value.actions,
+          highlight: value.highlight,
+          tweaks: {},
+        },
+      },
+      now,
+      await threadOfEvent(tx, room, event),
+      value.source,
+      selected.operationId,
+      false,
+      value.createdMs,
+    );
   }
 }
 

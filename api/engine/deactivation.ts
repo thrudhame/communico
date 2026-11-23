@@ -28,41 +28,49 @@ export async function runDeactivationWork(
   );
   for (const row of pending) {
     const user = '@' + row.localpart + ':' + tenant.serverName;
-    for (const membership of await roomsFor(server, user)) {
-      if (!['join', 'invite', 'knock'].includes(membership.membership)) {
-        continue;
+    try {
+      for (const membership of await roomsFor(server, user, 'admission')) {
+        if (!['join', 'invite', 'knock'].includes(membership.membership)) {
+          continue;
+        }
+        try {
+          const room = await openRoom(store, membership.roomId);
+          // No server/tenant read occurs inside the room's signing callback.
+          const signer = await options.prepareSigner();
+          await leave(room, user, signer);
+        } catch (error) {
+          options.failed(error);
+        }
       }
-      try {
-        const room = await openRoom(store, membership.roomId);
-        // No server/tenant read occurs inside the room's signing callback.
-        const signer = await options.prepareSigner();
-        await leave(room, user, signer);
-      } catch (error) {
-        options.failed(error);
+      // This inventory includes out-of-band invites and uncertain knock attempts,
+      // not only joined rooms. Rejection commits local departure + remote intent;
+      // the existing sender owns remote retries, never this worker.
+      for (const invitation of await invitesOf(user, { server })) {
+        if (
+          !['pending', 'attempting', 'failed-attempt'].includes(
+            invitation.status,
+          )
+        ) continue;
+        try {
+          const signer = await options.prepareSigner();
+          await rejectInviteRemote(invitation.roomId, user, {
+            store,
+            server,
+            self: tenant.serverName,
+            wake: options.wake,
+            signer,
+          });
+        } catch (error) {
+          options.failed(error);
+        }
       }
+      // Keep the root: a later imported room/prejoin can reveal old membership.
+      // Already departed rooms and prepared OOB intents cause no new signature.
+    } catch (error) {
+      // Discovery belongs to this account's work too. Its retained root retries
+      // later; an unavailable account never prevents the next account's turn.
+      options.failed(error);
     }
-    // This inventory includes out-of-band invites and uncertain knock attempts,
-    // not only joined rooms. Rejection commits local departure + remote intent;
-    // the existing sender owns remote retries, never this worker.
-    for (const invitation of await invitesOf(user, { server })) {
-      if (
-        !['pending', 'attempting', 'failed-attempt'].includes(invitation.status)
-      ) continue;
-      try {
-        const signer = await options.prepareSigner();
-        await rejectInviteRemote(invitation.roomId, user, {
-          store,
-          server,
-          self: tenant.serverName,
-          wake: options.wake,
-          signer,
-        });
-      } catch (error) {
-        options.failed(error);
-      }
-    }
-    // Keep the root: a later imported room/prejoin can reveal old membership.
-    // Already departed rooms and prepared OOB intents cause no new signature.
   }
 }
 

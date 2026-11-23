@@ -232,13 +232,13 @@ async function fixture(
   const replicas = async () =>
     new RoomReplicas(edge, await edgePairings(), signing.name, keys);
   return {
+    dir,
     get home() {
       return home;
     },
     get homePairings() {
       return hp;
     },
-    dir,
     source,
     room,
     ingest,
@@ -4219,6 +4219,8 @@ Deno.test('facade create variants refuse home-owned directory writes before any 
 Deno.test('replica service acquisition releases a failed composition before retrying with a new dispatcher', async () => {
   const f = await fixture();
   let dispatcher: unknown, releases = 0, attempts = 0;
+  let delayed: import('#engine/delayed-events.ts').DelayedEvents | undefined;
+  let delayedStops = 0, delayedWakes = 0;
   try {
     const tenant = await f.edgeTenant();
     setConfigForTests({
@@ -4250,6 +4252,24 @@ Deno.test('replica service acquisition releases a failed composition before retr
         dispatcher = edus;
         return Promise.resolve(service);
       },
+      delayedEvents: async (granted: typeof tenant) => {
+        assertEquals(granted.signer(), access.signer);
+        const { DelayedEvents } = await import('#engine/delayed-events.ts');
+        delayed = new DelayedEvents({ tenant: granted, store: f.edgeStore() });
+        delayed.wake = () => {
+          assertEquals(
+            theApp().tenant,
+            granted,
+            'scheduler woke before app binding',
+          );
+          delayedWakes++;
+        };
+        delayed.stop = () => {
+          delayedStops++;
+          return Promise.resolve();
+        };
+        return delayed;
+      },
       ingress: () => {
         if (++attempts === 1) {
           return Promise.reject(new Error('composition interrupted'));
@@ -4260,6 +4280,8 @@ Deno.test('replica service acquisition releases a failed composition before retr
         });
       },
       releaseServices: async () => {
+        await delayed?.stop();
+        delayed = undefined;
         await service.stop();
         dispatcher = undefined;
         releases++;
@@ -4275,8 +4297,12 @@ Deno.test('replica service acquisition releases a failed composition before retr
       1,
       'runtime owner must release services after failed acquisition',
     );
+    assertEquals(delayedWakes, 0);
+    assertEquals(delayedStops, 1);
     const app = await openReplicaApp(f.edgeStore(), tenant, access);
     assertEquals(app.deviceLists, service);
+    assertEquals(app.delayedEvents, delayed);
+    assertEquals(delayedWakes, 1);
     assertEquals(attempts, 2);
     await closeApp();
     assertEquals(
@@ -4284,6 +4310,9 @@ Deno.test('replica service acquisition releases a failed composition before retr
       1,
       'borrower does not stop successfully acquired owner services',
     );
+    assertEquals(delayedStops, 1);
+    await access.releaseServices();
+    assertEquals(delayedStops, 2);
   } finally {
     await closeApp();
     await f.close();

@@ -3,6 +3,7 @@ import { adminSocket } from '#engine/config.ts';
 import { openFacadeRuntime } from '#engine/facade/runtime.ts';
 import { startLinkTransport } from '#engine/facade/transport.ts';
 import { facadeOperations } from './admin/facade.ts';
+import { reportOperations } from './admin/reports.ts';
 import { operationHandler } from './admin/handler.ts';
 import { startAdminHandler } from './admin/socket.ts';
 import type { ServerLifetime } from './server-lifetime.ts';
@@ -49,6 +50,8 @@ export async function startFacade(
           keys: await runtime.verificationKeys(),
           signer: await runtime.requestSigner(),
           deviceLists: runtime.deviceLists,
+          pushSender: runtime.pushSender,
+          delayedEvents: runtime.delayedEvents,
           sender: runtime.sender,
           releaseServices: runtime.releaseServices,
           ingress: runtime.ingress,
@@ -161,6 +164,7 @@ export async function startFacade(
     });
     const admin = await startAdminHandler(
       operationHandler({
+        ...reportOperations({ server: runtime.server }),
         ...facadeOperations({
           role: 'facade',
           pairings: runtime.pairings,

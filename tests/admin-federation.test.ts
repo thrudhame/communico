@@ -16,6 +16,7 @@ import { genesis } from '#tests/fixtures/genesis.ts';
 import { startFakeServer } from '#tests/federation/fake-server.ts';
 
 Deno.test('admin federation operations cross the socket and affect their consumers', async (t) => {
+  setConfigForTests({ server: { name: 'test' } });
   const dir = await Deno.makeTempDir();
   const http = await startHttp();
   const app = http.app;
@@ -161,6 +162,7 @@ Deno.test('admin federation operations cross the socket and affect their consume
       'outbox retry wakes live sender, snapshot is real and prune removes work',
       async () => {
         setConfigForTests({
+          server: { name: 'test' },
           federation: { cacerts: ['tests/fixtures/tls/ca.crt'] },
         });
         resetCaCertsForTests();
@@ -182,6 +184,7 @@ Deno.test('admin federation operations cross the socket and affect their consume
         try {
           const g = await genesis(app.store, {
             roomId: '!admin-delivery:test',
+            signer: app.tenant.signer(),
           });
           await app.server.execute(
             "INSERT INTO outbox(room,pos,destination,event,state,added_ms,next_attempt_ms) VALUES(?,999,?,?,'pending',?,?)",
@@ -245,7 +248,7 @@ Deno.test('admin federation operations cross the socket and affect their consume
           await app.sender?.stop();
           app.sender = null;
           await fake.close();
-          setConfigForTests({});
+          setConfigForTests({ server: { name: 'test' } });
           resetCaCertsForTests();
         }
       },
@@ -254,7 +257,7 @@ Deno.test('admin federation operations cross the socket and affect their consume
       'reject-invite jobs are visible and operator prune settles them',
       async () => {
         await app.server.execute(
-          "INSERT INTO prejoin_memberships(room_id,user_id,event_id,room_version,event_json,invite_room_state,origin,received_ms,status,seq) VALUES('!invite|part:remote','@a:localhost','$invite','11','{}','[]','remote.test',1,'rejecting',1)",
+          "INSERT INTO prejoin_memberships(room_id,user_id,event_id,room_version,event_json,invite_room_state,origin,received_ms,status,seq) VALUES('!invite|part:remote','@a:test','$invite','11','{}','[]','remote.test',1,'rejecting',1)",
         );
         await app.server.tx(async (tx) => {
           const [row] = await tx.query(
@@ -346,5 +349,6 @@ Deno.test('admin federation operations cross the socket and affect their consume
     await admin.shutdown();
     await http.close();
     await Deno.remove(dir, { recursive: true });
+    setConfigForTests({});
   }
 });

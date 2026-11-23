@@ -17,7 +17,7 @@ import { serverSchema } from '#engine/server/schema.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { lookupAlias } from '#engine/server/aliases.ts';
-import { listedRooms } from '#engine/server/directory.ts';
+import { listedRooms, visibility } from '#engine/server/directory.ts';
 import { makeServer, seedServer } from './federation/doc-helper.ts';
 import { fedCaller } from './http-federation.ts';
 import { setConfigForTests } from '#engine/config.ts';
@@ -728,9 +728,62 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     );
     assertEquals(baselineResponse.status, 200);
     await baselineResponse.arrayBuffer();
+    const filterPath = 'user/%40outside%3Alogical.test/filter';
+    const homeFilterBody = { room: { timeline: { limit: 7 } } };
+    const homeFilter = await api(
+      filterPath,
+      homeFilterBody,
+      registered.body.access_token,
+    );
+    assertEquals(homeFilter.status, 200);
+    const openIdPath = 'user/%40outside%3Alogical.test/openid/request_token';
+    const homeOpenId = await api(openIdPath, {}, registered.body.access_token);
+    assertEquals(homeOpenId.status, 200);
+    const backupMetadata = {
+      algorithm: 'opaque',
+      auth_data: { public_key: 'home-backup-key' },
+    };
+    const backupSession = {
+      first_message_index: 3,
+      forwarded_count: 0,
+      is_verified: true,
+      session_data: { ciphertext: 'retained-home-ciphertext' },
+    };
+    const homeBackup = await api(
+      'room_keys/version',
+      backupMetadata,
+      registered.body.access_token,
+    );
+    assertEquals(homeBackup.status, 200);
+    const backupVersion = homeBackup.body.version;
+    assertEquals(
+      (await api(
+        'room_keys/keys/!backup%3Alogical.test/session?version=' +
+          backupVersion,
+        backupSession,
+        registered.body.access_token,
+        'PUT',
+      )).status,
+      200,
+    );
+    const openIdInfo = async (token?: string) => {
+      const response = await fetch(
+        `http://127.0.0.1:${facadePort}/_matrix/federation/v1/openid/userinfo`,
+        {
+          headers: token === undefined
+            ? {}
+            : { authorization: 'Bearer ' + token },
+        },
+      );
+      return { status: response.status, body: await response.json() };
+    };
     const created = await api(
       'createRoom',
-      { room_version: '11' },
+      {
+        room_version: '11',
+        room_alias_name: 'upgrade-home-boundary',
+        visibility: 'public',
+      },
       registered.body.access_token,
     );
     assertEquals(created.status, 200);
@@ -1028,6 +1081,166 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     facadePort = await edge.port('client');
     await edge.listening(facadePort);
     // Real public authoring while home is absent and federation is disabled.
+    const forgottenRoom = await edgeApi('createRoom', {
+      preset: 'public_chat',
+      initial_state: [{
+        type: 'm.room.encryption',
+        state_key: '',
+        content: { algorithm: 'm.megolm.v1.aes-sha2' },
+      }],
+    });
+    assertEquals(forgottenRoom.status, 200, JSON.stringify(forgottenRoom));
+    const forgottenPath = 'rooms/' +
+      encodeURIComponent(forgottenRoom.body.room_id);
+    assertEquals((await edgeApi(forgottenPath + '/leave', {})).status, 200);
+    assertEquals(await edgeApi(forgottenPath + '/forget', {}), {
+      status: 200,
+      body: {},
+    });
+    assertEquals(
+      (await edgeApi(forgottenPath + '/messages?dir=b')).status,
+      403,
+    );
+    const reportPaths = [
+      roomPath + '/report',
+      roomPath + '/report/' + encodeURIComponent(edgeEventId),
+      'users/' + encodeURIComponent(user) + '/report',
+    ];
+    for (const path of reportPaths) {
+      assertEquals(
+        await edgeApi(path, {
+          reason: 'cold-offline-private-report',
+          ...(path.includes('/report/') ? { score: -1 } : {}),
+        }, 'POST'),
+        { status: 200, body: {} },
+      );
+    }
+    assertEquals(
+      await edgeApi('users/%40nonexistent%3Alogical.test/report', {
+        reason: 'no disclosure',
+      }, 'POST'),
+      { status: 200, body: {} },
+    );
+    assertEquals(
+      await edgeApi('users/%40remote%3Aelsewhere.test/report', {
+        reason: 'no disclosure',
+      }, 'POST'),
+      { status: 200, body: {} },
+    );
+    const offlineReports =
+      (await adminCall(tls.dir + '/facade-auth.sock', 'reports/list')).body
+        .result.reports;
+    assertEquals(offlineReports.length, 3);
+    assertEquals(
+      new Set(offlineReports.map((r: { reportId: string }) => r.reportId)).size,
+      3,
+    );
+    assertEquals(
+      (await adminCall(tls.dir + '/facade-auth.sock', 'reports/resolve', {
+        id: offlineReports[0].id,
+        resolution: 'forbidden edge resolution',
+      })).status,
+      503,
+    );
+    assertEquals(await edgeApi(filterPath + '/' + homeFilter.body.filter_id), {
+      status: 200,
+      body: homeFilterBody,
+    });
+    const edgeFilterBody = { room: { timeline: { limit: 3 } } };
+    const edgeFilter = await edgeApi(filterPath, edgeFilterBody, 'POST');
+    assertEquals(edgeFilter.status, 200);
+    assert(edgeFilter.body.filter_id !== homeFilter.body.filter_id);
+    assertEquals(await edgeApi(filterPath + '/' + edgeFilter.body.filter_id), {
+      status: 200,
+      body: edgeFilterBody,
+    });
+    assertEquals(await openIdInfo(homeOpenId.body.access_token), {
+      status: 200,
+      body: { sub: user },
+    });
+    const edgeOpenId = await edgeApi(openIdPath, {}, 'POST');
+    assertEquals(edgeOpenId.status, 200);
+    assertEquals(edgeOpenId.body.token_type, 'Bearer');
+    assertEquals(edgeOpenId.body.matrix_server_name, 'logical.test');
+    assertEquals(await openIdInfo(edgeOpenId.body.access_token), {
+      status: 200,
+      body: { sub: user },
+    });
+    assertEquals((await openIdInfo()).body.errcode, 'M_MISSING_TOKEN');
+    assertEquals((await openIdInfo('invalid')).body.errcode, 'M_UNKNOWN_TOKEN');
+    const expectedBackup = {
+      ...backupMetadata,
+      version: backupVersion,
+      count: 1,
+      etag: '1',
+    };
+    assertEquals(await edgeApi('room_keys/version'), {
+      status: 200,
+      body: expectedBackup,
+    });
+    assertEquals(await edgeApi('room_keys/version/' + backupVersion), {
+      status: 200,
+      body: expectedBackup,
+    });
+    assertEquals(await edgeApi('room_keys/keys?version=' + backupVersion), {
+      status: 200,
+      body: {
+        rooms: {
+          '!backup:logical.test': { sessions: { session: backupSession } },
+        },
+      },
+    });
+    assertEquals(
+      await edgeApi(
+        'room_keys/keys/!backup%3Alogical.test?version=' + backupVersion,
+      ),
+      { status: 200, body: { sessions: { session: backupSession } } },
+    );
+    assertEquals(
+      await edgeApi(
+        'room_keys/keys/!backup%3Alogical.test/session?version=' +
+          backupVersion,
+      ),
+      { status: 200, body: backupSession },
+    );
+    assertEquals((await edgeApi('room_keys/version/missing')).status, 404);
+    for (
+      const [path, method] of [
+        ['room_keys/version', 'POST'],
+        ['room_keys/version/' + backupVersion, 'PUT'],
+        ['room_keys/version/' + backupVersion, 'DELETE'],
+        ...[
+          'room_keys/keys',
+          'room_keys/keys/!backup%3Alogical.test',
+          'room_keys/keys/!backup%3Alogical.test/session',
+        ].flatMap((path) =>
+          ['PUT', 'DELETE'].map((
+            method,
+          ) => [path + '?version=' + backupVersion, method])
+        ),
+      ]
+    ) {
+      assertEquals(
+        await edgeApi(path, method === 'DELETE' ? undefined : {}, method),
+        {
+          status: 503,
+          body: {
+            errcode: 'M_UNAVAILABLE',
+            error: 'operation requires home ingress',
+          },
+        },
+      );
+    }
+    assertEquals(
+      (await api(
+        'account/whoami',
+        undefined,
+        edgeOpenId.body.access_token,
+        'GET',
+        facadePort,
+      )).status,
+      401,
+    );
     // This room has never existed at home or in its exported inventory.
     const fresh = await edgeApi('createRoom', {
       room_version: '11',
@@ -1140,6 +1353,67 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       assertEquals(refused.status, 503);
       assertEquals(refused.body.errcode, 'M_UNAVAILABLE');
     }
+    const boundaryRooms = await edgeApi('joined_rooms');
+    assertEquals(await edgeApi(roomPath + '/upgrade', { new_version: '12' }), {
+      status: 503,
+      body: {
+        errcode: 'M_UNAVAILABLE',
+        error: 'operation requires home ingress',
+      },
+    });
+    assertEquals(await edgeApi('joined_rooms'), boundaryRooms);
+    assertEquals(
+      (await edgeApi(roomPath + '/state/m.room.tombstone')).status,
+      404,
+    );
+    // The remaining B8 inventory still owes these client directory read routes.
+    // Assert their retained owner state at the next stopped cut below instead.
+    const upgradeSeed = await edgeApi('createRoom', {
+      room_version: '11',
+      initial_state: [{
+        type: 'm.room.encryption',
+        state_key: '',
+        content: { algorithm: 'm.megolm.v1.aes-sha2' },
+      }],
+    }, 'POST');
+    assertEquals(upgradeSeed.status, 200);
+    const upgradePath = 'rooms/' +
+      encodeURIComponent(upgradeSeed.body.room_id) + '/upgrade';
+    const upgraded = await edgeApi(upgradePath, { new_version: '12' }, 'POST');
+    assertEquals(upgraded.status, 200, JSON.stringify(upgraded));
+    assertEquals(
+      await edgeApi(upgradePath, { new_version: '12' }, 'POST'),
+      upgraded,
+    );
+    const replacementPath = 'rooms/' +
+      encodeURIComponent(upgraded.body.replacement_room);
+    assertEquals(
+      (await edgeApi(replacementPath + '/state/m.room.create')).body.predecessor
+        .room_id,
+      upgradeSeed.body.room_id,
+    );
+    assertEquals(
+      (await edgeApi(replacementPath + '/state/m.room.encryption')).body
+        .algorithm,
+      'm.megolm.v1.aes-sha2',
+    );
+    const upgradeTombstone = await edgeApi(
+      'rooms/' + encodeURIComponent(upgradeSeed.body.room_id) +
+        '/state/m.room.tombstone',
+    );
+    assertEquals(
+      upgradeTombstone.body.replacement_room,
+      upgraded.body.replacement_room,
+    );
+    const upgradedEvent = await edgeApi(
+      replacementPath + '/send/m.room.encrypted/upgrade-offline',
+      {
+        algorithm: 'm.megolm.v1.aes-sha2',
+        ciphertext: 'offline-upgraded-room',
+      },
+      'PUT',
+    );
+    assertEquals(upgradedEvent.status, 200);
     // Both replicas author independent encrypted and state branches under the
     // same logical server while home has no running link process.
     const edgeBranch = await edgeApi(
@@ -1310,6 +1584,17 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       await edge.stop();
       const held = await open('facade');
       const server = await held.server();
+      assertEquals(
+        await server.query('SELECT * FROM room_upgrades WHERE old_room_id=?', [
+          roomId,
+        ]),
+        [],
+      );
+      assertEquals(
+        await lookupAlias(server, '#upgrade-home-boundary:logical.test'),
+        roomId,
+      );
+      assertEquals(await visibility(server, roomId), 'public');
       const before = await server.query(
         "SELECT operation_id FROM domain_operations WHERE kind='receipt' ORDER BY operation_id",
       );
@@ -1368,6 +1653,53 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       source: 'edge_a',
       incarnation: edgeIncarnation,
     };
+    for (const report of offlineReports) {
+      await home.observations.fact({
+        ...edgeIdentity,
+        stream: 'domain:' + user,
+      }, (record) => {
+        const body = object(object(record.payload).body);
+        if (body.kind !== 'domain-operation') return false;
+        const operation = object(body.operation);
+        return operation.kind === 'report' &&
+          JSON.parse(String(operation.payload)).reportId === report.reportId;
+      });
+    }
+    const homeReports =
+      (await adminCall(tls.dir + '/home-auth.sock', 'reports/list')).body.result
+        .reports;
+    assertEquals(homeReports.length, 3);
+    for (const expected of offlineReports) {
+      const actual = homeReports.find((r: { reportId: string }) =>
+        r.reportId === expected.reportId
+      );
+      assert(actual);
+      assertEquals({ ...actual, id: expected.id }, expected);
+    }
+    const resolvedReport = await adminCall(
+      tls.dir + '/home-auth.sock',
+      'reports/resolve',
+      { id: homeReports[0].id, resolution: 'home-real-wire-resolution' },
+    );
+    assertEquals(resolvedReport.status, 200);
+    const homeResolution = resolvedReport.body.result;
+    await homeFact(edge, pairing, 'domain:' + user, (record) => {
+      const body = object(object(record.payload).body);
+      if (body.kind !== 'domain-operation') return false;
+      const operation = object(body.operation);
+      return operation.kind === 'report-resolution' &&
+        JSON.parse(String(operation.payload)).reportId ===
+          homeResolution.reportId;
+    });
+    // Retain B6's actual consumers, but observe their exact applied facts using
+    // main's causal helper. No timer or repeated HTTP request substitutes for
+    // the import owner completing the original facade-signed event.
+    const edgeRoomFact = (id: string, room = roomId) =>
+      home!.observations.fact(
+        { ...edgeIdentity, stream: 'room:' + room },
+        (record) => roomView(record).steps.some((step) => step.eventId === id),
+      );
+    await edgeRoomFact(edgeEventId);
     await home.observations.fact({
       ...edgeIdentity,
       stream: 'domain:@outside:logical.test',
@@ -1382,16 +1714,6 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
           ]) &&
         JSON.parse(String(operation.payload)).ciphertext === 'edge-public';
     });
-    // No test exporter/importer or logical-name HTTP key lookup participates.
-    // The cold runtime must export and verify the original facade-signed PDU.
-    await home.observations.fact(
-      {
-        ...edgeIdentity,
-        stream: 'room:' + roomId,
-      },
-      (record) =>
-        roomView(record).steps.some((step) => step.eventId === edgeEventId),
-    );
     const reverseResponse = await api(
       roomPath + '/event/' + encodeURIComponent(edgeEventId),
       undefined,
@@ -1422,6 +1744,7 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
         (record) => roomView(record).steps.some((step) => step.eventId === id),
       );
     }
+    const homeContents = new Map<string, unknown>();
     for (
       const id of [
         edgeBranch.body.event_id,
@@ -1449,6 +1772,7 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       assertEquals(homeRead.body.event_id, id);
       assertEquals(edgeRead.body.event_id, id);
       assertEquals(homeRead.body.content, edgeRead.body.content);
+      homeContents.set(id, homeRead.body.content);
     }
     const [homeState, edgeState] = await Promise.all([
       api(
@@ -1466,16 +1790,21 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       ),
     );
     assertEquals(homeState.body.topic, edgeState.body.topic);
-    // The normal link workers bootstrap the new edge-originated room at home.
-    await home.observations.fact(
-      {
-        ...edgeIdentity,
-        stream: 'room:' + fresh.body.room_id,
-      },
-      (record) =>
-        roomView(record).steps.some((step) =>
-          step.eventId === freshEvent.body.event_id
-        ),
+    await edgeRoomFact(freshEvent.body.event_id, fresh.body.room_id);
+    await edgeRoomFact(
+      upgradedEvent.body.event_id,
+      upgraded.body.replacement_room,
+    );
+    const homeUpgradeRead = await api(
+      replacementPath + '/event/' +
+        encodeURIComponent(upgradedEvent.body.event_id),
+      undefined,
+      registered.body.access_token,
+    );
+    assertEquals(homeUpgradeRead.status, 200, JSON.stringify(homeUpgradeRead));
+    assertEquals(
+      homeUpgradeRead.body.content.ciphertext,
+      'offline-upgraded-room',
     );
     const freshHomeRead = await api(
       freshRoomPath + '/event/' + encodeURIComponent(freshEvent.body.event_id),
@@ -1663,6 +1992,124 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
           selector.content.request_id === 'home-runtime-key'
         );
     });
+    // The live consumers above serve applied publications while home runs.
+    // A separate cold reopen proves private data and upgrade retry retention.
+    const backupSuffix = {
+      ...backupSession,
+      first_message_index: 1,
+      session_data: { ciphertext: 'retained-home-ciphertext-suffix' },
+    };
+    assertEquals(
+      (await api(
+        'room_keys/keys/!backup%3Alogical.test/session?version=' +
+          backupVersion,
+        backupSuffix,
+        registered.body.access_token,
+        'PUT',
+      )).status,
+      200,
+    );
+    await homeFact(edge, pairing, 'domain:' + user, (record) => {
+      const body = object(object(record.payload).body);
+      if (body.kind !== 'domain-operation') return false;
+      const operation = object(body.operation);
+      return operation.kind === 'backup' &&
+        String(operation.payload).includes('retained-home-ciphertext-suffix');
+    });
+    await home.stop();
+    await edge.stop();
+    edge = await process(file('facade'), 'facade: link/local admin ready');
+    await finiteTail(edge, tls.dir + '/facade-auth.sock', [
+      'directory',
+      'auth:' + user,
+      'domain:' + user,
+      'room:' + roomId,
+      'room:' + fresh.body.room_id,
+    ]);
+    await edge.listening(facadePort);
+    assertEquals(
+      (await edgeApi(forgottenPath + '/messages?dir=b')).status,
+      403,
+    );
+    assertEquals(
+      await edgeApi(upgradePath, { new_version: '12' }, 'POST'),
+      upgraded,
+    );
+    assertEquals(
+      await edgeApi(
+        'rooms/' + encodeURIComponent(upgradeSeed.body.room_id) +
+          '/state/m.room.tombstone',
+      ),
+      upgradeTombstone,
+    );
+    assertEquals(
+      (await edgeApi(
+        replacementPath + '/event/' +
+          encodeURIComponent(upgradedEvent.body.event_id),
+      )).body.content.ciphertext,
+      'offline-upgraded-room',
+    );
+    assertEquals((await edgeApi(forgottenPath + '/join', {})).status, 200);
+    assertEquals(
+      (await edgeApi(forgottenPath + '/messages?dir=b')).status,
+      200,
+    );
+    assertEquals(await edgeApi(filterPath + '/' + edgeFilter.body.filter_id), {
+      status: 200,
+      body: edgeFilterBody,
+    });
+    assertEquals(
+      (await adminCall(tls.dir + '/facade-auth.sock', 'reports/list')).body
+        .result.reports,
+      offlineReports.map((report: { id: number; reportId: string }) =>
+        report.reportId === homeResolution.reportId
+          ? { ...homeResolution, id: report.id }
+          : report
+      ),
+    );
+    assertEquals(await openIdInfo(homeOpenId.body.access_token), {
+      status: 200,
+      body: { sub: user },
+    });
+    assertEquals(await openIdInfo(edgeOpenId.body.access_token), {
+      status: 200,
+      body: { sub: user },
+    });
+    assertEquals(await edgeApi('room_keys/version'), {
+      status: 200,
+      body: { ...expectedBackup, etag: '2' },
+    });
+    assertEquals(
+      await edgeApi(
+        'room_keys/keys/!backup%3Alogical.test/session?version=' +
+          backupVersion,
+      ),
+      { status: 200, body: backupSuffix },
+    );
+    for (const [id, content] of homeContents) {
+      const edgeRead = await edgeApi(
+        roomPath + '/event/' + encodeURIComponent(id),
+      );
+      assertEquals(edgeRead.status, 200, JSON.stringify({ id, ...edgeRead }));
+      assertEquals(edgeRead.body.event_id, id);
+      assertEquals(edgeRead.body.content, content);
+    }
+    const restoredEdgeState = await edgeApi(roomPath + '/state/m.room.topic');
+    assertEquals(
+      restoredEdgeState.status,
+      200,
+      JSON.stringify(restoredEdgeState),
+    );
+    assertEquals(restoredEdgeState.body.topic, homeState.body.topic);
+    const freshSuffixRead = await edgeApi(
+      freshRoomPath + '/event/' +
+        encodeURIComponent(freshHomeSuffix.body.event_id),
+    );
+    assertEquals(freshSuffixRead.status, 200, JSON.stringify(freshSuffixRead));
+    assertEquals(
+      freshSuffixRead.body.content.ciphertext,
+      'home-after-public-bootstrap',
+    );
     await edge.stop();
     const delivered = await open('facade');
     try {
@@ -1702,6 +2149,10 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       await delivered.close();
     }
     edge = await process(file('facade'), 'facade: link/local admin ready');
+    // The cold private-data proof above deliberately kept home stopped. Bring
+    // its real authority back before authoring and observing the logout barrier.
+    home = await process(file('home'), 'federation: disabled');
+    await home.listening(homePort);
     const before =
       (await adminCall(tls.dir + '/facade-auth.sock', 'facade/status')).body
         .result.scopes.find((scope: { scope: string }) =>
@@ -1790,10 +2241,33 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
   const timings = new ColdAuthTimings();
   timings.phase('configure and enroll');
   const tls = await facadeTls();
+  const deliveries: Record<string, unknown>[] = [];
+  let gatewayChanged = Promise.withResolvers<void>();
+  const gateway = Deno.serve({
+    hostname: '127.0.0.1',
+    port: 0,
+    cert: await Deno.readTextFile('tests/fixtures/tls/localhost.crt'),
+    key: await Deno.readTextFile('tests/fixtures/tls/localhost.key'),
+    onListen() {},
+  }, async (request) => {
+    assertEquals(new URL(request.url).pathname, '/_matrix/push/v1/notify');
+    assertEquals(request.headers.get('authorization'), null);
+    deliveries.push((await request.json()).notification);
+    gatewayChanged.resolve();
+    gatewayChanged = Promise.withResolvers<void>();
+    return Response.json({ rejected: [] });
+  });
+  const delivered = async (eventId: string) => {
+    for (;;) {
+      const found = deliveries.find((value) => value.event_id === eventId);
+      if (found) return found;
+      await gatewayChanged.promise;
+    }
+  };
   let homePort = 0, facadePort = 0, linkPort = 0;
   const bundlefile = tls.dir + '/public-auth-bundle.json';
   const file = (side: string) => tls.dir + '/' + side + '-public-auth.toml';
-  const configure = async (side: string, extra = '') => {
+  const configure = async (side: string, extra = '', maxDelay = 60000) => {
     await Deno.writeTextFile(
       file(side),
       `[server]\nname="logical.test"\nrole="${side}"\nport=${
@@ -1804,7 +2278,9 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
         (side === 'home'
           ? `nodes=["edge_a"]\npairfile="${bundlefile}"\n`
           : '') +
-        extra,
+        extra +
+        `\n[delayedevents]\nmaxdelayms=${maxDelay}\n` +
+        '\n[push]\ncacerts=["tests/fixtures/tls/ca.crt"]\nallowlist=["127.0.0.1/32"]\n',
     );
   };
   await configure('home');
@@ -1893,6 +2369,67 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       room_version: '11',
     }, departure.body.access_token);
     assertEquals(departureRoom.status, 200);
+    const legacyRoomPath = 'rooms/' +
+      encodeURIComponent(departureRoom.body.room_id);
+    assertEquals(
+      (await api(
+        'home',
+        legacyRoomPath + '/join',
+        {},
+        registered.body.access_token,
+      )).status,
+      200,
+    );
+    const legacyCiphertext = {
+      algorithm: 'm.megolm.v1.aes-sha2',
+      ciphertext: 'saved-home-notification-ciphertext',
+      session_id: 'saved-home-session',
+    };
+    const legacyNotice = await api(
+      'home',
+      legacyRoomPath + '/send/m.room.encrypted/notification-baseline',
+      legacyCiphertext,
+      departure.body.access_token,
+      'PUT',
+    );
+    assertEquals(legacyNotice.status, 200);
+    // /send now returns acceptance, and ordinary reads serve applied state.
+    // Observe publication through the real child process's sync consumer.
+    const deliveryDeadline = AbortSignal.timeout(30000);
+    let notificationSince: string | undefined;
+    for (;;) {
+      const query = new URLSearchParams({ timeout: '30000' });
+      if (notificationSince !== undefined) {
+        query.set('since', notificationSince);
+      }
+      const response = await fetch(
+        `http://127.0.0.1:${homePort}/_matrix/client/v3/sync?${query}`,
+        {
+          headers: { authorization: 'Bearer ' + registered.body.access_token },
+          signal: deliveryDeadline,
+        },
+      );
+      assertEquals(response.status, 200, await response.clone().text());
+      const body = await response.json();
+      notificationSince = body.next_batch;
+      if (
+        body.rooms?.join?.[departureRoom.body.room_id]?.timeline?.events?.some(
+          (event: { event_id: string }) =>
+            event.event_id === legacyNotice.body.event_id,
+        )
+      ) break;
+    }
+    const homeNotifications = await api(
+      'home',
+      'notifications',
+      undefined,
+      registered.body.access_token,
+    );
+    assertEquals(homeNotifications.status, 200);
+    const originalNotice = homeNotifications.body.notifications.find((
+      item: { event: { event_id: string } },
+    ) => item.event.event_id === legacyNotice.body.event_id);
+    assert(originalNotice, 'home baseline has no saved notification');
     const paired = await adminCall(
       tls.dir + '/home-public-auth.sock',
       'facade/pair',
@@ -1998,6 +2535,398 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       (await api('facade', 'account/whoami', undefined, 'unknown')).status,
       401,
     );
+    timings.phase('offline push and saved notifications');
+    await finiteTail(edge, tls.dir + '/facade-public-auth.sock', [
+      'domain:@outside:logical.test',
+      'domain:@departure:logical.test',
+    ]);
+    const importedHistory = await api(
+      'facade',
+      'notifications',
+      undefined,
+      session.body.access_token,
+    );
+    assertEquals(importedHistory.status, 200);
+    const importedNotices = importedHistory.body.notifications.filter((
+      item: { event: { event_id: string } },
+    ) => item.event.event_id === legacyNotice.body.event_id);
+    assertEquals(
+      importedNotices.length,
+      1,
+      'cold facade lost signed saved notification history',
+    );
+    assertEquals(importedNotices[0].event.content, legacyCiphertext);
+    for (
+      const [path, body] of [['notifications', undefined], [
+        'pushers',
+        undefined,
+      ], ['pushers/set', {}]] as const
+    ) {
+      assertEquals(
+        (await api('facade', path, body, registered.body.access_token)).status,
+        503,
+      );
+      assertEquals((await api('facade', path, body, 'unknown')).status, 401);
+    }
+    const pushRegistration = {
+      app_id: 'cold-app',
+      pushkey: 'cold-key',
+      kind: 'http',
+      app_display_name: 'Cold app',
+      device_display_name: 'Outside',
+      lang: 'en',
+      data: {
+        url: `https://127.0.0.1:${gateway.addr.port}/_matrix/push/v1/notify`,
+      },
+    };
+    assertEquals(
+      await api(
+        'facade',
+        'pushers/set',
+        pushRegistration,
+        session.body.access_token,
+      ),
+      { status: 200, body: {} },
+    );
+    assertEquals(
+      await api('facade', 'pushers', undefined, session.body.access_token),
+      { status: 200, body: { pushers: [pushRegistration] } },
+    );
+    const senderSession = await api('facade', 'login', {
+      ...login('push-sender-edge'),
+      identifier: { type: 'm.id.user', user: 'departure' },
+    });
+    assertEquals(senderSession.status, 200);
+    const pushRoomPath = 'rooms/' +
+      encodeURIComponent(departureRoom.body.room_id);
+    assertEquals(
+      (await api(
+        'facade',
+        pushRoomPath + '/join',
+        {},
+        session.body.access_token,
+      )).status,
+      200,
+    );
+    const ciphertext = {
+      algorithm: 'm.megolm.v1.aes-sha2',
+      ciphertext: 'cold-push-ciphertext',
+      session_id: 'cold-session',
+    };
+    const pushed = await api(
+      'facade',
+      pushRoomPath + '/send/m.room.encrypted/cold-push',
+      ciphertext,
+      senderSession.body.access_token,
+      'PUT',
+    );
+    assertEquals(pushed.status, 200);
+    const wire = await delivered(pushed.body.event_id);
+    assertEquals(wire.content, ciphertext);
+    assertEquals(
+      (wire.devices as Record<string, unknown>[]).map((device) =>
+        device.pushkey
+      ),
+      ['cold-key'],
+    );
+    const history = await api(
+      'facade',
+      'notifications',
+      undefined,
+      session.body.access_token,
+    );
+    assertEquals(history.status, 200, JSON.stringify(history));
+    const saved = history.body.notifications.find((
+      item: { event: { event_id: string } },
+    ) => item.event.event_id === pushed.body.event_id);
+    assert(saved);
+    assertEquals(saved.read, false);
+    assertEquals(saved.event.content, ciphertext);
+    assertEquals(saved.event.room_id, undefined);
+    assertEquals(saved.event.signatures, undefined);
+    const mute = 'pushrules/global/override/cold-mute';
+    assertEquals(
+      (await api(
+        'facade',
+        mute,
+        { conditions: [], actions: ['dont_notify'] },
+        session.body.access_token,
+        'PUT',
+      )).status,
+      200,
+    );
+    const silent = await api(
+      'facade',
+      pushRoomPath + '/send/m.room.encrypted/cold-muted',
+      ciphertext,
+      senderSession.body.access_token,
+      'PUT',
+    );
+    assertEquals(silent.status, 200);
+    timings.phase('offline native delayed owner and cold disabled scheduling');
+    const management = '../unstable/org.matrix.msc4140/delayed_events';
+    const waitDelayedState = async (key: string, marker: string) => {
+      let result;
+      const deadline = Date.now() + 10000;
+      do {
+        result = await api(
+          'facade',
+          pushRoomPath + '/state/test.delayed/' + key,
+          undefined,
+          senderSession.body.access_token,
+        );
+        if (result.status === 200) break;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      } while (Date.now() < deadline);
+      assertEquals(result, { status: 200, body: { marker } });
+    };
+    const delayPath = pushRoomPath + '/send/m.room.encrypted/cold-delay';
+    const delayed = await api(
+      'facade',
+      delayPath + '?org.matrix.msc4140.delay=60000',
+      { ...ciphertext, ciphertext: 'cold-delayed-ciphertext' },
+      senderSession.body.access_token,
+      'PUT',
+    );
+    assertEquals(delayed.status, 200, JSON.stringify(delayed));
+    assertEquals(delayed.body.event_id, undefined);
+    const delayId = delayed.body.delay_id;
+    assertEquals(
+      (await api(
+        'facade',
+        delayPath + '?org.matrix.msc4140.delay=60000',
+        { ignored: 'stable receipt' },
+        senderSession.body.access_token,
+        'PUT',
+      )).body,
+      delayed.body,
+    );
+    const listedDelay = await api(
+      'facade',
+      management,
+      undefined,
+      senderSession.body.access_token,
+    );
+    assertEquals(listedDelay.status, 200);
+    assertEquals(
+      listedDelay.body.delayed_events.filter((item: { delay_id: string }) =>
+        item.delay_id === delayId
+      ).length,
+      1,
+    );
+    assertEquals(
+      (await api(
+        'facade',
+        management + '/' + delayId,
+        undefined,
+        session.body.access_token,
+      )).status,
+      404,
+    );
+    assertEquals(
+      (await api(
+        'facade',
+        management + '/' + delayId + '/restart',
+        {},
+        registered.body.access_token,
+      )).status,
+      503,
+    );
+    assertEquals(
+      (await api('facade', management + '/legacy-home-id', { action: 'send' }))
+        .status,
+      503,
+    );
+    assertEquals(
+      (await api('facade', management + '/' + delayId + '/restart', {})).status,
+      200,
+    );
+    const cancelled = await api(
+      'facade',
+      pushRoomPath +
+        '/state/test.delayed/cancelled?org.matrix.msc4140.delay=60000',
+      { marker: 'must-not-run' },
+      senderSession.body.access_token,
+      'PUT',
+    );
+    assertEquals(cancelled.status, 200);
+    assertEquals(
+      (await api(
+        'facade',
+        management + '/' + cancelled.body.delay_id + '/cancel',
+        {},
+      )).status,
+      200,
+    );
+    const dueWhileStopped = await api(
+      'facade',
+      pushRoomPath + '/state/test.delayed/cold?org.matrix.msc4140.delay=2000',
+      { marker: 'cold-with-new-scheduling-disabled' },
+      senderSession.body.access_token,
+      'PUT',
+    );
+    assertEquals(dueWhileStopped.status, 200);
+    await edge.stop();
+    await new Promise((resolve) => setTimeout(resolve, 2100));
+    await configure('facade', '', 0);
+    edge = await process(file('facade'), 'facade: link/local admin ready');
+    await waitDelayedState('cold', 'cold-with-new-scheduling-disabled');
+    assertEquals(
+      (await api(
+        'facade',
+        pushRoomPath + '/state/test.delayed/cancelled',
+        undefined,
+        senderSession.body.access_token,
+      )).status,
+      404,
+    );
+    assertEquals(
+      (await api(
+        'facade',
+        management + '/' + delayId,
+        undefined,
+        senderSession.body.access_token,
+      )).body.content.ciphertext,
+      'cold-delayed-ciphertext',
+    );
+    assertEquals(
+      (await api(
+        'facade',
+        delayPath + '-disabled?org.matrix.msc4140.delay=1',
+        ciphertext,
+        senderSession.body.access_token,
+        'PUT',
+      )).status,
+      403,
+    );
+    assertEquals(
+      (await api('facade', management + '/' + delayId, { action: 'send' }))
+        .status,
+      200,
+    );
+    const delayedMessages = await api(
+      'facade',
+      pushRoomPath + '/messages?dir=b&limit=100',
+      undefined,
+      session.body.access_token,
+    );
+    assertEquals(delayedMessages.status, 200);
+    const delayedVisible = delayedMessages.body.chunk.filter((
+      item: { content: { ciphertext?: string } },
+    ) => item.content.ciphertext === 'cold-delayed-ciphertext');
+    assertEquals(
+      delayedVisible.length,
+      1,
+      'delayed command did not reach the actual room consumer exactly once',
+    );
+    assertEquals(
+      (await api('facade', management + '/' + delayId + '/send', {})).status,
+      404,
+    );
+    await edge.stop();
+    await configure('facade');
+    edge = await process(file('facade'), 'facade: link/local admin ready');
+    const automatic = await api(
+      'facade',
+      pushRoomPath + '/state/test.delayed/automatic?org.matrix.msc4140.delay=0',
+      { marker: 'automatic-after-bind' },
+      senderSession.body.access_token,
+      'PUT',
+    );
+    assertEquals(automatic.status, 200, JSON.stringify(automatic));
+    await waitDelayedState('automatic', 'automatic-after-bind');
+    assertEquals(
+      (await api(
+        'facade',
+        delayPath + '?org.matrix.msc4140.delay=60000',
+        ciphertext,
+        senderSession.body.access_token,
+        'PUT',
+      )).body,
+      delayed.body,
+    );
+    const restoredHistory = await api(
+      'facade',
+      'notifications',
+      undefined,
+      session.body.access_token,
+    );
+    assertEquals(restoredHistory.status, 200);
+    const restored = restoredHistory.body.notifications.filter((
+      item: { event: { event_id: string } },
+    ) => item.event.event_id === pushed.body.event_id);
+    assertEquals(restored.length, 1);
+    assertEquals({
+      actions: restored[0].actions,
+      read: restored[0].read,
+      ts: restored[0].ts,
+      content: restored[0].event.content,
+    }, {
+      actions: saved.actions,
+      read: saved.read,
+      ts: saved.ts,
+      content: saved.event.content,
+    });
+    assertEquals(
+      restoredHistory.body.notifications.some((
+        item: { event: { event_id: string } },
+      ) => item.event.event_id === silent.body.event_id),
+      false,
+    );
+    assertEquals(
+      (await api(
+        'facade',
+        pushRoomPath + '/receipt/m.read.private/' +
+          encodeURIComponent(pushed.body.event_id),
+        {},
+        session.body.access_token,
+      )).status,
+      200,
+    );
+    const readHistory = await api(
+      'facade',
+      'notifications',
+      undefined,
+      session.body.access_token,
+    );
+    assertEquals(
+      readHistory.body.notifications.find((
+        item: { event: { event_id: string } },
+      ) => item.event.event_id === pushed.body.event_id).read,
+      true,
+    );
+    assertEquals(
+      await api('facade', 'pushers/set', {
+        app_id: 'cold-app',
+        pushkey: 'cold-key',
+        kind: null,
+      }, session.body.access_token),
+      { status: 200, body: {} },
+    );
+    assertEquals(
+      await api('facade', 'pushers', undefined, session.body.access_token),
+      { status: 200, body: { pushers: [] } },
+    );
+    assertEquals(
+      (await api(
+        'facade',
+        mute,
+        undefined,
+        session.body.access_token,
+        'DELETE',
+      )).status,
+      200,
+    );
+    // Leave the pre-existing deactivation proof's original membership unchanged.
+    assertEquals(
+      (await api(
+        'facade',
+        pushRoomPath + '/leave',
+        {},
+        session.body.access_token,
+      )).status,
+      200,
+    );
     const toDevicePath = 'sendToDevice/m.room_key_request/public-owner-send';
     const originalRequest = {
       messages: {
@@ -2055,6 +2984,19 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       schemas: { room: roomSchema, server: serverSchema, tenant: tenantSchema },
     });
     try {
+      const savedServer = await sentStore.server();
+      const sourceFacts = await savedServer.query(
+        "SELECT payload_json FROM domain_operations WHERE kind='notification' AND source='home' AND json_extract(payload_json,'$.user')='@outside:logical.test' AND json_extract(payload_json,'$.event')=?",
+        [legacyNotice.body.event_id],
+      );
+      assertEquals(
+        sourceFacts.length,
+        1,
+        'cold public reader has no retained original home context',
+      );
+      const originalFact = JSON.parse(String(sourceFacts[0].payload_json));
+      assertEquals(originalFact.createdMs, originalNotice.ts);
+      assertEquals(originalFact.actions, originalNotice.actions);
       const db = await sentStore.tenant('logical.test');
       assertEquals(
         (await db.query(
@@ -2573,6 +3515,7 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
   } finally {
     await home?.dispose();
     await edge?.dispose();
+    await gateway.shutdown();
     await tls.close();
   }
 });

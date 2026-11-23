@@ -216,6 +216,62 @@ const F2_MEMBERSHIP: readonly Rule[] = [
   ),
 ];
 
+// B8 adds each private surface only after its owning semantic contract exists.
+const F2_CLIENT_DATA: readonly Rule[] = [
+  route(
+    'POST',
+    /^\/_matrix\/client\/v3\/rooms\/[^/]+\/upgrade$/,
+    'clientrooms',
+  ),
+  route(
+    'GET',
+    /^\/_matrix\/client\/unstable\/org\.matrix\.msc4140\/delayed_events(?:\/[^/]+)?$/,
+    'domain',
+  ),
+  route(
+    'POST',
+    /^\/_matrix\/client\/unstable\/org\.matrix\.msc4140\/delayed_events\/[^/]+(?:\/[^/]+)?$/,
+    'domain',
+  ),
+  route('GET', literal('/_matrix/client/v3/notifications'), 'domain'),
+  route('GET', literal('/_matrix/client/v3/pushers'), 'domain'),
+  route('POST', literal('/_matrix/client/v3/pushers/set'), 'domain'),
+  route('POST', /^\/_matrix\/client\/v3\/rooms\/[^/]+\/forget$/, 'clientrooms'),
+  route(
+    'POST',
+    /^\/_matrix\/client\/v3\/rooms\/[^/]+\/report(?:\/[^/]+)?$/,
+    'domain',
+  ),
+  route('POST', /^\/_matrix\/client\/v3\/users\/[^/]+\/report$/, 'domain'),
+  route(
+    'GET',
+    /^\/_matrix\/client\/v3\/room_keys\/(?:version(?:\/[^/]+)?|keys(?:\/[^/]+(?:\/[^/]+)?)?)$/,
+    'domain',
+  ),
+  route(
+    'POST',
+    /^\/_matrix\/client\/v3\/room_keys\/version$/,
+    'domain',
+    'home',
+  ),
+  ...['PUT', 'DELETE'].map((method) =>
+    route(
+      method,
+      /^\/_matrix\/client\/v3\/room_keys\/(?:version\/[^/]+|keys(?:\/[^/]+(?:\/[^/]+)?)?)$/,
+      'domain',
+      'home',
+    )
+  ),
+  route(
+    'POST',
+    /^\/_matrix\/client\/v3\/user\/[^/]+\/openid\/request_token$/,
+    'domain',
+  ),
+  route('GET', /^\/_matrix\/federation\/v1\/openid\/userinfo$/, 'domain'),
+  route('POST', /^\/_matrix\/client\/v3\/user\/[^/]+\/filter$/, 'domain'),
+  route('GET', /^\/_matrix\/client\/v3\/user\/[^/]+\/filter\/[^/]+$/, 'domain'),
+];
+
 const HOME_SERVICES = new Set([
   'recovery',
   'link-client',
@@ -244,7 +300,10 @@ export function capabilities(role: string, phase = 'f1') {
     service(name: string): boolean {
       if (
         role === 'facade' && phase === 'f2' &&
-        ['deactivation', 'device-lists', 'federation-sender'].includes(name)
+        ['deactivation', 'device-lists', 'federation-sender', 'push', 'delayed']
+          .includes(
+            name,
+          )
       ) {
         return true;
       }
@@ -262,6 +321,7 @@ export function capabilities(role: string, phase = 'f1') {
           ...F2_TODEVICE,
           ...F2_ROOMS,
           ...F2_MEMBERSHIP,
+          ...F2_CLIENT_DATA,
         ]
         : F1_PUBLIC)
         .filter((rule) => rule.path.test(path));

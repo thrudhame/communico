@@ -9,6 +9,132 @@ import { auditSnapshot } from '#engine/backup/audit.ts';
 import { describePayload } from '#engine/backup/manifest.ts';
 import { roomProjectionSources } from '#engine/store/projection-sources.ts';
 import { recoverServer } from '#engine/server/startup.ts';
+import { upgradeRoom } from '#engine/client/upgrade.ts';
+import { inspectSnapshot } from '#engine/store/inspect.ts';
+import { inventoryRestoredWork } from '#engine/backup/work.ts';
+import { serverSchema } from '#engine/server/schema.ts';
+import { tenantSchema } from '#engine/tenant/index.ts';
+import { roomSchema } from '#engine/room/schema.ts';
+
+Deno.test('backup audit: ordinary valid v12 creation is audited without an upgrade journal', async () => {
+  const f = await fixture();
+  try {
+    await f.audit();
+    await createRoom({
+      creator: '@audit:' + f.app.tenant.serverName,
+      version: '12',
+    });
+    assertEquals(await f.app.server.query('SELECT * FROM room_upgrades'), []);
+    await f.audit();
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('backup audit: actual pending upgrade identity and private restored-work inventory survive the cut', async () => {
+  const f = await fixture();
+  try {
+    const user = '@audit:' + f.app.tenant.serverName;
+    const initialize = f.app.store.initializeRoom.bind(f.app.store);
+    let injected = false;
+    f.app.store.initializeRoom = () => {
+      injected = true;
+      return Promise.reject(new Error('backup-upgrade-cut'));
+    };
+    try {
+      await assertRejects(
+        () => upgradeRoom(f.room, user, '12'),
+        Error,
+        'backup-upgrade-cut',
+      );
+    } finally {
+      f.app.store.initializeRoom = initialize;
+    }
+    assertEquals(injected, true);
+    const [intent] = await f.app.server.query(
+      'SELECT * FROM room_upgrades WHERE old_room_id=?',
+      [f.room],
+    );
+    assertEquals(intent.phase, 0);
+    await f.audit();
+    const cut = await f.capture();
+    await inspectSnapshot(f.storage, cut.path, cut.files, f.root, {
+      server: serverSchema,
+      tenant: tenantSchema,
+      room: roomSchema,
+    }, async (snapshot) => {
+      const inventory = await inventoryRestoredWork(snapshot, Date.now());
+      assertEquals(inventory.upgrades, [{
+        old_room_id: f.room,
+        user_id: user,
+        replacement_room: intent.replacement_room,
+        phase: 0,
+      }]);
+      const text = JSON.stringify(inventory.upgrades);
+      assertEquals(text.includes('plan_json'), false);
+      assertEquals(text.includes('createPdu'), false);
+      assertEquals(text.includes('powerLevels'), false);
+    });
+    const original = JSON.parse(String(intent.plan_json));
+    for (const column of ['user_id', 'replacement_room', 'plan_json']) {
+      const changed = structuredClone(original);
+      changed.prepared.createPdu.content.predecessor.room_id =
+        '!different:test';
+      await f.app.server.execute(
+        'UPDATE room_upgrades SET ' + column + '=? WHERE old_room_id=?',
+        [
+          column === 'plan_json' ? JSON.stringify(changed) : 'different',
+          f.room,
+        ],
+      );
+      try {
+        await assertRejects(
+          f.audit,
+          Error,
+          'room upgrade intent identity differs',
+        );
+      } finally {
+        await f.app.server.execute(
+          'UPDATE room_upgrades SET ' + column + '=? WHERE old_room_id=?',
+          [intent[column], f.room],
+        );
+      }
+    }
+    assertEquals(await upgradeRoom(f.room, user, '12'), {
+      replacement_room: intent.replacement_room,
+    });
+    await f.audit();
+    const completed = await f.capture();
+    await inspectSnapshot(f.storage, completed.path, completed.files, f.root, {
+      server: serverSchema,
+      tenant: tenantSchema,
+      room: roomSchema,
+    }, async (snapshot) => {
+      assertEquals(
+        (await inventoryRestoredWork(snapshot, Date.now())).upgrades,
+        [],
+      );
+    });
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('backup audit: report distributed identity cannot lose its retained source fact', async () => {
+  const f = await fixture();
+  try {
+    await f.app.server.execute(
+      "INSERT INTO reports(report_id,kind,reporter,user_id,reason,received_ms) VALUES('orphan-source','user','@audit:test','@other:test','private',1)",
+    );
+    await assertRejects(
+      f.audit,
+      Error,
+      'report identity or source fact differs',
+    );
+  } finally {
+    await f.close();
+  }
+});
 
 async function fixture(version = '11') {
   const root = await Deno.makeTempDir({ prefix: 'backup-audit-' });

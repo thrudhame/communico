@@ -42,6 +42,7 @@ export const tableContracts = {
       'waits',
       'remote_batches',
       'membership_receipts',
+      'local_join_observations',
       'membership_receipt_wires',
     ],
     // Room identity/exact acceptance cuts: auditRoom; completed progress is also
@@ -188,6 +189,8 @@ export const tableContracts = {
       'federation_join_attempts',
       'federation_invite_attempts',
       'membership_operations',
+      // Original prepared creation identity and request-owned phase/result.
+      'room_upgrades',
       'server_keys',
       'server_key_docs',
       'server_key_changes',
@@ -204,16 +207,24 @@ export const tableContracts = {
       'public_signing_keys',
       'remote_signing_keys',
       'federation_batches',
+      // operation_id binds each public evaluation to its retained notification
+      // source context; auditServer checks that durable pointer below.
       'push_evaluations',
       'notification_counts',
       'notification_horizons',
       'notification_receipt_refs',
       'notification_own_events',
       'notification_history',
+      // Terminal account lifecycle projection; original source facts survive.
+      'notification_retired_users',
+      // Removed-room retirement keeps late authenticated facts unapplied.
+      'notification_retired_rooms',
       'push_targets',
       'push_rejections',
       'push_delivery',
       'push_badges',
+      // Includes reports.report_id: original node identity, not local page IDs.
+      // Its immutable submission/resolution facts are retained in causal below.
       'reports',
       'restore_state',
       'facade_node',

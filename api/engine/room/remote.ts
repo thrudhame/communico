@@ -881,6 +881,15 @@ export async function ingestRemote(
             const prior = await tx.remoteBatches.get(operationId, inputHash);
             if (prior) return { grounded: [], outcomes: prior };
           }
+          // Retained before ingest, so a join that stays pending completes
+          // this context when any later path grounds it.
+          if (deps.localJoin !== undefined) {
+            await tx.joinObservations.retain(
+              deps.localJoin.eventId,
+              deps.localJoin.userId,
+              deps.localJoin.observation,
+            );
+          }
           const grounded: string[] = [];
           const results = new Map<number, RemoteOutcome>();
           // Revalidation (G8): the fetch phase ran unlocked — the stay, the
@@ -1058,6 +1067,10 @@ export async function ingestRemote(
               status?.standing === 'accepted' && status.grounding === 'grounded'
             ) {
               await tx.changes.localParticipation(eventId, userId);
+              await tx.joinObservations.complete(
+                eventId,
+                deps.localJoin.observation,
+              );
             }
           }
           const completed = outcomes.map((outcome, index) =>

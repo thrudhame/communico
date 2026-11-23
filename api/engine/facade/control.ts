@@ -210,11 +210,19 @@ export function homeVerificationKeys(
     const [held] = await db.query(
       'SELECT revision,roster_json,document_json FROM facade_key_roster WHERE singleton=1',
     );
+    const retained = rosterAt(held, roster.revision);
+    if (
+      retained !== null &&
+      (Number(held.revision) !== roster.revision ||
+        canonicalJson(retained) !== canonicalJson(roster))
+    ) {
+      throw new UpstreamError('validation', {
+        phase: 'key-lookup',
+        reason: 'local key roster differs from enrollment authority',
+      });
+    }
     return {
-      roster: Number(held.revision) === roster.revision &&
-          held.roster_json === canonicalJson(roster)
-        ? roster
-        : null,
+      roster: retained,
       document: held.document_json === null ? null : String(held.document_json),
     };
   });
