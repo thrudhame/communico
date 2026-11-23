@@ -156,6 +156,17 @@ export function enrollCompletion(
   return true;
 }
 
+// Durable acceptance without waiting: the committed head is already the
+// recoverable obligation; enrolling starts this process's owner on it.
+export async function enrollRoomWrite(
+  room: Room,
+  self: string,
+): Promise<boolean> {
+  if (hooks?.enroll === undefined) return false;
+  const target = await room.tx((tx) => tx.completion.capture());
+  return enrollCompletion(room, self, target);
+}
+
 export function completeRoomWrite(
   room: Room,
   self: string,

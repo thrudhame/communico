@@ -1214,6 +1214,13 @@ can own the operation again. Other origins, IDs and stores remain independent.
 Durable facade ingress retains its mailbox-owned serialization and receipts.
 (`api/engine/federation/transactions.ts`, `api/engine/facade/mailbox.ts`)
 
+A standalone transaction answers once every PDU's outcome is decided and
+durably accepted. Its committed room head is the publication obligation: the
+store-owned completion service is enrolled without the request waiting, and
+schema-enabled startup discovery finishes it after a restart. Joins, history and
+other consumers of published state keep waiting on their own exact obligation.
+(`api/engine/room/{ingest,hooks,remote}.ts`)
+
 Standalone flights and shared signing-key acquisition own subscriber demand.
 One disconnected caller cannot cancel another; the last caller cancels the
 actual recovery fetches, verification and speculative room work. Cancelled

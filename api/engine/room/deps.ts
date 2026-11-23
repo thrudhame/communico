@@ -4,6 +4,7 @@
 // The real federation client and key store arrive in stage 4; tests use
 // the fakes in tests/fixtures/.
 import type { Pdu } from '#engine/pdu.ts';
+import type { CommitWait } from '#engine/room/ingest.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { recoverableUpstream } from '#engine/net/upstream-error.ts';
 
@@ -161,4 +162,7 @@ export type RemoteDeps = {
   // Explicit local participation intent after a resident remote-vouch dance.
   // Ordinary remote receipt never acquires local policy from event content.
   localJoin?: { eventId: string; userId: string };
+  // Default 'published'. Inbound federation transactions answer at durable
+  // acceptance; their publication stays with the store's completion owner.
+  completion?: CommitWait;
 };
