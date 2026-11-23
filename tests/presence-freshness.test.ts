@@ -2,15 +2,19 @@ import { assert, assertEquals, assertRejects } from '@std/assert';
 import {
   capturePresence,
   getPresence,
+  importPresenceStatus,
   onEphemeral,
   presenceFor,
   publishPresence,
+  replacePresenceSource,
   setPresence,
+  withPresenceSync,
 } from '#engine/server/ephemeral.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { eventStreamTx, onEventStream } from '#engine/server/stream.ts';
 import { openStore } from '#engine/store/index.ts';
 import { historicalServerSchema } from '#tests/fixtures/server-schema-history.ts';
+import { bounded } from '#tests/helpers/server-process.ts';
 
 async function fixture() {
   const dir = await Deno.makeTempDir({ prefix: 'presence-freshness-' });
@@ -151,7 +155,7 @@ Deno.test('presence audience reads share freshness capture without waking their 
 
 Deno.test('presence freshness upgrade cannot mint receipt evidence for historical online rows', async () => {
   const f = await fixture();
-  let store = await f.open(historicalServerSchema(55));
+  let store = await f.open(historicalServerSchema(58));
   try {
     const user = '@remote:origin.test';
     await (await store.server()).execute(
@@ -208,20 +212,20 @@ Deno.test('presence freshness cannot revive old online activity after a cold sto
 Deno.test('presence freshness does not renew a remote observation while its write is queued', async () => {
   const f = await fixture();
   const store = await f.open();
+  const server = await store.server();
+  const tx = server.tx.bind(server);
   const clock = Date.now;
   const admitted = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
-  let held: Promise<void> | undefined;
   let observation: Promise<void> | undefined;
   try {
-    const server = await store.server();
     const received = clock();
     Date.now = () => received;
-    held = eventStreamTx(server, async () => {
+    server.tx = async (fn, options) => {
       admitted.resolve();
       await release.promise;
-    });
-    await admitted.promise;
+      return await tx(fn, options);
+    };
     observation = setPresence(
       server,
       '@remote:origin.test',
@@ -229,16 +233,124 @@ Deno.test('presence freshness does not renew a remote observation while its writ
       'queued status',
       { remote: true },
     );
+    await bounded(admitted.promise);
     Date.now = () => received + 31 * 60 * 1000;
     release.resolve();
-    await Promise.all([held, observation]);
-    const row = await getPresence(server, '@remote:origin.test');
-    assertEquals(row.presence, 'offline');
-    assertEquals(row.statusMsg, 'queued status');
+    await observation;
+    assertEquals(
+      await server.query(
+        'SELECT presence,status_msg,remote_received_ms FROM presence',
+      ),
+      [{
+        presence: 'offline',
+        status_msg: 'queued status',
+        remote_received_ms: received,
+      }],
+    );
   } finally {
     release.resolve();
-    await Promise.all([held, observation]);
+    server.tx = tx;
+    await Promise.allSettled([observation]);
     Date.now = clock;
+    await store.close();
+    await Deno.remove(f.dir, { recursive: true });
+  }
+});
+
+Deno.test('presence transactions do not queue behind a held event writer', async (t) => {
+  const f = await fixture();
+  const store = await f.open();
+  const server = await store.server();
+  const local = '@local:local.test';
+  const device = { deviceId: 'PHONE', generation: 1 };
+  const remote = '@remote:origin.test';
+  const syncEntered = Promise.withResolvers<void>();
+  const finishSync = Promise.withResolvers<void>();
+  const writerEntered = Promise.withResolvers<void>();
+  const finishWriter = Promise.withResolvers<void>();
+  let sync: Promise<void> | undefined;
+  let writer: Promise<void> | undefined;
+  const work: Promise<unknown>[] = [];
+  const admissionError = new Error('status admission reached');
+  const streamChanges: string[] = [];
+  const stop = onEventStream((path) => {
+    if (path === server.path) streamChanges.push(path);
+  });
+  try {
+    await setPresence(server, remote, 'online', 'keep', {
+      remote: true,
+    });
+    await server.execute(
+      'UPDATE presence SET remote_received_ms=0 WHERE user_id=?',
+      [remote],
+    );
+    const syncing = withPresenceSync(server, local, 'online', device, () => {
+      syncEntered.resolve();
+      return finishSync.promise;
+    });
+    sync = syncing;
+    await bounded(syncEntered.promise);
+    streamChanges.length = 0;
+    writer = eventStreamTx(server, async () => {
+      writerEntered.resolve();
+      await finishWriter.promise;
+    });
+    await bounded(writerEntered.promise);
+    const cases: [string, () => Promise<unknown>][] = [
+      ['explicit write', () => setPresence(server, local, 'online', 'new')],
+      ['source replacement', () =>
+        replacePresenceSource(
+          server,
+          { node: 'edge', incarnation: 'one' },
+          [{
+            userId: local,
+            ...device,
+            presence: 'online',
+            remainingMs: 30_000,
+            lastActiveAgo: 0,
+          }],
+          () => 0,
+          () => Promise.resolve(),
+        )],
+      ['sync completion', () => {
+        finishSync.resolve();
+        return syncing;
+      }],
+      ['read normalizes stale presence', async () => {
+        assertEquals((await getPresence(server, remote)).presence, 'offline');
+      }],
+      ['causal status admission', () =>
+        assertRejects(
+          () =>
+            importPresenceStatus(server, {
+              source: 'edge',
+              incarnation: 'one',
+              sequence: 1,
+              operationId: 'unused',
+              stream: 'unused',
+              semanticKey: 'unused',
+              kind: 'presence-status',
+              context: [],
+              payloadHash: 'unused',
+              payload: '{}',
+            }, () => Promise.reject(admissionError)),
+          Error,
+          admissionError.message,
+        )],
+    ];
+    for (const [name, run] of cases) {
+      await t.step(name, async () => {
+        const result = run();
+        work.push(result);
+        await bounded(result, 5_000);
+      });
+    }
+    assertEquals(streamChanges, []);
+  } finally {
+    stop();
+    finishWriter.resolve();
+    finishSync.resolve();
+    await Promise.allSettled([writer, sync, ...work]);
     await store.close();
     await Deno.remove(f.dir, { recursive: true });
   }

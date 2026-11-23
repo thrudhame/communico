@@ -54,6 +54,8 @@ import {
 import { testRemoteServer, testSigner } from './fixtures/signer.ts';
 import { assertAuthored } from './fixtures/authored.ts';
 import { sendLocal } from '#engine/room/ingest.ts';
+import { watchdog } from './support/ordering.ts';
+import { historicalServerSchema } from './fixtures/server-schema-history.ts';
 
 async function ourKeyDoc(name: string): Promise<Record<string, unknown>> {
   const us = await testRemoteServer(name);
@@ -486,6 +488,101 @@ Deno.test('inviter: signed attempt survives uncertain response and cold sender r
   }
 });
 
+Deno.test('inviter: discovered intent reloads a response committed by the live performer', async () => {
+  await withStore(async (store) => {
+    await withInviteHost(async (h) => {
+      const g = await genesis(store, { roomId: '!invite-discovery:test' });
+      const server = await store.server();
+      const fault = new Error('response committed before local ingest');
+      const faultServer = new Proxy(server, {
+        get(target, property) {
+          if (property === 'execute') {
+            return async (...args: Parameters<typeof server.execute>) => {
+              const value = await target.execute(...args);
+              if (args[0].includes('SET response_json=')) throw fault;
+              return value;
+            };
+          }
+          const value = Reflect.get(target, property);
+          return typeof value === 'function' ? value.bind(target) : value;
+        },
+      });
+      const deps: InviteDeps = {
+        store,
+        server,
+        signer: g.signer,
+        keys: productionKeyResolver(keyStore(server, { signer: g.signer })),
+        self: 'test',
+        wake: () => {},
+      };
+      const replyReached = Promise.withResolvers<void>();
+      const releaseReply = Promise.withResolvers<void>();
+      h.beforeReply = () => {
+        replyReached.resolve();
+        return releaseReply.promise;
+      };
+      const first = assertRejects(() =>
+        inviteRemote(
+          g.roomId,
+          '@dev:test',
+          `@zoe:${h.fake.name}`,
+          'retained',
+          undefined,
+          { ...deps, server: faultServer },
+        )
+      );
+      const provider = inviteIntentProvider(deps);
+      try {
+        await watchdog(replyReached.promise, 'live invite request dispatch');
+        // Discovery normally skips live claims. Capture precisely the durable
+        // query result here, then let the live performer finish before the
+        // provider examines it. No claim or response is modified by the test.
+        const query = server.query.bind(server);
+        const staleServer = new Proxy(server, {
+          get(target, property) {
+            if (property === 'query') {
+              return async (...args: Parameters<typeof server.query>) => {
+                const rows = await query(...args);
+                if (
+                  args[0].startsWith('SELECT * FROM federation_invite_attempts')
+                ) {
+                  releaseReply.resolve();
+                  assertEquals(await first, fault);
+                }
+                return rows;
+              };
+            }
+            const value = Reflect.get(target, property);
+            return typeof value === 'function' ? value.bind(target) : value;
+          },
+        });
+        const job = await provider(staleServer, h.fake.name);
+        assert(job);
+        const [retained] = await query(
+          'SELECT * FROM federation_invite_attempts',
+        );
+        assert(retained.response_json !== null);
+        await job.run();
+        assertEquals(
+          h.inviteRequests.length,
+          1,
+          'saved response must prevent a second PUT',
+        );
+        assert(
+          await g.room.tx((tx) => tx.events.get(String(retained.event_id))),
+        );
+        assertEquals(
+          await query('SELECT * FROM federation_invite_attempts'),
+          [],
+        );
+      } finally {
+        releaseReply.resolve();
+        await first;
+      }
+    });
+  });
+});
+
 Deno.test('inviter: same reference ID cannot hide changed immutable content', async () => {
   await withStore(async (store) => {
     await withInviteHost(async (h) => {
@@ -722,6 +819,223 @@ Deno.test('inviter: unauthorized local membership never becomes remote work', as
   });
 });
 
+Deno.test('inviter: new content replaces only a definitely refused attempt', async (t) => {
+  for (
+    const outcome of [
+      'refusal',
+      'uncertain',
+      'bad-evidence',
+      'timeout',
+      'throttle',
+      'non-matrix',
+    ]
+  ) {
+    await t.step(outcome, () =>
+      withStore(async (store) => {
+        await withInviteHost(async (h) => {
+          const g = await genesis(store, {
+            roomId: '!invite-new-content:test',
+          });
+          const server = await store.server();
+          const deps: InviteDeps = {
+            store,
+            server,
+            signer: g.signer,
+            keys: productionKeyResolver(keyStore(server, { signer: g.signer })),
+            self: 'test',
+            wake: () => {},
+          };
+          h.response = () => {
+            if (outcome === 'bad-evidence') return Response.json({});
+            if (outcome === 'non-matrix') {
+              return new Response('proxy refused', { status: 403 });
+            }
+            return Response.json({ errcode: 'M_FORBIDDEN', error: outcome }, {
+              status: outcome === 'refusal'
+                ? 403
+                : outcome === 'timeout'
+                ? 408
+                : outcome === 'throttle'
+                ? 429
+                : 502,
+            });
+          };
+          const invite = (reason: string) =>
+            inviteRemote(
+              g.roomId,
+              '@dev:test',
+              `@zoe:${h.fake.name}`,
+              reason,
+              undefined,
+              deps,
+            );
+          await assertRejects(() => invite('A'));
+          const [original] = await server.query(
+            'SELECT * FROM federation_invite_attempts',
+          );
+          const request = canonicalJson(h.inviteRequests[0]);
+          h.response = () => null;
+          if (outcome === 'refusal') {
+            deps.prepareRoomScope = () => {
+              throw new MatrixError(
+                503,
+                'M_UNAVAILABLE',
+                'fresh scope unavailable',
+              );
+            };
+            const denied = await assertRejects(() => invite('B'), MatrixError);
+            assertEquals(denied.status, 503);
+            assertEquals(h.inviteRequests.length, 1);
+            assertEquals(
+              (await server.query(
+                'SELECT event_id FROM federation_invite_attempts',
+              ))[0].event_id,
+              original.event_id,
+            );
+            delete deps.prepareRoomScope;
+            const next = await invite('B');
+            assert(next.eventId !== original.event_id);
+            assertEquals(
+              (h.inviteRequests[1].event.content as Record<string, unknown>)
+                .reason,
+              'B',
+            );
+          } else {
+            const conflict = await assertRejects(
+              () => invite('B'),
+              MatrixError,
+            );
+            assertEquals(conflict.status, 409);
+            assertEquals(h.inviteRequests.length, 1);
+            assertEquals(
+              (await server.query(
+                'SELECT request_json FROM federation_invite_attempts',
+              ))[0].request_json,
+              original.request_json,
+            );
+            const retry = await invite('A');
+            assertEquals(retry.eventId, original.event_id);
+            assertEquals(canonicalJson(h.inviteRequests[1]), request);
+          }
+          assertEquals(
+            await server.query('SELECT * FROM federation_invite_attempts'),
+            [],
+          );
+        });
+      }));
+  }
+});
+
+Deno.test('review inviter: upgrade preserves unknown dispatch certainty and fresh attempts start undispatched', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'invite-certainty-upgrade-' });
+  let store = await openStore(config(dir), {
+    schemas: { server: historicalServerSchema(53) },
+  });
+  try {
+    const old = await store.server();
+    for (const status of ['pending', 'refused']) {
+      await old.execute(
+        'INSERT INTO federation_invite_attempts(room_id,sender,target,event_id,destination,request_json,status,added_ms) VALUES(?,?,?,?,?,?,?,?)',
+        [
+          '!old:test',
+          '@sender:test',
+          '@' + status + ':remote.test',
+          '$' + status,
+          'remote.test',
+          '{"frozen":"intent"}',
+          status,
+          123,
+        ],
+      );
+    }
+    await store.close();
+    store = await openStore(config(dir), { schemas: { server: serverSchema } });
+    const current = await store.server();
+    assertEquals(
+      await current.query(
+        'SELECT request_json,may_have_applied FROM federation_invite_attempts ORDER BY event_id',
+      ),
+      [
+        { request_json: '{"frozen":"intent"}', may_have_applied: 1 },
+        { request_json: '{"frozen":"intent"}', may_have_applied: 1 },
+      ],
+    );
+    await current.execute(
+      "INSERT INTO federation_invite_attempts(room_id,sender,target,event_id,destination,request_json,status,added_ms) VALUES('!new:test','@sender:test','@new:remote.test','$new','remote.test','{}','pending',123)",
+    );
+    assertEquals(
+      await current.query(
+        "SELECT may_have_applied FROM federation_invite_attempts WHERE event_id='$new'",
+      ),
+      [{ may_have_applied: 0 }],
+    );
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('review inviter: a later refusal cannot erase an earlier uncertain dispatch across restart', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'invite-certainty-' });
+  const schemas = { room: roomSchema, server: serverSchema };
+  let store = await openStore(config(dir), { schemas });
+  try {
+    await withInviteHost(async (h) => {
+      const g = await genesis(store, { roomId: '!uncertain-refusal:test' });
+      const deps = async (): Promise<InviteDeps> => {
+        const server = await store.server();
+        return {
+          store,
+          server,
+          signer: g.signer,
+          keys: productionKeyResolver(keyStore(server, { signer: g.signer })),
+          self: 'test',
+          wake() {},
+        };
+      };
+      const invite = async (reason: string) =>
+        inviteRemote(
+          g.roomId,
+          '@dev:test',
+          `@zoe:${h.fake.name}`,
+          reason,
+          undefined,
+          await deps(),
+        );
+      h.response = () =>
+        Response.json({
+          errcode: 'M_UNKNOWN',
+          error: 'response lost after possible acceptance',
+        }, { status: 502 });
+      await assertRejects(() => invite('A'));
+      const original = canonicalJson(h.inviteRequests[0]);
+      await store.close();
+      store = await openStore(config(dir), { schemas });
+      h.response = () =>
+        Response.json({
+          errcode: 'M_NOT_FOUND',
+          error: 'federation temporarily disabled',
+        }, { status: 404 });
+      await assertRejects(() => invite('A'));
+      h.response = () => null;
+      const conflict = await assertRejects(() => invite('B'), MatrixError);
+      assertEquals(conflict.status, 409);
+      assertEquals(h.inviteRequests.length, 2);
+      await invite('A');
+      assertEquals(canonicalJson(h.inviteRequests[2]), original);
+      assertEquals(
+        await (await store.server()).query(
+          'SELECT * FROM federation_invite_attempts',
+        ),
+        [],
+      );
+    });
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test('inviter: definite missing-param refusal keeps exact intent for explicit retry', async () => {
   await withStore(async (store) => {
     await withInviteHost(async (h) => {
@@ -757,7 +1071,7 @@ Deno.test('inviter: definite missing-param refusal keeps exact intent for explic
       assertEquals(await provider(server, h.fake.name), null);
       assertEquals((await provider.review()).length, 1);
       const before = canonicalJson(h.inviteRequests[0]);
-      await retryPrejoinIntents(server, 'test', h.fake.name);
+      await retryPrejoinIntents(store, server, 'test', h.fake.name);
       const job = await provider(server, h.fake.name);
       assert(job);
       h.response = () => null;

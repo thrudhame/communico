@@ -62,6 +62,11 @@ export async function removeNotificationFacts(
       'INSERT INTO notification_retired_users(user) VALUES(?) ON CONFLICT DO NOTHING',
       [scope.user],
     );
+  } else {
+    await tx.execute(
+      'INSERT INTO notification_retired_rooms(room) VALUES(?) ON CONFLICT DO NOTHING',
+      [scope.room],
+    );
   }
   await tx.execute(
     `UPDATE domain_operations SET applied=-1 WHERE kind='notification' AND json_extract(payload_json,'$.${column}')=?`,
@@ -341,6 +346,37 @@ export type IndependentPush = {
   publication: PushPublication;
 };
 
+/** Receipt seeding is durable read-marker work, not per-notification work.
+ * General publication and independent eligibility share this fresh witness.
+ * Graph identity alone cannot repair a missing standalone/F1 horizon. Unknown
+ * targets still enter the existing ordered pending-reference owner. */
+async function notificationReceiptSeeds(
+  tx: Conn,
+  keys: readonly { room: string; user?: string }[],
+  graph: boolean,
+): Promise<{ user: string; room: string; scope: string; event: string }[]> {
+  if (!keys.length) return [];
+  const rows = await tx.query(
+    `SELECT DISTINCT r.user_id AS user,r.room_id AS room,r.thread_id AS scope,CAST(e.value AS TEXT) AS event
+    FROM json_each(?) j JOIN receipts r ON r.room_id=CAST(json_extract(j.value,'$.room') AS TEXT)
+      AND (json_type(j.value,'$.user') IS NULL OR r.user_id=CAST(json_extract(j.value,'$.user') AS TEXT)),json_each(r.event_ids) e
+    LEFT JOIN event_index i ON i.event=CAST(e.value AS TEXT) AND i.room=r.room_id
+    WHERE NOT EXISTS (
+      SELECT 1 FROM notification_graph_reads g WHERE g.user=r.user_id AND g.room=r.room_id AND g.scope=r.thread_id AND g.event=CAST(e.value AS TEXT))
+    OR (?=0
+      AND i.seq IS NOT NULL AND i.standing='accepted' AND i.grounding='grounded'
+      AND NOT EXISTS (SELECT 1 FROM notification_horizons h
+        WHERE h.user=r.user_id AND h.room=r.room_id AND h.scope=r.thread_id AND h.event_seq>=i.seq))`,
+    [JSON.stringify(keys), graph ? 1 : 0],
+  );
+  return rows.map((row) => ({
+    user: String(row.user),
+    room: String(row.room),
+    scope: String(row.scope),
+    event: String(row.event),
+  }));
+}
+
 /** Capture only inside the owning server attempt. Independent plain events
  * have no relation, pending-reference, replay or graph dependencies; all other
  * meanings retain the general ordered application path below. */
@@ -362,29 +398,21 @@ export async function captureIndependentPushes(
     UNION ALL SELECT 1 FROM json_each(?) j JOIN push_evaluations r ON r.event=CAST(j.value AS TEXT)
     UNION ALL SELECT 1 FROM json_each(?) j JOIN notification_own_events r ON r.event=CAST(j.value AS TEXT)
     UNION ALL SELECT 1 FROM json_each(?) j JOIN redactions r ON r.target=CAST(j.value AS TEXT)
-    UNION ALL SELECT 1 FROM json_each(?) j JOIN receipts r ON r.room_id=CAST(j.value AS TEXT),json_each(r.event_ids) e
-      WHERE NOT EXISTS (
-        SELECT 1 FROM notification_graph_reads g WHERE g.user=r.user_id AND g.room=r.room_id AND g.scope=r.thread_id AND g.event=CAST(e.value AS TEXT))
     LIMIT 1`,
-    [events, events, rooms, events, events, events, events, rooms],
+    [events, events, rooms, events, events, events, events],
   );
   if (dependencies.length) return null;
+  if (
+    (await notificationReceiptSeeds(
+      tx,
+      [...new Set(inputs.map((i) => i.room))].map((room) => ({ room })),
+      false,
+    )).length
+  ) return null;
   const horizons = await tx.query(
     'SELECT h.user,h.room,h.scope,h.event_seq FROM json_each(?) j JOIN notification_horizons h ON h.room=CAST(j.value AS TEXT)',
     [rooms],
   );
-  // A previously seeded receipt must still have its scalar horizon. Otherwise
-  // the general path owns its upgrade/repair and any resulting ordered deltas.
-  if (
-    (await tx.query(
-      `SELECT 1 FROM json_each(?) j JOIN receipts r ON r.room_id=CAST(j.value AS TEXT),json_each(r.event_ids) e JOIN event_index i ON i.event=CAST(e.value AS TEXT)
-    WHERE i.room=r.room_id AND i.seq IS NOT NULL
-      AND i.standing='accepted' AND i.grounding='grounded' AND NOT EXISTS (
-        SELECT 1 FROM notification_horizons h WHERE h.user=r.user_id AND h.room=r.room_id AND h.scope=r.thread_id AND h.event_seq>=i.seq)
-    LIMIT 1`,
-      [rooms],
-    )).length
-  ) return null;
   if (
     (await tx.query(
       `SELECT 1 FROM json_each(?) j JOIN receipts r ON r.room_id=CAST(j.value AS TEXT) JOIN notification_horizons h ON h.user=r.user_id AND h.room=r.room_id AND h.scope=r.thread_id
@@ -623,7 +651,6 @@ export async function reconcileNotificationEvent(
   event: string,
   now: number,
 ): Promise<void> {
-  await projectImportedNotificationEvent(tx, room, event, now);
   const affected = new Set([event]);
   let frontier = [event];
   for (let hop = 0; hop < 3 && frontier.length; hop++) {
@@ -679,6 +706,9 @@ export async function reconcileNotificationEvent(
         now,
       );
     }
+    // Read markers and local own-event reads are authoritative before a saved
+    // imported decision is materialized. No transient unread row may dispatch.
+    await projectImportedNotificationEvent(tx, room, target, now);
     const redacted = (await tx.query(
       'SELECT 1 FROM redactions WHERE room=? AND target=?',
       [room, target],
@@ -905,20 +935,22 @@ async function projectDecision(
     ],
   );
   if (!inserted || !input.decision?.notify) return;
-  // Current receipts seed upgrades too; the independent horizons retain the
-  // farther position even after a lagging public/private wire update.
-  const receipts = await tx.query(
-    'SELECT event_ids,thread_id FROM receipts WHERE user_id=? AND room_id=?',
-    [input.user, room],
-  );
-  for (const receipt of dispatch ? receipts : []) {
-    for (const eventId of JSON.parse(String(receipt.event_ids)) as string[]) {
+  // Native publication seeds only missing durable read facts. Imported saved
+  // notifications never advance local read markers or dispatch pushes.
+  if (dispatch) {
+    for (
+      const seed of await notificationReceiptSeeds(
+        tx,
+        [{ room, user: input.user }],
+        await graphReceiptsEnabled(tx),
+      )
+    ) {
       await advanceNotificationRead(
         tx,
-        input.user,
-        room,
-        String(receipt.thread_id),
-        eventId,
+        seed.user,
+        seed.room,
+        seed.scope,
+        seed.event,
         now,
       );
     }
@@ -1025,7 +1057,7 @@ export async function importNotificationOperation(
   history?: DomainHistoryProof,
 ) {
   const value = await acceptNotificationOperation(tx, operation, history);
-  await projectImportedNotificationEvent(tx, value.room, value.event, now);
+  await reconcileNotificationEvent(tx, value.room, value.event, now);
 }
 
 /** The existing server stream owns post-commit consumer wakes, as for imported
@@ -1067,6 +1099,12 @@ export async function requireNotificationHistory(
         String(row.semantic_key),
       );
       if (selected && savedNotification(selected).notify) {
+        const value = savedNotification(selected);
+        // OOB display is transient. An invite fact without a current display
+        // or accepted room event is retained evidence, not a history dependency.
+        if (
+          value.source === 'invite' && !await notificationTarget(conn, value)
+        ) continue;
         throw new MatrixError(
           503,
           'M_UNAVAILABLE',
@@ -1075,6 +1113,23 @@ export async function requireNotificationHistory(
       }
     }
   });
+}
+
+async function notificationTarget(
+  tx: Conn,
+  value: ReturnType<typeof savedNotification>,
+) {
+  const [target] = await tx.query(
+    "SELECT seq,pos FROM event_index WHERE event=? AND room=? AND standing='accepted' AND grounding='grounded' AND seq IS NOT NULL",
+    [value.event, value.room],
+  );
+  if (target) return target;
+  if (value.source !== 'invite') return undefined;
+  const [invite] = await tx.query(
+    "SELECT seq,seq AS pos FROM prejoin_memberships WHERE room_id=? AND user_id=? AND event_id=? AND kind='invite' AND status='pending'",
+    [value.room, value.user, value.event],
+  );
+  return invite;
 }
 
 /** Source facts may precede room evidence. Event projection revisits only the
@@ -1111,17 +1166,8 @@ async function projectImportedNotificationEvent(
       (Number(prior.native) === 1 ||
         prior.operation_id === selected.operationId)
     ) continue;
-    const [target] = await tx.query(
-      "SELECT seq,pos FROM event_index WHERE event=? AND room=? AND standing='accepted' AND grounding='grounded' AND seq IS NOT NULL",
-      [event, room],
-    );
-    const [invite] = value.source === 'invite'
-      ? await tx.query(
-        "SELECT seq FROM prejoin_memberships WHERE room_id=? AND user_id=? AND event_id=? AND kind='invite' AND status='pending'",
-        [room, value.user, event],
-      )
-      : [];
-    if (!target && !invite) continue;
+    const target = await notificationTarget(tx, value);
+    if (!target) continue;
     if (prior) {
       await removeDecisionProjection(
         tx,
@@ -1131,13 +1177,13 @@ async function projectImportedNotificationEvent(
         false,
       );
     }
-    const seq = Number(target?.seq ?? invite.seq);
+    const seq = Number(target.seq);
     await projectDecision(
       tx,
       room,
       event,
       seq,
-      Number(target?.pos ?? seq),
+      Number(target.pos ?? seq),
       {
         tenant: value.tenant,
         user: value.user,

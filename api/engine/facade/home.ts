@@ -2,6 +2,7 @@
 // selects node IDs. A stalled peer never serializes another peer's enrollment.
 import type { App } from '#engine/app.ts';
 import { config } from '#engine/config.ts';
+import { workerFailure } from '#engine/request-diagnostics.ts';
 import { capabilities } from './capabilities.ts';
 import { exportKeyRoster, refreshRetiredKeyDocument } from './control.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
@@ -140,11 +141,11 @@ export async function startHomeLinks(
   );
   const failed = (node: string, error: unknown) => {
     if (!controller.signal.aborted) {
-      console.error(
-        'facade link:',
-        node,
-        error instanceof LinkError ? error.code : 'LINK_UNAVAILABLE',
-      );
+      workerFailure({
+        owner: 'facade link',
+        server: app.tenant.serverName,
+        peer: node,
+      }, error);
     }
   };
   async function reconcile(id: string, node: string) {

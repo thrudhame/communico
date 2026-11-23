@@ -41,6 +41,7 @@ import * as filters from '#engine/tenant/filters.ts';
 import * as media from '#engine/tenant/media.ts';
 import * as pushers from '#engine/tenant/pushers.ts';
 import * as pushrules from '#engine/tenant/pushrules.ts';
+import { capturePublicationPolicies } from '#engine/tenant/push-policy.ts';
 import * as txns from '#engine/tenant/txns.ts';
 import * as completion from '#engine/tenant/completion.ts';
 import type { CompletionTarget } from '#engine/room/completion.ts';
@@ -807,6 +808,10 @@ function bind(
       clear: (localpart: string) => openid.clearOpenId(conn, localpart),
       expire: (now: number) => openid.expireOpenId(conn, now),
     },
+    pushPolicy: {
+      capture: (localparts: readonly string[]) =>
+        capturePublicationPolicies(conn, serverName, localparts),
+    },
     pushRules: {
       prepare: (localpart: string) =>
         pushrules.preparePushRules(conn, localpart, serverName),
@@ -986,9 +991,15 @@ function bind(
         changed();
       },
       next: () => delayedEvents.next(conn),
-      retry: async (ids: readonly string[], due: number) => {
-        await delayedEvents.retry(conn, ids, due);
-        changed();
+      retry: async (
+        ids: readonly string[],
+        due: number,
+        observed?: readonly Pick<
+          delayedEvents.DelayedEvent,
+          'id' | 'due' | 'since'
+        >[],
+      ) => {
+        await delayedEvents.retry(conn, ids, due, observed);
       },
       due: (now: number) => delayedEvents.due(conn, now),
       claim: async (id: string, now: number) => {

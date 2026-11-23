@@ -1,6 +1,9 @@
 // Test-only controls, env-gated in a child entrypoint that production never
 // imports. No test trigger is reachable from an HTTP/admin route.
 import { theApp } from '#engine/app.ts';
+import { observeFixtureListeners } from '#tests/helpers/fixture-listeners.ts';
+
+observeFixtureListeners();
 
 const barrier = Deno.env.get('DENO_COMMUNICO_TEST_EXIT_BARRIER');
 if (barrier) {

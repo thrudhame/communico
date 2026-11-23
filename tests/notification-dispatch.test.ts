@@ -118,7 +118,10 @@ Deno.test('projection dispatch: asynchronous observer does not retain the global
     let writer: Promise<string> | undefined;
     try {
       await entered.promise;
-      writer = withProjectionLock(() => Promise.resolve('writer acquired'));
+      writer = withProjectionLock(
+        store,
+        () => Promise.resolve('writer acquired'),
+      );
       // Test deadlock watchdog, not a product response-latency target. The
       // observer is still explicitly held when the independent writer finishes.
       const watchdog = new Promise<string>((resolve) => {

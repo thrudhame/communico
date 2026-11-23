@@ -4,12 +4,19 @@
 // The real federation client and key store arrive in stage 4; tests use
 // the fakes in tests/fixtures/.
 import type { Pdu } from '#engine/pdu.ts';
+import type { CommitWait } from '#engine/room/ingest.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { recoverableUpstream } from '#engine/net/upstream-error.ts';
 
 // A Fetcher may prove that send_join was refused before membership changed.
 // All other throws, including locally constructed MatrixErrors, are uncertain.
 export class SendJoinRefused extends MatrixError {}
+
+export class SendJoinNotDispatched extends Error {
+  constructor(readonly error: unknown) {
+    super('send_join was not dispatched', { cause: error });
+  }
+}
 
 // KeyResolver: verify one signature entry of an event at a time. The
 // resolver owns key discovery (direct fetch, witnesses, caching — stage
@@ -159,4 +166,7 @@ export type RemoteDeps = {
     userId: string;
     observation?: import('./hooks.ts').LocalJoinObservation;
   };
+  // Default 'published'. Inbound federation transactions answer at durable
+  // acceptance; their publication stays with the store's completion owner.
+  completion?: CommitWait;
 };

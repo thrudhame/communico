@@ -127,6 +127,52 @@ Deno.test('pusher append: home removes an unseen different-account registration 
   }
 });
 
+Deno.test('pusher append: home application order permits a late append=true and only a later replacement retires it', async () => {
+  const f = await fixture();
+  try {
+    await setPusher(f.et, 'bob', f.bob, input);
+    const puts = await f.et.tx((tx) => tx.pushers.operations('bob'));
+    const choices = await f.et.tx((tx) => tx.pushers.choices('bob'));
+    await setPusher(f.ht, 'alice', f.alice, { ...input, append: false });
+    await f.sync();
+    for (const op of [...choices, ...puts]) {
+      await f.ht.tx((tx) => tx.pushers.import(op));
+    }
+    assertEquals((await listPushers(f.ht, 'alice')).length, 1);
+    assertEquals((await listPushers(f.ht, 'bob')).length, 1);
+    const [native] = await f.ed.query(
+      "SELECT incarnation FROM pushers WHERE localpart='bob'",
+    );
+    assertEquals(
+      await f.et.tx((tx) =>
+        tx.pushers.isCurrent('bob', 'app', 'key', String(native.incarnation))
+      ),
+      true,
+    );
+    for (const op of [...choices, ...puts]) {
+      await f.ht.tx((tx) => tx.pushers.import(op));
+    }
+    assertEquals(
+      (await listPushers(f.ht, 'bob')).length,
+      1,
+      'replay is not another append or replacement',
+    );
+    await setPusher(f.ht, 'alice', f.alice, { ...input, append: false });
+    const removals = (await f.ht.tx((tx) => tx.pushers.operations('bob')))
+      .filter((op) => op.payload === 'null');
+    assertEquals(removals.length, 1);
+    for (const op of removals) await f.et.tx((tx) => tx.pushers.import(op));
+    assertEquals(await listPushers(f.ht, 'bob'), []);
+    assertEquals(await listPushers(f.et, 'bob'), []);
+    for (const op of [...choices, ...puts]) {
+      await f.ht.tx((tx) => tx.pushers.import(op));
+    }
+    assertEquals(await listPushers(f.ht, 'bob'), []);
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('pusher append: refresh retains original false intent but is not another replacement', async () => {
   const f = await fixture();
   try {

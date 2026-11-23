@@ -16,6 +16,7 @@ import {
   requireDomainSources,
 } from '#engine/facade/domain-control.ts';
 import { PUSH_KINDS } from '#engine/push/defaults.ts';
+import { validRoomId } from '#engine/room/identity.ts';
 
 export type SavedNotification = {
   tenant: string;
@@ -68,7 +69,7 @@ export function savedNotification(
     !value || typeof value.tenant !== 'string' ||
     typeof value.user !== 'string' || !/^@[^:]+:.+$/.test(value.user) ||
     value.user.slice(value.user.indexOf(':') + 1) !== value.tenant ||
-    typeof value.room !== 'string' || !/^!\S+:\S+$/.test(value.room) ||
+    !validRoomId(value.room) ||
     typeof value.event !== 'string' || !/^\$\S+$/.test(value.event) ||
     !['room', 'invite'].includes(value.source) ||
     !integer(value.ruleRevision) || !integer(value.ignoreRevision) ||
@@ -187,6 +188,24 @@ export async function acceptNotificationOperation(
     throw new Error('saved notification changed');
   }
   await importRegisterOperation(conn, operation);
+  // Keep authenticated history, but never turn missing evidence for a dropped
+  // room into a permanent history-admission dependency. A newly registered
+  // room or current OOB invite has its own live evidence lifecycle.
+  await conn.execute(
+    `UPDATE domain_operations SET applied=-1 WHERE operation_id=?
+    AND EXISTS (SELECT 1 FROM notification_retired_rooms WHERE room=?)
+    AND NOT EXISTS (SELECT 1 FROM rooms WHERE room_id=?)
+    AND NOT EXISTS (SELECT 1 FROM prejoin_memberships WHERE room_id=?
+      AND user_id=? AND event_id=? AND kind='invite' AND status='pending')`,
+    [
+      operation.operationId,
+      value.room,
+      value.room,
+      value.room,
+      value.user,
+      value.event,
+    ],
+  );
   return value;
 }
 

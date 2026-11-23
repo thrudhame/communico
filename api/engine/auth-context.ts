@@ -8,8 +8,21 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import { lookupToken, type TokenInfo } from '#engine/tenant/auth.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { roomCompletion } from '#engine/client/completion.ts';
+import type { DeviceIdentity } from '#engine/tenant/devices.ts';
+import { localpartOf } from '#engine/ids.ts';
 
 export type AuthContext = TokenInfo & { tenant: Tenant; token: string };
+
+/** Reuse the authenticated generation; never look up a replacement device. */
+export function authenticatedDevice(context: Context): DeviceIdentity | null {
+  const deviceId = context.state.device as string | undefined;
+  const generation = context.state.deviceGeneration as number | undefined;
+  return deviceId == null || generation == null ? null : {
+    localpart: localpartOf(context.state.user as string),
+    deviceId,
+    generation,
+  };
+}
 
 export async function authorizeFull(
   request: PathfinderRequest,
@@ -23,16 +36,23 @@ export async function authorizeFull(
   if (info === null) {
     throw new MatrixError(401, 'M_UNKNOWN_TOKEN', 'token not recognized');
   }
-  // Explicit room GET admission shares the same captured room boundary as sync
-  // and audience reads. Peeking and receipts own their boundary in the engine;
-  // search/notifications supply their actual audience there. Do not recapture
-  // their cuts here or wait behind unrelated private pending-room obligations.
+  // Explicit room reads await only this device's exact pending cuts in that
+  // room. Audience consumers select their scopes in the engine instead.
   const roomId = request.params.roomId;
   if (
     request.method === 'GET' && typeof roomId === 'string' &&
     !request.path.endsWith('/initialSync')
   ) {
-    await roomCompletion(theApp(), [roomId], request._raw.signal);
+    await roomCompletion(
+      theApp(),
+      [roomId],
+      request._raw.signal,
+      info.device_id === null || info.generation === null ? null : {
+        localpart: info.localpart,
+        deviceId: info.device_id,
+        generation: info.generation,
+      },
+    );
   }
   return { ...info, tenant, token };
 }

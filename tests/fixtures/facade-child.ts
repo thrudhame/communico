@@ -8,6 +8,7 @@ import { HomeEgress } from '#engine/facade/home-egress.ts';
 import { InboxWorker } from '#engine/facade/worker.ts';
 import { ActivityExchange } from '#engine/facade/activity.ts';
 import { noticeHeads } from '#engine/facade/notices.ts';
+import { observeFixtureListeners } from '#tests/helpers/fixture-listeners.ts';
 import {
   type Cut,
   type LinkRecord,
@@ -30,6 +31,7 @@ import {
 } from '#tests/helpers/facade-process.ts';
 
 const encoder = new TextEncoder();
+observeFixtureListeners();
 function emit(event: FacadeObservation) {
   const bytes = encoder.encode(
     observationPrefix + JSON.stringify(event) + '\n',

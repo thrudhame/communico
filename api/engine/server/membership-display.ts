@@ -13,7 +13,6 @@ export async function membershipDisplay(
   const history = await membershipHistory(conn, semanticKey);
   // Held rooms already have their normal DAG/state-resolution authority. Never
   // use this display selector to authorize a PDU or replace that room state.
-  if (held) return { ...history, display: [] };
   const facts = history.frontier.map((operation) => ({
     operation,
     state: JSON.parse(operation.payload) as MembershipState,
@@ -34,6 +33,7 @@ export async function membershipDisplay(
       .filter((state) => terminal.has(state.status))
       .map((state) => state.eventId),
   );
+  if (held) return { ...history, suppressed, display: [] };
   const pending = facts.filter(({ state }) =>
     state.status === 'pending' && !suppressed.has(state.eventId)
   );
@@ -68,6 +68,7 @@ export async function membershipDisplay(
   // there is no source-dot, payload-hash or imported-sequence tie breaker.
   return {
     ...history,
+    suppressed,
     display: candidates.filter(({ state }) => displayId(state) === eventId)
       .map(({ operation }) => operation),
   };

@@ -2077,6 +2077,7 @@ Deno.test('membership terminal: a verified causal rejection publishes real leave
     assertEquals(displayed[0].status, 'rejected');
     assert(displayed[0].seq > before[0].seq);
     const departure = await prejoinDeparture(displayed[0], {
+      store: f.home,
       server: db,
       signer: {
         ...f.ht.signer(),
@@ -2269,6 +2270,7 @@ Deno.test('membership source intent: legacy retraction without a departure compl
         if (position !== null) assertEquals(displayed[0].seq, position);
         position = displayed[0].seq;
         const departure = await prejoinDeparture(displayed[0], {
+          store: f.home,
           server: db,
           signer: {
             ...f.ht.signer(),
@@ -2338,6 +2340,7 @@ Deno.test('membership terminal authority: actual local leave survives source job
       if (seq !== null) assertEquals(displayed.seq, seq);
       seq = displayed.seq;
       const departure = await prejoinDeparture(displayed, {
+        store: f.home,
         server: db,
         signer: {
           ...f.ht.signer(),
@@ -2398,7 +2401,148 @@ Deno.test('membership terminal authority: missing departure evidence cannot eras
   }
 });
 
-Deno.test('membership terminal authority: joined source evidence completes only behind authentic held DAG authority without an OOB join', async () => {
+Deno.test('review membership: a concurrent same-event copy suppressed by a ready join completes its journal head', async () => {
+  const f = await fixture();
+  try {
+    const { record, state, keys } = await incoming(f);
+    const db = await f.home.server();
+    const copy = await source(f, 1, 'home', state.roomId);
+    copy.payload = canonicalJson(state);
+    copy.payloadHash = createHash('sha256').update(copy.payload).digest('hex');
+    await db.execute(
+      'UPDATE domain_operations SET payload_json=?,payload_hash=? WHERE operation_id=?',
+      [copy.payload, copy.payloadHash, copy.operationId],
+    );
+    // This completion observes only the local copy, not the concurrent link
+    // record. The latter remains on the frontier, but cannot display invite A.
+    await db.tx((conn) =>
+      appendMembershipSuccessor(conn, copy, { ...state, status: 'joined' })
+    );
+    const journal = new Journal(db, LINK_SUPPORTED);
+    await journal.receive(record.source, [record]);
+    assertEquals(
+      await lifecycleApplication(f.hs)(journal, record, keys, f.bundle.id),
+      true,
+    );
+    assertEquals(
+      (await journal.heads(record.source, 'in', record)).applied.sequence,
+      record.sequence,
+    );
+    assertEquals(await invitesOf(state.userId, { server: db }), []);
+  } finally {
+    await f.close();
+  }
+});
+
+for (const localReplacement of [false, true]) {
+  Deno.test(`review membership: completed successor withdraws only the obsolete bound import ${localReplacement}`, async () => {
+    const f = await fixture();
+    try {
+      const { record, state, keys, operation } = await incoming(f);
+      const db = await f.home.server();
+      const journal = new Journal(db, LINK_SUPPORTED);
+      await journal.receive(record.source, [record]);
+      await lifecycleApplication(f.hs)(journal, record, keys, f.bundle.id);
+      if (localReplacement) {
+        await db.execute(
+          'UPDATE prejoin_memberships SET source_binding=NULL WHERE room_id=?',
+          [state.roomId],
+        );
+      }
+      const successor = await remoteEvent(
+        state.roomId,
+        await testRemoteServer('remote.test'),
+        '11',
+        {
+          type: 'm.room.member',
+          sender: '@inviter:remote.test',
+          state_key: state.userId,
+          content: { membership: 'invite', reason: 'successor B' },
+          prev_events: [],
+        },
+      );
+      const nextState = {
+        ...state,
+        eventId: String(successor.event_id),
+        eventJson: canonicalJson(successor),
+      };
+      const next = await exportSuccessor(f, operation, nextState);
+      const joined = await exportSuccessor(f, next.operation, {
+        ...nextState,
+        status: 'joined',
+      });
+      await journal.receive(record.source, [next.record, joined.record]);
+      await f.hs.retain(next.record, keys, f.bundle.id);
+      await f.hs.retain(joined.record, keys, f.bundle.id);
+      for (const item of [next.record, joined.record]) {
+        assertEquals(
+          await lifecycleApplication(f.hs)(journal, item, keys, f.bundle.id),
+          true,
+        );
+      }
+      const invites = await invitesOf(state.userId, { server: db });
+      assertEquals(
+        invites.map((invite) => invite.eventId),
+        localReplacement ? [state.eventId] : [],
+      );
+      assertEquals(
+        await db.query('SELECT withdrawn FROM notifications WHERE event=?', [
+          state.eventId,
+        ]),
+        [{ withdrawn: localReplacement ? 0 : 1 }],
+      );
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+Deno.test('membership terminal application: superseded source facts and an unheld join complete the account prefix without display authority', async () => {
+  const f = await fixture();
+  try {
+    const { record, state, keys, operation } = await incoming(f);
+    const db = await f.home.server();
+    const journal = new Journal(db, LINK_SUPPORTED);
+    state.status = 'joined';
+    const next = await exportSuccessor(f, operation, state);
+    await journal.receive(record.source, [record, next.record]);
+    // Retention may run ahead of application. The first record is now dominated
+    // by a verified terminal fact, but neither record has display/DAG authority.
+    await f.hs.retain(record, keys, f.bundle.id);
+    await f.hs.retain(next.record, keys, f.bundle.id);
+    const before = await db.query('SELECT * FROM counters ORDER BY name');
+    for (const item of [record, next.record]) {
+      assertEquals(
+        await lifecycleApplication(f.hs)(journal, item, keys, f.bundle.id),
+        true,
+      );
+      assertEquals(
+        (await journal.heads(item.source, 'in', item)).applied.sequence,
+        item.sequence,
+      );
+    }
+    assertEquals(await f.home.rooms(), []);
+    assertEquals(await db.query('SELECT * FROM memberships'), []);
+    assertEquals(await invitesOf(state.userId, { server: db }), []);
+    assertEquals(await db.query('SELECT * FROM prejoin_jobs'), []);
+    assertEquals(
+      await db.query('SELECT * FROM counters ORDER BY name'),
+      before,
+    );
+    assertEquals(
+      (await db.query('SELECT * FROM membership_operations')).length,
+      2,
+    );
+    assertEquals(
+      await db.query('SELECT applied FROM domain_operations ORDER BY sequence'),
+      [{ applied: 1 }, { applied: 1 }],
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership terminal display: joined source evidence withdraws only the imported invite without an OOB join', async () => {
   for (const held of [false, true]) {
     const f = await fixture();
     try {
@@ -2424,38 +2568,65 @@ Deno.test('membership terminal authority: joined source evidence completes only 
       await lifecycleApplication(f.hs)(journal, record, keys, f.bundle.id);
       const before = await db.query('SELECT * FROM memberships');
       const displayed = await invitesOf(state.userId, { server: db });
-      const counters = await db.query('SELECT * FROM counters ORDER BY name');
+      const counters = await db.query(
+        "SELECT * FROM counters WHERE name='events'",
+      );
+      if (!held) {
+        assertEquals(displayed.length, 1);
+        assertEquals(
+          await db.query('SELECT withdrawn FROM notifications WHERE event=?', [
+            state.eventId,
+          ]),
+          [{ withdrawn: 0 }],
+        );
+      }
       state.status = 'joined';
       const next = await exportSuccessor(f, operation, state);
       await journal.receive(next.record.source, [next.record]);
-      if (held) {
+      assertEquals(
+        await lifecycleApplication(f.hs)(
+          journal,
+          next.record,
+          keys,
+          f.bundle.id,
+        ),
+        true,
+      );
+      assertEquals(await db.query('SELECT * FROM memberships'), before);
+      assertEquals(
+        await invitesOf(state.userId, { server: db }),
+        held ? displayed : [],
+      );
+      assertEquals(await f.home.rooms(), held ? [roomId] : []);
+      if (!held) {
         assertEquals(
-          await lifecycleApplication(f.hs)(
-            journal,
-            next.record,
-            keys,
-            f.bundle.id,
-          ),
-          true,
+          await db.query('SELECT withdrawn FROM notifications WHERE event=?', [
+            state.eventId,
+          ]),
+          [{ withdrawn: 1 }],
         );
-      } else {
-        await assertRejects(
-          () =>
-            lifecycleApplication(f.hs)(journal, next.record, keys, f.bundle.id),
-          Error,
-          'display evidence',
+        assertEquals(
+          await db.query(
+            'SELECT unread,highlight FROM notification_counts WHERE user=? AND room=?',
+            [state.userId, roomId],
+          ),
+          [{ unread: 0, highlight: 0 }],
+        );
+        assertEquals(
+          await db.query('SELECT * FROM prejoin_memberships WHERE room_id=?', [
+            roomId,
+          ]),
+          [],
         );
       }
-      assertEquals(await db.query('SELECT * FROM memberships'), before);
-      assertEquals(await invitesOf(state.userId, { server: db }), displayed);
       assertEquals(
-        await db.query('SELECT * FROM counters ORDER BY name'),
+        await db.query("SELECT * FROM counters WHERE name='events'"),
         counters,
       );
       assertEquals(
         (await journal.heads(next.record.source, 'in', next.record)).applied
           .sequence,
-        held ? next.record.sequence : record.sequence,
+        next.record.sequence,
       );
       assertEquals(await db.query('SELECT * FROM prejoin_jobs'), []);
     } finally {
@@ -2965,6 +3136,92 @@ Deno.test('membership admission: an accepted local-user knock keeps the remote r
     assertEquals(
       await db.query('SELECT * FROM federation_invite_attempts'),
       [],
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership export: completed home attestation discharges retired-home predecessor without facade history authorship', async () => {
+  const f = await fixture();
+  try {
+    const fact = await incoming(f);
+    const predecessor = {
+      ...fact.operation,
+      source: 'home',
+      incarnation: 'retired-home',
+    };
+    predecessor.operationId = canonicalJson([
+      predecessor.source,
+      predecessor.incarnation,
+      predecessor.stream,
+      predecessor.sequence,
+    ]);
+    const home = await f.home.server(), edge = await f.edge.server();
+    await home.tx((conn) => retainMembershipOperation(conn, predecessor));
+    const [history] = await f.hs.bootstrap('alice', f.bundle.id);
+    assertEquals(
+      (history.payload as { body: { kind: string } }).body.kind,
+      'membership-history',
+    );
+    await f.es.retain(history, fact.keys);
+    const successor = await source(f, 2);
+    successor.context = [{
+      source: predecessor.source,
+      incarnation: predecessor.incarnation,
+      sequence: predecessor.sequence,
+    }];
+    successor.payload = fact.operation.payload;
+    successor.payloadHash = fact.operation.payloadHash;
+    await edge.execute(
+      'UPDATE domain_operations SET context_json=?,payload_json=?,payload_hash=? WHERE operation_id=?',
+      [
+        canonicalJson(successor.context),
+        successor.payload,
+        successor.payloadHash,
+        successor.operationId,
+      ],
+    );
+    await assertRejects(
+      () => f.es.export('alice'),
+      LinkError,
+      'historical predecessors',
+    );
+    await f.ej.receive('home', [history]);
+    await assertRejects(
+      () => f.es.export('alice'),
+      LinkError,
+      'historical predecessors',
+    );
+    assertEquals(await f.es.apply(f.ej, history, fact.keys), true);
+    const exported = await f.es.export('alice');
+    assertEquals(
+      exported.length,
+      1,
+      'completed authenticated home evidence releases the local successor',
+    );
+    const body = (exported[0].payload as {
+      body: { kind: string; operation: MembershipOperation };
+    }).body;
+    assertEquals(body.kind, 'membership-operation');
+    assertEquals(body.operation, successor);
+    const records = await edge.query(
+      "SELECT record_json FROM facade_records WHERE peer='home' AND direction='out' AND stream=?",
+      [successor.stream],
+    );
+    assertEquals(
+      records.map((r) => JSON.parse(String(r.record_json)).payload.body.kind),
+      ['membership-operation', 'membership-operation'],
+    );
+    const journal = new Journal(home, LINK_SUPPORTED);
+    await journal.receive(f.node.node, [fact.record, ...exported]);
+    assertEquals(
+      await f.hs.apply(journal, fact.record, fact.keys, f.bundle.id),
+      true,
+    );
+    assertEquals(
+      await f.hs.apply(journal, exported[0], fact.keys, f.bundle.id),
+      true,
     );
   } finally {
     await f.close();

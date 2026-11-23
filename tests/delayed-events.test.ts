@@ -618,64 +618,80 @@ Deno.test('delayed: a failed deadline query retains autonomous retry and deliver
   }
 });
 
-Deno.test('delayed: a retained failing batch cannot starve a later command', async () => {
-  const f = await setup('delay-fair-retry');
-  const owner = new DelayedEvents(f.app);
-  await owner.stop();
-  const failures = new Set<string>();
-  const worker = new DelayedEvents({
-    store: f.app.store,
-    tenant: {
-      ...f.app.tenant,
-      tx: (fn) =>
-        f.app.tenant.tx((tx) =>
-          fn({
-            ...tx,
-            delayedEvents: {
-              ...tx.delayedEvents,
-              prepare: async (id, pdu) => {
-                if (failures.has(id)) {
-                  throw new Error('injected transient preparation failure');
-                }
-                return await tx.delayedEvents.prepare(id, pdu);
+for (const failureAt of ['preparation', 'room admission']) {
+  Deno.test(`delayed: a retained ${failureAt} failing batch cannot starve a later command`, async () => {
+    const f = await setup('delay-fair-retry');
+    const owner = new DelayedEvents(f.app);
+    await owner.stop();
+    const failures = new Set<string>();
+    let admissions = 0;
+    const worker = new DelayedEvents({
+      store: f.app.store,
+      tenant: {
+        ...f.app.tenant,
+        tx: (fn) =>
+          f.app.tenant.tx((tx) =>
+            fn({
+              ...tx,
+              delayedEvents: {
+                ...tx.delayedEvents,
+                prepare: async (id, pdu) => {
+                  if (failureAt === 'preparation' && failures.has(id)) {
+                    throw new Error('injected transient preparation failure');
+                  }
+                  return await tx.delayedEvents.prepare(id, pdu);
+                },
               },
-            },
-          })
-        ),
-    },
-  });
-  try {
-    for (let i = 0; i < 32; i++) {
-      const { delay_id: id } = await owner.schedule(
-        schedule(f.room, f.user, 'failed-' + i),
+            })
+          ),
+      },
+    }, {
+      admitRoom() {
+        if (failureAt === 'room admission' && admissions++ < 32) {
+          throw new MatrixError(
+            503,
+            'M_UNAVAILABLE',
+            'room replica unavailable',
+          );
+        }
+        return Promise.resolve();
+      },
+    });
+    try {
+      for (let i = 0; i < 32; i++) {
+        const { delay_id: id } = await owner.schedule(
+          schedule(f.room, f.user, 'failed-' + i),
+        );
+        failures.add(id);
+        await f.app.tenant.tx((tx) =>
+          tx.delayedEvents.action(id, 'send', Date.now() - 10000 + i)
+        );
+      }
+      const { delay_id: later } = await owner.schedule(
+        schedule(f.room, f.user, 'later'),
       );
-      failures.add(id);
       await f.app.tenant.tx((tx) =>
-        tx.delayedEvents.action(id, 'send', Date.now() - 10000 + i)
+        tx.delayedEvents.action(later, 'send', Date.now() - 1)
       );
+      await worker.drain();
+      await worker.drain();
+      assertEquals(
+        await readStateKey(f.room, f.user, 'test.delayed', 'later', null),
+        { value: 'later' },
+      );
+      assertEquals(
+        (await f.app.tenant.tx((tx) =>
+          tx.delayedEvents.list('delay-fair-retry')
+        ))
+          .length,
+        32,
+      );
+    } finally {
+      await worker.stop();
+      await f.cleanup();
     }
-    const { delay_id: later } = await owner.schedule(
-      schedule(f.room, f.user, 'later'),
-    );
-    await f.app.tenant.tx((tx) =>
-      tx.delayedEvents.action(later, 'send', Date.now() - 1)
-    );
-    await worker.drain();
-    await worker.drain();
-    assertEquals(
-      await readStateKey(f.room, f.user, 'test.delayed', 'later', null),
-      { value: 'later' },
-    );
-    assertEquals(
-      (await f.app.tenant.tx((tx) => tx.delayedEvents.list('delay-fair-retry')))
-        .length,
-      32,
-    );
-  } finally {
-    await worker.stop();
-    await f.cleanup();
-  }
-});
+  });
+}
 
 Deno.test('delayed: reconciliation uses one indexed state-key query despite unrelated publications', async () => {
   const f = await setup('delay-key-index');

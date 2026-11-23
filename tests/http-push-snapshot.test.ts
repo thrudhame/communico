@@ -1,5 +1,6 @@
 import { assert, assertEquals } from '@std/assert';
 import { startHttp } from '#tests/http-app.ts';
+import { roomDeliveredBySync } from '#tests/support/sync-delivery.ts';
 
 Deno.test('push sync snapshot: later event and private receipt cannot leak into an earlier event/count cut', async () => {
   const http = await startHttp();
@@ -32,7 +33,11 @@ Deno.test('push sync snapshot: later event and private receipt cannot leak into 
         msgtype: 'm.text',
         body: txn,
       }, 'PUT');
-    const first = await send('one');
+    let first!: { event_id: string };
+    await roomDeliveredBySync(http.matrix, b.access_token!, room, async () => {
+      first = await send('one');
+      return [first.event_id];
+    });
     const server = http.app.server;
     const original = server.tx.bind(server);
     let captured = false;
@@ -48,7 +53,15 @@ Deno.test('push sync snapshot: later event and private receipt cannot leak into 
       ) {
         captured = true;
         server.tx = original;
-        second = await send('two');
+        await roomDeliveredBySync(
+          http.matrix,
+          b.access_token!,
+          room,
+          async () => {
+            second = await send('two');
+            return [second!.event_id];
+          },
+        );
         await call(
           base + '/receipt/m.read.private/' +
             encodeURIComponent(first.event_id),

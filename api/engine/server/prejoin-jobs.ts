@@ -38,10 +38,16 @@ export type PrejoinJob = {
 };
 
 const performing = new WeakMap<Store, Set<string>>();
+function claimKey(work: PrejoinWork) {
+  return canonicalJson([work.roomId, work.userId]);
+}
+export function prejoinJobActive(store: Store, work: PrejoinWork): boolean {
+  return performing.get(store)?.has(claimKey(work)) ?? false;
+}
 export function beginPrejoinJob(store: Store, work: PrejoinWork) {
   let active = performing.get(store);
   if (!active) performing.set(store, active = new Set());
-  const key = canonicalJson([work.roomId, work.userId]);
+  const key = claimKey(work);
   if (active.has(key)) return null;
   active.add(key);
   return () => active.delete(key);

@@ -4,6 +4,238 @@ import { operationHandler } from '#root/api/admin/handler.ts';
 import { LinkError } from '#engine/facade/protocol.ts';
 import { startLinkTransport } from '#engine/facade/transport.ts';
 import { facadeTls } from './support/facade-tls.ts';
+import { pathfinder } from '@pathfinder/pathfinder';
+import { requestFailure } from '#engine/request-diagnostics.ts';
+import { bounded } from './helpers/server-process.ts';
+import { UpstreamError } from '#engine/net/upstream-error.ts';
+import { ServerLifetime } from '#root/api/server-lifetime.ts';
+
+Deno.test('listener owner retains exceptions escaping the router before Deno renders 500', async () => {
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => lines.push(args.join(' '));
+  const lifetime = new ServerLifetime();
+  const server = Deno.serve(
+    { hostname: '127.0.0.1', port: 0, onListen() {} },
+    lifetime.wrap('cs', () => {
+      throw new TypeError('escaped-router-marker');
+    }),
+  );
+  try {
+    const response = await fetch(
+      `http://127.0.0.1:${server.addr.port}/_matrix/client/v3/login?token=private-query`,
+    );
+    assertEquals(response.status, 500);
+    await response.body?.cancel();
+    const record = JSON.parse(
+      lines.find((line) => line.startsWith('http failure: '))!.slice(
+        'http failure: '.length,
+      ),
+    );
+    assertEquals(record.path, '/_matrix/client/v3/login');
+    assertEquals(record.error.message, 'escaped-router-marker');
+    assert(record.error.stack.includes('request-diagnostics.test.ts'));
+  } finally {
+    await server.shutdown();
+    console.error = original;
+  }
+});
+
+Deno.test('createRoom preserves the original unexpected exception for the shared 500 owner', async () => {
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => lines.push(args.join(' '));
+  try {
+    const app = await pathfinder({ roots: ['tests/fixtures/http-contract/'] });
+    const response = await app(
+      new Request('http://test/create', { method: 'POST', body: '{}' }),
+    );
+    assertEquals(response.status, 500);
+    await response.body?.cancel();
+    const record = JSON.parse(
+      lines.find((line) => line.startsWith('http failure: '))!.slice(
+        'http failure: '.length,
+      ),
+    );
+    assertEquals(record.error.name, 'Error');
+    assert(record.error.stack.includes('app.ts'));
+    assertEquals(record.path, '/create');
+  } finally {
+    console.error = original;
+  }
+});
+
+Deno.test('nested peer failures keep their existing private-wire cause disclosure boundary', () => {
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => lines.push(args.join(' '));
+  try {
+    requestFailure(
+      { method: 'GET', url: '/_matrix/client/v3/keys/query' },
+      new Error('outer', {
+        cause: new UpstreamError('protocol', {
+          phase: 'json',
+          reason: 'invalid JSON',
+          cause: new SyntaxError('private-wire-sentinel'),
+        }),
+      }),
+    );
+    assert(lines[0].includes('UpstreamError'));
+    assert(lines[0].includes('invalid JSON'));
+    assert(!lines[0].includes('private-wire-sentinel'));
+  } finally {
+    console.error = original;
+  }
+});
+
+Deno.test('typed Matrix 503 retains its original cause through the shared request observer', async () => {
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => lines.push(args.join(' '));
+  try {
+    const app = await pathfinder({ roots: ['tests/fixtures/http-contract/'] });
+    const response = await app(
+      new Request('http://test/typed?token=private-query'),
+    );
+    assertEquals(response.status, 503);
+    assertEquals((await response.json()).errcode, 'M_UNAVAILABLE');
+    const records = lines.filter((line) => line.startsWith('http failure: '));
+    assertEquals(records.length, 1);
+    const record = JSON.parse(records[0].slice('http failure: '.length));
+    assertEquals(record.path, '/typed');
+    assertEquals(record.error.cause.message, 'typed-child-marker');
+    assert(record.error.cause.stack.includes('get.ts'));
+  } finally {
+    console.error = original;
+  }
+});
+
+Deno.test('link post-upgrade response failure retains its exception and request identity', async () => {
+  const tls = await facadeTls();
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => lines.push(args.join(' '));
+  const release = Promise.withResolvers<void>();
+  const link = await startLinkTransport({
+    hostname: '127.0.0.1',
+    port: 0,
+    tls: tls.facade,
+    authorize: () => Promise.resolve(true),
+    handle: () =>
+      Promise.resolve(
+        new Response(
+          new ReadableStream({
+            async pull(controller) {
+              await release.promise;
+              controller.error(new TypeError('upgraded-child-marker'));
+            },
+          }),
+          { headers: { 'content-type': 'application/x-ndjson' } },
+        ),
+      ),
+  });
+  try {
+    await bounded(
+      new Promise<void>((resolve, reject) => {
+        const req = request(
+          link.url + '/_communico/link/v1/notices?token=private-query',
+          {
+            ...tls.home,
+            agent: false,
+            headers: {
+              connection: 'Upgrade',
+              upgrade: 'websocket',
+              'sec-websocket-key': 'dGhlIHNhbXBsZSBub25jZQ==',
+              'sec-websocket-version': '13',
+            },
+          },
+        );
+        req.once('error', reject);
+        req.once('response', () => reject(new Error('upgrade refused')));
+        req.once('upgrade', (_response, socket) => {
+          socket.once('close', () => resolve());
+          socket.once('error', reject);
+          release.resolve();
+        });
+        req.end();
+      }),
+    );
+    const record = JSON.parse(
+      lines.find((line) => line.startsWith('http failure: '))!.slice(
+        'http failure: '.length,
+      ),
+    );
+    assertEquals(record.path, '/_communico/link/v1/notices');
+    assertEquals(record.method, 'GET');
+    assertEquals(record.error.name, 'TypeError');
+    assertEquals(record.error.message, 'upgraded-child-marker');
+    assert(record.error.stack.includes('request-diagnostics.test.ts'));
+  } finally {
+    release.resolve();
+    await link.close();
+    console.error = original;
+    await tls.close();
+  }
+});
+
+Deno.test('Matrix shared 500 renderer retains unexpected cause and route', async () => {
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => lines.push(args.join(' '));
+  try {
+    const app = await pathfinder({ roots: ['tests/fixtures/http-contract/'] });
+    const response = await app(
+      new Request('http://test/?access_token=private-query'),
+    );
+    assertEquals(response.status, 500);
+    assertEquals((await response.json()).errcode, 'M_UNKNOWN');
+    const records = lines.filter((line) => line.startsWith('http failure: '));
+    assertEquals(records.length, 1);
+    const record = JSON.parse(records[0].slice('http failure: '.length));
+    assertEquals(record.method, 'GET');
+    assertEquals(record.path, '/');
+    assertEquals(record.error.name, 'Error');
+    assert(record.error.message.length > 0);
+    assert(record.error.stack.includes('get.ts'));
+    assert(!records[0].includes('private-query'));
+  } finally {
+    console.error = original;
+  }
+});
+
+Deno.test('safe diagnostic retains nested Error causes, aggregates and cycles without arbitrary objects', () => {
+  const lines: string[] = [];
+  const original = console.error;
+  console.error = (...args: unknown[]) => lines.push(args.join(' '));
+  try {
+    const child = Object.assign(new TypeError('child-marker'), {
+      body: 'private-body',
+    });
+    const root = new Error('outer-marker', {
+      cause: new AggregateError(
+        [child, { secret: 'private-secret' }],
+        'children',
+      ),
+    });
+    child.cause = root;
+    requestFailure({
+      method: 'POST',
+      url: '/_matrix/client/v3/login?token=private-query',
+    }, root);
+    const record = JSON.parse(lines[0].slice('http failure: '.length));
+    assertEquals(record.error.cause.errors[0].name, 'TypeError');
+    assertEquals(record.error.cause.errors[0].message, 'child-marker');
+    assert(
+      record.error.cause.errors[0].stack.includes(
+        'request-diagnostics.test.ts',
+      ),
+    );
+    assert(!lines[0].includes('private-'));
+    assert(lines[0].includes('Circular'));
+  } finally {
+    console.error = original;
+  }
+});
 
 Deno.test('concurrent admin, link HTTP and pre-upgrade failures retain safe request-correlated exceptions', async () => {
   const tls = await facadeTls();

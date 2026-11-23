@@ -257,6 +257,114 @@ Deno.test('resident membership rechecks prepared scope after network verificatio
   }
 });
 
+Deno.test('review join: resident membership cannot commit its event or receipt after native-boundary scope invalidation', async () => {
+  const f = await fixture();
+  const store = f.store();
+  const originalRoom = store.room.bind(store);
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let applying: Promise<unknown> | undefined;
+  try {
+    const original = await f.deps();
+    const made = await makeJoin(
+      f.roomId,
+      guest,
+      f.remote.name,
+      ['11'],
+      original,
+    );
+    const join = await signTemplate(made.event, f.remote);
+    const operation = JSON.stringify([f.remote.name, 'join', join.event_id]);
+    const db = await originalRoom(f.roomId);
+    const originalTx = db.tx.bind(db);
+    let wrapped = false;
+    store.room = async (id, options) => {
+      const held = await originalRoom(id, options);
+      if (id === f.roomId && !wrapped) {
+        wrapped = true;
+        held.tx = (fn, txOptions) =>
+          originalTx(async (conn) => {
+            const before = await conn.query(
+              'SELECT 1 FROM membership_receipts WHERE operation=?',
+              [operation],
+            );
+            const result = await fn(conn);
+            const after = await conn.query(
+              'SELECT 1 FROM membership_receipts WHERE operation=?',
+              [operation],
+            );
+            if (!before.length && after.length) {
+              entered.resolve();
+              await release.promise;
+            }
+            return result;
+          }, txOptions);
+      }
+      return held;
+    };
+    let current = true;
+    const checkCurrent = () => {
+      if (!current) {
+        throw new MatrixError(
+          503,
+          'M_UNAVAILABLE',
+          'test scope changed at native commit',
+        );
+      }
+    };
+    const deps = {
+      ...original,
+      prepareRoomScope: () =>
+        Promise.resolve({
+          checkCurrent,
+          check: (conn: Conn) => {
+            conn.admit(checkCurrent);
+            checkCurrent();
+            return Promise.resolve();
+          },
+        }),
+    };
+    applying = sendJoin(
+      f.roomId,
+      String(join.event_id),
+      toWire(join, '11'),
+      f.remote.name,
+      'v2',
+      deps,
+    ).then(() => null, (error) => error);
+    await Promise.race([
+      entered.promise,
+      applying.then((result) => {
+        throw new Error(
+          'membership settled before native barrier: ' + String(result),
+        );
+      }),
+    ]);
+    current = false;
+    release.resolve();
+    const outcome = await applying;
+    store.room = originalRoom;
+    db.tx = originalTx;
+    assertEquals(
+      await (await f.room()).tx((tx) => tx.events.get(String(join.event_id))),
+      null,
+    );
+    assertEquals(
+      await db.query('SELECT 1 FROM membership_receipts WHERE operation=?', [
+        operation,
+      ]),
+      [],
+    );
+    assert(outcome instanceof MatrixError);
+    assertEquals(outcome.status, 503);
+  } finally {
+    release.resolve();
+    await applying;
+    store.room = originalRoom;
+    await f.close();
+  }
+});
+
 Deno.test('resident knock and leave new work requires scope while exact results survive its loss', async () => {
   const f = await fixture(true);
   try {
@@ -458,6 +566,109 @@ Deno.test('resident membership distinguishes directory-proved absence from a mis
         assertEquals(error.status, knownAbsent ? 404 : 503);
       }
     }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('review receipt: ordered wire bytes are shared by content without losing signature variants on cold replay', async () => {
+  const f = await fixture();
+  try {
+    const original = {
+      event_id: '$same-event',
+      type: 'm.room.member',
+      content: { membership: 'join', displayname: 'x'.repeat(4096) },
+      signatures: { [self]: { 'ed25519:first': 'original' } },
+    };
+    const changed = {
+      ...original,
+      signatures: { [self]: { 'ed25519:second': 'later' } },
+    };
+    const first = {
+      state: [original, changed, original],
+      auth_chain: [changed, original],
+      event: original,
+      servers_in_room: [self],
+    };
+    const second = {
+      state: [changed, original],
+      auth_chain: [original, changed, changed],
+      event: changed,
+      servers_in_room: [self],
+    };
+    const room = await f.room();
+    await room.tx(async (tx) => {
+      assertEquals(
+        await tx.membershipReceipts.save('first', 'input1', first),
+        first,
+      );
+      assertEquals(
+        await tx.membershipReceipts.save('second', 'input2', second),
+        second,
+      );
+      assertEquals(
+        await tx.membershipReceipts.save('knock', 'input3', {
+          knock_room_state: [original, changed, original],
+        }),
+        { knock_room_state: [original, changed, original] },
+      );
+    });
+    const db = await f.store().room(f.roomId);
+    for (
+      const row of await db.query('SELECT result_json FROM membership_receipts')
+    ) {
+      assert(
+        String(row.result_json).length < 1024,
+        'receipts must retain references rather than repeated PDU payloads',
+      );
+    }
+    const wires = await db.query(
+      'SELECT wire_json FROM membership_receipt_wires',
+    );
+    assertEquals(
+      wires.length,
+      2,
+      'same event ID with changed signatures is distinct wire content',
+    );
+    assertEquals(
+      new Set(
+        wires.map((row) => JSON.stringify(JSON.parse(String(row.wire_json)))),
+      ).size,
+      2,
+    );
+    await f.reopen();
+    const reopened = await f.room();
+    await reopened.tx(async (tx) => {
+      assertEquals(await tx.membershipReceipts.get('first', 'input1'), first);
+      assertEquals(await tx.membershipReceipts.get('second', 'input2'), second);
+      assertEquals(await tx.membershipReceipts.get('knock', 'input3'), {
+        knock_room_state: [original, changed, original],
+      });
+      assertEquals(
+        await tx.membershipReceipts.save('first', 'input1', second),
+        first,
+      );
+    });
+    const paged = {
+      state: Array.from(
+        { length: 205 },
+        (_, n) => ({ ...original, event_id: '$page-' + n }),
+      ),
+      auth_chain: [],
+    };
+    await reopened.tx(async (tx) => {
+      assertEquals(
+        await tx.membershipReceipts.save('paged', 'input4', paged),
+        paged,
+      );
+    });
+    await f.reopen();
+    assertEquals(
+      await (await f.room()).tx((tx) =>
+        tx.membershipReceipts.get('paged', 'input4')
+      ),
+      paged,
+    );
   } finally {
     await f.close();
   }
@@ -797,6 +1008,13 @@ Deno.test('membership receipt and actual room ingest roll back together before p
         tx.membershipReceipts.get('aborted', 'same-input')
       ),
       null,
+    );
+    assertEquals(
+      await (await f.store().room(f.roomId)).query(
+        'SELECT * FROM membership_receipt_wires',
+      ),
+      [],
+      'aborted membership must not retain orphan wire bytes',
     );
     assertEquals(await f.changes(), before);
     const result = await sendJoin(

@@ -17,6 +17,7 @@ import type { Pdu } from '#engine/pdu.ts';
 import { roomVersionOf } from '#engine/room/build.ts';
 import type { Fetcher, KeyResolver, RemoteDeps } from '#engine/room/deps.ts';
 import { openRoom, type Room } from '#engine/room/index.ts';
+import type { CommitWait } from '#engine/room/ingest.ts';
 import {
   ingestRemote,
   type RemoteOutcome,
@@ -154,6 +155,7 @@ export async function receiveTransactionRoom(
   deps: TransactionDeps,
   operationId?: string,
   signal?: AbortSignal,
+  completion: CommitWait = 'published',
 ): Promise<PduResults> {
   signal?.throwIfAborted();
   const fed = config().federation;
@@ -168,6 +170,7 @@ export async function receiveTransactionRoom(
       fetcher: deps.fetcher,
       self: deps.self,
       signal,
+      completion,
       limits: {
         waitMs: fed.missingwaitms,
         limit: fed.missinglimit,
@@ -242,6 +245,7 @@ async function receiveRoom(
       operationId,
       'pushed',
       remoteDeps.signal,
+      remoteDeps.completion,
     );
     if (prior) {
       assignOutcomes(results, prior);
@@ -375,6 +379,10 @@ async function receiveOwnedTransaction(
         deps,
         undefined,
         signal,
+        // The answer reports decided, durably accepted outcomes. Publication
+        // is the store owner's committed obligation, recovered after restart;
+        // consumers needing published state wait on their own obligation.
+        'accepted',
       ),
     );
   }

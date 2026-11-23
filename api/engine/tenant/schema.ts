@@ -43,6 +43,7 @@ import {
   BACKUP_ACCOUNTING_SQL,
   migrateBackupAccounting,
 } from '#engine/tenant/backup-accounting.ts';
+import { BACKUP_PUBLICATION_SQL } from '#engine/tenant/key-backup.ts';
 
 const E2EE_SQL = `
 CREATE TABLE device_keys(localpart TEXT NOT NULL, device_id TEXT NOT NULL, generation INTEGER NOT NULL, key_json TEXT NOT NULL, PRIMARY KEY(localpart,device_id,generation));
@@ -287,6 +288,16 @@ CREATE INDEX delayed_events_user ON delayed_events(localpart);
 CREATE TABLE delayed_event_receipts(localpart TEXT NOT NULL,device_id TEXT NOT NULL,generation INTEGER NOT NULL,endpoint TEXT NOT NULL,txn_id TEXT NOT NULL,delay_id TEXT NOT NULL,PRIMARY KEY(localpart,device_id,generation,endpoint,txn_id));
 `;
 
+const DELAYED_RUNNABLE_INDEXES_SQL = `
+CREATE INDEX delayed_events_runnable_due ON delayed_events(due_ms,id) WHERE phase IN ('pending','sending');
+CREATE INDEX delayed_events_runnable_user ON delayed_events(localpart) WHERE phase IN ('pending','sending');
+`;
+
+const DELAYED_RETRY_SQL = `
+ALTER TABLE delayed_events ADD COLUMN retry_ms INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX delayed_events_retry_due ON delayed_events(MAX(due_ms,retry_ms),id) WHERE phase IN ('pending','sending');
+`;
+
 const PUBLIC_REPLICAS_SQL = `
 CREATE TABLE public_user_replicas(localpart TEXT PRIMARY KEY NOT NULL REFERENCES users(localpart),source_cut INTEGER NOT NULL,snapshot_json TEXT NOT NULL);
 `;
@@ -299,7 +310,7 @@ INSERT INTO deactivation_work SELECT localpart,EXISTS(SELECT 1 FROM erased_users
 `;
 
 export const tenantSchema: SchemaProvider = {
-  version: 42,
+  version: 45,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
     await db.exec(E2EE_SQL);
@@ -316,8 +327,11 @@ export const tenantSchema: SchemaProvider = {
     await db.exec(PROFILE_SQL);
     await db.exec(ERASURE_SQL);
     await db.exec(BACKUP_ACCOUNTING_SQL);
+    await db.exec(BACKUP_PUBLICATION_SQL);
     await db.exec(SLIDING_SYNC_SQL);
     await db.exec(DELAYED_EVENTS_SQL);
+    await db.exec(DELAYED_RUNNABLE_INDEXES_SQL);
+    await db.exec(DELAYED_RETRY_SQL);
     await db.exec(PUBLIC_REPLICAS_SQL);
     await db.exec(OWNER_CONTROL_SQL);
     await db.exec(ACCOUNT_AUTH_SQL);
@@ -342,6 +356,9 @@ export const tenantSchema: SchemaProvider = {
     await db.exec(TO_DEVICE_ROUTE_LOOKUPS_SQL);
   },
   migrations: {
+    44: (conn) => conn.exec(BACKUP_PUBLICATION_SQL),
+    43: (conn) => conn.exec(DELAYED_RETRY_SQL),
+    42: (conn) => conn.exec(DELAYED_RUNNABLE_INDEXES_SQL),
     41: (conn) => conn.exec(LINK_APPLICATION_PROJECTION_SQL),
     40: (conn) => conn.exec(TO_DEVICE_ROUTE_LOOKUPS_SQL),
     39: (conn) => conn.exec(TO_DEVICE_ADMISSION_POLICY_SQL),

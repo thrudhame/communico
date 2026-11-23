@@ -5,7 +5,6 @@ import type { Room, RoomTx } from '#engine/room/index.ts';
 import type { Store } from '#engine/store/index.ts';
 import { openTenant } from '#engine/tenant/index.ts';
 import { localpartOf } from '#engine/tenant/auth.ts';
-import { rulesetAt } from '#engine/tenant/pushrules.ts';
 import {
   type Decision,
   evaluate,
@@ -32,13 +31,6 @@ export type PushPublication = {
 };
 
 type Recipient = { tenant: string; user: string; displayName: string | null };
-type CapturedPolicy = {
-  ignored: Record<string, unknown>;
-  rules: Awaited<ReturnType<typeof rulesetAt>>;
-  ruleRevision: number;
-  ignoreRevision: number;
-  pusherIncarnations: string[];
-};
 export type PushCapture = {
   context: Omit<PushContext, 'userId' | 'displayName'>;
   recipients: Recipient[];
@@ -79,30 +71,18 @@ export async function prepareCapturedPushes(
   ) {
     const tenant = await openTenant(store, name);
     const decisions = await tenant.tx(async (tx) => {
-      const policies = new Map<string, CapturedPolicy | null>();
+      const policies = await tx.pushPolicy.capture(
+        captures.flatMap((capture) =>
+          capture.recipients.filter((r) => r.tenant === name).map((r) =>
+            localpartOf(r.user)
+          )
+        ),
+      );
       const out: { index: number; decision: PublicationDecision }[] = [];
       for (let index = 0; index < captures.length; index++) {
         const { context, recipients } = captures[index];
         for (const recipient of recipients.filter((r) => r.tenant === name)) {
           const lp = localpartOf(recipient.user);
-          if (!policies.has(lp)) {
-            const account = await tx.users.byLocalpart(lp);
-            const ignored = account === null || account.deactivated
-              ? null
-              : await tx.accountData.snapshot(lp, '', 'm.ignored_user_list');
-            policies.set(
-              lp,
-              account === null || account.deactivated ? null : {
-                ignored: (ignored?.content as {
-                  ignored_users?: Record<string, unknown>;
-                } | undefined)?.ignored_users ?? {},
-                rules: await rulesetAt(tx, lp, name),
-                ruleRevision: await tx.pushRules.streamSeq(lp),
-                ignoreRevision: ignored?.seq ?? 0,
-                pusherIncarnations: await tx.pushers.incarnations(lp),
-              },
-            );
-          }
           const policy = policies.get(lp);
           if (policy == null) continue;
           out.push({

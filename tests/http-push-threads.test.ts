@@ -2,6 +2,7 @@ import { assert, assertEquals } from '@std/assert';
 import { httpSuite } from '#tests/http-app.ts';
 import { observeSyncWait } from '#tests/support/sync-turn.ts';
 import { parseStreamToken } from '#engine/client/tokens.ts';
+import { roomDeliveredBySync } from '#tests/support/sync-delivery.ts';
 
 type Json = Record<string, unknown>;
 const suite = httpSuite('HTTP push thread counts');
@@ -65,12 +66,20 @@ suite.test('split counts, exact partial scopes, fully_read and own-send share on
           : {}),
       }, 'PUT')).event_id,
     );
-  const rootA = await send(a.access_token!);
-  const firstA = await send(a.access_token!, rootA);
-  const rootB = await send(a.access_token!);
-  await send(a.access_token!, rootB);
-  const lastA = await send(a.access_token!, rootA, true);
-  const main = await send(a.access_token!);
+  const [rootA, firstA, rootB, , lastA, main] = await roomDeliveredBySync(
+    suite.matrix,
+    b.access_token!,
+    room,
+    async () => {
+      const rootA = await send(a.access_token!);
+      const firstA = await send(a.access_token!, rootA);
+      const rootB = await send(a.access_token!);
+      const childB = await send(a.access_token!, rootB);
+      const lastA = await send(a.access_token!, rootA, true);
+      const main = await send(a.access_token!);
+      return [rootA, firstA, rootB, childB, lastA, main];
+    },
+  );
   for (const split of [undefined, false]) {
     const got = entry(await sync(split), room);
     assertEquals(got.unread_notifications, count(6, 1));
@@ -148,9 +157,13 @@ suite.test('private count-only zero wakes owner with a filtered timeline', async
   );
   const base = 'rooms/' + encodeURIComponent(room);
   await call(base + '/join', b.access_token!, {});
-  const sent = await call(base + '/send/m.room.message/wake', a.access_token!, {
-    body: 'activity',
-  }, 'PUT');
+  let sent!: Json;
+  await roomDeliveredBySync(suite.matrix, b.access_token!, room, async () => {
+    sent = await call(base + '/send/m.room.message/wake', a.access_token!, {
+      body: 'activity',
+    }, 'PUT');
+    return [String(sent.event_id)];
+  });
   const filter = encodeURIComponent(
     JSON.stringify({
       room: {
@@ -209,10 +222,18 @@ suite.test('a related main event acknowledges only the requested thread horizon'
         ...(parent ? { 'm.relates_to': { event_id: parent, rel_type } } : {}),
       }, 'PUT')).event_id,
     );
-  const root = await send();
-  await send(root, 'm.thread');
-  const f = await send(root, 'm.reference');
-  const g = await send(f, 'm.annotation');
+  const [root, , , g] = await roomDeliveredBySync(
+    suite.matrix,
+    b.access_token!,
+    room,
+    async () => {
+      const root = await send();
+      const child = await send(root, 'm.thread');
+      const f = await send(root, 'm.reference');
+      const g = await send(f, 'm.annotation');
+      return [root, child, f, g];
+    },
+  );
   const sync = async () =>
     entry(
       await call(
@@ -254,11 +275,16 @@ suite.test('redaction withdraws unread contributions and wakes a count-only zero
   );
   const base = 'rooms/' + encodeURIComponent(room);
   await call(base + '/join', b.access_token!, {});
-  const event = String(
-    (await call(base + '/send/m.room.message/redact', a.access_token!, {
-      body: 'activity',
-      'm.mentions': { user_ids: [b.user_id] },
-    }, 'PUT')).event_id,
+  const [event] = await roomDeliveredBySync(
+    suite.matrix,
+    b.access_token!,
+    room,
+    async () => [String(
+      (await call(base + '/send/m.room.message/redact', a.access_token!, {
+        body: 'activity',
+        'm.mentions': { user_ids: [b.user_id] },
+      }, 'PUT')).event_id,
+    )],
   );
   const filter = encodeURIComponent(
     JSON.stringify({ room: { timeline: { types: ['never'] } } }),

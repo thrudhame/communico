@@ -4,6 +4,7 @@ import { setConfigForTests } from '#engine/config.ts';
 import { theApp } from '#engine/app.ts';
 import { captureNotificationOperations } from '#engine/server/notification-operations.ts';
 import { reconcileNotificationEvent } from '#engine/server/notifications.ts';
+import { roomDeliveredBySync } from '#tests/support/sync-delivery.ts';
 
 type Json = Record<string, unknown>;
 const suite = httpSuite('HTTP notification history');
@@ -56,9 +57,16 @@ suite.test('would-have-notified history, highlights and stable exclusive paginat
         'm.mentions': highlight ? { user_ids: [b.user_id] } : {},
       }, 'PUT')).event_id,
     );
-  const first = await send('first');
-  const second = await send('second', true);
-  const third = await send('third');
+  const [first, second, third] = await roomDeliveredBySync(
+    suite.matrix,
+    b.access_token!,
+    room,
+    async () => [
+      await send('first'),
+      await send('second', true),
+      await send('third'),
+    ],
+  );
   const page = await call('notifications?limit=2', b.access_token!);
   const items = page.notifications as Json[];
   assertEquals(items.map((n) => (n.event as Json).event_id), [third, second]);
@@ -83,7 +91,12 @@ suite.test('would-have-notified history, highlights and stable exclusive paginat
     ),
     [second],
   );
-  await send('after-page');
+  await roomDeliveredBySync(
+    suite.matrix,
+    b.access_token!,
+    room,
+    async () => [await send('after-page')],
+  );
   await call(
     base + '/receipt/m.read.private/' + encodeURIComponent(second),
     b.access_token!,
@@ -109,12 +122,15 @@ suite.test('would-have-notified history, highlights and stable exclusive paginat
     (await call('notifications', stranger.access_token!)).notifications,
     [],
   );
-  await call(
-    base + '/redact/' + encodeURIComponent(second) + '/redact',
-    a.access_token!,
-    {},
-    'PUT',
-  );
+  await roomDeliveredBySync(suite.matrix, b.access_token!, room, async () => {
+    const redacted = await call(
+      base + '/redact/' + encodeURIComponent(second) + '/redact',
+      a.access_token!,
+      {},
+      'PUT',
+    );
+    return [String(redacted.event_id)];
+  });
   assertEquals(
     (await call('notifications?only=highlight', b.access_token!)).notifications,
     [],
@@ -155,19 +171,27 @@ suite.test('encrypted events stay ciphertext and read status follows independent
     ciphertext: 'opaque-blob',
     session_id: 'session',
   };
-  const root = String(
-    (await call(
-      base + '/send/m.room.encrypted/root',
-      a.access_token!,
-      ciphertext,
-      'PUT',
-    )).event_id,
-  );
-  const child = String(
-    (await call(base + '/send/m.room.encrypted/child', a.access_token!, {
-      ...ciphertext,
-      'm.relates_to': { rel_type: 'm.thread', event_id: root },
-    }, 'PUT')).event_id,
+  const [root, child] = await roomDeliveredBySync(
+    suite.matrix,
+    b.access_token!,
+    room,
+    async () => {
+      const root = String(
+        (await call(
+          base + '/send/m.room.encrypted/root',
+          a.access_token!,
+          ciphertext,
+          'PUT',
+        )).event_id,
+      );
+      const child = String(
+        (await call(base + '/send/m.room.encrypted/child', a.access_token!, {
+          ...ciphertext,
+          'm.relates_to': { rel_type: 'm.thread', event_id: root },
+        }, 'PUT')).event_id,
+      );
+      return [root, child];
+    },
   );
   await call(
     base + '/receipt/m.read.private/' + encodeURIComponent(root),
@@ -194,11 +218,16 @@ suite.test('zero-day read history is removed immediately without deleting reconc
     );
     const base = 'rooms/' + encodeURIComponent(room);
     await call(base + '/join', b.access_token!, {});
-    const event = String(
-      (await call(base + '/send/m.room.message/read', a.access_token!, {
-        body: 'activity',
-        'm.mentions': {},
-      }, 'PUT')).event_id,
+    const [event] = await roomDeliveredBySync(
+      suite.matrix,
+      b.access_token!,
+      room,
+      async () => [String(
+        (await call(base + '/send/m.room.message/read', a.access_token!, {
+          body: 'activity',
+          'm.mentions': {},
+        }, 'PUT')).event_id,
+      )],
     );
     assert(
       ((await call('notifications', b.access_token!)).notifications as Json[])
@@ -242,11 +271,16 @@ suite.test('bounded hidden-row scans advance cursors without leaking unavailable
   );
   const base = 'rooms/' + encodeURIComponent(room);
   await call(base + '/join', b.access_token!, {});
-  const event = String(
-    (await call(base + '/send/m.room.message/visible', a.access_token!, {
-      body: 'visible',
-      'm.mentions': {},
-    }, 'PUT')).event_id,
+  const [event] = await roomDeliveredBySync(
+    suite.matrix,
+    b.access_token!,
+    room,
+    async () => [String(
+      (await call(base + '/send/m.room.message/visible', a.access_token!, {
+        body: 'visible',
+        'm.mentions': {},
+      }, 'PUT')).event_id,
+    )],
   );
   const app = theApp();
   await app.server.tx(async (tx) => {
@@ -299,10 +333,20 @@ suite.test('saved notifying context with missing receiver evidence is unavailabl
   );
   const base = 'rooms/' + encodeURIComponent(room);
   await call(base + '/join', b.access_token!, {});
-  const event = String(
-    (await call(base + '/send/m.room.message/saved-context', a.access_token!, {
-      body: 'saved context',
-    }, 'PUT')).event_id,
+  const [event] = await roomDeliveredBySync(
+    suite.matrix,
+    b.access_token!,
+    room,
+    async () => [String(
+      (await call(
+        base + '/send/m.room.message/saved-context',
+        a.access_token!,
+        {
+          body: 'saved context',
+        },
+        'PUT',
+      )).event_id,
+    )],
   );
   const original =
     ((await call('notifications', b.access_token!)).notifications as Json[])

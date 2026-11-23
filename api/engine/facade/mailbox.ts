@@ -442,7 +442,7 @@ export class Mailbox {
           });
           rooms.push(result);
         } catch (error) {
-          failures.push(error);
+          failures.push(new Error('ingress room:' + roomId, { cause: error }));
         }
       },
     );
@@ -484,12 +484,16 @@ export class Mailbox {
             }),
           );
         } catch (error) {
-          failures.push(error);
+          failures.push(new Error('ingress EDU:' + index, { cause: error }));
         }
       }
     })();
     await Promise.all([...roomJobs, eduJob]);
-    if (failures.length) throw unavailable(failures[0]);
+    if (failures.length) {
+      throw unavailable(
+        new AggregateError(failures, 'durable ingress children failed'),
+      );
+    }
     // Completion order is not semantic input. Pin a deterministic whole answer.
     rooms.sort((a, b) =>
       a.roomId < b.roomId ? -1 : a.roomId > b.roomId ? 1 : 0

@@ -1,6 +1,7 @@
 import { MatrixError } from '#engine/matrix-error.ts';
 import { setFullyRead, setReceipt } from '#engine/receipts.ts';
 import { parseJson } from '#engine/operation-body.ts';
+import { authenticatedDevice } from '#engine/auth-context.ts';
 
 export default async function (
   request: import('@pathfinder/pathfinder').PathfinderRequest,
@@ -25,16 +26,19 @@ export default async function (
       userId,
       body['m.fully_read'],
       request._raw.signal,
+      authenticatedDevice(context),
     );
   }
   if (typeof body['m.read'] === 'string') {
     await setReceipt(roomId, userId, 'm.read', body['m.read'], {
       signal: request._raw.signal,
+      device: authenticatedDevice(context),
     });
   }
   if (typeof body['m.read.private'] === 'string') {
     await setReceipt(roomId, userId, 'm.read.private', body['m.read.private'], {
       signal: request._raw.signal,
+      device: authenticatedDevice(context),
     });
   }
   return {};

@@ -1,4 +1,9 @@
-import { assertEquals, assertRejects } from '@std/assert';
+import {
+  assert,
+  assertEquals,
+  assertRejects,
+  assertStrictEquals,
+} from '@std/assert';
 import { config, setConfigForTests } from '#engine/config.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { joinRemote } from '#engine/room/join.ts';
@@ -23,6 +28,244 @@ import {
   exportPublicKeyRaw,
 } from '#engine/signing-primitives.js';
 import { toWire } from '#engine/federation/pdu.ts';
+import { SendJoinRefused } from '#engine/room/deps.ts';
+import {
+  beginJoinAttempt,
+  releaseJoinAttempt,
+} from '#engine/server/join-attempts.ts';
+
+for (const version of ['v2', 'v1']) {
+  Deno.test(`review join: ${version} request signing failure before dispatch leaves no compensation debt`, async () => {
+    const dir = await Deno.makeTempDir({ prefix: 'join-not-dispatched-' });
+    const store = await openStore({
+      dir,
+      library: './.native/libturso_ffi.so',
+      checkpointlogbytes: 65536,
+      maxopenfiles: 8,
+      idleseconds: 300,
+    }, { schemas: { room: roomSchema, server: serverSchema } });
+    const signer = await testSigner();
+    const local = await testRemoteServer();
+    const fault = new Error('send_join request signer unavailable');
+    const guarded = {
+      ...signer,
+      sign: (canonical: string) => {
+        const request = JSON.parse(canonical);
+        if (String(request.uri).includes('/' + version + '/send_join/')) {
+          return Promise.reject(
+            fault,
+          );
+        }
+        return signer.sign(canonical);
+      },
+    };
+    let fr: Awaited<ReturnType<typeof makeFakeRoom>>;
+    let compensations = 0;
+    const peer = await startFakeServer({
+      ourKeyDoc: async () => ({
+        server_name: signer.serverName,
+        verify_keys: {
+          [signer.keyId]: {
+            key: b64encodeStd(await exportPublicKeyRaw(local.kp.publicKey)),
+          },
+        },
+      }),
+      handlers: (req) =>
+        req.path.includes('/make_join/')
+          ? Response.json({
+            room_version: fr.version,
+            event: fr.makeJoinAnswer('@anna:test').event,
+          })
+          : req.path.includes('/v2/send_join/')
+          ? Response.json({ errcode: 'M_UNRECOGNIZED', error: 'use v1' }, {
+            status: 404,
+          })
+          : null,
+    });
+    const old = config();
+    setConfigForTests({
+      federation: { cacerts: ['tests/fixtures/tls/ca.crt'] },
+    });
+    try {
+      fr = await makeFakeRoom({
+        roomId: '!not-dispatched:' + peer.name,
+        server: peer,
+      });
+      const server = await store.server();
+      const error = await assertRejects(() =>
+        joinRemote(store, {
+          roomId: fr.roomId,
+          user: '@anna:test',
+          via: [peer.name],
+          signer: guarded,
+          deps: {
+            self: 'test',
+            fetcher: productionFetcher(server, guarded, store),
+            keys: fakeKeyResolver(peer, local),
+            leave: () => {
+              compensations++;
+              throw new Error('peer refuses make_leave');
+            },
+          },
+        })
+      );
+      assertStrictEquals(error, fault);
+      assertEquals(compensations, 0);
+      assertEquals(await pendingJoinAttempts(server), []);
+      assertEquals(
+        peer.requests.filter((request) => request.path.includes('/send_join/'))
+          .length,
+        version === 'v1' ? 1 : 0,
+      );
+    } finally {
+      setConfigForTests(old);
+      await peer.close();
+      await store.close();
+      await Deno.remove(dir, { recursive: true });
+    }
+  });
+}
+
+Deno.test('confirmed outbound join refusal survives failed deletion and cold cleanup without a leave', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'join-refused-' });
+  const settings = {
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  };
+  const schemas = { room: roomSchema, server: serverSchema };
+  let store = await openStore(settings, { schemas });
+  const signer = await testSigner();
+  const local = await testRemoteServer();
+  let fr: Awaited<ReturnType<typeof makeFakeRoom>>;
+  const peer = await startFakeServer({
+    ourKeyDoc: async () => ({
+      server_name: signer.serverName,
+      verify_keys: {
+        [signer.keyId]: {
+          key: b64encodeStd(await exportPublicKeyRaw(local.kp.publicKey)),
+        },
+      },
+    }),
+    handlers: (req) => {
+      if (req.path.includes('/make_join/')) {
+        return Response.json({
+          room_version: fr.version,
+          event: fr.makeJoinAnswer('@anna:test').event,
+        });
+      }
+      if (req.path.includes('/send_join/')) {
+        assertEquals(req.verified, true);
+        return Response.json({
+          errcode: 'M_FORBIDDEN',
+          error: 'definite refusal',
+        }, { status: 403 });
+      }
+      return null;
+    },
+  });
+  const old = config();
+  setConfigForTests({ federation: { cacerts: ['tests/fixtures/tls/ca.crt'] } });
+  try {
+    fr = await makeFakeRoom({ roomId: '!refused:' + peer.name, server: peer });
+    const server = await store.server();
+    await server.exec(
+      "CREATE TRIGGER fail_refusal_delete BEFORE DELETE ON federation_join_attempts BEGIN SELECT RAISE(ABORT,'deletion unavailable'); END",
+    );
+    await assertRejects(
+      () =>
+        joinRemote(store, {
+          roomId: fr.roomId,
+          user: '@anna:test',
+          via: [peer.name],
+          signer,
+          deps: {
+            self: 'test',
+            fetcher: productionFetcher(server, signer, store),
+            keys: fakeKeyResolver(peer, local),
+          },
+        }),
+      SendJoinRefused,
+    );
+    const [attempt] = await pendingJoinAttempts(server);
+    assert(attempt);
+    await store.close();
+    store = await openStore(settings, { schemas });
+    installJoinAdmission(store);
+    const reopened = await store.server();
+    const [saved] = await reopened.query(
+      'SELECT remote_refused FROM federation_join_attempts',
+    );
+    assertEquals(
+      saved.remote_refused,
+      1,
+      'the actual typed HTTP refusal was persisted before deletion',
+    );
+    // A confirmed refusal is not a remote effect awaiting compensation.
+    await admitLocalJoin(store, fr.roomId, '@anna:test');
+    const deps = {
+      store,
+      server: reopened,
+      signer,
+      self: 'test',
+      keys: fakeKeyResolver(peer, local),
+      wake: () => {},
+    };
+    const provider = joinCleanupProvider(deps, inviteIntentProvider(deps));
+    const job = await provider(reopened, peer.name);
+    assert(job);
+    await assertRejects(() => job.run(), Error, 'deletion unavailable');
+    assertEquals(
+      peer.requests.filter((r) =>
+        r.path.includes('/make_leave/') || r.path.includes('/send_leave/')
+      ).length,
+      0,
+    );
+    await reopened.exec('DROP TRIGGER fail_refusal_delete');
+    // Replacement admission must not mistake the retained refused row for debt.
+    const replacement = { ...attempt, eventId: '$replacement' };
+    const signed = { ...attempt.signed!, event_id: replacement.eventId };
+    await beginJoinAttempt(store, replacement, signed);
+    releaseJoinAttempt(store, replacement);
+    // The previously selected intent must re-read the exact attempt, not undo new work.
+    await job.run();
+    assertEquals(
+      (await pendingJoinAttempts(reopened))[0].eventId,
+      replacement.eventId,
+    );
+    await reopened.execute('DELETE FROM federation_join_attempts');
+    // Exercise actual cold refused-row cleanup as well as stale-intent safety.
+    await reopened.execute(
+      'INSERT INTO federation_join_attempts(room_id,user_id,event_id,room_version,destination,added_ms,join_json,remote_refused) VALUES(?,?,?,?,?,?,?,1)',
+      [
+        attempt.roomId,
+        attempt.userId,
+        attempt.eventId,
+        attempt.roomVersion,
+        attempt.destination,
+        attempt.addedMs,
+        JSON.stringify(attempt.signed),
+      ],
+    );
+    const cleanup = await provider(reopened, peer.name);
+    assert(cleanup);
+    await cleanup.run();
+    assertEquals(await pendingJoinAttempts(reopened), []);
+    assertEquals(
+      peer.requests.filter((r) =>
+        r.path.includes('/make_leave/') || r.path.includes('/send_leave/')
+      ).length,
+      0,
+    );
+  } finally {
+    await peer.close();
+    await store.close();
+    setConfigForTests(old);
+    await Deno.remove(dir, { recursive: true });
+  }
+});
 
 Deno.test('outbound join retains the exact signed attempt before network under either encryption policy', async (t) => {
   const old = config();
@@ -189,6 +432,12 @@ Deno.test('outbound join schema upgrade preserves old compensation without inven
         'SELECT leave_json FROM federation_join_attempts',
       ),
       [{ leave_json: '{"event_id":"$leave"}' }],
+    );
+    assertEquals(
+      await (await store.server()).query(
+        'SELECT remote_refused FROM federation_join_attempts',
+      ),
+      [{ remote_refused: 0 }],
     );
   } finally {
     await store.close();

@@ -7,6 +7,8 @@ import { nextCounter } from '#engine/tenant/accountdata.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { validatePusher } from '#engine/push/registration.ts';
 import {
+  assertSessionAuthorityOwner,
+  captureRetainedSessionAuthorities,
   ownerUnavailable,
   requireSessionAuthority,
   retainedSessionAuthority,
@@ -17,7 +19,10 @@ import {
   readRegister,
   registerJson,
   type RegisterOperation,
+  registerOperationFromRow,
   registerOperations,
+  type RegisterView,
+  registerView,
   writeRegister,
 } from '#engine/facade/registers.ts';
 import type { DomainHistoryProof } from '#engine/facade/domain-control.ts';
@@ -150,6 +155,51 @@ type PusherSelection = {
   value?: NonNullable<ReturnType<typeof pusherOperation>['value']>;
 };
 
+type SelectionReader = {
+  deactivated: (localpart: string) => boolean | Promise<boolean>;
+  register: (key: string) => RegisterView | Promise<RegisterView>;
+  operations: (
+    key: string,
+  ) => RegisterOperation[] | Promise<RegisterOperation[]>;
+  keys: (
+    localpart: string,
+    appId: string,
+    pushkey: string,
+  ) => string[] | Promise<string[]>;
+  native: (
+    localpart: string,
+    appId: string,
+    pushkey: string,
+  ) => boolean | Promise<boolean>;
+  session: (
+    hash: string,
+  ) =>
+    | Awaited<ReturnType<typeof retainedSessionAuthority>>
+    | ReturnType<typeof retainedSessionAuthority>;
+};
+
+function selectionReader(conn: Conn): SelectionReader {
+  return {
+    deactivated: async (lp) =>
+      (await conn.query('SELECT deactivated FROM users WHERE localpart=?', [
+        lp,
+      ]))[0]?.deactivated === 1,
+    register: (key) => readRegister(conn, key),
+    operations: (key) => registerOperations(conn, key),
+    keys: async (lp, appId, pushkey) =>
+      (await conn.query(
+        "SELECT DISTINCT semantic_key FROM domain_operations WHERE kind='pusher' AND json_extract(semantic_key,'$[1]')=? AND json_extract(semantic_key,'$[2]')=? AND json_extract(semantic_key,'$[3]')=?",
+        [lp, appId, pushkey],
+      )).map((row) => String(row.semantic_key)),
+    native: async (lp, appId, pushkey) =>
+      !!(await conn.query(
+        'SELECT 1 FROM pushers WHERE localpart=? AND app_id=? AND pushkey=?',
+        [lp, appId, pushkey],
+      )).length,
+    session: (hash) => retainedSessionAuthority(conn, hash, false),
+  };
+}
+
 /** One verdict for public recovery reads, target enumeration and last send
  * admission. Removal never chooses the next retained contender. */
 async function selectedPusher(
@@ -157,52 +207,35 @@ async function selectedPusher(
   localpart: string,
   appId: string,
   pushkey: string,
+  reader: SelectionReader = selectionReader(conn),
 ): Promise<PusherSelection> {
-  const [account] = await conn.query(
-    'SELECT deactivated FROM users WHERE localpart=?',
-    [localpart],
-  );
-  if (account?.deactivated === 1) return { ready: true };
-  const view = await readRegister(conn, choiceKey(localpart, appId, pushkey));
+  if (await reader.deactivated(localpart)) return { ready: true };
+  const view = await reader.register(choiceKey(localpart, appId, pushkey));
   if (view.pending.length) return { ready: false };
   if (!view.winner) {
     // An observed removal may arrive without any choice/put. It cannot select
     // a sender; completely fenced old registrations need no active choice.
-    const keys = await conn.query(
-      "SELECT DISTINCT semantic_key FROM domain_operations WHERE kind='pusher' AND json_extract(semantic_key,'$[1]')=? AND json_extract(semantic_key,'$[2]')=? AND json_extract(semantic_key,'$[3]')=?",
-      [localpart, appId, pushkey],
-    );
-    for (const row of keys) {
+    for (const key of await reader.keys(localpart, appId, pushkey)) {
       if (
-        !(await registerOperations(conn, String(row.semantic_key))).some((op) =>
-          op.payload === 'null'
-        )
+        !(await reader.operations(key)).some((op) => op.payload === 'null')
       ) return { ready: false };
     }
-    const native = await conn.query(
-      'SELECT 1 FROM pushers WHERE localpart=? AND app_id=? AND pushkey=?',
-      [localpart, appId, pushkey],
-    );
-    return { ready: !native.length };
+    return { ready: !await reader.native(localpart, appId, pushkey) };
   }
   const choice = pusherChoice(view.winner);
   if (choice.value === null) return { ready: true };
-  const operations = await registerOperations(conn, choice.registrationKey!);
+  const operations = await reader.operations(choice.registrationKey!);
   const original = operations.find((op) => op.operationId === choice.value);
   if (!original) return { ready: false };
   if (!pusherOperation(original).value) {
     throw new Error('pusher choice references removal');
   }
   if (operations.some((op) => op.payload === 'null')) return { ready: true };
-  const current = await readRegister(conn, choice.registrationKey!);
+  const current = await reader.register(choice.registrationKey!);
   if (current.pending.length || !current.winner) return { ready: false };
   const value = pusherOperation(current.winner).value!;
   try {
-    const session = await retainedSessionAuthority(
-      conn,
-      value.accessHash,
-      false,
-    );
+    const session = await reader.session(value.accessHash);
     if (!session) return { ready: false };
   } catch (error) {
     if (!(error instanceof MatrixError) || error.status !== 401) throw error;
@@ -334,6 +367,30 @@ export async function capturePusherOperations(conn: Conn, localpart: string) {
     }
   }
   return await pusherOperations(conn, localpart);
+}
+
+/** Enrollment adopts only factless home registrations, including accounts not
+ * selected for replication. Retained choices/removals always outrank native
+ * recovery rows; reactivation cannot mint a replacement for either. */
+export async function captureLegacyPusherOperations(conn: Conn) {
+  const authority = await tenantAuthority(conn);
+  if (authority?.node !== 'home') return;
+  const rows = await conn.query(
+    `SELECT p.* FROM pushers p
+    JOIN users u ON u.localpart=p.localpart AND u.deactivated=0
+    JOIN access_tokens a ON a.token=p.access_token AND a.localpart=p.localpart
+    JOIN session_authority s ON s.hash=a.token AND s.localpart=p.localpart
+    WHERE s.node=? AND s.incarnation=? AND s.refresh=0 AND NOT EXISTS (
+      SELECT 1 FROM domain_operations o WHERE o.kind IN ('pusher','pusher-choice')
+      AND json_extract(o.semantic_key,'$[1]')=p.localpart
+      AND json_extract(o.semantic_key,'$[2]')=p.app_id
+      AND json_extract(o.semantic_key,'$[3]')=p.pushkey)`,
+    [authority.node, authority.incarnation],
+  );
+  for (const row of rows) {
+    await recordPusherOperation(conn, row, false);
+    await recordPusherChoice(conn, row);
+  }
 }
 
 function pusherOperation(operation: RegisterOperation) {
@@ -849,24 +906,130 @@ export async function pusherIncarnations(
   conn: Conn,
   localpart: string,
 ): Promise<string[]> {
-  const result: string[] = [];
-  for (
-    const row of await conn.query(
-      "SELECT app_id,pushkey,incarnation FROM pushers WHERE localpart=? AND kind='http'",
-      [localpart],
-    )
-  ) {
-    if (
-      await pusherIsCurrent(
+  return (await capturePusherIncarnations(conn, [localpart])).get(localpart) ??
+    [];
+}
+
+/** Capture durable routing candidates, not permission to send. An incomplete
+ * choice retains work for final admission instead of blocking publication or
+ * discarding a notification. A resolved losing choice never gains a route. */
+export async function capturePusherIncarnations(
+  conn: Conn,
+  localparts: readonly string[],
+): Promise<Map<string, string[]>> {
+  const selected = [...new Set(localparts)];
+  const result = new Map<string, string[]>(selected.map((lp) => [lp, []]));
+  if (!selected.length) return result;
+  const rows = await nativePusherCandidates(conn, selected);
+  if (!rows.length) return result;
+  const enrolled = await tenantAuthority(conn);
+  let reader: SelectionReader | undefined;
+  let sessions:
+    | Awaited<ReturnType<typeof captureRetainedSessionAuthorities>>
+    | undefined;
+  if (enrolled) {
+    const operations = (await conn.query(
+      "SELECT * FROM domain_operations WHERE kind IN ('pusher','pusher-choice') AND json_extract(semantic_key,'$[1]') IN (SELECT CAST(value AS TEXT) FROM json_each(?))",
+      [JSON.stringify(selected)],
+    )).map(registerOperationFromRow);
+    const groups = new Map<string, RegisterOperation[]>();
+    const keys = new Map<string, Set<string>>();
+    const hashes = new Set(rows.map((row) => String(row.access_token)));
+    for (const op of operations) {
+      const group = groups.get(op.semanticKey) ?? [];
+      group.push(op);
+      groups.set(op.semanticKey, group);
+      if (op.kind === 'pusher') {
+        const { key, value } = pusherOperation(op);
+        const identity = JSON.stringify(key.slice(1, 4));
+        const set = keys.get(identity) ?? new Set<string>();
+        set.add(op.semanticKey);
+        keys.set(identity, set);
+        if (value) hashes.add(value.accessHash);
+      }
+    }
+    sessions = await captureRetainedSessionAuthorities(conn, [...hashes]);
+    const heldSessions = sessions;
+    reader = {
+      // Every selection below is for an already joined live native candidate.
+      deactivated: () => false,
+      native: () => true,
+      register: (key) => registerView(groups.get(key) ?? []),
+      operations: (key) => groups.get(key) ?? [],
+      keys: (
+        lp,
+        appId,
+        pushkey,
+      ) => [...keys.get(JSON.stringify([lp, appId, pushkey])) ?? []],
+      session: (hash) => heldSessions(hash, false),
+    };
+  }
+  for (const row of rows) {
+    if (enrolled) {
+      if (
+        !await pusherSessionIsCurrent(
+          conn,
+          String(row.access_token),
+          () =>
+            assertSessionAuthorityOwner(
+              enrolled,
+              sessions!(String(row.access_token), false),
+            ),
+        )
+      ) {
+        continue;
+      }
+      const choice = await selectedPusher(
         conn,
-        localpart,
+        String(row.localpart),
         String(row.app_id),
         String(row.pushkey),
-        String(row.incarnation),
-      )
-    ) result.push(String(row.incarnation));
+        reader,
+      );
+      if (choice.ready && choice.incarnation !== row.incarnation) continue;
+    }
+    result.get(String(row.localpart))!.push(String(row.incarnation));
   }
   return result;
+}
+
+/** The native token/device predicate is shared by send and publication admission. */
+function nativePusherCandidates(
+  conn: Conn,
+  localparts: readonly string[],
+  target?: { appId: string; pushkey: string; incarnation: string },
+) {
+  return conn.query(
+    `SELECT p.localpart,p.app_id,p.pushkey,p.incarnation,p.access_token
+    FROM json_each(?) selected JOIN pushers p ON p.localpart=CAST(selected.value AS TEXT)
+    JOIN users u ON u.localpart=p.localpart
+    JOIN access_tokens a ON a.token=p.access_token AND a.localpart=p.localpart
+    WHERE p.kind='http' AND u.deactivated=0 AND (a.device_id IS NULL OR EXISTS (
+      SELECT 1 FROM devices d WHERE d.localpart=a.localpart AND d.device_id=a.device_id AND d.generation=a.generation))` +
+      (target ? ' AND p.app_id=? AND p.pushkey=? AND p.incarnation=?' : '') +
+      ' ORDER BY p.localpart,p.app_id,p.pushkey',
+    [
+      JSON.stringify(localparts),
+      ...(target ? [target.appId, target.pushkey, target.incarnation] : []),
+    ],
+  );
+}
+
+async function pusherSessionIsCurrent(
+  conn: Conn,
+  accessHash: string,
+  captured?: () => void,
+) {
+  try {
+    if (captured) captured();
+    else await requireSessionAuthority(conn, accessHash, false);
+    return true;
+  } catch (error) {
+    if (!(error instanceof MatrixError) || ![401, 503].includes(error.status)) {
+      throw error;
+    }
+    return false;
+  }
 }
 
 /** Send admission reads account, registration and its current token/device
@@ -879,22 +1042,14 @@ export async function pusherIsCurrent(
   pushkey: string,
   incarnation: string,
 ): Promise<boolean> {
-  const [native] = await conn.query(
-    `SELECT p.access_token FROM pushers p JOIN users u ON u.localpart=p.localpart
-    JOIN access_tokens a ON a.token=p.access_token AND a.localpart=p.localpart
-    WHERE p.localpart=? AND p.app_id=? AND p.pushkey=? AND p.incarnation=?
-    AND p.kind='http' AND u.deactivated=0 AND (a.device_id IS NULL OR EXISTS (
-      SELECT 1 FROM devices d WHERE d.localpart=a.localpart AND d.device_id=a.device_id AND d.generation=a.generation))`,
-    [localpart, appId, pushkey, incarnation],
-  );
+  const [native] = await nativePusherCandidates(conn, [localpart], {
+    appId,
+    pushkey,
+    incarnation,
+  });
   if (!native) return false;
   if (await tenantAuthority(conn)) {
-    try {
-      await requireSessionAuthority(conn, String(native.access_token), false);
-    } catch (error) {
-      if (
-        !(error instanceof MatrixError) || ![401, 503].includes(error.status)
-      ) throw error;
+    if (!await pusherSessionIsCurrent(conn, String(native.access_token))) {
       return false;
     }
     const selected = await selectedPusher(conn, localpart, appId, pushkey);

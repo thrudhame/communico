@@ -46,6 +46,45 @@ import type { Pdu } from '#engine/pdu.ts';
 import { startFakeServer } from './federation/fake-server.ts';
 import { seedServer } from './federation/doc-helper.ts';
 import { facadeTls } from './support/facade-tls.ts';
+import { controlledTimeouts } from './support/timers.ts';
+import { watchdog } from './support/ordering.ts';
+
+async function waitVerifiedDispatch<T>(dispatch: Promise<T>): Promise<T> {
+  return await watchdog(dispatch, 'verified send_leave dispatch');
+}
+
+Deno.test('membership runtime: verified dispatch checkpoint has a cleared watchdog', async (t) => {
+  for (const outcome of ['missing', 'observed']) {
+    await t.step(outcome, async () => {
+      const deadlines = controlledTimeouts(30000);
+      const dispatch = Promise.withResolvers<void>();
+      const waiting = waitVerifiedDispatch(dispatch.promise);
+      try {
+        assertEquals(
+          deadlines.timers.length,
+          1,
+          'dispatch must synchronously arm its watchdog',
+        );
+        if (outcome === 'missing') {
+          deadlines.timers[0].fire();
+          await assertRejects(
+            () => waiting,
+            Error,
+            'verified send_leave dispatch',
+          );
+        } else {
+          dispatch.resolve();
+          await waiting;
+        }
+        assertEquals(deadlines.timers[0].active, false);
+      } finally {
+        dispatch.resolve();
+        await waiting.catch(() => {});
+        deadlines.restore();
+      }
+    });
+  }
+});
 
 // The production inbox, not a directly called membership adapter, owns apply.
 // Retain its exact completion without a wall-clock readiness assertion.
@@ -598,7 +637,7 @@ async function membershipRuntime(kind: 'invite' | 'knock') {
             job.destination === localRemote!.name
           ),
         );
-        await sent.promise;
+        await waitVerifiedDispatch(sent.promise);
       } finally {
         releaseLocalLeave.resolve();
       }

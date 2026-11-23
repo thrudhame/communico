@@ -28,6 +28,7 @@ import {
   parseLocalStreamToken,
 } from './positions.ts';
 import { parseStreamToken } from './tokens.ts';
+import type { DeviceIdentity } from '#engine/tenant/devices.ts';
 export interface SearchRoomEvents {
   search_term: string;
   keys?: unknown;
@@ -72,6 +73,7 @@ export async function search(
   req: SearchRoomEvents,
   nextBatch: string | null,
   signal?: AbortSignal,
+  device: DeviceIdentity | null = null,
 ) {
   if (nextBatch !== null) {
     if (parseStreamToken(nextBatch) !== null) {
@@ -85,7 +87,7 @@ export async function search(
   const request = searchRequest(req), { filter, keys } = request;
   const tokens = request.term.toLowerCase().split(/\s+/).filter(Boolean);
   const rooms = await roomScope(userId, filter);
-  await roomCompletion(theApp(), rooms, signal);
+  await roomCompletion(theApp(), rooms, signal, device);
   const matched = new Map<string, Hit>();
   // roomScope owns predecessor expansion and exclusions. Apply the same
   // resolved scope to event filtering, not the unexpanded request room list.

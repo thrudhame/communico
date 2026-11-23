@@ -280,23 +280,27 @@ the next projection or startup rolls forward from its watermark.
 (`api/engine/room/schema.ts:109-120`, `api/engine/room/ingest.ts:685-714`,
 `api/engine/room/hooks.ts:21-48`, `api/engine/server/startup.ts:13-38`)
 
-Each room has one store-lifetime projection capture owner. Independent rooms
-prepare immutable room facts outside the global mutation queue. The existing
-500-change page bounds capture, extending only to finish its final event/effect
-unit. Uncontended units batch, but queued writer demand ends the turn after a
-complete event and its accepted membership, redaction and delivery effects.
-Policy inputs belong to that turn; its committed prefix reconciles once before
-the next queued writer runs. A caller's
-room capability and head are captured at admission, before waiting for an earlier
-room owner; later writes cannot enlarge that queued caller's obligation. Application rechecks both
-watermarks and the original room capability's incarnation before writing.
-Historical-context seed edges similarly commit the completed prefix cursor;
-same-room live publication waits for complete context. A page's immutable event,
-publication and push contexts share one room attempt and its state-group reader;
-unchanged publication state is not reconstructed once per event. Single-event
-push readers use the same capture owner. Tenant push decisions
-are recaptured inside each publication turn, so preparation cannot
-resurrect a deactivated account's notification facts.
+One Store-owned publication service owns both commit and lifecycle exclusion.
+Each room prepares immutable contiguous prefixes independently. Fixed-cut callers
+share this work without sharing or enlarging their receipt obligations. The
+existing 500-change page bounds capture, extending only to finish its final
+event/effect unit. The commit owner freezes all already-ready prefixes ahead of
+the next lifecycle barrier; later arrivals cannot extend that finite group.
+Consecutive same-room units and other ready rooms publish in one atomic server
+transaction, without a per-unit writer turn, timer or numeric batch quota.
+Independent room units use set insertion; dependent same-room units see their
+predecessors' effects in transaction order. Feed ranges are reserved only inside
+that owning transaction. A rollback acknowledges no prefix or sequence.
+
+Application rechecks expected watermarks and the original room capability's
+incarnation before writing. Required callbacks retain separate completion and
+cannot hold the writer or room preparation owner. Store shutdown drains admitted
+publication and callbacks before native storage closes. Historical-context pages
+commit their cursor atomically; same-room live publication waits for complete
+context. A page's immutable event, publication and push contexts share one room
+attempt and its state-group reader; unchanged publication state is not rebuilt
+per event. Tenant push decisions are recaptured for each admitted commit group,
+so a later group cannot resurrect a deactivated account's notification facts.
 (`api/engine/server/{project,push-project}.ts`)
 
 F2 room-replica v2 verifies each added signature and unions it in a room-owned
@@ -330,9 +334,10 @@ body/name/topic text without altering the PDU.
 
 ## Client reads and sync
 
-Both ordinary and sliding sync first capture the authenticated device generation's
-pending cuts and their room audience's accepted cuts, release the transactions and
-await those exact publications. This precedes ordinary stream-head clamping and sliding list/lease
+Both ordinary and sliding sync first capture only the authenticated device generation's
+exact pending send cuts, release the transactions and await those publications.
+Other accepted room work is not a read dependency: readers select applied state,
+and publication notifiers wake fresh captures. This precedes ordinary stream-head clamping and sliding list/lease
 selection, including timeout-zero, initial, full-state, list-only and encryption
 requests. Only successful rendering conditionally retires each captured revision;
 failed/cancelled consumers and concurrently higher revisions retain their markers.
@@ -341,10 +346,11 @@ room incarnation, not shared by independent sends across the tenant. It survives
 marker retirement to fence stale syncs and exact replay, and is removed with the
 device's receipts. Existing global revisions remain valid; first scoped use starts
 above the retained legacy ceiling without rewriting it.
-Shared effect-read admission captures the explicit room or the search/notification
-audience before event/relation/search/receipt/peek selection, regardless of sender,
-leaving client marker retirement to sync. A later acceptance cannot extend a
-captured target, and unrelated rooms or account reads acquire no global drain.
+Shared effect-read admission selects this same device's pending cuts in the
+explicit room or search/notification audience before event/relation/search/receipt/peek
+selection, leaving client marker retirement to sync. The authenticated generation
+is passed from the adapter, never replaced by a new lookup. A later acceptance
+cannot extend a captured target, and unrelated rooms or account reads acquire no global drain.
 Existing filters, visibility, limits and explicit historical tokens retain their
 meaning; completion does not inject an event into a filtered or trimmed response.
 (`api/engine/client/completion.ts`, `auth-context.ts`, `syncfeed.ts`, `sliding-sync/index.ts`)
@@ -700,6 +706,8 @@ event to return, not the next event's numeric slot.
 
 Typing is ephemeral; presence and receipts are server data, while
 account-data stream markers belong to the tenant.
+Presence mutations use their own counter in native transactions and publish
+post-commit ephemeral hints; they do not queue behind the event allocator.
 (`api/engine/client/tokens.ts:1-33`, `api/engine/server/stream.ts:1-52`,
 `api/engine/typing.ts:1-48`, `api/engine/server/schema.ts:115-132`,
 `api/engine/tenant/schema.ts:72-108`)
@@ -1224,6 +1232,13 @@ answer. Local failure reaches all waiters without caching success; a later retry
 can own the operation again. Other origins, IDs and stores remain independent.
 Durable facade ingress retains its mailbox-owned serialization and receipts.
 (`api/engine/federation/transactions.ts`, `api/engine/facade/mailbox.ts`)
+
+A standalone transaction answers once every PDU's outcome is decided and
+durably accepted. Its committed room head is the publication obligation: the
+store-owned completion service is enrolled without the request waiting, and
+schema-enabled startup discovery finishes it after a restart. Joins, history and
+other consumers of published state keep waiting on their own exact obligation.
+(`api/engine/room/{ingest,hooks,remote}.ts`)
 
 Standalone flights and shared signing-key acquisition own subscriber demand.
 One disconnected caller cannot cancel another; the last caller cancels the

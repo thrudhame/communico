@@ -14,11 +14,14 @@ import {
 import {
   captureNotificationOperations,
   notificationOperations,
+  recordNotificationOperation,
 } from '#engine/server/notification-operations.ts';
 import { createHash } from 'node:crypto';
 import type { PushPublication } from '#engine/server/push-project.ts';
+import { buildCreate } from '#engine/room/build.ts';
+import { testSigner } from './fixtures/signer.ts';
 
-async function fixture() {
+async function fixture(room = '!room:test') {
   const dir = await Deno.makeTempDir({ prefix: 'facade-notifications-' });
   const stores: Awaited<ReturnType<typeof openStore>>[] = [];
   for (const side of ['home', 'edge', 'recovered']) {
@@ -57,11 +60,12 @@ async function fixture() {
         'hash',
       ]);
       await conn.execute(
-        "INSERT INTO event_index(event,room,pos,standing,grounding,seq) VALUES('$event','!room:test',1,'accepted','grounded',?)",
-        [node === 'home' ? 5 : 71],
+        "INSERT INTO event_index(event,room,pos,standing,grounding,seq) VALUES('$event',?,1,'accepted','grounded',?)",
+        [room, node === 'home' ? 5 : 71],
       );
       await conn.execute(
-        "INSERT INTO receipt_dag_nodes(room,event) VALUES('!room:test','$event')",
+        "INSERT INTO receipt_dag_nodes(room,event) VALUES(?,'$event')",
+        [room],
       );
     });
   }
@@ -108,6 +112,136 @@ function publication(notify = true): PushPublication {
     }],
   };
 }
+
+for (const status of ['absent', 'joined', 'left'] as const) {
+  Deno.test(`facade notifications: late invite fact with ${status} display cannot block account history`, async () => {
+    const f = await fixture();
+    try {
+      const saved = await f.home.tx((conn) =>
+        recordNotificationOperation(
+          conn,
+          '!room:test',
+          '$late-invite',
+          'invite',
+          publication().decisions[0],
+          1000,
+        )
+      );
+      if (status !== 'absent') {
+        await f.edge.execute(
+          'INSERT INTO prejoin_memberships(room_id,user_id,event_id,room_version,event_json,invite_room_state,origin,received_ms,status,seq,kind) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+          [
+            '!room:test',
+            '@bob:test',
+            '$late-invite',
+            '11',
+            '{}',
+            '[]',
+            'test',
+            1000,
+            status,
+            72,
+            'invite',
+          ],
+        );
+      }
+      await f.edge.tx((conn) =>
+        importNotificationOperation(conn, saved!.operation, 2000)
+      );
+      await requireNotificationHistory(f.edge, '@bob:test');
+      assertEquals(await f.edge.query('SELECT * FROM notifications'), []);
+      // The fact is retained, not discarded: matching future pending evidence
+      // may still materialize it at its receiver-local position.
+      await f.edge.execute('DELETE FROM prejoin_memberships');
+      await f.edge.execute(
+        'INSERT INTO prejoin_memberships(room_id,user_id,event_id,room_version,event_json,invite_room_state,origin,received_ms,status,seq,kind) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+        [
+          '!room:test',
+          '@bob:test',
+          '$late-invite',
+          '11',
+          '{}',
+          '[]',
+          'test',
+          1000,
+          'pending',
+          73,
+          'invite',
+        ],
+      );
+      await assertRejects(
+        () => requireNotificationHistory(f.edge, '@bob:test'),
+        Error,
+        'saved notification evidence unavailable',
+      );
+      await f.edge.tx((conn) =>
+        reconcileNotificationEvent(conn, '!room:test', '$late-invite', 3000)
+      );
+      await requireNotificationHistory(f.edge, '@bob:test');
+      assertEquals(
+        await f.edge.query('SELECT event,event_seq FROM notifications'),
+        [{ event: '$late-invite', event_seq: 73 }],
+      );
+    } finally {
+      await f.close();
+    }
+  });
+}
+
+Deno.test('facade notifications: both qualified and v12-derived room IDs publish and import', async (t) => {
+  const create = await buildCreate(
+    {
+      sender: '@alice:test',
+      content: { room_version: '12' },
+      origin_server_ts: Date.now(),
+    },
+    await testSigner(),
+    '12',
+  );
+  for (const room of ['!room:test', '!' + String(create.event_id).slice(1)]) {
+    await t.step(room, async () => {
+      const f = await fixture(room);
+      try {
+        await f.home.tx((conn) =>
+          applyPushPublication(conn, room, '$event', 5, 17, publication(), 1000)
+        );
+        const [fact] = await f.home.tx((conn) =>
+          notificationOperations(conn, '@bob:test')
+        );
+        assertEquals(JSON.parse(fact.payload).room, room);
+        await f.edge.tx((conn) =>
+          importNotificationOperation(conn, fact, 2000)
+        );
+        for (const db of [f.home, f.edge]) {
+          assertEquals(await db.query('SELECT room,event FROM notifications'), [
+            { room, event: '$event' },
+          ]);
+          assertEquals(
+            await db.tx(async (conn) =>
+              roomNotificationCounts(
+                (await notificationSnapshot(conn, '@bob:test', 0)).rooms.get(
+                  room,
+                ),
+              )
+            ),
+            { notification_count: 1, highlight_count: 0 },
+          );
+        }
+        assertEquals(await f.edge.query('SELECT * FROM push_delivery'), []);
+        assertEquals(await f.edge.query('SELECT * FROM push_badges'), []);
+        await f.edge.tx((conn) =>
+          importNotificationOperation(conn, fact, 3000)
+        );
+        assertEquals(
+          (await f.edge.query('SELECT * FROM notifications')).length,
+          1,
+        );
+      } finally {
+        await f.close();
+      }
+    });
+  }
+});
 
 Deno.test('facade notifications: native notify and suppress retain immutable source intent with their projection', async (t) => {
   for (const notify of [true, false]) {
@@ -382,6 +516,235 @@ Deno.test('facade notifications: missing event evidence retains facts and projec
       (await f.edge.query('SELECT unread FROM notification_counts'))[0].unread,
       0,
     );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade notifications: pending reads precede imported materialization without transient gateway work', async (t) => {
+  for (const factFirst of [false, true]) {
+    await t.step(String(factFirst), async () => {
+      const f = await fixture();
+      try {
+        await f.home.tx((conn) =>
+          applyPushPublication(
+            conn,
+            '!room:test',
+            '$event',
+            5,
+            17,
+            publication(),
+            1000,
+          )
+        );
+        const [operation] = await f.home.tx((conn) =>
+          notificationOperations(conn, '@bob:test')
+        );
+        await f.edge.execute(
+          "INSERT INTO push_targets VALUES('test','@bob:test','app','key','native-device','{}',1,'active')",
+        );
+        await f.edge.execute('DELETE FROM event_index');
+        await f.edge.tx((conn) =>
+          advanceNotificationRead(
+            conn,
+            '@bob:test',
+            '!room:test',
+            '',
+            '$event',
+            1500,
+          )
+        );
+        assertEquals(
+          (await f.edge.query('SELECT * FROM notification_receipt_refs'))
+            .length,
+          1,
+        );
+        if (factFirst) {
+          await f.edge.tx((conn) =>
+            importNotificationOperation(conn, operation, 2000)
+          );
+        }
+        await f.edge.tx(async (conn) => {
+          await conn.execute(
+            "INSERT INTO event_index(event,room,pos,standing,grounding,seq) VALUES('$event','!room:test',3,'accepted','grounded',71)",
+          );
+          if (factFirst) {
+            await reconcileNotificationEvent(
+              conn,
+              '!room:test',
+              '$event',
+              3000,
+            );
+          } else await importNotificationOperation(conn, operation, 3000);
+        });
+        const [notification] = await f.edge.query(
+          'SELECT read_ms,native FROM notifications JOIN push_evaluations USING(tenant,user,event)',
+        );
+        assertEquals(Number(notification.read_ms) > 0, true);
+        assertEquals(notification.native, 0);
+        assertEquals(
+          await f.edge.tx(async (conn) =>
+            roomNotificationCounts(
+              (await notificationSnapshot(conn, '@bob:test', 0)).rooms.get(
+                '!room:test',
+              ),
+            )
+          ),
+          { notification_count: 0, highlight_count: 0 },
+        );
+        assertEquals(
+          await f.edge.query('SELECT * FROM notification_receipt_refs'),
+          [],
+        );
+        assertEquals(await f.edge.query('SELECT * FROM push_delivery'), []);
+        assertEquals(await f.edge.query('SELECT * FROM push_badges'), []);
+        await requireNotificationHistory(f.edge, '@bob:test');
+      } finally {
+        await f.close();
+      }
+    });
+  }
+});
+
+Deno.test('facade notifications: a receipt clearing an existing native notification still advances its badge', async () => {
+  const f = await fixture();
+  try {
+    await f.edge.execute(
+      "INSERT INTO push_targets VALUES('test','@bob:test','app','key','native-device','{}',1,'active')",
+    );
+    await f.edge.tx((conn) =>
+      applyPushPublication(
+        conn,
+        '!room:test',
+        '$event',
+        71,
+        3,
+        publication(),
+        1000,
+      )
+    );
+    const [before] = await f.edge.query('SELECT revision FROM push_badges');
+    await f.edge.tx((conn) =>
+      advanceNotificationRead(
+        conn,
+        '@bob:test',
+        '!room:test',
+        '',
+        '$event',
+        2000,
+      )
+    );
+    const [after] = await f.edge.query('SELECT revision FROM push_badges');
+    assertEquals(Number(after.revision) > Number(before.revision), true);
+    assertEquals(
+      (await f.edge.query('SELECT read_ms FROM notifications'))[0].read_ms,
+      2000,
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade notifications: first facts arriving after room retirement cannot block unrelated history after reopen', async () => {
+  const f = await fixture();
+  try {
+    await f.home.tx((conn) =>
+      applyPushPublication(
+        conn,
+        '!room:test',
+        '$event',
+        5,
+        17,
+        publication(),
+        1000,
+      )
+    );
+    const [operation] = await f.home.tx((conn) =>
+      notificationOperations(conn, '@bob:test')
+    );
+    await f.edge.tx(async (conn) => {
+      await applyPushPublication(
+        conn,
+        '!other:test',
+        '$other',
+        72,
+        4,
+        publication(),
+        1000,
+      );
+      await removeNotificationFacts(conn, { room: '!room:test' });
+      await conn.execute("DELETE FROM event_index WHERE room='!room:test'");
+    });
+    const db = await f.reopenEdge();
+    await db.tx((conn) => importNotificationOperation(conn, operation, 2000));
+    await requireNotificationHistory(db, '@bob:test');
+    assertEquals(await db.query('SELECT room,event FROM notifications'), [{
+      room: '!other:test',
+      event: '$other',
+    }]);
+    assertEquals(
+      await db.tx((conn) => notificationOperations(conn, '@bob:test')).then((
+        ops,
+      ) => ops.some((op) => op.operationId === operation.operationId)),
+      true,
+    );
+    await db.tx(async (conn) => {
+      await conn.execute(
+        "INSERT INTO event_index(event,room,pos,standing,grounding,seq) VALUES('$event','!room:test',3,'accepted','grounded',73)",
+      );
+      await reconcileNotificationEvent(conn, '!room:test', '$event', 3000);
+      await importNotificationOperation(conn, operation, 3000);
+    });
+    assertEquals(await db.query('SELECT room,event FROM notifications'), [{
+      room: '!other:test',
+      event: '$other',
+    }]);
+    await requireNotificationHistory(db, '@bob:test');
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade notifications: a recreated room can await new notification evidence instead of remaining retired', async () => {
+  const f = await fixture();
+  try {
+    await f.home.tx((conn) =>
+      applyPushPublication(
+        conn,
+        '!room:test',
+        '$after',
+        6,
+        18,
+        publication(),
+        1000,
+      )
+    );
+    const [operation] = await f.home.tx((conn) =>
+      notificationOperations(conn, '@bob:test')
+    );
+    await f.edge.tx(async (conn) => {
+      await removeNotificationFacts(conn, { room: '!room:test' });
+      await conn.execute("DELETE FROM event_index WHERE room='!room:test'");
+      await conn.execute(
+        "INSERT INTO rooms VALUES('!room:test','recreated',2000)",
+      );
+      await importNotificationOperation(conn, operation, 2000);
+    });
+    await assertRejects(
+      () => requireNotificationHistory(f.edge, '@bob:test'),
+      Error,
+      'saved notification evidence unavailable',
+    );
+    await f.edge.tx(async (conn) => {
+      await conn.execute(
+        "INSERT INTO event_index(event,room,pos,standing,grounding,seq) VALUES('$after','!room:test',4,'accepted','grounded',74)",
+      );
+      await reconcileNotificationEvent(conn, '!room:test', '$after', 3000);
+    });
+    await requireNotificationHistory(f.edge, '@bob:test');
+    assertEquals(await f.edge.query('SELECT event FROM notifications'), [{
+      event: '$after',
+    }]);
   } finally {
     await f.close();
   }

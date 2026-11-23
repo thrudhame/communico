@@ -164,7 +164,12 @@ Deno.test('knock expiry stays reviewable, explicit retry reconciles and old retr
       'failed-attempt',
     );
     assertEquals((await provider.review()).length, 1);
-    await retryPrejoinIntents(guest.server, guest.name, resident.name);
+    await retryPrejoinIntents(
+      guest.store,
+      guest.server,
+      guest.name,
+      resident.name,
+    );
     const retry = await provider(guest.server, resident.name);
     assert(retry !== null);
     await retry.run();

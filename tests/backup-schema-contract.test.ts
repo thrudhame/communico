@@ -74,6 +74,14 @@ for (const migrated of [false, true]) {
             indexes,
           );
         }
+        if (kind === 'tenants') {
+          assertEquals(
+            (await db.query(
+              "SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'delayed_events_runnable_%' ORDER BY name",
+            )).map((row) => row.name),
+            ['delayed_events_runnable_due', 'delayed_events_runnable_user'],
+          );
+        }
         await auditTables(db, kind);
         await db.exec('CREATE TABLE unregistered_durable_state(value TEXT)');
         await assertRejects(

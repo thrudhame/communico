@@ -35,7 +35,11 @@ import {
   withMembershipFence,
 } from '#engine/room/hooks.ts';
 import { assertLocalEncryption } from '#engine/room/encryption-policy.ts';
-import { afterRoomCommit, ingestInTx } from '#engine/room/ingest.ts';
+import {
+  afterRoomCommit,
+  type CommitWait,
+  ingestInTx,
+} from '#engine/room/ingest.ts';
 import type { Room, RoomTx } from '#engine/room/index.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
 import { aclAllows, assertAcl } from '#engine/room/acl.ts';
@@ -646,6 +650,7 @@ export async function replayRemoteBatch(
   operationId: string,
   source: VerifiedItem['source'] = 'pushed',
   signal?: AbortSignal,
+  wait: CommitWait = 'published',
 ): Promise<RemoteOutcome[] | null> {
   if (!operationId) throw new Error('E_REMOTE_BATCH_IDENTITY');
   const prior = await room.tx((tx) =>
@@ -662,6 +667,7 @@ export async function replayRemoteBatch(
         outcome.eventId === null ? [] : [outcome.eventId]
       ),
       signal,
+      wait,
     );
   }
   return prior;
@@ -688,6 +694,7 @@ export async function ingestRemote(
       operationId,
       source,
       deps.signal,
+      deps.completion,
     );
     if (prior) return prior;
   }
@@ -873,6 +880,15 @@ export async function ingestRemote(
           if (operationId !== undefined) {
             const prior = await tx.remoteBatches.get(operationId, inputHash);
             if (prior) return { grounded: [], outcomes: prior };
+          }
+          // Retained before ingest, so a join that stays pending completes
+          // this context when any later path grounds it.
+          if (deps.localJoin !== undefined) {
+            await tx.joinObservations.retain(
+              deps.localJoin.eventId,
+              deps.localJoin.userId,
+              deps.localJoin.observation,
+            );
           }
           const grounded: string[] = [];
           const results = new Map<number, RemoteOutcome>();
@@ -1080,6 +1096,12 @@ export async function ingestRemote(
     ];
     return committed.outcomes;
   } finally {
-    await afterRoomCommit(room, deps.self, arrived, deps.signal);
+    await afterRoomCommit(
+      room,
+      deps.self,
+      arrived,
+      deps.signal,
+      deps.completion,
+    );
   }
 }

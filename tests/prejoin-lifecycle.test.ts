@@ -24,7 +24,12 @@ import { serverSchema } from '#engine/server/schema.ts';
 import { recordMembershipOperation } from '#engine/server/membership-operations.ts';
 import { membershipOperations } from '#engine/server/membership-operations.ts';
 import { bindMembershipDisplay } from '#engine/server/membership-selection.ts';
-import { prejoinJobs, updatePrejoinJob } from '#engine/server/prejoin-jobs.ts';
+import {
+  beginPrejoinJob,
+  prejoinJobId,
+  prejoinJobs,
+  updatePrejoinJob,
+} from '#engine/server/prejoin-jobs.ts';
 import { verify } from '#engine/room/verify.ts';
 import {
   eventStreamMax,
@@ -109,7 +114,9 @@ async function fixture(
         return Response.json({
           room_version: '11',
           event: {
-            ...room.makeLeaveTemplate('@dev:test').event as Record<
+            ...room.makeLeaveTemplate(
+              decodeURIComponent(req.url.pathname.split('/').at(-1)!),
+            ).event as Record<
               string,
               unknown
             >,
@@ -423,7 +430,7 @@ Deno.test('prejoin jobs: expiry retry and prune retain exact old work without bo
     assertEquals(expired.id, original.id);
     assertEquals(expired.work.status, 'failed-retract');
     assertEquals((await provider.review()).length, 1);
-    await retryPrejoinIntents(f.deps.server, 'test', f.origin);
+    await retryPrejoinIntents(f.deps.store, f.deps.server, 'test', f.origin);
     const [retried] = await prejoinJobs(f.deps.server);
     assertEquals(retried.id, original.id);
     assertEquals(retried.work.eventId, original.work.eventId);
@@ -438,7 +445,10 @@ Deno.test('prejoin jobs: expiry retry and prune retain exact old work without bo
       selected,
     );
     await assertRejects(() => admitLocalJoin(f.deps.store, f.roomId, f.user));
-    assertEquals(await pruneRejectIntents(f.deps.server, 'test', f.origin), 1);
+    assertEquals(
+      await pruneRejectIntents(f.deps.store, f.deps.server, 'test', f.origin),
+      1,
+    );
     assertEquals(await prejoinJobs(f.deps.server), []);
     assertEquals(
       (await inviteFor(f.roomId, f.user, f.deps))?.eventId,
@@ -850,7 +860,12 @@ Deno.test('prejoin: compensating departure materialization retains its exact sig
       knockRemote(f.roomId, f.user, {}, [f.origin], f.deps)
     );
     assertEquals(
-      await pruneRejectIntents(f.deps.server, f.deps.self, f.origin),
+      await pruneRejectIntents(
+        f.deps.store,
+        f.deps.server,
+        f.deps.self,
+        f.origin,
+      ),
       1,
     );
     const intent = await inviteFor(f.roomId, f.user, f.deps);
@@ -1229,6 +1244,76 @@ Deno.test('prejoin knock: a late response cannot overtake a newer publication', 
     assertEquals(await inviteFor(f.roomId, f.user, f.deps), null);
     assertEquals(await eventStreamMax(f.deps.server), cut);
   }));
+
+Deno.test('prejoin knock: provider skips held claims and settles superseded attempts', async (t) => {
+  await t.step(
+    'held member does not starve another job at the same destination',
+    () =>
+      fixture(async (f) => {
+        await f.publish();
+        f.knockAnswer(() => Promise.resolve(Response.json({})));
+        for (const user of [f.user, '@other:test']) {
+          await assertRejects(() =>
+            knockRemote(f.roomId, user, {}, [f.origin], f.deps)
+          );
+        }
+        const first = await inviteFor(f.roomId, f.user, f.deps);
+        const other = await inviteFor(f.roomId, '@other:test', f.deps);
+        assert(first);
+        assert(other);
+        const release = beginPrejoinJob(f.deps.store, first);
+        assert(release);
+        const provider = inviteIntentProvider(f.deps);
+        f.knockAnswer(() =>
+          Promise.resolve(Response.json({ knock_room_state: [] }))
+        );
+        try {
+          const job = await provider(f.deps.server, f.origin);
+          assert(job);
+          assertEquals(job.id, 'knock-attempt:' + prejoinJobId(other));
+          await job.run();
+          assertEquals(
+            (await inviteFor(f.roomId, '@other:test', f.deps))?.status,
+            'pending',
+          );
+          assertEquals(await provider(f.deps.server, f.origin), null);
+          assertEquals(
+            (await inviteFor(f.roomId, f.user, f.deps))?.status,
+            'attempting',
+          );
+        } finally {
+          release();
+        }
+        const resumed = await provider(f.deps.server, f.origin);
+        assert(resumed);
+        await resumed.run();
+        assertEquals(
+          (await inviteFor(f.roomId, f.user, f.deps))?.status,
+          'pending',
+        );
+        assertEquals(f.knockRequests(), 4);
+        assertEquals(await provider(f.deps.server, f.origin), null);
+      }),
+  );
+  await t.step(
+    'a newer publication is terminal, not repeatedly selected',
+    () =>
+      fixture(async (f) => {
+        await f.publish();
+        f.knockAnswer(() => Promise.resolve(Response.json({})));
+        await assertRejects(() =>
+          knockRemote(f.roomId, f.user, {}, [f.origin], f.deps)
+        );
+        const cut = await f.publish();
+        const provider = inviteIntentProvider(f.deps);
+        assertEquals(await provider(f.deps.server, f.origin), null);
+        assertEquals(await provider(f.deps.server, f.origin), null);
+        assertEquals(f.knockRequests(), 1);
+        assertEquals(await eventStreamMax(f.deps.server), cut);
+        assertEquals(await prejoinJobs(f.deps.server), []);
+      }),
+  );
+});
 
 Deno.test('prejoin knock: uncertain response retains the exact attempt for the cold sender owner', () =>
   fixture(async (f) => {

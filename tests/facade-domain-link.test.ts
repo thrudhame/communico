@@ -923,23 +923,34 @@ Deno.test('domain schedules: signed inventory and suffix retain account-wide rep
     );
     // An existing standalone schedule has no semantic fact until enrollment.
     const homeDb = await f.home.tenant('logical.test');
-    await homeDb.execute(
-      'INSERT INTO delayed_events(id,localpart,room_id,type,state_key,content,delay_ms,since_ms,due_ms,room_pos,state_event) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
-      [
-        event.id,
-        event.localpart,
-        event.roomId,
-        event.type,
-        event.stateKey,
-        JSON.stringify(event.content),
-        event.delay,
-        event.since,
-        event.due,
-        event.roomPos,
-        event.stateEvent,
-      ],
-    );
+    for (const id of ['quarantined-legacy', event.id]) {
+      await homeDb.execute(
+        'INSERT INTO delayed_events(id,localpart,room_id,type,state_key,content,delay_ms,since_ms,due_ms,room_pos,state_event) VALUES(?,?,?,?,?,?,?,?,?,?,?)',
+        [
+          id,
+          event.localpart,
+          event.roomId,
+          event.type,
+          event.stateKey,
+          JSON.stringify(event.content),
+          event.delay,
+          event.since,
+          event.due,
+          event.roomPos,
+          event.stateEvent,
+        ],
+      );
+      if (id === 'quarantined-legacy') await homeDb.tx(sanitizeRestoredTenant);
+    }
+    // The same account may contain a restored factless legacy schedule. It is
+    // private quarantine evidence, not permission to reconstruct source history.
     const records = await f.hs.bootstrap('alice', f.bundle.id);
+    assertEquals(
+      await homeDb.query(
+        "SELECT phase FROM delayed_events WHERE id='quarantined-legacy'",
+      ),
+      [{ phase: 'quarantined' }],
+    );
     const body =
       (records.at(-1)!.payload as { body: Record<string, unknown> }).body;
     assertEquals(
@@ -1007,7 +1018,8 @@ Deno.test('domain schedules: signed inventory and suffix retain account-wide rep
           'delayed_events' in homeList
             ? homeList.delayed_events.map((e) => e.delay_id)
             : [],
-          [edgeId],
+          // Quarantined local evidence stays listed, like any restored row.
+          ['quarantined-legacy', edgeId],
         );
         await assertRejects(
           () => homeWorker.action(edgeId, 'send'),
@@ -1021,7 +1033,7 @@ Deno.test('domain schedules: signed inventory and suffix retain account-wide rep
         await homeDb.query('SELECT id FROM delayed_events WHERE localpart=?', [
           'alice',
         ]),
-        [],
+        [{ id: 'quarantined-legacy' }],
       );
       const homeExport = await f.hs.export('alice', f.bundle.id);
       assert(
@@ -2199,6 +2211,71 @@ Deno.test('facade forget: visibility failure rolls back the source fact and impo
   }
 });
 
+for (
+  const [newerForget, ingress] of [[false, 'send'], [true, 'send'], [
+    false,
+    'ingest',
+  ], [true, 'ingest']] as const
+) {
+  Deno.test(`facade forget: accepted in-room invite restores only observed visibility (${ingress}, newer forget: ${newerForget})`, async () => {
+    const f = await fixture();
+    const user = '@alice:logical.test';
+    try {
+      installJoinAdmission(f.home);
+      const created = await createRoom(f.home, {
+        creator: '@bob:logical.test',
+        preset: 'public_chat',
+      }, f.ht.signer());
+      const room = await openRoom(f.home, created.roomId),
+        db = await f.home.server();
+      await joinLocal(room, user, f.ht.signer());
+      await project(f.home, room.id);
+      await leaveLocal(room, user, f.ht.signer());
+      await project(f.home, room.id);
+      await forget(db, room.id, user, 'logical.test');
+      setJoinObservation(f.home, async (roomId, userId) => {
+        const captured = await prepareRejoin(db, roomId, userId);
+        if (newerForget) await forget(db, roomId, userId, 'logical.test');
+        return captured;
+      });
+      const partial = {
+        type: 'm.room.member',
+        sender: '@bob:logical.test',
+        state_key: user,
+        content: { membership: 'invite' },
+      };
+      const result = ingress === 'send'
+        ? await sendLocal(room, partial, f.ht.signer())
+        : await ingestLocal(
+          room,
+          await room.tx((tx) => buildInTx(tx, room.id, partial, f.ht.signer())),
+          f.ht.serverName,
+        );
+      assertEquals(result.standing, 'accepted');
+      await project(f.home, room.id);
+      assertEquals(
+        (await membershipOf(db, room.id, user))!.forgotten,
+        newerForget,
+      );
+      const operations = await db.tx((tx) => forgetOperations(tx, user));
+      const count = operations.length;
+      await project(f.home, room.id);
+      assertEquals(
+        (await db.tx((tx) => forgetOperations(tx, user))).length,
+        count,
+      );
+      assertEquals(
+        operations.some((op) =>
+          JSON.parse(op.payload).eventId === result.eventId
+        ),
+        true,
+      );
+    } finally {
+      await f.close();
+    }
+  });
+}
+
 Deno.test('facade forget: actual local join retains admission context across cold projection and idempotent retry', async () => {
   const f = await fixture();
   const user = '@alice:logical.test';
@@ -2260,6 +2337,133 @@ Deno.test('facade forget: actual local join retains admission context across col
     } finally {
       await reopened.close();
     }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade forget: a stale rejoin observation is inert evidence and never blocks the room cursor', async (t) => {
+  const f = await fixture();
+  const user = '@alice:logical.test';
+  try {
+    installJoinAdmission(f.home);
+    const db = await f.home.server();
+    for (
+      const [name, stale] of [
+        ['superseded authority incarnation', 'authority'],
+        ['join no longer accepted and grounded', 'standing'],
+      ] as const
+    ) {
+      await t.step(name, async () => {
+        // Each case owns its room: one wedged cursor cannot fail the other.
+        const created = await createRoom(f.home, {
+          creator: '@bob:logical.test',
+          preset: 'public_chat',
+        }, f.ht.signer());
+        const room = await openRoom(f.home, created.roomId);
+        setJoinObservation(
+          f.home,
+          (roomId, userId) => prepareRejoin(db, roomId, userId),
+        );
+        await joinLocal(room, user, f.ht.signer());
+        await leaveLocal(room, user, f.ht.signer());
+        await project(f.home, room.id);
+        await forget(db, room.id, user, 'logical.test');
+        const count = (await db.tx((tx) => forgetOperations(tx, user))).length;
+        setJoinObservation(f.home, async (roomId, userId) => {
+          const captured = await prepareRejoin(db, roomId, userId);
+          return stale === 'authority'
+            ? { ...captured, incarnation: 'superseded-incarnation' }
+            : captured;
+        });
+        const joined = await joinLocal(room, user, f.ht.signer());
+        if (stale === 'standing') {
+          await room.tx((tx) =>
+            tx.events.setStatus(joined.eventId, {
+              standing: 'rejected',
+              grounding: 'grounded',
+              origin: null,
+              received_ts: Date.now(),
+            })
+          );
+        }
+        const later = await sendLocal(room, {
+          type: 'm.room.message',
+          sender: '@bob:logical.test',
+          content: { msgtype: 'm.text', body: 'after ' + stale },
+        }, f.ht.signer());
+        await project(f.home, room.id);
+        assertEquals(
+          await db.query('SELECT room FROM feed WHERE event=?', [
+            later.eventId,
+          ]),
+          [{ room: room.id }],
+          'stale observation blocked later room projection',
+        );
+        assertEquals(
+          (await db.tx((tx) => forgetOperations(tx, user))).length,
+          count,
+          'stale observation authored a rejoin',
+        );
+        assertEquals(
+          (await membershipOf(db, room.id, user))!.forgotten,
+          true,
+        );
+      });
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('facade forget: producers fence an in-flight receive of the account stream', async () => {
+  const f = await fixture();
+  const room = '!fenced:logical.test', user = '@alice:logical.test';
+  try {
+    const hd = await f.home.server(), ed = await f.edge.server();
+    for (const db of [hd, ed]) {
+      await db.execute(
+        "INSERT INTO memberships(user,room,membership,event,seq) VALUES(?,?,'leave',?,1)",
+        [user, room, '$leave'],
+      );
+    }
+    const bootstrap = await f.hs.bootstrap('alice', f.bundle.id);
+    await f.toEdge(bootstrap);
+    await forget(hd, room, user, 'logical.test');
+    const suffix = (await f.hs.export('alice', f.bundle.id)).filter((record) =>
+      record.sequence > bootstrap.at(-1)!.sequence
+    );
+    assert(suffix.length > 0);
+    const held = Promise.withResolvers<void>();
+    const receiver = new Journal({
+      ...ed,
+      tx: async (fn, options) => {
+        await held.promise;
+        return await ed.tx(fn, options);
+      },
+    }, LINK_SUPPORTED);
+    const receiving = receiver.receive('home', suffix);
+    try {
+      for (
+        const produce of [
+          () => prepareRejoin(ed, room, user),
+          () => forget(ed, room, user, 'logical.test'),
+        ]
+      ) {
+        await assertRejects(
+          produce,
+          MatrixError,
+          'forget snapshot unavailable',
+        );
+      }
+    } finally {
+      held.resolve();
+      await receiving;
+    }
+    assertEquals(
+      await ed.query('SELECT room FROM forgotten WHERE user=?', [user]),
+      [],
+    );
   } finally {
     await f.close();
   }
@@ -4742,3 +4946,4 @@ Deno.test('domain history: authenticated current home, account and control bindi
     });
   }
 });
+import { sanitizeRestoredTenant } from '#engine/tenant/restore.ts';

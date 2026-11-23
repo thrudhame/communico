@@ -93,7 +93,10 @@ export async function applyLinkApplication<T>(
     applied.projectionRevision ?? (pending !== before ? pending : 0),
     Number(legacy?.value ?? 0),
   );
-  if (applied.retain !== false || projectionRevision) {
+  // Projection debt is independently durable in the tenant counters. It must
+  // not turn an explicitly empty capture into a completed result: that capture
+  // identity remains current until actual source work advances its export cut.
+  if (applied.retain !== false) {
     await retainLinkApplication(
       conn,
       peer,

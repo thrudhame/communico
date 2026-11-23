@@ -43,6 +43,9 @@ export type LivePresenceObservation = PresenceDevice & {
   lastActiveAgo: number;
 };
 
+// Presence owns its counter. Use server transactions with MVCC retries, not
+// the event allocator's queue; only receipt paths below share that queue.
+
 /** Export only this database's activity, never a projection imported from a
  * different node. An active sync has a bounded fresh observation, not a lease
  * that can outlive the source after disconnection. Explicit status is separate. */
@@ -102,7 +105,7 @@ export async function replacePresenceSource(
     if (seen.has(key)) invalidParameter('duplicate presence observation');
     seen.add(key);
   }
-  const changes = await eventStreamTx(server, async (tx) => {
+  const changes = await server.tx(async (tx) => {
     await check(tx);
     const local = await localPresenceIdentity(tx);
     if (source.node === local.node) invalidParameter('local presence source');
@@ -397,7 +400,7 @@ export async function withPresenceSync<T>(
     return await run();
   } finally {
     try {
-      await eventStreamTx(server, async (tx) => {
+      await server.tx(async (tx) => {
         const source = await localPresenceIdentity(tx);
         await tx.execute(
           'UPDATE presence_observations SET last_sync_ms=MAX(last_sync_ms,?) WHERE user_id=? AND node=? AND incarnation=? AND device_id=? AND generation=?',
@@ -439,7 +442,7 @@ async function writePresence(
   }
   const receivedMs = opts.remote ? opts.receivedMs ?? Date.now() : Date.now();
   const lastActiveMs = receivedMs - (opts.lastActiveAgo ?? 0);
-  const row = await eventStreamTx(server, async (tx) => {
+  const row = await server.tx(async (tx) => {
     const [current] = await tx.query('SELECT * FROM presence WHERE user_id=?', [
       userId,
     ]);
@@ -503,17 +506,20 @@ export async function ensurePresenceRow(
   server: Db,
   userId: string,
 ): Promise<void> {
-  await eventStreamTx(server, async (tx) => {
+  const row = await server.tx(async (tx) => {
     if (
       (await tx.query('SELECT 1 FROM presence WHERE user_id=?', [userId]))
         .length
-    ) return;
+    ) return null;
     const seq = await next(tx, 'presence');
+    const lastActiveMs = Date.now();
     await tx.execute(
       "INSERT INTO presence(user_id,presence,status_msg,last_active_ms,seq,remote_received_ms) VALUES(?,'offline',NULL,?,?,NULL)",
-      [userId, Date.now(), seq],
+      [userId, lastActiveMs, seq],
     );
+    return { presence: 'offline', statusMsg: null, lastActiveMs, seq };
   });
+  if (row !== null) notify(server, { kind: 'presence', userId, row });
 }
 function presenceExpired(r: Row | undefined): boolean {
   return r !== undefined && r.presence !== 'offline' &&
@@ -578,8 +584,7 @@ export async function getPresence(
     projected.lastActiveMs === Number(current.last_active_ms)
   ) return presenceRow(current);
   // A concurrent authenticated observation wins over a stale reader's expiry.
-  const value = await eventStreamTx(
-    server,
+  const value = await server.tx(
     (tx) => normalizePresence(tx, userId, server),
   );
   if (value.changed) {
@@ -594,7 +599,7 @@ export async function importPresenceStatus(
   check: (conn: Conn) => Promise<void>,
   history?: DomainHistoryProof,
 ) {
-  const change = await eventStreamTx(server, async (tx) => {
+  const change = await server.tx(async (tx) => {
     await check(tx);
     const value = await acceptPresenceStatus(tx, operation, history);
     if (!value.available) return null;

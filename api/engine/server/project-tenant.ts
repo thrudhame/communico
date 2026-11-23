@@ -8,6 +8,7 @@ import { enqueueEdu } from '#engine/server/delivery.ts';
 import { removeNotificationFacts } from '#engine/server/notifications.ts';
 import { projectPushTargets } from '#engine/server/push-targets.ts';
 import {
+  completedTenantProjection,
   completeTenantProjection,
   pendingTenantProjection,
 } from '#engine/tenant/hooks.ts';
@@ -16,9 +17,23 @@ import {
   fanoutSigningChange,
 } from '#engine/server/device-federation.ts';
 
-export function projectTenant(store: Store, tenant: string): Promise<void> {
-  return withProjectionLock(async () => {
+export async function projectTenant(
+  store: Store,
+  tenant: string,
+  through?: number,
+): Promise<void> {
+  // Completed receipt recovery must not queue behind newer tenant work. Check
+  // again under the lock in case another projector completed while we waited.
+  if (
+    through !== undefined &&
+    await completedTenantProjection(await store.tenant(tenant)) >= through
+  ) return;
+  return withProjectionLock(store, async () => {
     const server = await store.server(), db = await store.tenant(tenant);
+    if (
+      through !== undefined &&
+      await completedTenantProjection(db) >= through
+    ) return;
     const pending = await pendingTenantProjection(db);
     await projectPushTargets(store, tenant);
     const accountSource = tenantSource('accounts', tenant);

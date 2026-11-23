@@ -3,7 +3,7 @@ import { serverSchema } from '#engine/server/schema.ts';
 import { openStore } from '#engine/store/index.ts';
 import { historicalServerSchema } from './fixtures/server-schema-history.ts';
 
-Deno.test('room upgrade intent migration crosses v54 to v55 before current-schema equivalence', async () => {
+Deno.test('room upgrade intent migration crosses v56 to v57 before current-schema equivalence', async () => {
   const root = await Deno.makeTempDir({ prefix: 'upgrade-schema-' });
   const settings = (name: string) => ({
     dir: root + '/' + name,
@@ -13,7 +13,7 @@ Deno.test('room upgrade intent migration crosses v54 to v55 before current-schem
     idleseconds: 300,
   });
   let old = await openStore(settings('old'), {
-    schemas: { server: historicalServerSchema(54) },
+    schemas: { server: historicalServerSchema(56) },
   });
   const fresh = await openStore(settings('fresh'), {
     schemas: { server: serverSchema },
@@ -27,11 +27,11 @@ Deno.test('room upgrade intent migration crosses v54 to v55 before current-schem
     );
     await old.close();
     // Pin the historical boundary separately: later append-only migrations must
-    // not change what the room-upgrade migration installed at v55.
+    // not change what the room-upgrade migration installed at v57.
     old = await openStore(settings('old'), {
       schemas: {
         server: {
-          ...historicalServerSchema(55),
+          ...historicalServerSchema(57),
           migrations: serverSchema.migrations,
         },
       },
@@ -40,7 +40,7 @@ Deno.test('room upgrade intent migration crosses v54 to v55 before current-schem
       await (await old.server()).query(
         "SELECT v FROM meta WHERE k='schema_version'",
       ),
-      [{ v: '55' }],
+      [{ v: '57' }],
     );
     assertEquals(
       await (await old.server()).query('SELECT * FROM room_upgrades'),
@@ -65,6 +65,143 @@ Deno.test('room upgrade intent migration crosses v54 to v55 before current-schem
         "SELECT v FROM meta WHERE k='schema_version'",
       ),
       [{ v: String(serverSchema.version) }],
+    );
+  } finally {
+    await old.close();
+    await fresh.close();
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test('notification room retirement appends to v57 with fresh-schema equivalence', async () => {
+  const root = await Deno.makeTempDir({
+    prefix: 'notification-retirement-schema-',
+  });
+  const settings = (name: string) => ({
+    dir: root + '/' + name,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  });
+  let old = await openStore(settings('old'), {
+    schemas: { server: historicalServerSchema(57) },
+  });
+  const fresh = await openStore(settings('fresh'), {
+    schemas: { server: serverSchema },
+  });
+  try {
+    assertEquals(
+      await (await old.server()).query(
+        "SELECT name FROM sqlite_master WHERE name='notification_retired_rooms'",
+      ),
+      [],
+    );
+    await (await old.server()).execute(
+      "INSERT INTO room_upgrades VALUES('!old:test','@alice:test','!new:test','{}',0)",
+    );
+    await old.close();
+    old = await openStore(settings('old'), {
+      schemas: { server: serverSchema },
+    });
+    const db = await old.server();
+    const sql =
+      "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso%' ORDER BY type,name";
+    assertEquals(await db.query(sql), await (await fresh.server()).query(sql));
+    assertEquals(
+      await db.query('SELECT * FROM notification_retired_rooms'),
+      [],
+    );
+    assertEquals((await db.query('SELECT * FROM room_upgrades')).length, 1);
+    await db.execute(
+      "INSERT INTO notification_retired_rooms VALUES('!removed:test')",
+    );
+    await old.close();
+    old = await openStore(settings('old'), {
+      schemas: { server: serverSchema },
+    });
+    assertEquals(
+      await (await old.server()).query(
+        'SELECT * FROM notification_retired_rooms',
+      ),
+      [{ room: '!removed:test' }],
+    );
+  } finally {
+    await old.close();
+    await fresh.close();
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test('presence migrations append after v58 and retain historical rows without inventing observations', async () => {
+  const root = await Deno.makeTempDir({ prefix: 'presence-schema-' });
+  const settings = (name: string) => ({
+    dir: root + '/' + name,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  });
+  const openOld = (version: number) =>
+    openStore(settings('old'), {
+      schemas: {
+        server: {
+          ...historicalServerSchema(version),
+          migrations: serverSchema.migrations,
+        },
+      },
+    });
+  let old = await openOld(58);
+  const fresh = await openStore(settings('fresh'), {
+    schemas: { server: serverSchema },
+  });
+  const observations =
+    "SELECT name FROM sqlite_master WHERE name='presence_observations'";
+  const presence = {
+    user_id: '@old:test',
+    presence: 'online',
+    status_msg: 'retained',
+    last_active_ms: 123,
+    seq: 5,
+    remote_received_ms: 0,
+  };
+  try {
+    const at58 = await old.server();
+    assertEquals(
+      (await at58.query('PRAGMA table_info(presence)')).map((row) => row.name),
+      ['user_id', 'presence', 'status_msg', 'last_active_ms', 'seq'],
+    );
+    assertEquals(await at58.query(observations), []);
+    await at58.execute(
+      "INSERT INTO presence VALUES('@old:test','online','retained',123,5)",
+    );
+    await at58.execute(
+      "INSERT INTO notification_retired_rooms VALUES('!retired:test')",
+    );
+    await old.close();
+    old = await openOld(59);
+    const at59 = await old.server();
+    assertEquals(await at59.query('SELECT * FROM presence'), [presence]);
+    assertEquals(await at59.query(observations), []);
+    await old.close();
+    old = await openStore(settings('old'), {
+      schemas: { server: serverSchema },
+    });
+    const at60 = await old.server();
+    assertEquals(await at60.query('SELECT * FROM presence'), [presence]);
+    assertEquals(await at60.query('SELECT * FROM presence_observations'), []);
+    assertEquals(await at60.query('SELECT * FROM notification_retired_rooms'), [
+      { room: '!retired:test' },
+    ]);
+    assertEquals(
+      await at60.query("SELECT v FROM meta WHERE k='schema_version'"),
+      [{ v: '60' }],
+    );
+    const schema =
+      "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso%' ORDER BY type,name";
+    assertEquals(
+      await at60.query(schema),
+      await (await fresh.server()).query(schema),
     );
   } finally {
     await old.close();

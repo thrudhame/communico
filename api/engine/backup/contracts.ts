@@ -43,6 +43,7 @@ export const tableContracts = {
       'remote_batches',
       'membership_receipts',
       'local_join_observations',
+      'membership_receipt_wires',
     ],
     // Room identity/exact acceptance cuts: auditRoom; completed progress is also
     // checked against server publication by auditServer.
@@ -218,6 +219,8 @@ export const tableContracts = {
       'notification_history',
       // Terminal account lifecycle projection; original source facts survive.
       'notification_retired_users',
+      // Removed-room retirement keeps late authenticated facts unapplied.
+      'notification_retired_rooms',
       'push_targets',
       'push_rejections',
       'push_delivery',

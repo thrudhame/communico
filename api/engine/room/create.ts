@@ -28,6 +28,7 @@ import {
 } from '#engine/room/encryption-policy.ts';
 import { prepareSigner, type Signer } from '#engine/room/signer.ts';
 import type { Store } from '#engine/store/index.ts';
+import { createHash } from 'node:crypto';
 
 export type CreateRoomOptions = {
   creator: string;
@@ -98,12 +99,17 @@ export async function createRoom(
   opts: CreateRoomOptions,
   signer: Signer,
 ): Promise<CreateRoomResult> {
-  return await initializePreparedRoom(
-    store,
-    await prepareRoom(store, opts, signer),
-    signer,
-  );
+  for (;;) {
+    const prepared = await prepareRoom(store, opts, signer);
+    try {
+      return await initializePlan(store, prepared, signer, false);
+    } catch (error) {
+      if (!(error instanceof CreationCollision)) throw error;
+    }
+  }
 }
+
+class CreationCollision extends Error {}
 
 export async function prepareRoom(
   store: Store,
@@ -378,6 +384,24 @@ export async function initializePreparedRoom(
   prepared: PreparedRoom,
   signer: Signer,
 ): Promise<CreateRoomResult> {
+  return await initializePlan(store, prepared, signer, true);
+}
+
+async function initializePlan(
+  store: Store,
+  prepared: PreparedRoom,
+  signer: Signer,
+  replay: boolean,
+): Promise<CreateRoomResult> {
+  // Capture the immutable workflow input before any await. Signature enrichment
+  // does not change a plan; every requested initial effect does.
+  prepared = JSON.parse(JSON.stringify(prepared));
+  const { signatures: _signatures, unsigned: _unsigned, ...material } =
+    prepared.createPdu;
+  const identity = createHash('sha256').update(canonicalJson({
+    ...prepared,
+    createPdu: material,
+  })).digest('hex');
   const {
     roomId: finalRoomId,
     createPdu,
@@ -402,7 +426,9 @@ export async function initializePreparedRoom(
         if (!(error instanceof Deno.errors.NotFound)) throw error;
       }
       if (existing) {
+        if (!replay) throw new CreationCollision();
         return await existing.tx(async (tx) => {
+          await tx.creationReceipt.require(identity);
           const row = await tx.events.get(String(createPdu.event_id));
           const material = (pdu: Pdu) => {
             const { signatures: _signatures, unsigned: _unsigned, ...value } =
@@ -434,6 +460,7 @@ export async function initializePreparedRoom(
         });
       }
       return await initializeRoom(store, finalRoomId, async (tx) => {
+        await tx.creationReceipt.record(identity);
         const send = async (
           type: string,
           stateKey: string,

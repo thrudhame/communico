@@ -424,10 +424,16 @@ export class OwnerControls {
     );
     const left = rows[0][0], right = rows[1][0];
     if (
-      !left || !right || left.revision !== right.revision ||
+      !left || !right || left.revision !== right.revision
+    ) {
+      // The independent control stream commits server, then tenant. Auth and
+      // reverse exports wait for that installation without a terminal refusal.
+      throw new VerificationUnavailable('ownership control unavailable');
+    }
+    if (
       left.body_hash !== right.body_hash ||
       left.signed_json !== right.signed_json
-    ) throw new VerificationUnavailable('ownership control unavailable');
+    ) unavailable();
     const signed = await this.verified(
       JSON.parse(String(left.signed_json)),
       grant,

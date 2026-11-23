@@ -165,6 +165,7 @@ export async function selectLists(
         !(options.since !== undefined && seq > options.since)
       ) continue;
       const departure = await prejoinDeparture(inviteOf(row), {
+        store: app.store,
         server: app.server,
         signer: app.tenant.signer(),
       });

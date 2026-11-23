@@ -19,6 +19,11 @@ import { queueBadge } from '#engine/server/push-queue.ts';
 import { startPushSender } from '#engine/push/sender.ts';
 import { createHash } from 'node:crypto';
 import { registerJson } from '#engine/facade/registers.ts';
+import { writeRegister } from '#engine/facade/registers.ts';
+import {
+  prepareCapturedPush,
+  prepareInvitePush,
+} from '#engine/server/push-project.ts';
 
 const input = {
   app_id: 'app',
@@ -33,7 +38,7 @@ const input = {
 };
 const choiceKey = JSON.stringify(['pusher-choice', 'alice', 'app', 'key']);
 
-async function fixture() {
+async function fixture(enroll = true) {
   const dir = await Deno.makeTempDir({ prefix: 'pusher-choice-' });
   const open = (side: string) =>
     openStore({
@@ -51,15 +56,17 @@ async function fixture() {
     const [node, tenant, db] of [['home', ht, hd], ['edge', et, ed]] as const
   ) {
     await tenant.tx((tx) => tx.users.insert('alice', 'Alice'));
-    await db.tx((conn) =>
-      activateTenantAuthority(conn, {
-        node,
-        incarnation: node + '-store',
-        homeIncarnation: 'home-store',
-        edgeNode: 'edge',
-        edgeIncarnation: 'edge-store',
-      })
-    );
+    if (enroll) {
+      await db.tx((conn) =>
+        activateTenantAuthority(conn, {
+          node,
+          incarnation: node + '-store',
+          homeIncarnation: 'home-store',
+          edgeNode: 'edge',
+          edgeIncarnation: 'edge-store',
+        })
+      );
+    }
   }
   const token = await issueToken(ht, 'alice', 'HOME');
   const edgeToken = await issueToken(et, 'alice', 'EDGE');
@@ -87,6 +94,116 @@ async function fixture() {
     },
   };
 }
+
+Deno.test('pusher activation: existing home registrations retain identity and queued work without account capture', async () => {
+  const f = await fixture(false);
+  try {
+    await setPusher(f.ht, 'alice', f.token, input);
+    const native = await f.hd.query('SELECT * FROM pushers');
+    const changes = await f.hd.query('SELECT * FROM pusher_changes');
+    await projectTenant(f.home, 'test');
+    const server = await f.home.server();
+    await server.tx((tx) => queueBadge(tx, '@alice:test'));
+    const badges = await server.query('SELECT * FROM push_badges');
+    const activate = () =>
+      f.hd.tx((conn) =>
+        activateTenantAuthority(conn, {
+          node: 'home',
+          incarnation: 'home-store',
+          homeIncarnation: 'home-store',
+          edgeNode: 'edge',
+          edgeIncarnation: 'edge-store',
+        })
+      );
+    await activate();
+    const { append: _, ...publicPusher } = input;
+    assertEquals(await listPushers(f.ht, 'alice'), [publicPusher]);
+    assertEquals(
+      await f.ht.tx((tx) =>
+        tx.pushers.isCurrent(
+          'alice',
+          'app',
+          'key',
+          String(native[0].incarnation),
+        )
+      ),
+      true,
+    );
+    const puts = await f.ht.tx((tx) => tx.pushers.operations('alice'));
+    const choices = await f.ht.tx((tx) => tx.pushers.choices('alice'));
+    assertEquals(puts.length, 1);
+    assertEquals(choices.length, 1);
+    await activate();
+    assertEquals(await f.ht.tx((tx) => tx.pushers.operations('alice')), puts);
+    assertEquals(await f.ht.tx((tx) => tx.pushers.choices('alice')), choices);
+    assertEquals(await f.hd.query('SELECT * FROM pushers'), native);
+    assertEquals(await f.hd.query('SELECT * FROM pusher_changes'), changes);
+    assertEquals(await server.query('SELECT * FROM push_badges'), badges);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('pusher activation: recorded removals and incomplete choices are never backfilled from native rows', async (t) => {
+  for (const pending of [false, true]) {
+    await t.step(String(pending), async () => {
+      const f = await fixture(false);
+      try {
+        await setPusher(f.ht, 'alice', f.token, input);
+        const [native] = await f.hd.query('SELECT * FROM pushers');
+        const target = JSON.stringify([
+          'pusher',
+          'alice',
+          'app',
+          'key',
+          native.incarnation,
+        ]);
+        await f.hd.tx((conn) =>
+          writeRegister(
+            conn,
+            { source: 'home', incarnation: 'home-store' },
+            choiceKey,
+            'pusher-choice',
+            JSON.stringify(
+              pending
+                ? JSON.stringify([
+                  'home',
+                  'home-store',
+                  'register:' + target,
+                  1,
+                ])
+                : null,
+            ),
+          )
+        );
+        const before = await f.ht.tx((tx) => tx.pushers.choices('alice'));
+        await f.hd.tx((conn) =>
+          activateTenantAuthority(conn, {
+            node: 'home',
+            incarnation: 'home-store',
+            homeIncarnation: 'home-store',
+            edgeNode: 'edge',
+            edgeIncarnation: 'edge-store',
+          })
+        );
+        assertEquals(await f.ht.tx((tx) => tx.pushers.operations('alice')), []);
+        assertEquals(
+          await f.ht.tx((tx) => tx.pushers.choices('alice')),
+          before,
+        );
+        if (pending) {
+          await assertRejects(
+            () => listPushers(f.ht, 'alice'),
+            Error,
+            'pusher selection unavailable',
+          );
+        } else assertEquals(await listPushers(f.ht, 'alice'), []);
+      } finally {
+        await f.close();
+      }
+    });
+  }
+});
 
 Deno.test('pusher choice: registration chooses once, refresh preserves choice and removal never falls back', async () => {
   const f = await fixture();
@@ -157,6 +274,14 @@ Deno.test('pusher choice: concurrent registrations converge across public reads 
     );
     assertEquals(await f.et.tx((tx) => tx.pushers.incarnations('alice')), []);
     assertEquals(
+      await f.et.tx(async (tx) =>
+        (await tx.pushPolicy.capture(['alice'])).get('alice')
+          ?.pusherIncarnations
+      ),
+      [],
+      'publication policy must not route a losing local registration',
+    );
+    assertEquals(
       (await f.ed.query('SELECT * FROM pusher_changes WHERE payload IS NULL'))
         .length,
       1,
@@ -212,6 +337,43 @@ Deno.test('pusher choice: missing selected registration is unavailable, not empt
     const badges = await server.query('SELECT * FROM push_badges');
     await f.sync();
     await f.et.tx((tx) => tx.pushers.import(choice));
+    assertEquals(
+      (await f.et.tx((tx) => tx.pushPolicy.capture(['alice']))).get('alice')
+        ?.pusherIncarnations,
+      [String(native.incarnation)],
+      'unresolved routing must retain a candidate without admitting a send',
+    );
+    const event = {
+      event_id: '$pending-choice',
+      room_id: '!pending:test',
+      sender: '@bob:test',
+      type: 'm.room.member',
+      state_key: '@alice:test',
+      content: { membership: 'invite' },
+      prev_events: [],
+      auth_events: [],
+      depth: 1,
+      origin_server_ts: 1,
+      hashes: { sha256: '' },
+      signatures: {},
+    };
+    const captured = await prepareCapturedPush(f.edge, {
+      context: { event, joinedCount: 2, senderPower: 0, notificationPower: {} },
+      recipients: [{
+        tenant: 'test',
+        user: '@alice:test',
+        displayName: 'Alice',
+      }],
+    });
+    assertEquals(captured.decisions.length, 1);
+    assertEquals(captured.decisions[0].pusherIncarnations, [
+      String(native.incarnation),
+    ]);
+    const invited = await prepareInvitePush(f.edge, 'test', event);
+    assertEquals(invited.decisions.length, 1);
+    assertEquals(invited.decisions[0].pusherIncarnations, [
+      String(native.incarnation),
+    ]);
     await assertRejects(
       () => listPushers(f.et, 'alice'),
       Error,

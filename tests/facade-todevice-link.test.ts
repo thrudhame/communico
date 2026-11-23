@@ -197,6 +197,49 @@ function rehash(record: LinkRecord): LinkRecord {
   return { ...body, hash: recordHash(body) };
 }
 
+Deno.test('review capture: legacy projection debt cannot freeze an empty export before later to-device delivery', async () => {
+  const f = await fixture();
+  try {
+    const db = await f.edge.tenant('logical.test');
+    const legacy = await db.tx(recordTenantProjection);
+    await db.execute(
+      "INSERT INTO counters(name,value) VALUES('facade_projection_legacy',?)",
+      [legacy],
+    );
+    setTenantProjector(projectTenant);
+    assertEquals(await f.es.export('alice'), []);
+    assertEquals(
+      await pendingTenantProjection(db),
+      0,
+      'the independent old projection debt is discharged',
+    );
+    await send(f);
+    const records = await f.es.export('alice');
+    assert(
+      records.length > 0,
+      'an empty capture must remain eligible under the same export binding',
+    );
+    for (const record of records) {
+      await f.hj.receive('edge_a', [record]);
+      await f.hs.apply(f.hj, record, f.bundle.id);
+    }
+    const lan = await deviceIdentity(f.ht, 'alice', 'LAN');
+    const page = await f.ht.tx((tx) =>
+      tx.toDevice.deliverSliding(lan, 'legacy-capture', 100, config().e2ee)
+    );
+    assertEquals(page.events.length, 1);
+    assertEquals(page.events[0].content, { request_id: 'fresh-session' });
+    assertEquals(
+      await f.es.export('alice'),
+      [],
+      'nonempty capture retains its exact completed cut',
+    );
+  } finally {
+    setTenantProjector(undefined);
+    await f.close();
+  }
+});
+
 Deno.test('to-device link: idle exports do no retained-history signing or journal work', async () => {
   const f = await fixture();
   try {

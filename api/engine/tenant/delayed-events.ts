@@ -105,6 +105,14 @@ async function retain(
   const key = semanticKey(String(row.localpart), id);
   const before = await readRegister(conn, key);
   const phase = terminal ?? String(row.phase);
+  // Device cleanup owns the ephemeral retry lookup, not the immutable command
+  // identity. Once authored, every transition retains the original receipts.
+  const original = before.conflicts.find((op) => op.sequence === 1) ??
+    before.winner;
+  const receipts = original ? factOf(original).receipts : await conn.query(
+    'SELECT localpart,device_id,generation,endpoint,txn_id FROM delayed_event_receipts WHERE delay_id=? ORDER BY localpart,device_id,generation,endpoint,txn_id',
+    [id],
+  );
   const payload = registerJson(JSON.stringify({
     event: { ...eventOf(row), phase },
     eventId: row.event_id,
@@ -113,10 +121,7 @@ async function retain(
     // Completion bookkeeping alone does not distinguish accepted/soft-failed/
     // rejected room outcomes. Only the actual ingest result may supply this.
     standing,
-    receipts: await conn.query(
-      'SELECT localpart,device_id,generation,endpoint,txn_id FROM delayed_event_receipts WHERE delay_id=? ORDER BY localpart,device_id,generation,endpoint,txn_id',
-      [id],
-    ),
+    receipts,
   }));
   if (before.winner?.payload === payload) return;
   if (before.winner) {
@@ -141,7 +146,7 @@ export async function captureOperations(conn: Conn, localpart: string) {
   }
   for (
     const row of await conn.query(
-      'SELECT id FROM delayed_events WHERE localpart=? ORDER BY id',
+      'SELECT id,phase FROM delayed_events WHERE localpart=? ORDER BY id',
       [localpart],
     )
   ) {
@@ -149,6 +154,9 @@ export async function captureOperations(conn: Conn, localpart: string) {
     if ((await registerOperations(conn, semanticKey(localpart, id))).length) {
       continue;
     }
+    // Rollback evidence cannot establish a missing original source fact. Keep
+    // it quarantined locally without blocking the rest of the account inventory.
+    if (row.phase === 'quarantined') continue;
     // Only legacy home rows may lack their atomic source fact. Never recreate
     // another incarnation's authorship from a materialized executable row.
     if (id.startsWith('d.')) throw new Error('delayed source fact unavailable');
@@ -198,12 +206,14 @@ function factOf(
     ) ||
     !(e.stateEvent === null || typeof e.stateEvent === 'string') ||
     !['pending', 'sending', 'cancelled', 'completed'].includes(e.phase) ||
-    !(body.eventId === null || typeof body.eventId === 'string') ||
+    !(body.eventId === null ||
+      (typeof body.eventId === 'string' && body.eventId.length > 0)) ||
     !(body.pdu === null ||
       (typeof body.pdu === 'object' && !Array.isArray(body.pdu) &&
         body.pdu.event_id === body.eventId && body.pdu.room_id === e.roomId)) ||
     typeof body.completed !== 'boolean' ||
     (body.completed && (body.eventId === null || body.pdu !== null)) ||
+    (!body.completed && ((body.eventId === null) !== (body.pdu === null))) ||
     (e.phase === 'completed' && !body.completed) ||
     !(body.standing === null ||
       ['accepted', 'soft_failed', 'rejected'].includes(body.standing)) ||
@@ -347,12 +357,14 @@ async function localRows(conn: Conn, rows: Row[]): Promise<Row[]> {
   );
 }
 
-async function ownerSelection(conn: Conn) {
+async function runnableSelection(conn: Conn) {
   const authority = await tenantAuthority(conn);
-  if (!authority) return { sql: '1', params: [] as (string | number)[] };
+  const active = "phase IN ('pending','sending')";
+  if (!authority) return { sql: active, params: [] as (string | number)[] };
   const prefix = ownerPrefix(authority.node, authority.incarnation);
   return {
-    sql: "(substr(id,1,?)=? OR (?='home' AND substr(id,1,2)!='d.'))",
+    sql: active +
+      " AND (substr(id,1,?)=? OR (?='home' AND substr(id,1,2)!='d.'))",
     params: [prefix.length, prefix, authority.node],
   };
 }
@@ -463,9 +475,11 @@ export async function add(
   if (!account.length || account[0].deactivated !== 0) {
     throw new MatrixError(403, 'M_FORBIDDEN', 'account inactive');
   }
+  const runnable = await runnableSelection(conn);
   const count = await conn.query(
-    'SELECT COUNT(*) AS n FROM delayed_events WHERE localpart=?',
-    [event.localpart],
+    'SELECT COUNT(*) AS n FROM delayed_events WHERE localpart=? AND ' +
+      runnable.sql,
+    [event.localpart, ...runnable.params],
   );
   if (Number(count[0].n) >= limit) {
     throw new MatrixError(429, 'M_LIMIT_EXCEEDED', 'too many delayed events');
@@ -527,7 +541,7 @@ export async function action(
   if (action === 'cancel') return await remove(conn, id);
   await retain(conn, id);
   await conn.execute(
-    "UPDATE delayed_events SET since_ms=?,due_ms=? WHERE id=? AND phase='pending'",
+    "UPDATE delayed_events SET since_ms=?,due_ms=?,retry_ms=0 WHERE id=? AND phase='pending'",
     [
       action === 'restart' ? now : event.since,
       action === 'restart' ? now + event.delay : now,
@@ -537,9 +551,9 @@ export async function action(
   await retain(conn, id);
 }
 export async function next(conn: Conn): Promise<number | null> {
-  const owner = await ownerSelection(conn);
+  const owner = await runnableSelection(conn);
   const [row] = await conn.query(
-    "SELECT MIN(due_ms) AS n FROM delayed_events WHERE phase IN ('pending','sending') AND " +
+    'SELECT MIN(MAX(due_ms,retry_ms)) AS n FROM delayed_events WHERE ' +
       owner.sql,
     owner.params,
   );
@@ -549,26 +563,29 @@ export async function retry(
   conn: Conn,
   ids: readonly string[],
   due: number,
+  observed: readonly Pick<DelayedEvent, 'id' | 'due' | 'since'>[] = [],
 ): Promise<void> {
-  if (ids.length === 0) return;
   for (const id of ids) {
-    await requireOwner(conn, id);
-    await retain(conn, id);
+    const event = await get(conn, id);
+    if (event === null) continue;
+    requireUnfenced(event.phase);
+    const selected = observed.find((event) => event.id === id);
+    // Room admission precedes claim. Rebase that still-pending selection only
+    // if no concurrent restart/send changed its observed deadline or origin.
+    await conn.execute(
+      "UPDATE delayed_events SET retry_ms=? WHERE id=? AND (phase='sending'" +
+        (selected ? " OR (phase='pending' AND due_ms=? AND since_ms=?)" : '') +
+        ')',
+      [due, id, ...(selected ? [selected.due, selected.since] : [])],
+    );
   }
-  await conn.execute(
-    `UPDATE delayed_events SET due_ms=? WHERE phase='sending' AND id IN (${
-      ids.map(() => '?').join(',')
-    })`,
-    [due, ...ids],
-  );
-  for (const id of ids) await retain(conn, id);
 }
 export async function due(conn: Conn, now: number): Promise<DelayedEvent[]> {
-  const owner = await ownerSelection(conn);
+  const owner = await runnableSelection(conn);
   return (await conn.query(
-    "SELECT * FROM delayed_events WHERE phase IN ('pending','sending') AND due_ms<=? AND " +
+    'SELECT * FROM delayed_events WHERE MAX(due_ms,retry_ms)<=? AND ' +
       owner.sql +
-      ' ORDER BY due_ms,id LIMIT 32',
+      ' ORDER BY MAX(due_ms,retry_ms),id LIMIT 32',
     [now, ...owner.params],
   )).map(eventOf);
 }
@@ -578,10 +595,14 @@ export async function claim(
   now: number,
 ): Promise<DelayedEvent | null> {
   const event = await get(conn, id);
+  const [local] = await conn.query(
+    'SELECT retry_ms FROM delayed_events WHERE id=?',
+    [id],
+  );
   // Selection is only a hint. A concurrent heartbeat may have restarted the
   // deadline before this transaction acquired the command.
   if (
-    event === null || event.due > now ||
+    event === null || event.due > now || Number(local.retry_ms) > now ||
     !['pending', 'sending'].includes(event.phase)
   ) return null;
   await retain(conn, id);
