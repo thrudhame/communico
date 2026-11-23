@@ -28,7 +28,11 @@ import type { Tenant } from '#engine/tenant/index.ts';
 import { appendRecord, type Journal, receivedFence } from './journal.ts';
 import type { Pairings } from './pairing.ts';
 import { membershipExportPrefix } from './membership.ts';
-import { ReplicaCutPending, type ReplicaReadiness } from './readiness.ts';
+import {
+  type ObserveCut,
+  ReplicaCutPending,
+  type ReplicaReadiness,
+} from './readiness.ts';
 import { signingFence } from './signing-authority.ts';
 import { type CommitCheck, commitCheck } from '#engine/store/commit.ts';
 import {
@@ -292,9 +296,16 @@ function pendingAccount(
   pairing: string,
   stream: string,
 ): ReplicaCutPending | undefined {
-  if (pendingSuffix(row)) return new ReplicaCutPending(pairing, stream, false);
+  if (pendingSuffix(row)) {
+    return new ReplicaCutPending(pairing, stream, false, Number(row!.applied));
+  }
   if (row && Number(row.owner_received) > Number(row.owner_applied ?? 0)) {
-    return new ReplicaCutPending(pairing, 'owner-control', false);
+    return new ReplicaCutPending(
+      pairing,
+      'owner-control',
+      false,
+      Number(row.owner_applied ?? 0),
+    );
   }
   if (!row || Number(row.applied) === 0) {
     return new ReplicaCutPending(pairing, stream, true);
@@ -319,7 +330,12 @@ export class DirectoryReplicas {
       [pairing],
     );
     if (access === 'current' && pendingSuffix(row)) {
-      throw new ReplicaCutPending(pairing, 'directory', false);
+      throw new ReplicaCutPending(
+        pairing,
+        'directory',
+        false,
+        Number(row!.applied),
+      );
     }
     if (!row || Number(row.applied) === 0) {
       throw new ReplicaCutPending(pairing, 'directory', !pendingSuffix(row));
@@ -371,10 +387,29 @@ export class DirectoryReplicas {
     scope: string,
     signal?: AbortSignal,
   ): Promise<'ready' | 'absent'> {
-    return await this.admit(() => this.scopeStateFor(scope, 'current'), signal);
+    return await this.admit(
+      (observe) => this.scopeStateFor(scope, 'current', observe),
+      signal,
+    );
   }
 
-  private admit<T>(read: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+  /** A pure read can be repeated when the scope changes before its answer. */
+  async withCurrentScopes<T>(
+    read: (requireScope: (scope: string) => Promise<void>) => Promise<T>,
+    signal: AbortSignal,
+  ): Promise<T> {
+    return await this.admit((observe) =>
+      read(async (scope) => {
+        if (await this.scopeStateFor(scope, 'current', observe) === 'absent') {
+          throw new MatrixError(404, 'M_NOT_FOUND', 'scope not found');
+        }
+      }), signal);
+  }
+
+  private admit<T>(
+    read: (observe?: ObserveCut) => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> {
     return signal && this.readiness
       ? this.readiness.wait(read, signal)
       : read();
@@ -383,9 +418,11 @@ export class DirectoryReplicas {
   private async scopeStateFor(
     scope: string,
     access: ScopeAccess,
+    observe?: ObserveCut,
   ): Promise<'ready' | 'absent'> {
     const grant = await this.pairings.active();
     const pairing = grant.body.transcript.body.context.id;
+    observe?.(pairing, 'directory');
     const snapshot = await this.snapshotAt(pairing, access);
     const view = snapshot.view;
     const unavailable = () => {
@@ -397,6 +434,7 @@ export class DirectoryReplicas {
       // An ordinary inventory read does not depend on every received room.
       // Its selected audience prepares each actual room dependency separately.
       if (access === 'applied') return 'ready';
+      observe?.(pairing, 'rooms');
       const incoming = await this.db.query(
         "SELECT DISTINCT stream FROM facade_streams WHERE peer='home' AND direction='in' AND source='home' AND incarnation=? AND (stream LIKE 'room:%' OR stream LIKE 'membership:%')",
         [pairing],
@@ -415,7 +453,24 @@ export class DirectoryReplicas {
           ),
           ...local.map((row) => 'room:' + String(row.room)),
         ])
-      ) await this.requireScope(room);
+      ) {
+        if (
+          await this.db.tx((conn) =>
+            this.scopeStateAt(
+              conn,
+              room,
+              pairing,
+              grant.body.revision,
+              view.cuts[room],
+              access,
+              undefined,
+              observe,
+            )
+          ) === 'absent'
+        ) {
+          throw new MatrixError(404, 'M_NOT_FOUND', 'scope not found');
+        }
+      }
       return 'ready';
     }
     return await this.db.tx((conn) =>
@@ -426,6 +481,8 @@ export class DirectoryReplicas {
         grant.body.revision,
         view.cuts[scope],
         access,
+        undefined,
+        observe,
       )
     );
   }
@@ -440,7 +497,8 @@ export class DirectoryReplicas {
     signal?: AbortSignal,
   ): Promise<ReplicaRoomAdmission> {
     return await this.admit(
-      () => this.prepareScope(roomId, allowAbsent, 'current', localUser),
+      (observe) =>
+        this.prepareScope(roomId, allowAbsent, 'current', localUser, observe),
       signal,
     );
   }
@@ -457,10 +515,12 @@ export class DirectoryReplicas {
     allowAbsent: boolean,
     access: ScopeAccess,
     localUser?: string,
+    observe?: ObserveCut,
   ): Promise<ReplicaRoomAdmission> {
     const received = receivedFence(this.db), authority = signingFence(this.db);
     const grant = await this.pairings.active();
     const pairing = grant.body.transcript.body.context.id;
+    observe?.(pairing, 'directory');
     const snapshot = await this.snapshotAt(pairing, access);
     const view = snapshot.view;
     const unavailable = (): never => {
@@ -478,6 +538,7 @@ export class DirectoryReplicas {
         ]
       ) {
         localAuth.add(stream);
+        observe?.(pairing, stream);
       }
     }
     const checkCurrent = commitCheck(() => {
@@ -491,7 +552,7 @@ export class DirectoryReplicas {
         ) unavailable();
       }
     }, authority);
-    const check = async (conn: Conn) => {
+    const verify = async (conn: Conn, observe?: ObserveCut) => {
       const [binding] = await conn.query(
         "SELECT state,grant_json FROM facade_pairings WHERE id=? AND side='facade'",
         [pairing],
@@ -536,14 +597,15 @@ export class DirectoryReplicas {
         view.cuts[scope],
         access,
         localAuth,
+        observe,
       );
       if (state === 'absent' && !allowAbsent) {
         throw new MatrixError(404, 'M_NOT_FOUND', 'scope not found');
       }
       conn.admit(checkCurrent);
     };
-    await this.db.tx(check);
-    return { check, checkCurrent };
+    await this.db.tx((conn) => verify(conn, observe));
+    return { check: (conn) => verify(conn), checkCurrent };
   }
 
   /** Selection comes from the authenticated account stream, initiation from
@@ -566,7 +628,9 @@ export class DirectoryReplicas {
     required?: number,
     access: ScopeAccess = 'current',
     localAuth?: Set<string>,
+    observe?: ObserveCut,
   ): Promise<'ready' | 'absent'> {
+    observe?.(pairing, scope);
     const [held] = await conn.query(
       "SELECT s.received,s.received_hash,s.applied,s.applied_hash,v.source_cut,v.ready,v.pending_hash FROM facade_streams s LEFT JOIN facade_scopes v ON v.incarnation=s.incarnation AND v.scope=s.stream WHERE s.peer='home' AND s.direction='in' AND s.source='home' AND s.incarnation=? AND s.stream=?",
       [pairing, scope],
@@ -586,7 +650,12 @@ export class DirectoryReplicas {
         if (
           pendingSuffix(held) || Number(held?.applied ?? 0) < (required ?? 0)
         ) {
-          throw new ReplicaCutPending(pairing, scope, !pendingSuffix(held));
+          throw new ReplicaCutPending(
+            pairing,
+            scope,
+            !pendingSuffix(held),
+            Number(held?.applied ?? 0),
+          );
         }
         throw new MatrixError(503, 'M_UNAVAILABLE', 'replica unavailable');
       }
@@ -610,12 +679,19 @@ export class DirectoryReplicas {
       if (
         pendingSuffix(held) || Number(held?.source_cut ?? 0) < (required ?? 0)
       ) {
-        throw new ReplicaCutPending(pairing, scope, !pendingSuffix(held));
+        throw new ReplicaCutPending(
+          pairing,
+          scope,
+          !pendingSuffix(held),
+          Number(held?.applied ?? 0),
+        );
       }
       throw new MatrixError(503, 'M_UNAVAILABLE', 'replica unavailable');
     }
     if (scope.startsWith('room:')) {
       const local = await this.localScopesAt(conn, pairing, scope.slice(5));
+      if (local.length) observe?.(pairing, 'owner-control');
+      for (const row of local) observe?.(pairing, String(row.stream));
       for (const row of local) {
         if (!selectedAccountScope(row, pairing, grantRevision, this.self)) {
           continue;

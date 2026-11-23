@@ -253,13 +253,15 @@ Pairings.prototype.retire = async function (...args) {
 
 const waitForReadiness = ReplicaReadiness.prototype.wait;
 ReplicaReadiness.prototype.wait = async function <T>(
-  read: () => Promise<T>,
+  read: (observe: (pairing: string, stream: string) => void) => Promise<T>,
   signal: AbortSignal,
 ): Promise<T> {
   let stream: string | undefined;
-  const observedRead = async () => {
+  const observedRead = async (
+    observe: (pairing: string, stream: string) => void,
+  ) => {
     try {
-      return await read();
+      return await read(observe);
     } catch (error) {
       if (error instanceof ReplicaCutPending && stream === undefined) {
         stream = error.stream;

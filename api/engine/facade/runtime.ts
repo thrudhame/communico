@@ -99,7 +99,14 @@ export async function openFacadeRuntime(
     beforeStartup: (store) => bindRole(store, identity),
   });
   const server = await store.server();
-  const journal = new Journal(server, LINK_SUPPORTED);
+  const journal = new Journal(
+    server,
+    LINK_SUPPORTED,
+    (peer, stream) =>
+      peer === 'home' && stream.source === 'home'
+        ? readiness.receiving(stream.incarnation, stream.stream)
+        : undefined,
+  );
   const notices = new NoticeHub();
   let node: NodeIdentity | undefined;
   let tenant: Tenant | undefined;
@@ -468,7 +475,13 @@ export async function openFacadeRuntime(
         readiness.applied(stream.incarnation, stream.stream);
         notices.changed();
       },
-      failed: (error, stream, after) =>
+      failed: (error, stream, after) => {
+        if (
+          stream && after !== undefined && error instanceof LinkError &&
+          ['LINK_BAD_RECORD', 'LINK_CAPABILITY_MISMATCH'].includes(error.code)
+        ) {
+          readiness.refused(stream.incarnation, stream.stream, after);
+        }
         inboxFailure(
           {
             server: identity.server,
@@ -481,7 +494,8 @@ export async function openFacadeRuntime(
           error,
           stream,
           after,
-        ),
+        );
+      },
     });
   }
   const releaseServices = async () => {
@@ -730,6 +744,18 @@ export async function openFacadeRuntime(
         await pairings(),
         identity.server,
       ).prepareReadRoomScope(roomId, allowAbsent);
+    },
+    async withCurrentScopes<T>(
+      read: (requireScope: (scope: string) => Promise<void>) => Promise<T>,
+      signal: AbortSignal,
+    ): Promise<T> {
+      return await new DirectoryReplicas(
+        server,
+        await pairings(),
+        identity.server,
+        settings.phase as 'f1' | 'f2',
+        readiness,
+      ).withCurrentScopes(read, signal);
     },
     async requireScope(
       scope: string,

@@ -43,6 +43,7 @@ export async function startFacade(
           requireReadScope: runtime.requireReadScope,
           prepareReadRoomScope: runtime.prepareReadRoomScope,
           requireScope: runtime.requireScope,
+          withCurrentScopes: runtime.withCurrentScopes,
           prepareRoomScope: runtime.prepareRoomScope,
           keyDocument: runtime.keyDocument,
           publicRooms: runtime.publicRooms,
