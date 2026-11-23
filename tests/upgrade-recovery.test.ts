@@ -7,6 +7,7 @@ import { stateAtSeq } from '#engine/client/room.ts';
 import { lookupAlias } from '#engine/server/aliases.ts';
 import { join, leave } from '#engine/client/membership.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { withRoomLock } from '#engine/room/lock.ts';
 
 for (const kind of ['tombstone', 'power'] as const) {
   Deno.test(`upgrade conditional ${kind} write preserves a competing state update`, async () => {
@@ -36,7 +37,7 @@ for (const kind of ['tombstone', 'power'] as const) {
       });
       const room = app.store.room.bind(app.store);
       const execute = app.server.execute.bind(app.server);
-      let armed = false, opens = 0, injected = false, published = false;
+      let armed = false, opens = 0, injected = false;
       app.server.execute = async (sql, values) => {
         const result = await execute(sql, values);
         if (
@@ -53,9 +54,6 @@ for (const kind of ['tombstone', 'power'] as const) {
           armed = false;
           injected = true;
           if (kind === 'tombstone') {
-            published =
-              (await stateAtSeq(old.roomId, null, [['m.room.tombstone', '']]))
-                .length > 0;
             await writeStateKey(
               old.roomId,
               user.user_id,
@@ -109,12 +107,10 @@ for (const kind of ['tombstone', 'power'] as const) {
           'SELECT phase FROM room_upgrades WHERE old_room_id=?',
           [old.roomId],
         );
-        if (!published) {
-          assertEquals(failure instanceof MatrixError && failure.status, 503);
-          assertEquals(retained.phase, 2);
-        } else {
-          assertEquals(failure, undefined);
-        }
+        // A competing tombstone before OR after our conditional write must
+        // fence the directory phase. Publication alone cannot authorize aliases.
+        assertEquals(failure instanceof MatrixError && failure.status, 503);
+        assertEquals(retained.phase, 2);
       } else {
         assertEquals(failure, undefined);
         const locked = state.find((r) =>
@@ -449,6 +445,109 @@ async function withUpgradeApp(
     await Deno.remove(dir, { recursive: true });
   }
 }
+
+Deno.test('upgrade retains admission while excluding competing room mutations', () =>
+  withUpgradeApp(async (app) => {
+    const user = await registerUser(app.tenant, {
+      localpart: 'upgrader',
+      password: 'pw',
+    });
+    const old = await createRoom({ creator: user.user_id });
+    const execute = app.server.execute.bind(app.server);
+    let entered = false, checked = false;
+    let competing: Promise<void> | undefined;
+    app.server.execute = async (sql, values) => {
+      if (!sql.startsWith('INSERT INTO room_upgrades(')) {
+        return await execute(sql, values);
+      }
+      competing = withRoomLock(old.roomId, () => {
+        entered = true;
+        return Promise.resolve();
+      });
+      const result = await execute(sql, values);
+      checked = true;
+      assertEquals(
+        entered,
+        false,
+        'room mutation entered before admission retention',
+      );
+      return result;
+    };
+    try {
+      await upgradeRoom(old.roomId, user.user_id, '12');
+    } finally {
+      app.server.execute = execute;
+      await competing;
+    }
+    assertEquals(checked, true);
+    assertEquals(entered, true);
+  }));
+
+for (const mismatch of ['version', 'creators'] as const) {
+  Deno.test(`upgrade rejects legacy replacement with mismatched ${mismatch} before retention`, () =>
+    withUpgradeApp(async (app) => {
+      const user = await registerUser(app.tenant, {
+        localpart: 'upgrader',
+        password: 'pw',
+      });
+      const old = await createRoom({ creator: user.user_id });
+      const replacement = await createRoom({
+        creator: user.user_id,
+        version: '12',
+      });
+      await writeStateKey(old.roomId, user.user_id, 'm.room.tombstone', '', {
+        replacement_room: replacement.roomId,
+      });
+      const error = await assertRejects(() =>
+        upgradeRoom(
+          old.roomId,
+          user.user_id,
+          mismatch === 'version' ? '11' : '12',
+          mismatch === 'creators' ? ['@other:test'] : undefined,
+        ), MatrixError);
+      assertEquals([error.status, error.errcode], [400, 'M_BAD_STATE']);
+      assertEquals(await app.server.query('SELECT * FROM room_upgrades'), []);
+      assertEquals((await app.store.rooms()).length, 2);
+    }));
+}
+
+Deno.test('upgrade conflicting tombstone never moves aliases to a refused replacement', () =>
+  withUpgradeApp(async (app) => {
+    const user = await registerUser(app.tenant, {
+      localpart: 'upgrader',
+      password: 'pw',
+    });
+    const old = await createRoom({
+      creator: user.user_id,
+      alias: 'upgrade-race',
+    });
+    const other = await createRoom({ creator: user.user_id });
+    const execute = app.server.execute.bind(app.server);
+    let injected = false;
+    app.server.execute = async (sql, values) => {
+      const result = await execute(sql, values);
+      if (
+        sql.startsWith('UPDATE room_upgrades SET phase=') && values?.[0] === 2
+      ) {
+        injected = true;
+        await writeStateKey(old.roomId, user.user_id, 'm.room.tombstone', '', {
+          replacement_room: other.roomId,
+        });
+      }
+      return result;
+    };
+    try {
+      const error = await assertRejects(
+        () => upgradeRoom(old.roomId, user.user_id, '12'),
+        MatrixError,
+      );
+      assertEquals(error.status, 503);
+    } finally {
+      app.server.execute = execute;
+    }
+    assertEquals(injected, true);
+    assertEquals(await lookupAlias(app.server, old.roomAlias!), old.roomId);
+  }));
 
 Deno.test('upgrade lockdown retry derives from current power, never a stale plan', () =>
   withUpgradeApp(async (app) => {
