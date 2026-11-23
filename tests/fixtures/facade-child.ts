@@ -8,6 +8,10 @@ import { DirectoryReplicas } from '#engine/facade/directory.ts';
 import { AccountSnapshots } from '#engine/facade/accounts.ts';
 import { HomeEgress } from '#engine/facade/home-egress.ts';
 import { RoomReplicas } from '#engine/facade/replication.ts';
+import {
+  ReplicaCutPending,
+  ReplicaReadiness,
+} from '#engine/facade/readiness.ts';
 import { InboxWorker } from '#engine/facade/worker.ts';
 import { noticeHeads } from '#engine/facade/notices.ts';
 import { observeFixtureListeners } from '#tests/helpers/fixture-listeners.ts';
@@ -244,6 +248,32 @@ Pairings.prototype.retire = async function (...args) {
   } catch (error) {
     failure('pairing retire', error);
     throw error;
+  }
+};
+
+const waitForReadiness = ReplicaReadiness.prototype.wait;
+ReplicaReadiness.prototype.wait = async function <T>(
+  read: () => Promise<T>,
+  signal: AbortSignal,
+): Promise<T> {
+  let stream: string | undefined;
+  const observedRead = async () => {
+    try {
+      return await read();
+    } catch (error) {
+      if (error instanceof ReplicaCutPending && stream === undefined) {
+        stream = error.stream;
+        emit({ kind: 'readiness', stream, state: 'pending' });
+      }
+      throw error;
+    }
+  };
+  try {
+    return await waitForReadiness.call(this, observedRead, signal) as T;
+  } finally {
+    if (stream !== undefined && signal.aborted) {
+      emit({ kind: 'readiness', stream, state: 'cancelled' });
+    }
   }
 };
 

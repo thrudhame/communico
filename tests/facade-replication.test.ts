@@ -35,6 +35,8 @@ import { exportAccountAuth } from '#engine/facade/accounts.ts';
 import { MembershipOperations } from '#engine/facade/membership.ts';
 import { exportOwnerControl, OwnerControls } from '#engine/facade/ownership.ts';
 import { startInboxWorker } from '#engine/facade/worker.ts';
+import { JournalClient } from '#engine/facade/client.ts';
+import { LinkClient } from '#engine/facade/transport.ts';
 import * as serving from '#engine/federation/serve.ts';
 import { pathfinder } from '@pathfinder/pathfinder';
 import {
@@ -151,6 +153,7 @@ async function fixture(
   seedServer = serverSchema,
   version = '11',
   facadePin = 'b'.repeat(64),
+  homePin = 'a'.repeat(64),
 ) {
   const dir = await Deno.makeTempDir({ prefix: 'facade-replication-' });
   const open = (name: string, schema = serverSchema) =>
@@ -175,7 +178,7 @@ async function fixture(
     await home.server(),
     tenant.signer(),
     tenant.publicB64,
-    'a'.repeat(64),
+    homePin,
   );
   const edgePairings = async () =>
     new Pairings(
@@ -196,11 +199,11 @@ async function fixture(
   await fp.accept(bundle);
   const grant = await hp.grant(
     bundle.id,
-    await fp.challenge(bundle.id, bundle.secret, 'a'.repeat(64)),
+    await fp.challenge(bundle.id, bundle.secret, homePin),
   );
   await hp.confirm(
     bundle.id,
-    await fp.complete(bundle.id, grant, 'a'.repeat(64)),
+    await fp.complete(bundle.id, grant, homePin),
   );
   const signing = await makeRemoteServer(tenant.serverName);
   const source = await makeFakeRoom({
@@ -1663,10 +1666,12 @@ Deno.test('PAIR503: signed membership validation precedes pending facade cuts', 
     const waiting = await child.holdPublication(directoryHold);
     await bounded(waiting.held(), 5000);
     const base = `http://127.0.0.1:${await child.port('client')}`;
-    const call = fedCaller((request) => {
-      const url = new URL(request.url);
-      return fetch(new Request(base + url.pathname, request));
-    }, guest);
+    const caller = (signal?: AbortSignal) =>
+      fedCaller((request) => {
+        const url = new URL(request.url);
+        return fetch(new Request(base + url.pathname, request), { signal });
+      }, guest);
+    const observations = child.observations;
     const event = async (membership: string) => {
       const sender = '@guest:guest.test';
       return await signTemplate({
@@ -1680,29 +1685,65 @@ Deno.test('PAIR503: signed membership validation precedes pending facade cuts', 
         auth_events: [],
       }, guest);
     };
-    const check = async (endpoint: string, membership: string) => {
+    const check = async (
+      endpoint: string,
+      membership: string,
+      stream: string,
+    ) => {
       const valid = await event(membership);
       const uri = '/_matrix/federation/' + endpoint + '/' +
         encodeURIComponent(f.source.roomId) + '/' +
         encodeURIComponent(String(valid.event_id));
-      const pending = await call('PUT', uri, valid);
-      assertEquals([pending.status, pending.body.errcode], [
-        503,
-        'M_UNAVAILABLE',
-      ]);
       const malformed = { ...valid, type: 'm.room.message' };
       const unsigned = await fetch(base + uri, {
         method: 'PUT',
         body: JSON.stringify(malformed),
       });
       await unsigned.body?.cancel();
-      const bad = await call('PUT', uri, malformed);
+      const bad = await caller()('PUT', uri, malformed);
       assertEquals([bad.status, bad.body.errcode], [400, 'M_BAD_JSON']);
       assertEquals(unsigned.status, 401);
+
+      const abort = new AbortController();
+      const mark = observations.mark();
+      const pending = caller(abort.signal)('PUT', uri, valid);
+      try {
+        await bounded(
+          Promise.race([
+            observations.wait(
+              (o) =>
+                o.kind === 'readiness' && o.stream === stream &&
+                o.state === 'pending',
+              mark,
+            ),
+            pending.then(({ status }) => {
+              throw new Error(`membership answered before apply: ${status}`);
+            }),
+          ]),
+          5000,
+        );
+        abort.abort();
+        await bounded(
+          assertRejects(() => pending, DOMException, 'aborted'),
+          5000,
+        );
+        // The server's wait must unwind without releasing the publication.
+        await bounded(
+          observations.wait(
+            (o) =>
+              o.kind === 'readiness' && o.stream === stream &&
+              o.state === 'cancelled',
+            mark,
+          ),
+          5000,
+        );
+      } finally {
+        abort.abort();
+      }
     };
     await t.step(
       'send_join with pending directory',
-      () => check('v2/send_join', 'join'),
+      () => check('v2/send_join', 'join', next.stream),
     );
     await waiting.release();
     await bounded(
@@ -1715,7 +1756,7 @@ Deno.test('PAIR503: signed membership validation precedes pending facade cuts', 
     await bounded((await child.holdPublication(roomHold)).held(), 5000);
     await t.step(
       'send_knock with pending room',
-      () => check('v1/send_knock', 'knock'),
+      () => check('v1/send_knock', 'knock', room.stream),
     );
   } finally {
     await child?.dispose();
@@ -1902,6 +1943,117 @@ for (const dependency of ['directory', 'account'] as const) {
     }
   });
 }
+
+Deno.test('PAIR503: missing room delivery waits until poll reconciliation expires', async () => {
+  setConfigForTests({
+    server: { name: 'logical.test' },
+    federation: { enabled: true, mode: 'open' },
+    facade: { phase: 'f2' },
+  });
+  const tls = await facadeTls();
+  const f = await fixture(serverSchema, '11', tls.facadePin, tls.homePin);
+  let child: Awaited<ReturnType<typeof facadeProcess>> | undefined;
+  try {
+    const journal = await f.journal(), directory = await f.directoryOwner();
+    const first = await f.exports(), initial = await f.directoryExport();
+    assert(first?.hash && initial);
+    await journal.receive('home', [first]);
+    await journal.receive('home', [initial]);
+    assert(await (await f.replicas()).apply(journal, first));
+    assert(await directory.apply(journal, initial));
+
+    const message = await f.source.addEvent({
+      type: 'm.room.message',
+      content: { body: 'advertised but not yet delivered' },
+    });
+    await f.ingest([message]);
+    const inventory = await f.directoryExport(), suffix = await f.exports();
+    assert(inventory && suffix?.hash);
+    await journal.receive('home', [inventory]);
+    assert(await directory.apply(journal, inventory));
+    const guest = await makeRemoteServer('guest.test');
+    await seedServer(await f.edgeServer(), guest);
+    await f.edgeStore().close();
+
+    const path = tls.dir + '/expiry.toml';
+    const pollSeconds = 3;
+    await Deno.writeTextFile(
+      path,
+      `[server]\nname="logical.test"\nrole="facade"\nport=0\n[store]\ndir="${f.dir}/edge"\n[media]\nroot="${f.dir}/media"\n[admin]\nsocket="${tls.dir}/expiry.sock"\n[federation]\nenabled=true\nport=0\ncert="${tls.dir}/facade.crt"\nkey="${tls.dir}/facade.key"\n[facade]\nphase="f2"\nnodeid="edge_a"\nurl="https://facade.test"\nlinkport=0\nlinkcert="${tls.dir}/facade.crt"\nlinkkey="${tls.dir}/facade.key"\nlinkcacerts=["${tls.dir}/ca.crt"]\nnotify="poll"\npollseconds=${pollSeconds}\n`,
+    );
+    child = await facadeProcess(path, 'facade: link/local admin ready');
+    const base = `http://127.0.0.1:${await child.port('client')}`;
+    const uri = '/_matrix/federation/v1/make_knock/' +
+      encodeURIComponent(f.source.roomId) + '/%40guest%3Aguest.test?ver=11';
+    const call = fedCaller((request) => {
+      const url = new URL(request.url);
+      return fetch(new Request(base + url.pathname + url.search, request));
+    }, guest);
+    const peer = await f.homePairings.connection(f.bundle.id);
+    assert(peer.grant);
+    const client = new JournalClient(
+      new LinkClient(tls.home, {
+        url: `https://127.0.0.1:${await child.port('link')}`,
+        pin: tls.facadePin,
+      }),
+      {
+        server: peer.context.server,
+        node: peer.context.node,
+        pairing: f.bundle.id,
+        incarnation: peer.grant.body.transcript.body.incarnation,
+        revision: peer.grant.body.revision,
+      },
+      () => Promise.resolve(),
+    );
+    const began = performance.now();
+    const hello = await client.hello();
+    const before = { sequence: first.sequence, hash: first.hash };
+    assertEquals(
+      hello.incoming.find(({ stream }) => stream === suffix.stream)?.received,
+      before,
+    );
+    // No polling or delivery until this request returns. The facade knows the
+    // room needs a higher cut from the installed directory inventory.
+    const mark = child.observations.mark();
+    const pending = call('GET', uri);
+    await bounded(
+      Promise.race([
+        child.observations.wait(
+          (o) =>
+            o.kind === 'readiness' && o.stream === suffix.stream &&
+            o.state === 'pending',
+          mark,
+        ),
+        pending.then(({ status }) => {
+          throw new Error(`federation answered before readiness: ${status}`);
+        }),
+      ]),
+      5000,
+    );
+    const expired = await bounded(pending, pollSeconds * 1000 + 5000);
+    assertEquals([expired.status, expired.body.errcode], [
+      503,
+      'M_UNAVAILABLE',
+    ]);
+    assert(
+      performance.now() - began >= pollSeconds * 1000,
+      'admission answered before the poll freshness window expired',
+    );
+
+    // The expiry was not a publication: the next hello still sees the old cut.
+    assertEquals(
+      (await client.hello()).incoming.find(({ stream }) =>
+        stream === suffix.stream
+      )?.received,
+      before,
+    );
+  } finally {
+    await child?.dispose();
+    await tls.close();
+    await f.close();
+    setConfigForTests({});
+  }
+});
 
 Deno.test('cold inbox rejection before Journal.apply rejects the finite tail promptly', async () => {
   const tls = await facadeTls();
