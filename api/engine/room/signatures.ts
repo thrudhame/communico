@@ -22,6 +22,7 @@ export type SignatureEvidence = {
   readonly eventId: string;
   readonly material: string;
   readonly redactedMaterial: string;
+  readonly pdu: string;
   readonly signatures: Readonly<
     Record<string, Readonly<Record<string, string>>>
   >;
@@ -74,6 +75,7 @@ export async function prepareEventSignatures(
           minValidUntilMs: getRulebook(roomVersion).spec.enforceKeyValidity
             ? Number(verified.pdu.origin_server_ts)
             : 0,
+          discovery: 'cached',
           signal: options.signal,
         });
         options.signal?.throwIfAborted();
@@ -93,6 +95,7 @@ export async function prepareEventSignatures(
     [verifiedEvidence]: true as const,
     eventId: verified.eventId,
     material,
+    pdu: JSON.stringify(verified.pdu),
     redactedMaterial: eventMaterial(redact(
       verified.pdu as unknown as Record<string, unknown>,
       roomVersion,

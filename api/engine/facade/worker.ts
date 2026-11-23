@@ -353,102 +353,124 @@ export function startHomeLinkWorker(
 
 /** Facade application is local and independent of the home socket. The same
  * explicit domain completion contract is used by both runtime roles. */
-export function startInboxWorker(options: {
-  journal: Journal;
+type InboxOptions = {
+  journal: Pick<Journal, 'streams' | 'heads'>;
   peer: string;
   pollseconds: number;
   apply(stream: Stream): Promise<boolean>;
   changed(): void;
-  failed(error: unknown, stream?: Stream): void;
-}) {
-  let stopped = false;
-  let scanning: Promise<void> | undefined;
-  const running = new Map<string, Promise<void>>();
-  const rerun = new Set<string>();
-  const dependencies = new ApplicationDependencies();
-  let dirty = false;
-  const start = (stream: Stream) => {
-    if (stopped) return;
-    const id = key(stream);
-    if (running.has(id)) {
-      rerun.add(id);
-      return;
-    }
-    const work = (async () => {
-      try {
-        do {
-          rerun.delete(id);
-          try {
-            const heads = await options.journal.heads(
-              options.peer,
-              'in',
-              stream,
-            );
-            let applied = heads.applied.sequence;
-            dependencies.track(stream, heads, () => start(stream));
-            while (!stopped && await options.apply(stream)) {
-              const next = await options.journal.heads(
+  failed(error: unknown, stream?: Stream, after?: number): void;
+};
+
+export function startInboxWorker(options: InboxOptions) {
+  return new InboxWorker(options);
+}
+
+export class InboxWorker {
+  readonly wake: () => void;
+  readonly close: () => Promise<void>;
+
+  get peer(): string {
+    return this.options.peer;
+  }
+
+  /** Includes domain validation before Journal.apply and transaction failures. */
+  failed(error: unknown, stream?: Stream, after?: number): void {
+    this.options.failed(error, stream, after);
+  }
+
+  constructor(private readonly options: InboxOptions) {
+    let stopped = false;
+    let scanning: Promise<void> | undefined;
+    const running = new Map<string, Promise<void>>();
+    const rerun = new Set<string>();
+    const dependencies = new ApplicationDependencies();
+    let dirty = false;
+    const start = (stream: Stream) => {
+      if (stopped) return;
+      const id = key(stream);
+      if (running.has(id)) {
+        rerun.add(id);
+        return;
+      }
+      const work = (async () => {
+        try {
+          do {
+            rerun.delete(id);
+            let applied: number | undefined;
+            try {
+              const heads = await options.journal.heads(
                 options.peer,
                 'in',
                 stream,
               );
-              if (next.applied.sequence <= applied) {
-                throw new LinkError(
-                  'LINK_DIVERGED',
-                  'domain reported application without durable completion',
+              applied = heads.applied.sequence;
+              dependencies.track(stream, heads, () => start(stream));
+              while (!stopped && await options.apply(stream)) {
+                const next = await options.journal.heads(
+                  options.peer,
+                  'in',
+                  stream,
                 );
+                if (next.applied.sequence <= applied) {
+                  throw new LinkError(
+                    'LINK_DIVERGED',
+                    'domain reported application without durable completion',
+                  );
+                }
+                applied = next.applied.sequence;
+                dependencies.track(stream, next, () => start(stream));
+                dependencies.progressed(stream);
+                options.changed();
               }
-              applied = next.applied.sequence;
-              dependencies.track(stream, next, () => start(stream));
-              dependencies.progressed(stream);
-              options.changed();
+            } catch (error) {
+              this.failed(error, stream, applied);
             }
-          } catch (error) {
-            options.failed(error, stream);
-          }
-        } while (!stopped && rerun.delete(id));
-      } finally {
-        running.delete(id);
-      }
-    })();
-    running.set(id, work);
-  };
-  const scan = () => {
-    dirty = true;
-    return scanning ??= (async () => {
-      try {
-        do {
-          dirty = false;
-          try {
-            for (
-              const stream of await options.journal.streams(options.peer, 'in')
-            ) {
-              if (stopped) break;
-              start(stream);
+          } while (!stopped && rerun.delete(id));
+        } finally {
+          running.delete(id);
+        }
+      })();
+      running.set(id, work);
+    };
+    const scan = () => {
+      dirty = true;
+      return scanning ??= (async () => {
+        try {
+          do {
+            dirty = false;
+            try {
+              for (
+                const stream of await options.journal.streams(
+                  options.peer,
+                  'in',
+                )
+              ) {
+                if (stopped) break;
+                start(stream);
+              }
+            } catch (error) {
+              this.failed(error);
             }
-          } catch (error) {
-            options.failed(error);
-          }
-        } while (!stopped && dirty);
-      } finally {
-        scanning = undefined;
-      }
-    })();
-  };
-  const timer = setInterval(() => void scan(), options.pollseconds * 1000);
-  void scan();
-  let closed: Promise<void> | undefined;
-  return {
-    wake: () => {
+          } while (!stopped && dirty);
+        } finally {
+          scanning = undefined;
+        }
+      })();
+    };
+    const timer = setInterval(() => void scan(), options.pollseconds * 1000);
+    void scan();
+    let closed: Promise<void> | undefined;
+    this.wake = () => {
       if (!stopped) void scan();
-    },
-    close() {
+    };
+    this.close = () => {
       return closed ??= (async () => {
         stopped = true;
         clearInterval(timer);
         await scanning;
         await Promise.all(running.values());
       })();
-    },
-  };
+    };
+  }
 }

@@ -5,8 +5,11 @@ import {
   LINK_CAPABILITIES,
   LINK_VERSION,
   LinkError,
+  type Stream,
 } from '#engine/facade/protocol.ts';
 import type { LinkClient } from '#engine/facade/transport.ts';
+import { startInboxWorker } from '#engine/facade/worker.ts';
+import type { Journal } from '#engine/facade/journal.ts';
 
 Deno.test('typed client refuses forged response identity, stream ownership and malformed cuts', async () => {
   const peer = {
@@ -67,5 +70,54 @@ Deno.test('typed client refuses forged response identity, stream ownership and m
   ) {
     answer = { ...valid, ...patch };
     await assertRejects(() => client.hello(), LinkError);
+  }
+});
+
+Deno.test('inbox reports the original pre-apply rejection without blocking another stream', async () => {
+  const rejected = new Error('refused before journal apply');
+  const failed = Promise.withResolvers<unknown>();
+  const applied = Promise.withResolvers<void>();
+  let through = 0;
+  const streams = ['directory', 'public:@other:logical.test'].map((stream) => ({
+    source: 'home',
+    incarnation: 'pair',
+    stream,
+    received: { sequence: 1, hash: 'a'.repeat(64) },
+    applied: EMPTY_CUT,
+  }));
+  const heads = (stream: Stream) => ({
+    ...stream,
+    received: { sequence: 1, hash: 'a'.repeat(64) },
+    applied: stream.stream === 'directory' || through === 0
+      ? EMPTY_CUT
+      : { sequence: through, hash: 'a'.repeat(64) },
+  });
+  const journal = {
+    streams: () => Promise.resolve(streams.map(heads)),
+    heads: (_peer, _direction, stream) => Promise.resolve(heads(stream)),
+  } satisfies Pick<Journal, 'streams' | 'heads'>;
+  const worker = startInboxWorker({
+    journal,
+    peer: 'home',
+    pollseconds: 3600,
+    apply: (stream) => {
+      if (stream.stream === 'directory') return Promise.reject(rejected);
+      if (through) return Promise.resolve(false);
+      through++;
+      return Promise.resolve(true);
+    },
+    failed: (error, stream, after) => {
+      assertEquals(stream, streams[0]);
+      assertEquals(after, 0);
+      failed.resolve(error);
+    },
+    changed: () => applied.resolve(),
+  });
+  try {
+    assertEquals(await failed.promise, rejected);
+    await applied.promise;
+    assertEquals(through, 1);
+  } finally {
+    await worker.close();
   }
 });

@@ -21,7 +21,12 @@ import {
 } from '#engine/facade/directory.ts';
 import { exportOwnerControl, OwnerControls } from '#engine/facade/ownership.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
-import { LINK_CAPABILITIES, LINK_SUPPORTED } from '#engine/facade/protocol.ts';
+import { changeSigningAuthority } from '#engine/facade/signing-authority.ts';
+import {
+  LINK_CAPABILITIES,
+  LINK_SUPPORTED,
+  LinkError,
+} from '#engine/facade/protocol.ts';
 import { bindRole } from '#engine/facade/role.ts';
 import { recordHash } from '#engine/facade/protocol.ts';
 import {
@@ -85,7 +90,7 @@ async function fixture(historicalHome = false, applyAccount = true) {
     await legacy.server();
     await legacy.close();
   }
-  let home = await open('home', historicalHome ? 50 : serverSchema.version);
+  let home = await open('home', historicalHome ? 51 : serverSchema.version);
   const edge = await open('edge');
   await bindRole(home, { role: 'home', server: 'logical.test', node: '' });
   await bindRole(edge, {
@@ -1073,7 +1078,17 @@ async function exportSuccessor(
 Deno.test('membership upgrade: an enrolled historical installation freezes local work and never promotes foreign display into a job', async () => {
   const f = await fixture(true);
   try {
-    const { record, state: foreign, keys, operation } = await incoming(f);
+    // Seed the historical retraction state without publishing a new pending
+    // invite through today's notification schema before the jobs migration.
+    const { record, state: foreign, keys, operation } = await incoming(
+      f,
+      'edge',
+      'invite',
+      undefined,
+      {},
+      undefined,
+      'rejecting',
+    );
     const db = await f.home.server();
     const journal = new Journal(db, [...LINK_SUPPORTED, {
       type: 'membership-operation',
@@ -1121,7 +1136,7 @@ Deno.test('membership upgrade: an enrolled historical installation freezes local
       prev_events: [String(invite.event_id)],
     });
     // Actual pre-jobs schema rows, not a current-schema store with a fake pragma.
-    // This is the pre-upgrade local execution intent that migration 50 owns.
+    // This is the pre-upgrade local execution intent that migration 51 owns.
     await db.tx(async (conn) => {
       const seq = await nextEventSeq(conn);
       await conn.execute(
@@ -1261,6 +1276,9 @@ Deno.test('membership application: account completion wakes a blocked OOB stream
       },
     });
     await blocked.promise;
+    assert(failures[0] instanceof LinkError);
+    assertEquals(failures[0].code, 'LINK_UNAVAILABLE');
+    assertEquals(failures[0].status, 503);
     assertEquals((await f.ej.heads('home', 'in', record)).applied.sequence, 0);
     assertEquals(await invitesOf(state.userId, { server: db }), []);
     release.resolve();
@@ -2598,6 +2616,40 @@ Deno.test('membership admission: retirement during key verification cannot commi
       [],
     );
   } finally {
+    await f.close();
+  }
+});
+
+Deno.test('membership admission: invalidation after retention callback cannot cross native commit', async () => {
+  const f = await fixture();
+  const server = await f.edge.server();
+  const original = server.tx.bind(server);
+  try {
+    const { record, keys } = await incoming(f, 'home');
+    server.tx = (fn, options) =>
+      original(async (conn) => {
+        const result = await fn(conn);
+        const retained = await conn.query(
+          "SELECT 1 FROM domain_operations WHERE kind='membership'",
+        );
+        if (retained.length) {
+          // Complete a no-storage invalidation after the last owner callback check.
+          await changeSigningAuthority(server, () =>
+            Promise.resolve(), () =>
+            Promise.resolve());
+        }
+        return result;
+      }, options);
+    await assertRejects(() => f.es.retain(record, keys));
+    server.tx = original;
+    assertEquals(
+      await server.query(
+        "SELECT * FROM domain_operations WHERE kind='membership'",
+      ),
+      [],
+    );
+  } finally {
+    server.tx = original;
     await f.close();
   }
 });

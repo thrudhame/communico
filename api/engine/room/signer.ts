@@ -2,6 +2,8 @@
 // and its key arrive in stage 4, so callers inject the signing identity.
 // Tests use a fixed key via #engine/signing-primitives.js.
 export interface Signer {
+  // Prepared authority is retained by the room transaction's commit owner.
+  readonly admit?: import('#engine/store/commit.ts').CommitCheck;
   readonly serverName: string;
   // The full key id — used verbatim as the signatures map key
   // ('ed25519:…').

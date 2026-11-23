@@ -969,7 +969,11 @@ export async function listPushers(
   localpart: string,
 ): Promise<PusherRow[]> {
   return await tenant.tx(async (tx) => {
-    await tx.ingress.check({ kind: 'domain', localpart, feature: 'pushers' });
+    await tx.ingress.check({
+      kind: 'domain-read',
+      localpart,
+      feature: 'pushers',
+    });
     return await tx.pushers.ofUser(localpart);
   });
 }

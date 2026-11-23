@@ -103,7 +103,10 @@ Deno.test('facade delayed activation: native owner gates reads, mutations and cl
     const guarded = await openTenant(f.stores[1], 'logical.test', {
       ingress: {
         check(_conn, intent) {
-          if (intent.kind === 'domain' && intent.feature === 'schedules') {
+          if (
+            (intent.kind === 'domain' || intent.kind === 'domain-read') &&
+            intent.feature === 'schedules'
+          ) {
             throw new MatrixError(
               503,
               'M_UNAVAILABLE',

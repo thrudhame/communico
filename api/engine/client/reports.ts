@@ -5,7 +5,7 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import { withRoomLock } from '#engine/room/lock.ts';
 import { membershipOf, redactionOf } from '#engine/server/read.ts';
 import { type ReportKind, storeReport } from '#engine/server/reports.ts';
-import { lookupRoom, requireRoom } from './room.ts';
+import { lookupRoomForAdmission, requireRoomForAdmission } from './room.ts';
 import { canSeeEvent } from './visibility.ts';
 
 export async function reportContent(
@@ -48,14 +48,15 @@ export async function reportContent(
   } else {
     await withRoomLock(target, async () => {
       if (kind === 'room') {
-        await requireRoom(target);
+        await requireRoomForAdmission(target);
         await storeReport(app.server, { kind, roomId: target, ...details });
         return;
       }
-      const room = await lookupRoom(target);
+      const room = await lookupRoomForAdmission(target);
       if (
         room === null || eventId === undefined ||
-        (await membershipOf(app.server, target, reporter))?.membership !==
+        (await membershipOf(app.server, target, reporter, 'admission'))
+            ?.membership !==
           'join' ||
         !await canSeeEvent(reporter, room, eventId) ||
         await redactionOf(app.server, target, eventId) !== null

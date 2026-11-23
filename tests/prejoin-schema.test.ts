@@ -40,10 +40,10 @@ Deno.test('prejoin v20 upgrade preserves v19 invite events, sequences and unboun
       schemas: { server: { ...serverSchema, version: 22 } },
     });
     await v22.close();
-    const v49 = await openStore(config, {
-      schemas: { server: { ...serverSchema, version: 49 } },
+    const v50 = await openStore(config, {
+      schemas: { server: { ...serverSchema, version: 50 } },
     });
-    await v49.close();
+    await v50.close();
     const current = await openStore(config, {
       schemas: { server: serverSchema },
     });

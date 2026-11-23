@@ -2,6 +2,7 @@
 // Control effects and their journal result share the server transaction. Signing
 // and signature verification happen outside that transaction.
 import { canonicalJson } from '#engine/canonical.ts';
+import { commitCheck } from '#engine/store/commit.ts';
 import { createHash } from 'node:crypto';
 import { config } from '#engine/config.ts';
 import {
@@ -27,7 +28,12 @@ import type { Store } from '#engine/store/index.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { appendRecord, type Journal } from './journal.ts';
 import { homePublicKeys, type Pairings } from './pairing.ts';
-import { changeSigningAuthority, signingFence } from './signing-authority.ts';
+import {
+  changeSigningAuthority,
+  signingFence,
+  verificationFence,
+  VerificationUnavailable,
+} from './signing-authority.ts';
 import {
   integer,
   LinkError,
@@ -133,10 +139,21 @@ function approvedVerificationKeys(
       if (name !== signer.serverName) {
         return await remote.getVerifyKey(name, keyId, floor, purpose, context);
       }
-      const unchanged = signingFence(db);
+      const unchanged = verificationFence(db);
       unchanged();
       const { roster, document: raw } = await load();
-      const key = roster?.keys.find((key) => key.keyId === keyId);
+      unchanged();
+      if (roster === null) {
+        throw new VerificationUnavailable('key roster not ready');
+      }
+      const key = roster.keys.find((key) =>
+        key.keyId === keyId &&
+        (key.retiredAt === null ||
+          (purpose !== 'request' && floor <= key.retiredAt))
+      );
+      if (roster.server === name && key && raw === null) {
+        throw new VerificationUnavailable('key document not ready');
+      }
       let document: KeyDoc | null = null;
       if (roster && raw !== null) {
         try {
@@ -145,11 +162,10 @@ function approvedVerificationKeys(
           // An older partial publication confers no key authority.
         }
       }
+      unchanged();
       if (
-        !roster || roster.server !== name || !key || !document ||
-        floor > document.valid_until_ts ||
-        (key.retiredAt !== null &&
-          (purpose === 'request' || floor > key.retiredAt))
+        roster.server !== name || !key || !document ||
+        floor > document.valid_until_ts
       ) {
         throw new UpstreamError('validation', {
           phase: 'key-lookup',
@@ -184,11 +200,19 @@ export function homeVerificationKeys(
     const [held] = await db.query(
       'SELECT revision,roster_json,document_json FROM facade_key_roster WHERE singleton=1',
     );
+    const retained = rosterAt(held, roster.revision);
+    if (
+      retained !== null &&
+      (Number(held.revision) !== roster.revision ||
+        canonicalJson(retained) !== canonicalJson(roster))
+    ) {
+      throw new UpstreamError('validation', {
+        phase: 'key-lookup',
+        reason: 'local key roster differs from enrollment authority',
+      });
+    }
     return {
-      roster: Number(held.revision) === roster.revision &&
-          held.roster_json === canonicalJson(roster)
-        ? roster
-        : null,
+      roster: retained,
       document: held.document_json === null ? null : String(held.document_json),
     };
   });
@@ -298,6 +322,25 @@ export async function publishKeyDocument(
   }
 }
 
+function onlyHomeSigns(roster: Roster, signer: Signer): boolean {
+  return roster.keys.every((key) =>
+    key.keyId === signer.keyId || key.retiredAt !== null
+  );
+}
+
+/** Retirement no longer needs a peer signature. The existing home lifecycle
+ * repairs this complete publication even when no retired link can reconnect. */
+export async function refreshRetiredKeyDocument(
+  db: Database,
+  signer: Signer,
+  publicKey: string,
+): Promise<void> {
+  const roster = await homeRoster(db, signer, publicKey);
+  if (roster.keys.length > 1 && onlyHomeSigns(roster, signer)) {
+    await publishedKeyDocument(db, signer, publicKey);
+  }
+}
+
 /** A public read never starts network collection or publishes a partial roster. */
 export async function publishedKeyDocument(
   db: Database,
@@ -307,11 +350,7 @@ export async function publishedKeyDocument(
 ): Promise<KeyDoc | null> {
   const roster = await homeRoster(db, signer, publicKey);
   if (roster.keys.length === 1) return null;
-  if (
-    roster.keys.every((key) =>
-      key.keyId === signer.keyId || key.retiredAt !== null
-    )
-  ) {
+  if (onlyHomeSigns(roster, signer)) {
     return await publishKeyDocument(db, signer, publicKey, () => {
       throw new LinkError('LINK_UNAVAILABLE', 'unexpected active facade');
     });
@@ -541,6 +580,7 @@ export class FacadeKeys {
     return {
       serverName: this.signer.serverName,
       keyId: this.signer.keyId,
+      admit: commitCheck(check, unchanged),
       sign: async (canonical) => {
         check();
         const signature = await this.signer.sign(canonical);
@@ -675,49 +715,52 @@ export class FacadeKeys {
       () =>
         changeSigningAuthority(
           this.db,
-          () =>
-            journal.apply('home', stream, async (conn, current) => {
+          async (conn) => {
+            const [binding] = await conn.query(
+              "SELECT state,revision FROM facade_pairings WHERE id=? AND side='facade'",
+              [context.id],
+            );
+            if (
+              binding?.state !== 'paired' ||
+              Number(binding.revision) !== grant.body.revision
+            ) {
+              throw new LinkError(
+                'LINK_UNPAIRED',
+                'control grant changed',
+                403,
+              );
+            }
+            const [held] = await conn.query(
+              'SELECT revision,roster_json FROM facade_key_roster WHERE singleton=1',
+            );
+            if (
+              Number(held.revision) > body.revision ||
+              (Number(held.revision) === body.revision &&
+                held.roster_json !== encoded)
+            ) {
+              throw new LinkError(
+                'LINK_DIVERGED',
+                'regressing or changed control revision',
+              );
+            }
+            if (document || Number(held.revision) !== body.revision) {
+              await conn.execute(
+                'UPDATE facade_key_roster SET revision=?,roster_json=?,document_json=?,issued_ms=NULL WHERE singleton=1',
+                [
+                  body.revision,
+                  encoded,
+                  document ? canonicalJson(document) : null,
+                ],
+              );
+            }
+            return { revision: body.revision };
+          },
+          (write) =>
+            journal.apply('home', stream, (conn, current) => {
               if (current.hash !== record.hash) {
                 throw new LinkError('LINK_DIVERGED', 'control apply raced');
               }
-              const [binding] = await conn.query(
-                "SELECT state,revision FROM facade_pairings WHERE id=? AND side='facade'",
-                [context.id],
-              );
-              if (
-                binding?.state !== 'paired' ||
-                Number(binding.revision) !== grant.body.revision
-              ) {
-                throw new LinkError(
-                  'LINK_UNPAIRED',
-                  'control grant changed',
-                  403,
-                );
-              }
-              const [held] = await conn.query(
-                'SELECT revision,roster_json FROM facade_key_roster WHERE singleton=1',
-              );
-              if (
-                Number(held.revision) > body.revision ||
-                (Number(held.revision) === body.revision &&
-                  held.roster_json !== encoded)
-              ) {
-                throw new LinkError(
-                  'LINK_DIVERGED',
-                  'regressing or changed control revision',
-                );
-              }
-              if (document || Number(held.revision) !== body.revision) {
-                await conn.execute(
-                  'UPDATE facade_key_roster SET revision=?,roster_json=?,document_json=?,issued_ms=NULL WHERE singleton=1',
-                  [
-                    body.revision,
-                    encoded,
-                    document ? canonicalJson(document) : null,
-                  ],
-                );
-              }
-              return { revision: body.revision };
+              return write(conn);
             }),
         ),
     );

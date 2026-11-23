@@ -55,7 +55,12 @@ import {
 import { buildInTx } from '#engine/room/build.ts';
 import { loadFilter, storeFilter } from '#engine/tenant/filters.ts';
 import { issueOpenIdToken, openIdUserInfo } from '#engine/tenant/openid.ts';
-import { hashToken, issueToken, lookupToken } from '#engine/tenant/auth.ts';
+import {
+  hashToken,
+  insertAccessToken,
+  issueToken,
+  lookupToken,
+} from '#engine/tenant/auth.ts';
 import {
   listPushers,
   recordPusherChange,
@@ -73,6 +78,11 @@ import { notificationOperations } from '#engine/server/notification-operations.t
 import { onEventStream } from '#engine/server/stream.ts';
 import { DelayedEvents } from '#engine/delayed-events.ts';
 import { startPushSender } from '#engine/push/sender.ts';
+import { drainResources } from '#engine/lifetime.ts';
+import { closeApp, openReplicaApp } from '#engine/app.ts';
+import { keyStore } from '#engine/federation/keys.ts';
+import { ignoredSenders } from '#engine/client/ignored.ts';
+import { pathfinder } from '@pathfinder/pathfinder';
 import { setAvatarUrl, setDisplayName } from '#engine/tenant/users.ts';
 import { Journal } from '#engine/facade/journal.ts';
 import { exportOwnerControl, OwnerControls } from '#engine/facade/ownership.ts';
@@ -108,8 +118,13 @@ import { testRemoteServer, testSigner } from './fixtures/signer.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import {
+  accountDataMax,
+  captureAccountData,
   captureAccountDataOperations,
   getAccountData,
+  listGlobalAccountData,
+  listGlobalAccountDataSince,
+  listRoomAccountData,
   putAccountData,
   updateRoomTag,
 } from '#engine/tenant/accountdata.ts';
@@ -120,6 +135,7 @@ import {
 } from '#engine/tenant/profiles.ts';
 import {
   capturePushRuleOperations,
+  pushStreamSeq,
   putRule,
   rulesetFor,
   setRuleEnabled,
@@ -133,7 +149,9 @@ import {
   recordReceiptOperation,
 } from '#engine/server/receipt-operations.ts';
 
-async function fixture() {
+async function fixture(option: boolean | string = true) {
+  const applyAuth = option !== false;
+  const token = typeof option === 'string' ? option : undefined;
   const dir = await Deno.makeTempDir({ prefix: 'facade-domain-link-' });
   const open = (side: string) =>
     openStore({
@@ -208,9 +226,17 @@ async function fixture() {
   await owners.apply(ej, control);
   const auth = await exportAccountAuth(home, ht, hp, bundle.id, 'alice', false);
   await ej.receive('home', [auth]);
-  await new AccountSnapshots(edge, et, fp, owners).apply(ej, auth);
+  if (applyAuth) {
+    await new AccountSnapshots(edge, et, fp, owners).apply(ej, auth);
+  }
   const hs = new DomainOperations(home, ht, hp),
     es = new DomainOperations(edge, et, fp, node);
+  if (token) {
+    const hash = await hashToken(token);
+    await (await edge.tenant('logical.test')).tx((conn) =>
+      insertAccessToken(conn, hash, 'alice', null, null)
+    );
+  }
   return {
     dir,
     open,
@@ -223,6 +249,7 @@ async function fixture() {
     hj,
     ej,
     owners,
+    auth,
     node,
     bundle,
     hs,
@@ -248,6 +275,36 @@ async function fixture() {
     },
   };
 }
+
+Deno.test('domain bootstrap waits for its retained auth dependency without an identity rejection', async () => {
+  const f = await fixture(false);
+  try {
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    assert(records.length > 0);
+    await f.ej.receive('home', records);
+    const refusal = await assertRejects(
+      () => f.es.apply(f.ej, records[0]),
+      LinkError,
+      'account not selected',
+    );
+    assertEquals(refusal.code, 'LINK_UNAVAILABLE');
+    assertEquals(
+      (await f.ej.heads('home', 'in', records[0])).applied.sequence,
+      0,
+    );
+    await new AccountSnapshots(f.edge, f.et, f.fp, f.owners).apply(
+      f.ej,
+      f.auth,
+    );
+    for (const record of records) assert(await f.es.apply(f.ej, record));
+    assertEquals(
+      (await f.ej.heads('home', 'in', records[0])).applied.sequence,
+      records.at(-1)!.sequence,
+    );
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('domain schedules: signed inventory and suffix retain account-wide replicas without executable jobs', async () => {
   const f = await fixture();
@@ -790,7 +847,7 @@ Deno.test('domain pushers: append=false reaches home and affected selected accou
     await assertRejects(
       () => f.hs.export('bob', f.bundle.id),
       LinkError,
-      'domain account not selected',
+      'account not selected: awaiting home auth export',
     );
     const auth = await exportAccountAuth(
       f.home,
@@ -2680,11 +2737,27 @@ Deno.test('domain backup: signed home revisions retain ciphertext, exact etags, 
       record.sequence > previous
     );
     await f.ej.receive('home', suffix);
+    // Pure reads retain the complete applied backup while the newer deletion
+    // is received but unapplied; receiving alone grants no mutation authority.
+    assertEquals(
+      await tenant.tx((tx) => tx.keyBackup.version('alice', 'get')),
+      { ...metadata, version: '1', count: 1, etag: '1' },
+    );
+    assertEquals(
+      await tenant.tx((tx) =>
+        tx.keyBackup.keys('alice', 'get', '1', '!backup:logical.test', 's')
+      ),
+      data,
+    );
     const pending = await assertRejects(
-      () => tenant.tx((tx) => tx.keyBackup.version('alice', 'get')),
+      () =>
+        tenant.tx((tx) =>
+          tx.keyBackup.version('alice', 'post', undefined, metadata)
+        ),
       MatrixError,
     );
     assertEquals(pending.status, 503);
+    assertEquals(await tenant.tx((tx) => tx.streams.heads()), before);
     for (const record of suffix) await f.es.apply(f.ej, record);
     assertEquals(
       await tenant.tx((tx) => tx.keyBackup.version('alice', 'get')),
@@ -2901,21 +2974,56 @@ Deno.test('domain link: user-facing register owners require complete domain boot
       record.sequence > cut
     );
     await f.ej.receive('home', suffix);
-    await assertRejects(
-      () => getAccountData(tenant, 'alice', '', 'm.direct'),
-      MatrixError,
-      'domain snapshot unavailable',
-    );
+    assertEquals(await getAccountData(tenant, 'alice', '', 'm.direct'), {
+      after: 'complete',
+    });
     for (const record of suffix) await f.es.apply(f.ej, record);
     assertEquals(await getAccountData(tenant, 'alice', '', 'm.direct'), {
       suffix: true,
     });
+    const profile = await getPublicProfile(tenant, 'alice');
+    const rules = await rulesetFor(tenant, 'alice');
+    await f.edge.close();
+    const reopened = await f.open('edge');
+    try {
+      const pairings = new Pairings(
+        await reopened.server(),
+        f.node.signer(),
+        f.node.publicKey,
+        'b'.repeat(64),
+        f.node,
+      );
+      const restored = await enrolledTenant(
+        reopened,
+        pairings,
+        'logical.test',
+        'edge_a',
+        new FacadeAuth(
+          await reopened.server(),
+          pairings,
+          f.node,
+          new AuthLinkHealth({ notify: 'websocket', pollseconds: 1 }),
+          {
+            replicatecredentials: false,
+            allowstaleauth: false,
+            authmaxstalehours: 1,
+          },
+        ),
+      );
+      assertEquals(await getAccountData(restored, 'alice', '', 'm.direct'), {
+        suffix: true,
+      });
+      assertEquals(await getPublicProfile(restored, 'alice'), profile);
+      assertEquals(await rulesetFor(restored, 'alice'), rules);
+    } finally {
+      await reopened.close();
+    }
   } finally {
     await f.close();
   }
 });
 
-Deno.test('domain admission: retained preparations refuse a newly received suffix at every register owner', async () => {
+Deno.test('domain admission: retained reads survive a newer suffix while mutations still refuse', async () => {
   const f = await fixture();
   try {
     const bootstrap = await f.hs.bootstrap('alice', f.bundle.id);
@@ -2948,9 +3056,6 @@ Deno.test('domain admission: retained preparations refuse a newly received suffi
     assertEquals(suffix.length > 0, true);
     await f.ej.receive('home', suffix);
     const intents = [
-      () => getAccountData(tenant, 'alice', '', 'm.direct'),
-      () => getPublicProfile(tenant, 'alice'),
-      () => rulesetFor(tenant, 'alice'),
       () => putAccountData(tenant, 'alice', '', 'm.direct', { stale: true }),
       () => updateRoomTag(tenant, 'alice', '!r:logical.test', 'work', {}),
       () => setProfileField(tenant, 'alice', 'org.example.field', 'stale'),
@@ -2959,13 +3064,25 @@ Deno.test('domain admission: retained preparations refuse a newly received suffi
       () => setRuleEnabled(tenant, 'alice', 'override', '.m.rule.master', true),
     ];
     const before = await f.et.tx((tx) => tx.streams.heads());
+    assertEquals(await getAccountData(tenant, 'alice', '', 'm.direct'), null);
+    assertEquals(
+      (await getPublicProfile(tenant, 'alice'))?.displayname,
+      'Alice',
+    );
+    assertEquals(
+      await rulesetFor(tenant, 'alice'),
+      await rulesetFor(f.ht, 'alice'),
+    );
     for (const intent of intents) {
       await assertRejects(intent, MatrixError, 'domain snapshot unavailable');
     }
     assertEquals(await f.et.tx((tx) => tx.streams.heads()), before);
     for (const record of suffix) await f.es.apply(f.ej, record);
-    // Application restores fresh admission, never the earlier retained cut.
+    // Application restores fresh admission, never the earlier mutation permit.
     await assertRejects(intents[0], MatrixError, 'domain snapshot unavailable');
+    assertEquals(await getAccountData(tenant, 'alice', '', 'm.direct'), {
+      pending: true,
+    });
     const current = await enrolledTenant(
       f.edge,
       f.fp,
@@ -2978,6 +3095,406 @@ Deno.test('domain admission: retained preparations refuse a newly received suffi
     });
   } finally {
     await f.close();
+  }
+});
+
+Deno.test('domain applied reads: every register owner serves HTTP during suffix application without admitting writes or ACKs', async (t) => {
+  for (const owner of ['account-data', 'profile', 'push-rules']) {
+    await t.step(owner, async () => {
+      const token = 'applied-read-token';
+      const f = await fixture(token);
+      let http: Deno.HttpServer<Deno.NetAddr> | undefined;
+      let application: Promise<boolean> | undefined;
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      try {
+        await putAccountData(f.ht, 'alice', '', 'm.direct', { applied: true });
+        await putAccountData(f.ht, 'alice', '', 'm.ignored_user_list', {
+          ignored_users: { '@ignored:logical.test': {} },
+        });
+        await putAccountData(f.ht, 'alice', '!r:logical.test', 'm.tag', {
+          tags: { applied: {} },
+        });
+        const bootstrap = await f.hs.bootstrap('alice', f.bundle.id);
+        await f.toEdge(bootstrap);
+        const authority = new FacadeAuth(
+          await f.edge.server(),
+          f.fp,
+          f.node,
+          new AuthLinkHealth({ notify: 'websocket', pollseconds: 1 }),
+          {
+            replicatecredentials: false,
+            allowstaleauth: true,
+            authmaxstalehours: 1,
+          },
+        );
+        const tenant = await enrolledTenant(
+          f.edge,
+          f.fp,
+          'logical.test',
+          'edge_a',
+          authority,
+        );
+        setConfigForTests({ server: { name: 'logical.test', role: 'facade' } });
+        const unused = () =>
+          Promise.reject(new Error('unused replica service'));
+        await openReplicaApp(f.edge, tenant, {
+          requireReadScope: unused,
+          prepareReadRoomScope: unused,
+          requireScope: unused,
+          prepareRoomScope: unused,
+          keyDocument: unused,
+          publicRooms: unused,
+          keys: keyStore(await f.edge.server(), { signer: f.node.signer() }),
+          signer: f.node.signer(),
+        });
+        http = Deno.serve({
+          hostname: '127.0.0.1',
+          port: 0,
+          onListen: () => {},
+        }, await pathfinder({ roots: ['api/endpoints/matrix/'] }));
+        const request = async (path: string, body?: unknown) => {
+          const response = await fetch(
+            `http://127.0.0.1:${http!.addr.port}/_matrix/client/v3/${path}`,
+            {
+              method: body === undefined ? 'GET' : 'PUT',
+              headers: {
+                authorization: 'Bearer ' + token,
+                'content-type': 'application/json',
+              },
+              body: body === undefined ? undefined : JSON.stringify(body),
+            },
+          );
+          return { status: response.status, body: await response.json() };
+        };
+        const paths = {
+          'account-data': 'user/@alice:logical.test/account_data/m.direct',
+          profile: 'profile/@alice:logical.test/displayname',
+          'push-rules': 'pushrules/global/override/.m.rule.master/enabled',
+        };
+        const path = paths[owner as keyof typeof paths];
+        const baseline = await request(path);
+        assertEquals(baseline.status, 200, JSON.stringify(baseline));
+        if (owner === 'account-data') {
+          await putAccountData(f.ht, 'alice', '', 'm.direct', { newer: true });
+        } else if (owner === 'profile') {
+          await setProfileField(f.ht, 'alice', 'displayname', 'New Alice');
+        } else {
+          await setRuleEnabled(
+            f.ht,
+            'alice',
+            'override',
+            '.m.rule.master',
+            true,
+          );
+        }
+        // Freeze this owner's sender record before exporting the later tail.
+        await f.hs.export('alice', f.bundle.id);
+        // A second record remains unapplied after this owner's semantic commit.
+        await putAccountData(f.ht, 'alice', '', 'm.tail', { pending: true });
+        const suffix = (await f.hs.export('alice', f.bundle.id)).filter((
+          record,
+        ) => record.sequence > bootstrap.at(-1)!.sequence).sort((a, b) =>
+          a.sequence - b.sequence
+        );
+        assertEquals(suffix.length >= 2, true);
+        assertEquals(
+          (suffix[0].payload as { body: DomainOperation }).body.operation.kind,
+          owner,
+        );
+        await f.ej.receive('home', suffix);
+        const before = await f.ej.heads('home', 'in', suffix[0]);
+        const news = await f.et.tx((tx) => tx.streams.heads());
+        assertEquals(await request(path), baseline);
+        const refusedBody = owner === 'account-data'
+          ? {}
+          : owner === 'profile'
+          ? { displayname: 'denied' }
+          : { enabled: false };
+        assertEquals(
+          (await request(path, refusedBody)).status,
+          503,
+        );
+        assertEquals(await f.et.tx((tx) => tx.streams.heads()), news);
+        assertEquals(await f.ej.heads('home', 'in', suffix[0]), before);
+        const apply = f.ej.apply.bind(f.ej);
+        f.ej.apply = async (...args) => {
+          entered.resolve();
+          await release.promise;
+          return await apply(...args);
+        };
+        application = f.es.apply(f.ej, suffix[0]);
+        void application.then(
+          () =>
+            entered.reject(
+              new Error('application completed before journal entry'),
+            ),
+          entered.reject,
+        );
+        await entered.promise;
+        const applied = owner === 'account-data'
+          ? { newer: true }
+          : owner === 'profile'
+          ? { displayname: 'New Alice' }
+          : { enabled: true };
+        const semanticNews = await f.et.tx((tx) => tx.streams.heads());
+        assertEquals(await request(path), { status: 200, body: applied });
+        assertEquals((await request(path, refusedBody)).status, 503);
+        // Every ordinary accessor, including visibility's ignored-user policy,
+        // shares this intent. None may stamp news or advance the held ACK.
+        assertEquals(
+          await listGlobalAccountData(tenant, 'alice'),
+          await listGlobalAccountData(f.et, 'alice'),
+        );
+        assertEquals(
+          await listGlobalAccountDataSince(tenant, 'alice', 0),
+          await listGlobalAccountDataSince(f.et, 'alice', 0),
+        );
+        assertEquals(
+          await listRoomAccountData(tenant, 'alice', '!r:logical.test'),
+          await listRoomAccountData(f.et, 'alice', '!r:logical.test'),
+        );
+        assertEquals(
+          await accountDataMax(tenant, 'alice'),
+          await accountDataMax(f.et, 'alice'),
+        );
+        assertEquals(
+          await pushStreamSeq(tenant, 'alice'),
+          await pushStreamSeq(f.et, 'alice'),
+        );
+        assertEquals(
+          await tenant.tx((tx) =>
+            captureAccountData(tx, 'alice', 'logical.test', null)
+          ),
+          await f.et.tx((tx) =>
+            captureAccountData(tx, 'alice', 'logical.test', null)
+          ),
+        );
+        assertEquals([
+          ...await ignoredSenders({
+            tenant,
+            userId: '@alice:logical.test',
+            deviceId: null,
+          }),
+        ], ['@ignored:logical.test']);
+        assertEquals(await f.et.tx((tx) => tx.streams.heads()), semanticNews);
+        assertEquals(await f.ej.heads('home', 'in', suffix[0]), before);
+        release.resolve();
+        await application;
+        f.ej.apply = apply;
+        for (const record of suffix.slice(1)) await f.es.apply(f.ej, record);
+        assertEquals(await request(path), { status: 200, body: applied });
+      } finally {
+        release.resolve();
+        if (application) await Promise.allSettled([application]);
+        await drainResources([
+          () => http?.shutdown(),
+          closeApp,
+          () => f.close(),
+          () => setConfigForTests({}),
+        ]);
+      }
+    });
+  }
+});
+
+Deno.test('domain feature reads: private consumers retain applied values without admitting newer-suffix mutations', async (t) => {
+  const token = 'feature-applied-read-token';
+  const f = await fixture(token);
+  let http: Deno.HttpServer<Deno.NetAddr> | undefined;
+  try {
+    const filter = { room: { timeline: { limit: 3 } } };
+    await (await f.home.server()).execute(
+      'INSERT INTO forgotten(user,room) VALUES(?,?)',
+      ['@alice:logical.test', '!feature:logical.test'],
+    );
+    await (await f.edge.server()).execute(
+      "INSERT INTO memberships(user,room,membership,event,seq) VALUES(?,?,'leave',?,1)",
+      ['@alice:logical.test', '!feature:logical.test', '$feature-leave'],
+    );
+    const filterId = await storeFilter(f.ht, 'alice', filter);
+    await f.ht.tx((tx) =>
+      tx.keyBackup.version('alice', 'post', undefined, {
+        algorithm: 'm.megolm_backup.v1.curve25519-aes-sha2',
+        auth_data: { public_key: 'opaque' },
+      })
+    );
+    const bootstrap = await f.hs.bootstrap('alice', f.bundle.id);
+    await f.toEdge(bootstrap);
+    const authority = new FacadeAuth(
+      await f.edge.server(),
+      f.fp,
+      f.node,
+      new AuthLinkHealth({ notify: 'websocket', pollseconds: 1 }),
+      {
+        replicatecredentials: false,
+        allowstaleauth: true,
+        authmaxstalehours: 1,
+      },
+    );
+    const tenant = await enrolledTenant(
+      f.edge,
+      f.fp,
+      'logical.test',
+      'edge_a',
+      authority,
+    );
+    setConfigForTests({ server: { name: 'logical.test', role: 'facade' } });
+    const unused = () => Promise.reject(new Error('unused replica service'));
+    await openReplicaApp(f.edge, tenant, {
+      requireReadScope: unused,
+      prepareReadRoomScope: unused,
+      requireScope: unused,
+      prepareRoomScope: unused,
+      keyDocument: unused,
+      publicRooms: unused,
+      keys: keyStore(await f.edge.server(), { signer: f.node.signer() }),
+      signer: f.node.signer(),
+    });
+    http = Deno.serve(
+      { hostname: '127.0.0.1', port: 0, onListen: () => {} },
+      await pathfinder({ roots: ['api/endpoints/matrix/'] }),
+    );
+    const notifications = async () => {
+      const response = await fetch(
+        `http://127.0.0.1:${http!.addr.port}/_matrix/client/v3/notifications`,
+        { headers: { authorization: 'Bearer ' + token } },
+      );
+      assertEquals(response.status, 200, await response.clone().text());
+      return await response.json();
+    };
+    const reads = {
+      filters: () => loadFilter(tenant, 'alice', filterId),
+      pushers: () => listPushers(tenant, 'alice'),
+      backups: () => tenant.tx((tx) => tx.keyBackup.version('alice', 'get')),
+      schedules: () => tenant.tx((tx) => tx.delayedEvents.list('alice')),
+      notifications,
+      rooms: async () => roomsFor(await f.edge.server(), '@alice:logical.test'),
+      sliding: async () =>
+        slidingListSnapshot(await f.edge.server(), '@alice:logical.test'),
+      membership: async () =>
+        membershipOf(
+          await f.edge.server(),
+          '!feature:logical.test',
+          '@alice:logical.test',
+        ),
+    };
+    const baseline = new Map<string, unknown>();
+    for (const [name, read] of Object.entries(reads)) {
+      baseline.set(name, await read());
+    }
+    assertEquals(baseline.get('filters'), filter);
+    assertEquals(baseline.get('membership'), {
+      roomId: '!feature:logical.test',
+      membership: 'leave',
+      eventId: '$feature-leave',
+      seq: 1,
+      forgotten: true,
+    });
+    await putAccountData(f.ht, 'alice', '', 'm.pending-feature-tail', {
+      pending: true,
+    });
+    const suffix = (await f.hs.export('alice', f.bundle.id)).filter((record) =>
+      record.sequence > bootstrap.at(-1)!.sequence
+    );
+    assert(suffix.length > 0);
+    await f.ej.receive('home', suffix);
+    const before = await f.ej.heads('home', 'in', suffix[0]);
+    const news = await f.et.tx((tx) => tx.streams.heads());
+    for (const [name, read] of Object.entries(reads)) {
+      await t.step(
+        name,
+        async () => assertEquals(await read(), baseline.get(name)),
+      );
+    }
+    await assertRejects(
+      () => storeFilter(tenant, 'alice', {}),
+      MatrixError,
+      'domain snapshot unavailable',
+    );
+    await assertRejects(
+      () => issueOpenIdToken(tenant, 'alice'),
+      MatrixError,
+      'domain snapshot unavailable',
+    );
+    await assertRejects(
+      async () =>
+        prepareRejoin(
+          await f.edge.server(),
+          '!feature:logical.test',
+          '@alice:logical.test',
+        ),
+      MatrixError,
+      'forget snapshot unavailable',
+    );
+    await assertRejects(
+      async () =>
+        roomsFor(await f.edge.server(), '@alice:logical.test', 'admission'),
+      MatrixError,
+      'forget snapshot unavailable',
+    );
+    await assertRejects(
+      async () =>
+        membershipOf(
+          await f.edge.server(),
+          '!feature:logical.test',
+          '@alice:logical.test',
+          'admission',
+        ),
+      MatrixError,
+      'forget snapshot unavailable',
+    );
+    assertEquals(await f.ej.heads('home', 'in', suffix[0]), before);
+    assertEquals(await f.et.tx((tx) => tx.streams.heads()), news);
+  } finally {
+    await drainResources([
+      () => http?.shutdown(),
+      closeApp,
+      () => f.close(),
+      () => setConfigForTests({}),
+    ]);
+  }
+});
+
+Deno.test('domain applied reads: account and control bindings remain mandatory', async (t) => {
+  for (const column of ['pairing', 'grant_revision', 'owner_revision']) {
+    await t.step(column, async () => {
+      const f = await fixture();
+      try {
+        await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+        const authority = new FacadeAuth(
+          await f.edge.server(),
+          f.fp,
+          f.node,
+          new AuthLinkHealth({ notify: 'websocket', pollseconds: 1 }),
+          {
+            replicatecredentials: false,
+            allowstaleauth: false,
+            authmaxstalehours: 1,
+          },
+        );
+        const tenant = await enrolledTenant(
+          f.edge,
+          f.fp,
+          'logical.test',
+          'edge_a',
+          await authority.prepare(),
+        );
+        await (await f.edge.tenant('logical.test')).execute(
+          `UPDATE account_auth_snapshots SET ${column}=? WHERE localpart='alice'`,
+          [column === 'pairing' ? 'different-pairing' : 999],
+        );
+        for (
+          const read of [
+            () => getAccountData(tenant, 'alice', '', 'm.direct'),
+            () => getPublicProfile(tenant, 'alice'),
+            () => rulesetFor(tenant, 'alice'),
+          ]
+        ) await assertRejects(read, MatrixError, 'domain snapshot unavailable');
+      } finally {
+        await f.close();
+      }
+    });
   }
 });
 

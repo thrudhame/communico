@@ -58,9 +58,9 @@ import type { ErasureCut } from '#engine/room/state.ts';
 import { writeCertificate } from '#engine/tenant/certificate.ts';
 import {
   type DomainBinding,
+  requireAccountSelection,
   requireDomainControl,
 } from '#engine/facade/domain-control.ts';
-import { LinkError } from '#engine/facade/protocol.ts';
 import {
   b32encode,
   b64decode,
@@ -162,6 +162,8 @@ function bind(
     return value;
   };
   return {
+    admit: (check: import('#engine/store/commit.ts').CommitCheck) =>
+      conn.admit(check),
     ingress: { check: authorize },
     domains: {
       authorize: async (
@@ -170,20 +172,11 @@ function bind(
       ) => {
         await requireDomainControl(conn, view);
         if (!selected) return;
-        const [row] = await conn.query(
-          'SELECT pairing,grant_revision FROM account_auth_snapshots WHERE localpart=?',
-          [view.localpart],
-        );
-        if (
-          row?.pairing !== selected.pairing ||
-          Number(row.grant_revision) !== selected.revision
-        ) {
-          throw new LinkError(
-            'LINK_IDENTITY_MISMATCH',
-            'domain account not selected',
-            403,
-          );
-        }
+        await requireAccountSelection(conn, {
+          localpart: view.localpart,
+          pairing: selected.pairing,
+          grantRevision: selected.revision,
+        });
       },
     },
     publicReplica: {
@@ -216,7 +209,11 @@ function bind(
         input?: unknown,
       ) => {
         if (action === 'get') {
-          await authorize({ kind: 'domain', localpart, feature: 'backups' });
+          await authorize({
+            kind: 'domain-read',
+            localpart,
+            feature: 'backups',
+          });
         }
         return await keyBackup.backupVersion(
           conn,
@@ -236,7 +233,11 @@ function bind(
         input?: unknown,
       ) => {
         if (action === 'get') {
-          await authorize({ kind: 'domain', localpart, feature: 'backups' });
+          await authorize({
+            kind: 'domain-read',
+            localpart,
+            feature: 'backups',
+          });
         }
         return await keyBackup.backupKeys(
           conn,
@@ -925,12 +926,20 @@ function bind(
         history?: import('#engine/facade/domain-control.ts').DomainHistoryProof,
       ) => delayedEvents.importOperation(conn, operation, history),
       replicas: async (localpart: string) => {
-        await authorize({ kind: 'domain', localpart, feature: 'schedules' });
+        await authorize({
+          kind: 'domain-read',
+          localpart,
+          feature: 'schedules',
+        });
         return await delayedEvents.replicas(conn, localpart);
       },
       get: admittedDelay,
       list: async (localpart: string) => {
-        await authorize({ kind: 'domain', localpart, feature: 'schedules' });
+        await authorize({
+          kind: 'domain-read',
+          localpart,
+          feature: 'schedules',
+        });
         return await delayedEvents.list(conn, localpart);
       },
       receipt: async (receipt: delayedEvents.DelayReceipt) => {

@@ -28,7 +28,7 @@ export async function runDeactivationWork(
   );
   for (const row of pending) {
     const user = '@' + row.localpart + ':' + tenant.serverName;
-    for (const membership of await roomsFor(server, user)) {
+    for (const membership of await roomsFor(server, user, 'admission')) {
       if (!['join', 'invite', 'knock'].includes(membership.membership)) {
         continue;
       }

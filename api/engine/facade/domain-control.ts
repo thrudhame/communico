@@ -9,6 +9,37 @@ import type { RegisterOperation, RegisterSource } from './registers.ts';
 import type { OwnerControl } from './ownership.ts';
 import { LinkError } from './protocol.ts';
 
+/** Absence is not conflicting authority. All selection owners use this rule
+ * before committing semantic effects or their application/export cursors. */
+export function requireSelectionReady(selected: boolean, message: string) {
+  if (!selected) throw new LinkError('LINK_UNAVAILABLE', message, 503);
+}
+
+/** Home's selected export is a dependency just like the destination's applied
+ * auth snapshot. Call on the server connection, after checking the grant. */
+export async function requireAccountExport(
+  conn: Conn,
+  selection: {
+    peer: string;
+    pairing: string;
+    server: string;
+    localpart: string;
+  },
+) {
+  const [row] = await conn.query(
+    'SELECT 1 FROM facade_exports WHERE peer=? AND incarnation=? AND scope=?',
+    [
+      selection.peer,
+      selection.pairing,
+      'auth:@' + selection.localpart + ':' + selection.server,
+    ],
+  );
+  requireSelectionReady(
+    !!row,
+    'account not selected: awaiting home auth export',
+  );
+}
+
 export type DomainBinding = {
   server: string;
   pairing: string;
@@ -93,6 +124,30 @@ export async function requireDomainSources(
   }
   if (!allowed(operation) || !Array.isArray(operation.context)) {
     throw new Error('domain source unavailable');
+  }
+}
+
+/** Auth and semantic streams drain independently. Absence is a dependency,
+ * never implicit selection; a retained conflicting selection is not a retry.
+ * Call in the owning tenant transaction before reading or installing facts. */
+export async function requireAccountSelection(
+  conn: Conn,
+  view: Pick<DomainBinding, 'localpart' | 'pairing' | 'grantRevision'>,
+) {
+  const [row] = await conn.query(
+    'SELECT pairing,grant_revision FROM account_auth_snapshots WHERE localpart=?',
+    [view.localpart],
+  );
+  requireSelectionReady(!!row, 'account not selected: awaiting auth snapshot');
+  if (
+    row.pairing !== view.pairing ||
+    Number(row.grant_revision) !== view.grantRevision
+  ) {
+    throw new LinkError(
+      'LINK_IDENTITY_MISMATCH',
+      'account not selected by enrolled authority',
+      403,
+    );
   }
 }
 

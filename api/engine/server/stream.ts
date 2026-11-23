@@ -3,6 +3,7 @@
 // as their writes. A rollback rolls back the cursor too; replay allocates
 // nothing. This queue serializes the two writers without retaining a Db.
 import type { Conn, Database as Db } from '#engine/store/db.ts';
+import { reservePublicationCounter } from './publication-rows.ts';
 
 const writers = new Map<string, Promise<void>>();
 const listeners = new Set<(path: string) => void>();
@@ -48,6 +49,11 @@ export async function nextEventSeq(tx: Conn): Promise<number> {
     "SELECT value FROM counters WHERE name = 'events'",
   );
   return Number(rows[0].value);
+}
+
+/** One rollback-scoped range, mapped in the writer's original FIFO order. */
+export function reserveEventSeqs(tx: Conn, count: number): Promise<number> {
+  return reservePublicationCounter(tx, 'events', count);
 }
 
 export async function eventStreamMax(db: Db): Promise<number> {

@@ -99,6 +99,11 @@ export type App = {
 /** Granted read dependencies are supplied by the node composition root. The
  * endpoint tree never reconstructs a home identity or reaches into a link owner. */
 export type ReplicaAccess = {
+  requireReadScope(scope: string, allowAbsent?: boolean): Promise<void>;
+  prepareReadRoomScope(
+    roomId: string,
+    allowAbsent?: boolean,
+  ): Promise<ReplicaRoomAdmission>;
   requireScope(scope: string, allowAbsent?: boolean): Promise<void>;
   prepareRoomScope(
     roomId: string,
@@ -294,11 +299,13 @@ export async function openReplicaApp(
     );
   };
   const federationContacts = new PendingContacts(server);
+  let stopRuleMigration: (() => void) | undefined;
   try {
     const federationEdus = eduState(server, tenant.serverName, store);
     const deviceLists = await replica.deviceLists?.(federationEdus);
     const pushSender = await replica.pushSender?.();
     const grantedTenant = { ...tenant, signer: () => replica.signer };
+    stopRuleMigration = await installRuleMigration(store, grantedTenant);
     const delayedEvents = await replica.delayedEvents?.(grantedTenant);
     const app: App = {
       store,
@@ -332,6 +339,7 @@ export async function openReplicaApp(
       close: () =>
         drainResources([
           () => federationContacts.close(),
+          () => stopRuleMigration?.(),
           () => store.close(),
         ]),
     };
@@ -342,6 +350,7 @@ export async function openReplicaApp(
     return app;
   } catch (error) {
     await drainResources([
+      () => stopRuleMigration?.(),
       () => federationContacts.close(),
       async () => {
         await replica.releaseServices?.();

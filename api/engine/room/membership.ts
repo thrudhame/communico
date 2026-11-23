@@ -133,7 +133,7 @@ async function admitJoin(
     userId,
     signer.serverName,
     (tx, authorizer) =>
-      withMembershipFence(admission, async () => {
+      withMembershipFence(admission, tx, async () => {
         const current = await membershipInTx(tx, userId);
         if (current?.membership === 'join') {
           return { roomId: room.id, eventId: current.eventId, created: false };
@@ -184,7 +184,7 @@ async function admitJoin(
     },
     absent
       ? (tx) =>
-        withMembershipFence(admission, async () => {
+        withMembershipFence(admission, tx, async () => {
           const result = await absent(tx, prepared);
           if (result?.created) {
             await tx.joinObservations.complete(result.eventId, observation);
@@ -230,7 +230,7 @@ export async function leave(
       signer = await prepareSigner(signer);
     }
     return await room.tx((tx) =>
-      withMembershipFence(admission, async () => {
+      withMembershipFence(admission, tx, async () => {
         const current = await membershipInTx(tx, userId);
         if (current === null) {
           throw new MatrixError(

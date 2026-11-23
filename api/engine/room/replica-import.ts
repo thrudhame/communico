@@ -34,12 +34,16 @@ export async function importReplicaRoom(
     keys: KeyResolver;
     signal?: AbortSignal;
     signatureUnion?: boolean;
+    home?: boolean;
+    admit?: () => void;
   },
 ): Promise<void> {
   if (manifest.version !== 1) {
     throw new MatrixError(400, 'M_BAD_JSON', 'replica manifest version');
   }
-  if (manifest.after > 0) await openRoom(store, manifest.roomId);
+  const roomHandle = () =>
+    openRoom(store, manifest.roomId, { admit: input.admit });
+  if (manifest.after > 0) await roomHandle();
   const residents = new Map(Object.entries(manifest.residents));
   const pack = new Map<string, Pdu>();
   const signatures = new Map<string, SignatureEvidence>();
@@ -82,11 +86,86 @@ export async function importReplicaRoom(
   }
   const event = (id: string): Pdu =>
     pack.get(id) ?? unavailable('replica event is unavailable');
-  const boundaries = new Map(
-    manifest.boundaries.map((boundary) => [boundary.eventId, boundary]),
-  );
+  // Keep the compact wire descriptions, not a complete state/auth copy per
+  // join. Validate all references and removals before any room effects, then
+  // materialize only the boundary requested by a snapshot consumer.
+  const boundaries = new Map<string, ReplicaRoom['boundaries'][number]>();
+  const contains = (
+    boundary: ReplicaRoom['boundaries'][number],
+    field: 'state' | 'authChain',
+    id: string,
+  ): boolean => {
+    for (;;) {
+      if (boundary[field].includes(id)) return true;
+      if (boundary.base === undefined) return false;
+      const removed = field === 'state'
+        ? boundary.removedState
+        : boundary.removedAuth;
+      if (removed?.includes(id)) return false;
+      boundary = boundaries.get(boundary.base) ??
+        unavailable('replica boundary base is unavailable');
+    }
+  };
+  for (const boundary of manifest.boundaries) {
+    if (boundaries.has(boundary.eventId)) {
+      throw new MatrixError(400, 'M_BAD_JSON', 'duplicate replica boundary');
+    }
+    if (boundary.base === undefined) {
+      boundaries.set(boundary.eventId, boundary);
+      continue;
+    }
+    const base = boundaries.get(boundary.base);
+    if (!base) unavailable('replica boundary base is unavailable');
+    for (
+      const [field, removed] of [
+        ['state', boundary.removedState ?? []],
+        ['authChain', boundary.removedAuth ?? []],
+      ] as const
+    ) {
+      const seen = new Set<string>();
+      for (const id of removed) {
+        if (seen.has(id) || !contains(base, field, id)) {
+          throw new MatrixError(
+            400,
+            'M_BAD_JSON',
+            'replica removes unknown boundary event',
+          );
+        }
+        seen.add(id);
+      }
+    }
+    boundaries.set(boundary.eventId, boundary);
+  }
+  const expandedBoundary = (id: string) => {
+    let boundary = boundaries.get(id);
+    if (!boundary) return undefined;
+    // Preserve complete-list ordering/duplicates for the existing snapshot
+    // verifier. Only a delta has set semantics in the original wire contract.
+    if (boundary.base === undefined) return boundary;
+    const chain = [boundary];
+    while (boundary.base !== undefined) {
+      boundary = boundaries.get(boundary.base) ??
+        unavailable('replica boundary base is unavailable');
+      chain.push(boundary);
+    }
+    const state = new Set<string>(), auth = new Set<string>();
+    for (let i = chain.length - 1; i >= 0; i--) {
+      const part = chain[i];
+      if (part.base !== undefined) {
+        for (const event of part.removedState ?? []) state.delete(event);
+        for (const event of part.removedAuth ?? []) auth.delete(event);
+      }
+      for (const event of part.state) state.add(event);
+      for (const event of part.authChain) auth.add(event);
+    }
+    return {
+      ...chain[0],
+      state: [...state].sort(),
+      authChain: [...auth].sort(),
+    };
+  };
   const snapshot = (id: string) => {
-    const boundary = boundaries.get(id);
+    const boundary = expandedBoundary(id);
     if (!boundary) unavailable('replica before-state is unavailable');
     return {
       resident: boundary.resident,
@@ -103,7 +182,7 @@ export async function importReplicaRoom(
     timestampToEvent: () => Promise.resolve(null),
     missingEvents: () => Promise.resolve([]),
     stateIds: (_room, id) => {
-      const boundary = boundaries.get(id);
+      const boundary = expandedBoundary(id);
       return Promise.resolve(
         boundary
           ? { pduIds: boundary.state, authChainIds: boundary.authChain }
@@ -142,13 +221,13 @@ export async function importReplicaRoom(
       authChain: [...pack.values()],
     });
   // Verification using a declared version is not proof that it is the room's
-  // version. Authenticate the signed create before any v2 overlay can commit.
+  // version. Authenticate the signed create before any v2 evidence can commit.
   const packEvidence = input.signatureUnion ? await verifyPack() : undefined;
   const initialized = new Set<string>();
   // Known auth/genesis events and signature-only packs need the same immutable
-  // comparison/union as live steps. Validate them before any bootstrap writes.
+  // material comparison as live steps. Validate them before bootstrap writes.
   if (packEvidence && (await store.rooms()).includes(manifest.roomId)) {
-    const room = await openRoom(store, manifest.roomId);
+    const room = await roomHandle();
     await withRoomLock(room.id, () =>
       room.tx(async (tx) => {
         const stay = await tx.segments.latestStay();
@@ -161,7 +240,7 @@ export async function importReplicaRoom(
         }
         await tx.events.list([...signatures.keys()]);
         for (const evidence of signatures.values()) {
-          await tx.events.mergeSignatures(evidence);
+          await tx.events.mergeSignatures(evidence, input.home);
         }
       }));
   }
@@ -194,7 +273,7 @@ export async function importReplicaRoom(
     input.signal?.throwIfAborted();
     const step = manifest.steps[i];
     await ensure(step.stay);
-    const room = await openRoom(store, manifest.roomId);
+    const room = await roomHandle();
     if (step.kind === 'history') {
       const chunk = [];
       do {
@@ -294,7 +373,10 @@ export async function importReplicaRoom(
     await withRoomLock(room.id, () =>
       room.tx(async (tx) => {
         if (input.signatureUnion) {
-          await tx.events.mergeSignatures(signatures.get(step.eventId)!);
+          await tx.events.mergeSignatures(
+            signatures.get(step.eventId)!,
+            input.home,
+          );
         } else {
           const existing = await tx.events.get(step.eventId);
           if (
@@ -347,7 +429,7 @@ export async function importReplicaRoom(
     if (!initialized.has(id)) {
       await ensure(id);
     }
-    const room = await openRoom(store, manifest.roomId);
+    const room = await roomHandle();
     const closed = await room.tx(async (tx) => {
       const stay = (await tx.segments.list()).find((held) =>
         held.kind === 'stay' &&
@@ -365,7 +447,7 @@ export async function importReplicaRoom(
   // copied source status or live publication. Later source transitions can
   // ground them normally. This also works after the final stay has closed.
   const evidence = packEvidence ?? await verifyPack();
-  const room = await openRoom(store, manifest.roomId);
+  const room = await roomHandle();
   await withRoomLock(room.id, () =>
     room.tx(async (tx) => {
       const stay = await tx.segments.latestStay();

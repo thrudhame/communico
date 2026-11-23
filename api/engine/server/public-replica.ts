@@ -1,6 +1,7 @@
 // Home-owned directory intent, not derived room metadata or a server-file copy.
 // Callers pin this semantic value and install it in their own server transaction.
 import { splitId } from '#engine/ids.ts';
+import { validRoomId } from '#engine/room/identity.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Conn } from '#engine/store/db.ts';
 import { changedColumns } from '#engine/store/changed.ts';
@@ -33,10 +34,7 @@ function row(raw: unknown): Record<string, unknown> {
   return raw as Record<string, unknown>;
 }
 function room(raw: unknown): string {
-  if (
-    typeof raw !== 'string' || !raw.startsWith('!') || !splitId(raw).server ||
-    !splitId(raw).localpart
-  ) bad();
+  if (!validRoomId(raw)) bad();
   return raw;
 }
 function local(raw: unknown, sigil: string, self: string): string {

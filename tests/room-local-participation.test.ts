@@ -150,7 +150,7 @@ Deno.test('local participation upgrade preserves old event evidence without inve
     idleseconds: 300,
   };
   let store = await openStore(config, {
-    schemas: { server: historicalServerSchema(45) },
+    schemas: { server: historicalServerSchema(46) },
   });
   try {
     let server = await store.server();

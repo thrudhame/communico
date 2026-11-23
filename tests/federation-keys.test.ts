@@ -43,6 +43,8 @@ import type { Database } from '#engine/store/db.ts';
 import { documentsFromAnswer } from '#engine/federation/witness.ts';
 import { UpstreamError } from '#engine/net/upstream-error.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
+import { prepareEventSignatures } from '#engine/room/signatures.ts';
+import { remoteEvent } from './fixtures/remote.ts';
 import {
   directOnly,
   makeDoc,
@@ -86,6 +88,170 @@ function stubDeps(over: Partial<KeysDeps>): KeysDeps {
       : () => Promise.resolve([]),
   };
 }
+
+Deno.test('event evidence: optional signer domains cannot start key discovery', async () => {
+  await withStore(async (store) => {
+    const server = await store.server();
+    const author = await makeServer('evidence-author.test');
+    const witness = await makeServer('evidence-known.test');
+    const unknown = await makeServer('evidence-unknown.test');
+    const authorDoc = await makeDoc(author);
+    await seedServer(server, witness);
+    const calls: string[] = [];
+    const keys = keyStore(server, {
+      deps: stubDeps({
+        directGet: (name) => {
+          calls.push(name);
+          return name === author.name
+            ? Promise.resolve(authorDoc)
+            : Promise.reject(
+              new UpstreamError('transport', {
+                phase: 'key-lookup',
+                reason: 'optional discovery attempted',
+              }),
+            );
+        },
+      }),
+    });
+    const partial = {
+      type: 'm.room.message',
+      sender: '@alice:' + author.name,
+      content: { body: 'optional evidence never owns discovery' },
+      prev_events: [],
+      origin_server_ts: 1,
+    };
+    const event = await remoteEvent('!evidence:test', author, '11', partial);
+    for (const signer of [witness, unknown]) {
+      const signed = await remoteEvent('!evidence:test', signer, '11', partial);
+      Object.assign(event.signatures, signed.signatures);
+    }
+    event.signatures['another-unknown.test'] = event.signatures[unknown.name];
+    const original = structuredClone(event);
+    const prepared = await prepareEventSignatures(
+      event,
+      '11',
+      productionKeyResolver(keys),
+    );
+    assertEquals(calls, [author.name]);
+    assertEquals(
+      Object.keys(prepared.evidence.signatures).sort(),
+      [
+        author.name,
+        witness.name,
+      ].sort(),
+    );
+    assertEquals(JSON.parse(prepared.evidence.pdu), original);
+    assertEquals(await keys.listServerKeys(unknown.name), [{
+      rows: [],
+      doc: null,
+    }]);
+  });
+});
+
+Deno.test('cached verification: validity, retirement, intrinsic names and misses preserve ordinary discovery', async () => {
+  await withStore(async (store) => {
+    const server = await store.server();
+    const known = await makeServer('cached-evidence.test');
+    const retired = await makeServer('cached-retired.test');
+    const unknown = await makeServer('cached-unknown.test');
+    const retiredAt = Date.now();
+    const validUntil = retiredAt + 3600_000;
+    await seedServer(
+      server,
+      known,
+      await makeDoc(known, {
+        validUntilMs: validUntil,
+        oldVerifyKeys: {
+          'ed25519:old': {
+            key: b64encodeStd(await exportPublicKeyRaw(retired.kp.publicKey)),
+            expired_ts: retiredAt,
+          },
+        },
+      }),
+    );
+    let directCalls = 0;
+    let witnessCalls = 0;
+    const ks = keyStore(server, {
+      deps: stubDeps({
+        directGet: () => {
+          directCalls++;
+          return makeDoc(unknown);
+        },
+        listWitnesses: () => {
+          witnessCalls++;
+          return Promise.resolve([]);
+        },
+      }),
+    });
+    const cached = { discovery: 'cached' as const };
+    const pub = await ks.getVerifyKey(
+      known.name,
+      known.keyId,
+      retiredAt,
+      'event',
+      cached,
+    );
+    assertEquals(
+      await exportPublicKeyRaw(pub),
+      await exportPublicKeyRaw(known.kp.publicKey),
+    );
+    const old = await ks.getVerifyKey(
+      known.name,
+      'ed25519:old',
+      retiredAt,
+      'event',
+      cached,
+    );
+    assertEquals(
+      await exportPublicKeyRaw(old),
+      await exportPublicKeyRaw(retired.kp.publicKey),
+    );
+    for (
+      const [name, id, floor, purpose] of [
+        [known.name, 'ed25519:old', retiredAt, 'request'],
+        [known.name, 'ed25519:old', retiredAt + 1, 'event'],
+        [known.name, known.keyId, validUntil + 1, 'event'],
+        [known.name, 'ed25519:absent', 0, 'event'],
+        [unknown.name, unknown.keyId, 0, 'event'],
+      ] as const
+    ) {
+      await assertRejects(
+        () => ks.getVerifyKey(name, id, floor, purpose, cached),
+        UpstreamError,
+      );
+    }
+    const intrinsic = b32encode(await exportPublicKeyRaw(unknown.kp.publicKey))
+      .toLowerCase().replace(/=+$/, '');
+    assertEquals(
+      await exportPublicKeyRaw(
+        await ks.getVerifyKey(intrinsic, 'ed25519:0', 0, 'event', cached),
+      ),
+      await exportPublicKeyRaw(unknown.kp.publicKey),
+    );
+    assertEquals([directCalls, witnessCalls], [0, 0]);
+    await ks.getVerifyKey(unknown.name, unknown.keyId, 0, 'event');
+    assertEquals(
+      [directCalls, witnessCalls],
+      [1, 1],
+      'cache-only misses must not poison discovery',
+    );
+    const controller = new AbortController();
+    const reason = new Error('cancel cached verification');
+    controller.abort(reason);
+    assertStrictEquals(
+      await assertRejects(() =>
+        ks.getVerifyKey(
+          known.name,
+          known.keyId,
+          0,
+          'event',
+          { ...cached, signal: controller.signal },
+        )
+      ),
+      reason,
+    );
+  });
+});
 
 Deno.test('our key document: shape, ed25519: id, unpadded b64, self-signature', async () => {
   const { signer, publicKey } = await randomSigner('keys-own.test');

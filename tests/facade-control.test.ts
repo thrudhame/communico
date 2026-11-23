@@ -9,11 +9,16 @@ import {
   publishKeyDocument,
 } from '#engine/facade/control.ts';
 import { homeKeyDocument } from '#engine/federation/keydoc.ts';
+import { startHomeLinks } from '#engine/facade/home.ts';
 import { signWithSigner } from '#engine/federation/keys.ts';
 import { initializeNode } from '#engine/facade/identity.ts';
 import { Journal } from '#engine/facade/journal.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
 import { LINK_CAPABILITIES, LinkError } from '#engine/facade/protocol.ts';
+import {
+  changeSigningAuthority,
+  VerificationUnavailable,
+} from '#engine/facade/signing-authority.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { UpstreamError } from '#engine/net/upstream-error.ts';
 import { serverSchema } from '#engine/server/schema.ts';
@@ -22,6 +27,8 @@ import { openStore } from '#engine/store/index.ts';
 import type { Database } from '#engine/store/db.ts';
 import type { Signer } from '#engine/room/signer.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
+import { startHttp } from './http-app.ts';
+import { facadeTls } from './support/facade-tls.ts';
 import {
   importPublicKeyFromRaw,
   matrixBase64,
@@ -175,6 +182,65 @@ async function fixture(seedServer = serverSchema) {
   };
 }
 
+Deno.test('home link recovery publishes last-facade retirement before any public key request', async () => {
+  const tls = await facadeTls();
+  const f = await fixture();
+  let app: Awaited<ReturnType<typeof openApp>> | undefined;
+  let links: Awaited<ReturnType<typeof startHomeLinks>> | undefined;
+  try {
+    await f.receive();
+    const retiredAt = Date.now();
+    const revoked = await f.hp.revoke(f.bundle.id, retiredAt);
+    setConfigForTests({
+      server: { name: 'logical.test', role: 'home' },
+      facade: {
+        // The retired peer need not remain in the configured worker set.
+        nodes: ['not_enrolled'],
+        linkcert: tls.dir + '/home.crt',
+        linkkey: tls.dir + '/home.key',
+        linkcacerts: [tls.dir + '/ca.crt'],
+      },
+    });
+    app = await f.openHomeApp();
+    links = await startHomeLinks(app);
+    // No key-document request or explicit control publisher repairs this cut.
+    assertEquals(
+      (await app.federationKeys.getVerifyKey(
+        'logical.test',
+        app.tenant.keyId,
+        Date.now(),
+        'event',
+      )).algorithm.name,
+      'Ed25519',
+    );
+    const [held] = await app.server.query(
+      'SELECT revision,document_json FROM facade_key_roster WHERE singleton=1',
+    );
+    assertEquals(Number(held.revision), revoked.body.revision);
+    const doc = JSON.parse(String(held.document_json));
+    assertEquals(Object.keys(doc.verify_keys), [app.tenant.keyId]);
+    assertEquals(doc.old_verify_keys[f.node.keyId], {
+      key: f.node.publicKey,
+      expired_ts: retiredAt,
+    });
+    assertEquals(
+      await verifyJson(
+        doc,
+        'logical.test',
+        app.tenant.keyId,
+        await importPublicKeyFromRaw(matrixBase64(app.tenant.publicB64, 32)),
+      ),
+      true,
+    );
+  } finally {
+    await links?.close();
+    if (app) await closeApp();
+    await f.close();
+    await tls.close();
+    setConfigForTests({});
+  }
+});
+
 Deno.test('home-only App resolves its own key without logical-self acquisition', async () => {
   setConfigForTests({ server: { name: 'logical.test', role: 'home' } });
   const dir = await Deno.makeTempDir({ prefix: 'home-app-keys-' });
@@ -241,23 +307,37 @@ Deno.test('cold home App resolves its enrolled co-signed logical-server roster',
         [invalid],
       );
       for (const keyId of [f.tenant.keyId, f.node.keyId]) {
-        await assertRejects(
-          () =>
-            app.federationKeys.getVerifyKey(
-              'logical.test',
-              keyId,
-              0,
-              'event',
-            ),
-          UpstreamError,
-          'local key unavailable',
-        );
+        const lookup = () =>
+          app.federationKeys.getVerifyKey('logical.test', keyId, 0, 'event');
+        if (invalid === null) {
+          const error = await assertRejects(
+            lookup,
+            VerificationUnavailable,
+            'not ready',
+          );
+          assertEquals(error.code, 'LINK_UNAVAILABLE');
+        } else {await assertRejects(
+            lookup,
+            UpstreamError,
+            'local key unavailable',
+          );}
       }
     }
     await app.server.execute(
       'UPDATE facade_key_roster SET document_json=? WHERE singleton=1',
       [held.document_json],
     );
+    for (const keyId of [f.tenant.keyId, f.node.keyId]) {
+      assertEquals(
+        (await app.federationKeys.getVerifyKey(
+          'logical.test',
+          keyId,
+          0,
+          'event',
+        )).algorithm.name,
+        'Ed25519',
+      );
+    }
   } finally {
     await closeApp();
     await f.close();
@@ -378,7 +458,11 @@ Deno.test('both room replicas resolve only complete current local rosters and re
           const verifier = db === f.server()
             ? f.keys().verificationKeys()
             : await f.homeKeys();
-          await assertRejects(
+          const pending = ['stale roster', 'missing roster', 'missing document']
+            .includes(invalid);
+          const error = await assertRejects<
+            VerificationUnavailable | UpstreamError
+          >(
             () =>
               verifier.getVerifyKey(
                 'logical.test',
@@ -386,8 +470,17 @@ Deno.test('both room replicas resolve only complete current local rosters and re
                 floor,
                 'event',
               ),
-            UpstreamError,
+            // PR #131 retains hard refusal for corrupt documents/signatures.
+            ['stale roster', 'missing roster', 'missing document'].includes(
+                invalid,
+              )
+              ? VerificationUnavailable
+              : UpstreamError,
           );
+          if (pending) {
+            assert(error instanceof VerificationUnavailable);
+            assertEquals(error.code, 'LINK_UNAVAILABLE');
+          } else assert(error instanceof UpstreamError);
         }
         await db.execute(
           'UPDATE facade_key_roster SET revision=?,roster_json=?,document_json=? WHERE singleton=1',
@@ -436,6 +529,74 @@ Deno.test('both room replicas resolve only complete current local rosters and re
   } finally {
     await f.close();
     setConfigForTests({});
+  }
+});
+
+Deno.test('home room verification retries pending authority without disguising a wrong retained roster', async () => {
+  const f = await fixture();
+  try {
+    const verifier = await f.homeKeys();
+    const lookup = () =>
+      verifier.getVerifyKey('logical.test', f.node.keyId, 0, 'event');
+    const pending = async () => {
+      const error = await assertRejects(
+        lookup,
+        VerificationUnavailable,
+        'not ready',
+      );
+      assertEquals(error.code, 'LINK_UNAVAILABLE');
+    };
+    await pending();
+    await f.receive();
+    assertEquals((await lookup()).algorithm.name, 'Ed25519');
+    const db = await f.home.server();
+    const [saved] = await db.query(
+      'SELECT revision,roster_json,document_json FROM facade_key_roster WHERE singleton=1',
+    );
+    try {
+      await db.execute(
+        'UPDATE facade_key_roster SET document_json=NULL WHERE singleton=1',
+      );
+      await pending();
+      for (const wrong of ['server', 'key', 'revision']) {
+        const roster = JSON.parse(String(saved.roster_json));
+        if (wrong === 'server') roster.server = 'wrong.test';
+        if (wrong === 'key') roster.keys[0].publicKey = 'A'.repeat(43);
+        if (wrong === 'revision') roster.revision += 1;
+        await db.execute(
+          'UPDATE facade_key_roster SET roster_json=?,document_json=? WHERE singleton=1',
+          [canonicalJson(roster), saved.document_json],
+        );
+        await assertRejects(lookup, UpstreamError);
+      }
+    } finally {
+      await db.execute(
+        'UPDATE facade_key_roster SET revision=?,roster_json=?,document_json=? WHERE singleton=1',
+        [saved.revision, saved.roster_json, saved.document_json],
+      );
+    }
+    assertEquals((await lookup()).algorithm.name, 'Ed25519');
+    const entered = Promise.withResolvers<void>();
+    const release = Promise.withResolvers<void>();
+    const writing = changeSigningAuthority(db, async () => {
+      entered.resolve();
+      await release.promise;
+    });
+    try {
+      await entered.promise;
+      const error = await assertRejects(
+        lookup,
+        VerificationUnavailable,
+        'authority changed',
+      );
+      assertEquals(error.code, 'LINK_UNAVAILABLE');
+    } finally {
+      release.resolve();
+      await writing;
+    }
+    assertEquals((await lookup()).algorithm.name, 'Ed25519');
+  } finally {
+    await f.close();
   }
 });
 
@@ -585,7 +746,8 @@ Deno.test('re-enrollment makes every roster consumer unavailable until its new c
           0,
           'event',
         ),
-      UpstreamError,
+      VerificationUnavailable,
+      'key roster not ready',
     );
     await f.reopen();
     await assertRejects(() => f.keys().document(), MatrixError, 'not ready');
@@ -594,6 +756,159 @@ Deno.test('re-enrollment makes every roster consumer unavailable until its new c
     assertEquals((await f.keys().status()).ready, true);
     assertEquals((await f.keys().document()).verify_keys, prior.verify_keys);
   } finally {
+    await f.close();
+  }
+});
+
+Deno.test('verification distinguishes pending publications from invalid authority and preserves its fence across key loading', async (t) => {
+  setConfigForTests({ facade: { maxofflinedays: 1 } });
+  const f = await fixture();
+  try {
+    const record = await f.receive();
+    await f.keys().apply(f.journal(), record);
+    const server = f.server();
+    const [original] = await server.query(
+      'SELECT revision,roster_json,document_json FROM facade_key_roster WHERE singleton=1',
+    );
+    const lookup = (id = f.tenant.keyId, floor = 0) =>
+      f.keys().verificationKeys().getVerifyKey(
+        'logical.test',
+        id,
+        floor,
+        'event',
+      );
+    const restore = () =>
+      server.execute(
+        'UPDATE facade_key_roster SET revision=?,roster_json=?,document_json=? WHERE singleton=1',
+        [original.revision, original.roster_json, original.document_json],
+      );
+    for (
+      const pending of ['missing roster', 'older roster', 'missing document']
+    ) {
+      await t.step(pending, async () => {
+        await restore();
+        if (pending === 'missing roster') {
+          await server.execute(
+            'UPDATE facade_key_roster SET roster_json=NULL WHERE singleton=1',
+          );
+        } else if (pending === 'older roster') {
+          await server.execute(
+            'UPDATE facade_key_roster SET revision=0 WHERE singleton=1',
+          );
+        } else {await server.execute(
+            'UPDATE facade_key_roster SET document_json=NULL WHERE singleton=1',
+          );}
+        const error = await assertRejects(
+          () => lookup(),
+          VerificationUnavailable,
+          'not ready',
+        );
+        assertEquals(error.code, 'LINK_UNAVAILABLE');
+        await restore();
+        assertEquals((await lookup()).algorithm.name, 'Ed25519');
+      });
+    }
+    for (
+      const corrupt of [
+        'document bytes',
+        'document signature',
+        'document identity',
+        'unknown key',
+        'validity floor',
+      ]
+    ) {
+      await t.step(corrupt, async () => {
+        await restore();
+        if (corrupt.startsWith('document')) {
+          const document = JSON.parse(String(original.document_json));
+          if (corrupt === 'document signature') {
+            document.signatures['logical.test'][f.tenant.keyId] = 'A'.repeat(
+              86,
+            );
+          }
+          if (corrupt === 'document identity') {
+            document.server_name = 'wrong.test';
+          }
+          await server.execute(
+            'UPDATE facade_key_roster SET document_json=? WHERE singleton=1',
+            [corrupt === 'document bytes' ? '{}' : JSON.stringify(document)],
+          );
+        }
+        await assertRejects(
+          () =>
+            lookup(
+              corrupt === 'unknown key' ? 'ed25519:unknown' : f.tenant.keyId,
+              corrupt === 'validity floor' ? Number.MAX_SAFE_INTEGER : 0,
+            ),
+          UpstreamError,
+          'local key unavailable',
+        );
+      });
+    }
+    await restore();
+    await t.step('authority changes during the asynchronous read', async () => {
+      let changed = false;
+      const database: Database = {
+        ...server,
+        async query(sql, values) {
+          const rows = await server.query(sql, values);
+          if (!changed && sql.includes('FROM facade_key_roster')) {
+            changed = true;
+            await changeSigningAuthority(server, () => Promise.resolve());
+          }
+          return rows;
+        },
+      };
+      const error = await assertRejects(
+        () =>
+          f.keys(database).verificationKeys().getVerifyKey(
+            'logical.test',
+            f.tenant.keyId,
+            0,
+            'event',
+          ),
+        VerificationUnavailable,
+        'authority changed',
+      );
+      assertEquals(error.code, 'LINK_UNAVAILABLE');
+      assertEquals((await lookup()).algorithm.name, 'Ed25519');
+    });
+  } finally {
+    await f.close();
+    setConfigForTests({});
+  }
+});
+
+Deno.test('pending verification authority is retryable at the real public HTTP boundary', async () => {
+  const f = await fixture();
+  const http = await startHttp();
+  try {
+    const owner = f.keys();
+    http.app.federationKeys.getVerifyKey =
+      owner.verificationKeys().getVerifyKey;
+    const uri = '/_matrix/federation/v1/query/nope';
+    const origin = f.tenant.serverName;
+    const destination = http.app.tenant.serverName;
+    const signature = await f.tenant.signer().sign(
+      canonicalJson({ method: 'GET', uri, origin, destination }),
+    );
+    const request = () =>
+      new Request('http://x' + uri, {
+        headers: {
+          authorization:
+            `X-Matrix origin="${origin}",destination="${destination}",key="${f.tenant.keyId}",sig="${signature}"`,
+        },
+      });
+    const waiting = await http.matrix(request());
+    assertEquals(waiting.status, 503);
+    assertEquals((await waiting.json()).errcode, 'M_UNAVAILABLE');
+    const record = await f.receive();
+    await owner.apply(f.journal(), record);
+    const ready = await http.matrix(request());
+    assertEquals(ready.status, 404);
+    assertEquals((await ready.json()).errcode, 'M_UNRECOGNIZED');
+  } finally {
+    await http.close();
     await f.close();
   }
 });
@@ -818,9 +1133,10 @@ Deno.test('roster retirement is preserved, and changed or forged control cannot 
         expired_ts: retiredAt,
       });
       assertEquals(doc.verify_keys[node.keyId], undefined);
-      for (
-        const verification of [f.keys().verificationKeys(), await f.homeKeys()]
-      ) {
+      for (const db of [f.server(), await f.home.server()]) {
+        const verification = db === f.server()
+          ? f.keys().verificationKeys()
+          : await f.homeKeys();
         assertEquals(
           (await verification.getVerifyKey(
             'logical.test',
@@ -830,26 +1146,53 @@ Deno.test('roster retirement is preserved, and changed or forged control cannot 
           )).algorithm.name,
           'Ed25519',
         );
-        await assertRejects(
-          () =>
-            verification.getVerifyKey(
-              'logical.test',
-              node.keyId,
-              retiredAt + 1,
-              'event',
-            ),
-          UpstreamError,
-        );
-        await assertRejects(
-          () =>
-            verification.getVerifyKey(
-              'logical.test',
-              node.keyId,
-              retiredAt - 1,
-              'request',
-            ),
-          UpstreamError,
-        );
+        for (const missingDocument of [false, true]) {
+          try {
+            if (missingDocument) {
+              await db.execute(
+                'UPDATE facade_key_roster SET document_json=NULL WHERE singleton=1',
+              );
+            }
+            await assertRejects(
+              () =>
+                verification.getVerifyKey(
+                  'logical.test',
+                  node.keyId,
+                  retiredAt + 1,
+                  'event',
+                ),
+              UpstreamError,
+            );
+            await assertRejects(
+              () =>
+                verification.getVerifyKey(
+                  'logical.test',
+                  node.keyId,
+                  retiredAt - 1,
+                  'request',
+                ),
+              UpstreamError,
+            );
+            if (missingDocument) {
+              await assertRejects(
+                () =>
+                  verification.getVerifyKey(
+                    'logical.test',
+                    node.keyId,
+                    retiredAt,
+                    'event',
+                  ),
+                VerificationUnavailable,
+                'not ready',
+              );
+            }
+          } finally {
+            await db.execute(
+              'UPDATE facade_key_roster SET document_json=? WHERE singleton=1',
+              [canonicalJson(doc)],
+            );
+          }
+        }
       }
     } finally {
       await otherStore.close();

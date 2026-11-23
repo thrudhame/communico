@@ -15,6 +15,7 @@ import {
 } from '#engine/signing-primitives.js';
 import type { Manifest } from '#engine/backup/manifest.ts';
 import { tenantProjectionSources } from '#engine/store/projection-sources.ts';
+import { completionCounterName } from './completion.ts';
 
 export async function auditTenant(db: CapturedQuery, id: string) {
   const rows = await db.query(
@@ -97,7 +98,6 @@ export async function auditTenant(db: CapturedQuery, id: string) {
       ['key_pools', 'key_pool_updates', 'seq'],
       ['device_generation', 'devices', 'generation'],
       ['cross_signing', 'cross_signing_keys', 'revision'],
-      ['client_completion', 'client_completion_cuts', 'revision'],
     ]
   ) await counterCeiling(db, heads, counter, table, column);
   for (const table of ['transaction_completions', 'client_completion_cuts']) {
@@ -114,7 +114,22 @@ export async function auditTenant(db: CapturedQuery, id: string) {
         nonnegative(target.through, 'completion cut') === 0
       ) auditFailure('completion target ownership');
       if (table === 'client_completion_cuts') {
-        if (nonnegative(target.revision, 'completion revision') === 0) {
+        const counter = completionCounterName({
+          localpart: String(target.localpart),
+          deviceId: String(target.device_id),
+          generation: Number(target.generation),
+        }, {
+          roomId: String(target.room_id),
+          generation: String(target.room_generation),
+          through: Number(target.through),
+        });
+        const revision = nonnegative(target.revision, 'completion revision');
+        // Unchanged legacy markers still belong to the old global allocator;
+        // first mutation of a scope durably switches it to its own ceiling.
+        if (
+          revision === 0 ||
+          revision > (heads[counter] ?? heads.client_completion ?? 0)
+        ) {
           auditFailure('completion revision');
         }
       } else {
