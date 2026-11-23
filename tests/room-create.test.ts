@@ -76,6 +76,91 @@ async function withStore(
   }
 }
 
+Deno.test('prepared v12 creation binds the whole request, not only the create event, after reopen', async () => {
+  const dir = await Deno.makeTempDir();
+  let store = await openStore(config(dir), { schemas: { room: roomSchema } });
+  try {
+    const signer = await testSigner();
+    const opts: CreateRoomOptions = {
+      creator: '@creator:' + signer.serverName,
+      version: '12',
+      name: 'first name',
+      topic: 'first topic',
+      invite: ['@bob:' + signer.serverName],
+    };
+    const now = Date.now;
+    const fixed = now();
+    let first: Awaited<ReturnType<typeof prepareRoom>>;
+    let other: Awaited<ReturnType<typeof prepareRoom>>;
+    try {
+      Date.now = () => fixed;
+      [first, other] = await Promise.all([
+        prepareRoom(store, opts, signer),
+        prepareRoom(store, {
+          ...opts,
+          name: 'different name',
+          topic: 'different topic',
+          invite: ['@charlie:' + signer.serverName],
+        }, signer),
+      ]);
+    } finally {
+      Date.now = now;
+    }
+    assertEquals(
+      first.roomId,
+      other.roomId,
+      'fixture must collide before either request publishes',
+    );
+    const result = await initializePreparedRoom(store, first, signer);
+    const db = await store.room(result.roomId);
+    const events = await db.query('SELECT id,pdu FROM events ORDER BY id');
+    await assertRejects(
+      () => initializePreparedRoom(store, other, signer),
+      Error,
+      'E_CREATE_ROOM_IDENTITY',
+    );
+    assertEquals(
+      await db.query('SELECT id,pdu FROM events ORDER BY id'),
+      events,
+    );
+    await store.close();
+    store = await openStore(config(dir), { schemas: { room: roomSchema } });
+    assertEquals(await initializePreparedRoom(store, first, signer), result);
+    for (
+      const change of [
+        { name: 'changed' },
+        { topic: 'changed' },
+        { invite: ['@other:' + signer.serverName] },
+        {
+          initial_state: [{
+            type: 'm.room.topic',
+            content: { topic: 'changed' },
+          }],
+        },
+      ]
+    ) {
+      await assertRejects(
+        () =>
+          initializePreparedRoom(store, {
+            ...first,
+            options: { ...first.options, ...change },
+          }, signer),
+        Error,
+        'E_CREATE_ROOM_IDENTITY',
+      );
+    }
+    assertEquals(
+      await (await store.room(result.roomId)).query(
+        'SELECT id,pdu FROM events ORDER BY id',
+      ),
+      events,
+    );
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 async function open(store: Store, roomId: string): Promise<Room> {
   return await openRoom(store, roomId);
 }

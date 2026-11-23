@@ -28,6 +28,7 @@ import {
 } from '#engine/room/encryption-policy.ts';
 import { prepareSigner, type Signer } from '#engine/room/signer.ts';
 import type { Store } from '#engine/store/index.ts';
+import { createHash } from 'node:crypto';
 
 export type CreateRoomOptions = {
   creator: string;
@@ -378,6 +379,15 @@ export async function initializePreparedRoom(
   prepared: PreparedRoom,
   signer: Signer,
 ): Promise<CreateRoomResult> {
+  // Capture the immutable workflow input before any await. Signature enrichment
+  // does not change a plan; every requested initial effect does.
+  prepared = JSON.parse(JSON.stringify(prepared));
+  const { signatures: _signatures, unsigned: _unsigned, ...material } =
+    prepared.createPdu;
+  const identity = createHash('sha256').update(canonicalJson({
+    ...prepared,
+    createPdu: material,
+  })).digest('hex');
   const {
     roomId: finalRoomId,
     createPdu,
@@ -403,6 +413,7 @@ export async function initializePreparedRoom(
       }
       if (existing) {
         return await existing.tx(async (tx) => {
+          await tx.creationReceipt.require(identity);
           const row = await tx.events.get(String(createPdu.event_id));
           const material = (pdu: Pdu) => {
             const { signatures: _signatures, unsigned: _unsigned, ...value } =
@@ -434,6 +445,7 @@ export async function initializePreparedRoom(
         });
       }
       return await initializeRoom(store, finalRoomId, async (tx) => {
+        await tx.creationReceipt.record(identity);
         const send = async (
           type: string,
           stateKey: string,
