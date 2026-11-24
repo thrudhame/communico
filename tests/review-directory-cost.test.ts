@@ -1,4 +1,5 @@
 import { assertEquals } from '@std/assert';
+import { MatrixError } from '#engine/matrix-error.ts';
 import { type Conn, operations } from '#engine/store/db.ts';
 import { startHttp } from '#tests/http-app.ts';
 
@@ -71,6 +72,62 @@ Deno.test('directory: discovery reads only join-rule and history-visibility stat
     assertEquals(types, ['m.room.join_rules', 'm.room.history_visibility']);
   } finally {
     app.store.room = original;
+    await http.close();
+  }
+});
+
+Deno.test('directory: unready candidate admission cannot hide a ready match', async () => {
+  const http = await startHttp();
+  const { tenant } = http.app;
+  const original = tenant.tx.bind(tenant);
+  try {
+    const searcher = await http.registerTestUser('candidate-searcher', 'pw');
+    const pending = await http.registerTestUser('candidate-pending', 'pw');
+    const ready = await http.registerTestUser('candidate-ready', 'pw');
+    for (const user of [pending, ready]) {
+      const room = await http.matrix(
+        new Request('http://x/_matrix/client/v3/createRoom', {
+          method: 'POST',
+          headers: { Authorization: 'Bearer ' + user.access_token },
+          body: JSON.stringify({ preset: 'public_chat' }),
+        }),
+      );
+      await room.arrayBuffer();
+      assertEquals(room.status, 200);
+    }
+    tenant.tx = (fn) =>
+      original(async (tx) => {
+        const check = tx.ingress.check;
+        tx.ingress.check = (intent) => {
+          if (
+            intent.kind === 'domain-read' &&
+            intent.localpart === 'candidate-pending'
+          ) {
+            throw new MatrixError(
+              503,
+              'M_UNAVAILABLE',
+              'awaiting account auth snapshot',
+            );
+          }
+          return check(intent);
+        };
+        return await fn(tx);
+      });
+    const response = await http.matrix(
+      new Request('http://x/_matrix/client/v3/user_directory/search', {
+        method: 'POST',
+        headers: { Authorization: 'Bearer ' + searcher.access_token },
+        body: JSON.stringify({ search_term: 'candidate-' }),
+      }),
+    );
+    const body = await response.json();
+    assertEquals(response.status, 200);
+    assertEquals(body.results.map((r: { user_id: string }) => r.user_id), [
+      ready.user_id,
+    ]);
+    assertEquals(body.limited, false);
+  } finally {
+    tenant.tx = original;
     await http.close();
   }
 });

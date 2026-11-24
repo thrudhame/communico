@@ -374,10 +374,18 @@ export async function searchUsers(searcher: string, term: string, limit = 10) {
   const needle = term.toLowerCase(), results: Record<string, unknown>[] = [];
   for (const user of candidates) {
     if (!user.endsWith(':' + serverName())) continue;
-    const profile = await getPublicProfile(
-      theApp().tenant,
-      localpartOf(user),
-    );
+    let profile;
+    try {
+      profile = await getPublicProfile(theApp().tenant, localpartOf(user));
+    } catch (error) {
+      // Candidate admission is independent of searcher admission. Do not
+      // expose the candidate via a user-ID match when its read is unproved.
+      if (
+        error instanceof MatrixError && error.status === 503 &&
+        error.errcode === 'M_UNAVAILABLE'
+      ) continue;
+      throw error;
+    }
     if (
       !user.toLowerCase().includes(needle) &&
       !profile?.displayname?.toLowerCase().includes(needle)
