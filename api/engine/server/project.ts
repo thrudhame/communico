@@ -43,6 +43,7 @@ import {
   projectReceiptGraphs,
   type ReceiptMembership,
   receiptMembership,
+  withPublicationReceiptMode,
 } from '#engine/server/receipt-frontier.ts';
 import { reconcileReceiptMarks } from '#engine/server/ephemeral.ts';
 import { projectRejoin, type RejoinObservation } from './membership.ts';
@@ -813,7 +814,7 @@ async function publishGroup(group: PublicationTurn[]): Promise<void> {
   if (active.length) {
     const server = await group[0].store.server();
     const now = Date.now();
-    await eventStreamTx(server, async (tx) => {
+    const applyGroup = async (tx: Conn) => {
       // Each wave contains one complete unit per room. The next same-room unit
       // reads the effects of its predecessor in this same atomic attempt, while
       // compatible independent rooms still use the set insertion path. No
@@ -854,7 +855,8 @@ async function publishGroup(group: PublicationTurn[]): Promise<void> {
         await advance(tx, roomSource('push-context', work.roomId), pos);
         await advance(tx, roomSource('receipt-graph', work.roomId), pos);
       }
-    });
+    };
+    await eventStreamTx(server, withPublicationReceiptMode(applyGroup));
   }
   // A post-commit typing/listener failure is this unit's failure, not grounds
   // for replaying the durable group or suppressing another room's completion.
