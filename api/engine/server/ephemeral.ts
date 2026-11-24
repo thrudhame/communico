@@ -10,6 +10,7 @@ import { isJoined, receiptTargetInThread } from '#engine/server/read.ts';
 import { advanceNotificationRead } from '#engine/server/notifications.ts';
 import {
   acceptPresenceStatus,
+  presenceStatusReady,
   recordPresenceStatus,
   requirePresenceStatus,
 } from '#engine/server/presence-operations.ts';
@@ -137,7 +138,7 @@ export async function replacePresenceSource(
           value.deviceId,
           value.generation,
           value.presence,
-          now - value.lastActiveAgo - age,
+          Math.max(0, now - value.lastActiveAgo - age),
           now + remaining - LOCAL_SYNC_GRACE_MS,
         ],
       );
@@ -642,10 +643,15 @@ export async function capturePresence(
   const visible = new Set([userId, ...await sharedUsers(tx, userId)]);
   for (const user of subjects ?? visible) {
     if (!visible.has(user)) continue;
-    await requirePresenceStatus(tx, user);
+    // A bulk snapshot may omit an unproved co-member status; an explicit
+    // subject read or the observer's own status must still fail closed.
+    const strict = subjects !== undefined || user === userId;
+    if (strict) await requirePresenceStatus(tx, user);
+    const statusReady = strict || await presenceStatusReady(tx, user);
     const value = await normalizePresence(tx, user, server);
-    rows.set(user, value.row);
-    if (value.changed) changes.push({ userId: user, row: value.row });
+    const row = statusReady ? value.row : { ...value.row, statusMsg: null };
+    rows.set(user, row);
+    if (value.changed) changes.push({ userId: user, row });
   }
   return { rows, changes };
 }

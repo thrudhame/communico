@@ -529,6 +529,34 @@ Deno.test('live activity wire preserves source, account, deletion and expiry bou
       },
     );
     await t.step(
+      'activity ages floor at epoch without renewing expiry',
+      async () => {
+        const before = Date.now();
+        const age = 12;
+        await f.edgeActivity.apply(f.bundle.id, {
+          ...snapshot,
+          presence: [{
+            ...snapshot.presence[0],
+            lastActiveAgo: Number.MAX_SAFE_INTEGER,
+          }],
+        }, () => age);
+        const [held] = await server.query(
+          'SELECT last_active_ms,last_sync_ms FROM presence_observations WHERE user_id=? AND node=?',
+          [user, 'home'],
+        );
+        const after = Date.now();
+        await f.edgeActivity.apply(
+          f.bundle.id,
+          { ...snapshot, presence: [] },
+          () => 0,
+        );
+        const offset = snapshot.presence[0].remainingMs - age - 30000;
+        assertEquals(held.last_active_ms, 0);
+        assert(Number(held.last_sync_ms) >= before + offset);
+        assert(Number(held.last_sync_ms) <= after + offset);
+      },
+    );
+    await t.step(
       'missing selection is not an empty admitted account',
       async () => {
         const db = await f.edge.tenant('logical.test');
@@ -956,7 +984,36 @@ Deno.test('domain presence status: completeness, concurrent losers, observed cle
   }
 });
 
-Deno.test('domain presence status: stale pairing inventory and missing activation cannot authorize a read', async () => {
+Deno.test('domain presence status: an unready co-member cannot withhold the snapshot or reveal status', async () => {
+  const f = await fixture();
+  try {
+    const edge = await f.edge.server();
+    const alice = '@alice:logical.test', bob = '@bob:logical.test';
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    for (const user of [alice, bob]) {
+      await edge.execute(
+        "INSERT INTO memberships(user,room,membership,event,seq) VALUES(?,?,'join','$join',0)",
+        [user, '!status:logical.test'],
+      );
+    }
+    await edge.execute(
+      "INSERT INTO presence(user_id,presence,status_msg,last_active_ms,seq) VALUES(?,'offline','unproved',0,0)",
+      [bob],
+    );
+    const view = await edge.tx((conn) => capturePresence(conn, alice, edge));
+    assert(view.rows.has(alice));
+    assertEquals(view.rows.get(bob)?.statusMsg, null);
+    await assertRejects(
+      () => getPresence(edge, bob),
+      MatrixError,
+      'presence status unavailable',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain presence status: stale pairing inventory and missing activation cannot authorize a read or write', async () => {
   const f = await fixture();
   try {
     const user = '@alice:logical.test';
@@ -981,6 +1038,15 @@ Deno.test('domain presence status: stale pairing inventory and missing activatio
       MatrixError,
       'presence status unavailable',
     );
+    const read = () =>
+      edge.query('SELECT * FROM presence WHERE user_id=?', [user]);
+    const before = await read();
+    await assertRejects(
+      () => setPresence(edge, user, 'online', 'unreplicated'),
+      MatrixError,
+      'presence status unavailable',
+    );
+    assertEquals(await read(), before);
   } finally {
     await f.close();
   }

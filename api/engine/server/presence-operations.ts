@@ -38,7 +38,7 @@ function key(user: string) {
   return JSON.stringify(['presence-status', user.slice(1, user.indexOf(':'))]);
 }
 
-export async function requirePresenceStatus(
+export async function presenceStatusReady(
   conn: Pick<Conn, 'query'>,
   user: string,
 ) {
@@ -48,21 +48,26 @@ export async function requirePresenceStatus(
   const [binding] = await conn.query(
     "SELECT a.pairing,r.server_name FROM runtime_identity r LEFT JOIN facade_owner_activation a ON 1=1 WHERE r.singleton=1 AND r.role='facade'",
   );
-  if (!binding || domainOf(user) !== binding.server_name) return;
+  if (!binding || domainOf(user) !== binding.server_name) return true;
   const [cut] = await conn.query(
     "SELECT s.received,s.received_hash,s.applied,s.applied_hash,f.ready,f.pending_hash FROM facade_streams s JOIN facade_scopes f ON f.incarnation=s.incarnation AND f.scope=? WHERE s.peer='home' AND s.direction='in' AND s.source='home' AND s.incarnation=? AND s.stream=?",
     ['presence-status:' + user, binding.pairing, 'domain:' + user],
   );
-  if (
-    !cut || cut.ready !== 1 || cut.pending_hash !== null ||
-    cut.received !== cut.applied || cut.received_hash !== cut.applied_hash ||
-    (current &&
-      !current('home', {
+  return !!cut && cut.ready === 1 && cut.pending_hash === null &&
+    cut.received === cut.applied && cut.received_hash === cut.applied_hash &&
+    (!current ||
+      current('home', {
         source: 'home',
         incarnation: String(binding.pairing),
         stream: 'domain:' + user,
-      }))
-  ) {
+      }));
+}
+
+export async function requirePresenceStatus(
+  conn: Pick<Conn, 'query'>,
+  user: string,
+) {
+  if (!await presenceStatusReady(conn, user)) {
     throw new MatrixError(503, 'M_UNAVAILABLE', 'presence status unavailable');
   }
 }
@@ -76,9 +81,9 @@ export async function recordPresenceStatus(
   user: string,
   status: string | null,
 ) {
+  await requirePresenceStatus(conn, user);
   const source = await authority(conn);
   if (!source || domainOf(user) !== source.server) return;
-  await requirePresenceStatus(conn, user);
   await writeRegister(
     conn,
     source,
