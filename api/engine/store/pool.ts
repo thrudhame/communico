@@ -79,6 +79,26 @@ export class Pool {
     this.incarnations.set(key, Symbol());
   }
 
+  /** Resolve keys once; the returned probe neither opens nor retains files. */
+  async revisionProbe(
+    kind: FileKind,
+    ids: readonly string[],
+  ): Promise<(id: string) => string | undefined> {
+    const keys = new Map(
+      await Promise.all(
+        ids.map(async (id) => [id, `${kind}:${await keyFor(id)}`] as const),
+      ),
+    );
+    return (id) => {
+      const key = keys.get(id);
+      if (
+        this.closed || key === undefined || this.retiring.has(key) ||
+        this.removing.has(key) || this.fileWork.has(key)
+      ) return undefined;
+      return this.entries.get(key)?.db.stableRevision;
+    };
+  }
+
   /** Fence new leases as soon as the engine has committed deletion intent,
    * before fallible server cleanup or physical removal begins. */
   async retire(kind: FileKind, id: string): Promise<void> {

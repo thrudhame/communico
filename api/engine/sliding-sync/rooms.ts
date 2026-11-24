@@ -21,9 +21,10 @@ import {
   stripPrejoin,
 } from '#engine/federation/prejoin.ts';
 import { formatCursor } from '#engine/room/segments.ts';
-import type { ListSelection } from './lists.ts';
+import type { ListCandidate, ListSelection } from './lists.ts';
 import type { RoomConfig } from './types.ts';
 import type { Counts } from '#engine/server/notifications.ts';
+import { captureDisplayProof, type DisplayProof } from './display-proof.ts';
 
 type Json = Record<string, unknown>;
 export type SentRoom = {
@@ -34,6 +35,7 @@ export type SentRoom = {
   config: RoomConfig;
   members: Record<string, string>;
   metadata: Json;
+  display?: DisplayProof;
 };
 const object = (v: unknown): Json =>
   v !== null && typeof v === 'object' && !Array.isArray(v) ? v as Json : {};
@@ -46,6 +48,31 @@ const bumpTypes = [
   'm.poll.start',
   'm.beacon_info',
 ];
+
+function alreadyDelivered(
+  c: ListCandidate,
+  config: RoomConfig,
+  previous: SentRoom | undefined,
+  proof: DisplayProof | undefined,
+  direct: boolean,
+  counts: Counts,
+): boolean {
+  const old = previous?.display;
+  return proof !== undefined && old !== undefined &&
+    proof.roomRevision === old.roomRevision &&
+    proof.projection === old.projection && proof.ignored === old.ignored &&
+    proof.erasure === old.erasure &&
+    c.membership === 'join' && previous?.membership === 'join' &&
+    previous.membershipEvent === c.eventId && previous.cut > 0 &&
+    c.activity <= previous.cut && previous.cut <= c.cut &&
+    config.timelineLimit === previous.config.timelineLimit &&
+    (config.timelineLimit === 0 || c.activity <= previous.timelineCut) &&
+    JSON.stringify(config.requiredState) ===
+      JSON.stringify(previous.config.requiredState) &&
+    previous.metadata.is_dm === direct &&
+    previous.metadata.notification_count === counts.notification_count &&
+    previous.metadata.highlight_count === counts.highlight_count;
+}
 
 async function metadata(
   room: Room,
@@ -147,13 +174,29 @@ export async function roomPayloads(
       Array.isArray(v) ? v : []
     ),
   );
+  const proofFor = await captureDisplayProof(
+    viewer,
+    [...selection.rooms].filter(([, { candidate }]) =>
+      candidate.membership === 'join' && !candidate.prejoin &&
+      !candidate.departure
+    ).map(([id]) => id),
+  );
   for (const [id, { candidate: c, config }] of selection.rooms) {
     const previous = input.previous[id];
-    const room = await heldRoom(id);
-    if (room === null && !c.prejoin && !c.departure) continue;
     if (c.cut > input.eventCut) {
       throw new Error('room exceeds captured event cut');
     }
+    const counts = input.notifications?.get(id) ??
+      { notification_count: 0, highlight_count: 0 };
+    if (
+      alreadyDelivered(c, config, previous, proofFor(id), dm.has(id), counts)
+    ) {
+      // Keep the previous delivery coverage, not the new connection/event cut.
+      continue;
+    }
+    const room = await heldRoom(id);
+    if (room === null && !c.prejoin && !c.departure) continue;
+    const before = proofFor(id);
     const prejoin = c.membership === 'invite' || c.membership === 'knock';
     const admission = !prejoin && !c.departure && room !== null
       ? await admitState(room, {
@@ -313,8 +356,6 @@ export async function roomPayloads(
     }
     // Optional wire omission must not erase the last value held by the client.
     meta.is_dm = dm.has(id);
-    const counts = input.notifications?.get(id) ??
-      { notification_count: 0, highlight_count: 0 };
     meta = { ...meta, ...counts };
     let changed = initial || eventsPresent(entry.timeline) ||
       eventsPresent(entry.required_state) ||
@@ -350,6 +391,17 @@ export async function roomPayloads(
       },
       members,
       metadata: meta,
+      // A writer anywhere in the observed view invalidates this certificate;
+      // never attach a later observation to an earlier rendered payload.
+      ...(before !== undefined &&
+          before.roomRevision === proofFor(id)?.roomRevision &&
+          end === c.cut && c.activity <= end &&
+          admission?.rows.some((row) =>
+            row.type === 'm.room.member' && row.stateKey === viewer.userId &&
+            row.eventId === c.eventId && row.content.membership === 'join'
+          )
+        ? { display: before }
+        : {}),
     };
   }
   return { rooms, sent };
