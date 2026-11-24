@@ -14,6 +14,7 @@ import { onProjected } from '#engine/server/project.ts';
 import { appendRecord, type Journal } from './journal.ts';
 import type { Grant, Pairings } from './pairing.ts';
 import { applyReplicaScope } from './scopes.ts';
+import { requireSelectionReady } from './domain-control.ts';
 import {
   integer,
   LinkError,
@@ -316,6 +317,7 @@ export class RoomReplicas {
           const openings = new Set(
             manifest.stays.map((stay) => stay.opening.eventId),
           );
+          let participation = false;
           for (const event of manifest.events) {
             if (
               !openings.has(String(event.event_id)) ||
@@ -324,11 +326,18 @@ export class RoomReplicas {
               domainOf(event.sender) !== this.self ||
               event.content?.membership !== 'join'
             ) continue;
+            participation = true;
             const [selected] = await conn.query(
               'SELECT 1 FROM facade_exports WHERE peer=? AND incarnation=? AND scope=?',
               [peer, pairing!, 'auth:' + event.sender],
             );
             if (selected) return;
+          }
+          if (participation) {
+            requireSelectionReady(
+              false,
+              'room awaits selected account participation',
+            );
           }
           throw new LinkError(
             'LINK_IDENTITY_MISMATCH',

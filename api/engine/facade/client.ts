@@ -13,11 +13,14 @@ import type { Pairings } from './pairing.ts';
 import {
   type Cut,
   cutOf,
+  DOMAIN_OPERATION_V2_CAPABILITY,
   integer,
   LINK_CAPABILITIES,
   LINK_SUPPORTED,
   LINK_VERSION,
   LinkError,
+  LIVE_ACTIVITY_CAPABILITY,
+  type LiveActivity,
   negotiate,
   object,
   recordOf,
@@ -103,6 +106,13 @@ export async function openJournalClient(
 }
 
 export class JournalClient {
+  private activityRequest?: string;
+  #domainReaderVersion?: 1 | 2;
+
+  get domainReaderVersion(): 1 | 2 | undefined {
+    return this.#domainReaderVersion;
+  }
+
   constructor(
     private readonly wire: LinkClient,
     readonly peer: {
@@ -212,13 +222,101 @@ export class JournalClient {
     if (revision < this.peer.revision) {
       throw new LinkError('LINK_DIVERGED', 'regressing control revision');
     }
-    return {
+    const hello = {
       revision,
       scopes: list(value.scopes).map(text),
       incoming: heads(value.incoming, true),
       outgoing: heads(value.outgoing, false),
       exportAcks: heads(value.exportAcks, false),
     };
+    const supported = value.supported === undefined
+      ? []
+      : list(value.supported);
+    const readers = supported.map((raw) => {
+      const entry = object(raw);
+      return { type: text(entry.type), version: integer(entry.version, 1) };
+    });
+    const v2 = DOMAIN_OPERATION_V2_CAPABILITY;
+    // A concurrent hello started before the reader upgraded may arrive late.
+    // The supported rolling direction for this enrollment is v1 to v2.
+    if (
+      readers.some((entry) =>
+        entry.type === v2.type && entry.version === v2.version
+      )
+    ) {
+      this.#domainReaderVersion = 2;
+    } else this.#domainReaderVersion ??= 1;
+    return hello;
+  }
+
+  /** Both legs use a receiver challenge from this attempt, never from a
+   * previous wake. Receiver-local age bounds the flight without wall-clock
+   * synchronization or subtracting an unrelated poll/reconnect interval. */
+  async activity(owner: LiveActivity, signal?: AbortSignal): Promise<void> {
+    const challenge = crypto.randomUUID();
+    const started = performance.now();
+    this.activityRequest = challenge;
+    const required = [...LINK_CAPABILITIES, LIVE_ACTIVITY_CAPABILITY];
+    const validate = (value: Record<string, unknown>, expected: string) => {
+      if (
+        !negotiate(value, this.peer.server, LINK_SUPPORTED).required.some((
+          entry,
+        ) =>
+          entry.type === LIVE_ACTIVITY_CAPABILITY.type &&
+          entry.version === LIVE_ACTIVITY_CAPABILITY.version
+        )
+      ) {
+        throw new LinkError(
+          'LINK_CAPABILITY_MISMATCH',
+          'live activity response not negotiated',
+        );
+      }
+      if (value.challenge !== expected) {
+        throw new LinkError('LINK_DIVERGED', 'wrong live activity challenge');
+      }
+    };
+    try {
+      const value = await this.call(
+        'activity',
+        { required, challenge },
+        signal,
+      );
+      await this.authorized();
+      signal?.throwIfAborted();
+      if (this.activityRequest !== challenge) return;
+      validate(value, challenge);
+      const next = text(value.nextChallenge);
+      const send = async () => {
+        const snapshot = await owner.capture(this.peer.pairing);
+        signal?.throwIfAborted();
+        if (this.activityRequest !== challenge) return;
+        const finish = crypto.randomUUID();
+        // Older listeners treat this as an ordinary answer and return an
+        // extra snapshot. It is never applied or kept for the next wake.
+        const reply = await this.call('activity', {
+          required,
+          challenge: finish,
+          answer: { challenge: next, snapshot },
+          finish: true,
+        }, signal);
+        validate(reply, finish);
+      };
+      const results = await Promise.allSettled([
+        send(),
+        owner.apply(
+          this.peer.pairing,
+          value.snapshot,
+          () => Math.max(0, performance.now() - started),
+        ),
+      ]);
+      for (const result of results) {
+        if (result.status === 'rejected') throw result.reason;
+      }
+    } finally {
+      if (this.activityRequest === challenge) {
+        this.activityRequest = undefined;
+      }
+    }
   }
 
   async signKeyDocument(

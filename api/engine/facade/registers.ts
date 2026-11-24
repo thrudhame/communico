@@ -236,7 +236,19 @@ export function registerWinner(
  * present. This also keeps a missing dependency from entering a local write's
  * observed context. No arrival-order-dependent rejection or guessed ancestor. */
 function resolved(rows: RegisterOperation[]): RegisterOperation[] {
+  const ready = new Set(
+    causalRegisterOrder(rows).map(({ operationId }) => operationId),
+  );
+  return rows.filter((row) => ready.has(row.operationId));
+}
+
+/** Resolved operations in publishable order, with every predecessor before its
+ * successors. Unresolved operations cannot be included in the stream. */
+export function causalRegisterOrder(
+  rows: RegisterOperation[],
+): RegisterOperation[] {
   const ready = new Set<string>();
+  const ordered: RegisterOperation[] = [];
   let progress = true;
   while (progress) {
     progress = false;
@@ -246,10 +258,11 @@ function resolved(rows: RegisterOperation[]): RegisterOperation[] {
         continue;
       }
       ready.add(row.operationId);
+      ordered.push(row);
       progress = true;
     }
   }
-  return rows.filter((row) => ready.has(row.operationId));
+  return ordered;
 }
 
 export async function readRegister(

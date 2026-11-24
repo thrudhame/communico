@@ -56,10 +56,12 @@ import {
 import { filterEvents, type RoomFilter } from '#engine/tenant/filters.ts';
 import { waitForSync } from '#engine/sync-wait.ts';
 import {
+  capturePresence,
   presenceFor,
+  publishPresence,
   receiptRoomsSince,
   receiptSnapshot,
-  setPresenceValue,
+  withPresenceSync,
 } from '#engine/server/ephemeral.ts';
 import {
   captureTyping,
@@ -364,9 +366,24 @@ async function assembleSync(
       )
     );
   }
-  if (i.setPresence !== undefined) {
-    await setPresenceValue(app.server, i.userId, i.setPresence);
-  }
+  return await withPresenceSync(
+    app.server,
+    i.userId,
+    i.setPresence,
+    device ?? undefined,
+    () => assembleSyncView(i, domain, epoch, recoveryReset, device),
+  );
+}
+
+async function assembleSyncView(
+  i: SyncInputs,
+  domain: string,
+  epoch: string | undefined,
+  recoveryReset: boolean,
+  device: DeviceIdentity | null,
+): Promise<Record<string, unknown>> {
+  const app = theApp();
+  const lp = localpartOf(i.userId);
   sweepTyping();
   await waitForRelevant(i, device);
   sweepTyping();
@@ -374,6 +391,7 @@ async function assembleSync(
   // One server transaction selects events, receipts, memberships and counts.
   // Rendering afterward may be slow, but cannot mix a later count/receipt cut.
   const snapshot = await app.server.tx(async (tx) => {
+    const presence = await capturePresence(tx, i.userId, app.server);
     const counters = new Map(
       (await tx.query('SELECT name,value FROM counters')).map((
         r,
@@ -430,8 +448,10 @@ async function assembleSync(
       receipts,
       members,
       oob,
+      presence,
     };
   });
+  publishPresence(app.server, snapshot.presence);
   const accountSnapshot = await app.tenant.tx((tx) =>
     captureAccountData(tx, lp, app.tenant.serverName, i.since?.aSeq ?? null)
   );
@@ -618,10 +638,9 @@ async function assembleSync(
     for (const u of result.joiners) allJoiners.add(u);
   }
   const presenceEvents = new Map<string, Record<string, unknown>>();
-  const visiblePresence = await presenceFor(app.server, i.userId);
   const includePresence = (u: string) => {
-    const row = visiblePresence.get(u);
-    if (row === undefined) return;
+    const row = snapshot.presence.rows.get(u);
+    if (!row) return;
     const content: Record<string, unknown> = { presence: row.presence };
     if (row.statusMsg !== null) content.status_msg = row.statusMsg;
     if (row.presence !== 'offline' && row.lastActiveMs > 0) {
@@ -629,7 +648,7 @@ async function assembleSync(
     }
     presenceEvents.set(u, { type: 'm.presence', sender: u, content });
   };
-  for (const [u, row] of visiblePresence) {
+  for (const [u, row] of snapshot.presence.rows) {
     if (
       i.since === null ||
       row.seq > i.since.pSeq ||

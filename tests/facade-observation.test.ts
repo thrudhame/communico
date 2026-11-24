@@ -5,8 +5,11 @@ import {
   FacadeHealthConnections,
   FacadeObservations,
   facadeProcess,
+  observeActivityApplication,
+  observeActivityCapture,
   observeJournalApplication,
   observeJournalCompletion,
+  observeLiveInput,
   publicationCommand,
 } from './helpers/facade-process.ts';
 import { LinkError, recordHash } from '#engine/facade/protocol.ts';
@@ -43,6 +46,275 @@ Deno.test('facade observations retain exact completions across waiter enrollment
       (record) => record.hash === expected.hash,
     ),
     expected,
+  );
+});
+
+Deno.test('live observations wait for completion but never hide a missing consumer effect', async () => {
+  const observations = new FacadeObservations();
+  const held = Promise.withResolvers<void>();
+  const snapshot = {
+    presence: [{ userId: '@alice:test', presence: 'online' }],
+    typing: [],
+  };
+  const completed = (pairing: string, snapshot: unknown) =>
+    observations.accept({
+      kind: 'activity',
+      pairing,
+      snapshot,
+      appliedMs: Date.now(),
+    });
+  const applied = observeActivityApplication(async () => {
+    await held.promise;
+  }, completed);
+  const mark = observations.mark();
+  let observed = false;
+  const result = observations.wait((event) => event.kind === 'activity', mark)
+    .then(() => {
+      observed = true;
+    });
+  const work = applied.call(
+    { capture: () => Promise.resolve({}), apply: applied },
+    'pair',
+    snapshot,
+    () => 0,
+  );
+  await Promise.resolve();
+  assertEquals(observed, false);
+  assertEquals(observations.mark(), mark);
+  held.resolve();
+  await work;
+  await result;
+  // Mutation: the completed operation above omitted its consumer write. The
+  // observer must still resolve, letting a strict consumer assertion fail.
+  await assertRejects(
+    async () => {
+      const consumer = await Promise.resolve({ presence: 'offline' });
+      assertEquals(consumer.presence, snapshot.presence[0].presence);
+    },
+    Error,
+    'Values are not equal',
+  );
+  const beforeRefusal = observations.mark();
+  const refused = observeActivityApplication(
+    () => Promise.reject(new Error('held authority')),
+    completed,
+  );
+  await assertRejects(() =>
+    refused.call(
+      { capture: () => Promise.resolve({}), apply: refused },
+      'pair',
+      snapshot,
+      () => 0,
+    )
+  );
+  assertEquals(observations.mark(), beforeRefusal);
+});
+
+function liveObservers() {
+  const source = {
+    observations: new FacadeObservations(),
+    fence: () => Promise.resolve('action-fence'),
+  };
+  const receiver = {
+    observations: new FacadeObservations(),
+    fence: () => Promise.resolve('receiver-fence'),
+  };
+  const snapshot = { present: true };
+  const matches = (raw: unknown) => (raw as typeof snapshot).present;
+  const capture = (present: boolean, capturedMs = 20, fence = 'action-fence') =>
+    source.observations.accept({
+      kind: 'capture',
+      pairing: 'pair',
+      snapshot: { present },
+      fence,
+      startedMs: capturedMs - 1,
+      capturedMs,
+    });
+  const application = (appliedMs = 10) =>
+    receiver.observations.accept({
+      kind: 'activity',
+      pairing: 'pair',
+      snapshot,
+      appliedMs,
+    });
+  return { source, receiver, matches, capture, application };
+}
+
+Deno.test('finite live input fails explicitly when absent or expired before application', async (t) => {
+  for (const observedBefore of [false, true]) {
+    await t.step(observedBefore ? 'expired' : 'absent', async () => {
+      const live = liveObservers();
+      const pending = assertRejects(
+        () =>
+          observeLiveInput(
+            live.source,
+            live.receiver,
+            'pair',
+            0,
+            live.matches,
+          ),
+        Error,
+        'input expired before application',
+      );
+      if (observedBefore) live.capture(true, 10);
+      live.capture(false, 20);
+      await pause(0);
+      // Deterministic cleanup also makes the old indefinite observer fail RED,
+      // rather than hanging the test process waiting for an impossible input.
+      live.receiver.observations.close(new Error('observer remained pending'));
+      const error = await pending;
+      assertEquals(error.message.includes('capturedMs=20'), true);
+      assertEquals(error.message.includes('appliedMs=none'), true);
+    });
+  }
+});
+
+Deno.test('finite live input ignores in-flight pre-fence captures and transient capture refusals', async () => {
+  const live = liveObservers();
+  const held = Promise.withResolvers<unknown>();
+  const capture = observeActivityCapture(
+    () => held.promise,
+    (event) => live.source.observations.accept(event),
+  );
+  publicationCommand({ action: 'fence', id: 'old' }, () => {});
+  const work = capture.call(
+    { capture, apply: () => Promise.resolve() },
+    'pair',
+  );
+  publicationCommand({ action: 'fence', id: 'action-fence' }, () => {});
+  let settled = false;
+  const pending = observeLiveInput(
+    live.source,
+    live.receiver,
+    'pair',
+    0,
+    live.matches,
+  ).then(() => settled = true);
+  held.resolve({ present: false });
+  await work;
+  const refused = observeActivityCapture(
+    () =>
+      Promise.reject(new LinkError('LINK_UNAVAILABLE', 'authority pending')),
+    (event) => live.source.observations.accept(event),
+  );
+  await assertRejects(
+    () =>
+      refused.call(
+        { capture: refused, apply: () => Promise.resolve() },
+        'pair',
+      ),
+    Error,
+    'authority pending',
+  );
+  live.source.observations.accept({
+    kind: 'blocked',
+    operation: 'activity',
+    error: 'LINK_UNAVAILABLE',
+  });
+  await pause(0);
+  assertEquals(settled, false);
+  live.capture(true);
+  live.application();
+  await pending;
+});
+
+Deno.test('finite live input reconciles cross-pipe order with timestamps and a receiver fence', async () => {
+  const live = liveObservers();
+  const fenced = Promise.withResolvers<void>();
+  live.receiver.fence = () => {
+    live.application(10);
+    fenced.resolve();
+    return Promise.resolve('receiver-fence');
+  };
+  const pending = observeLiveInput(
+    live.source,
+    live.receiver,
+    'pair',
+    0,
+    live.matches,
+  );
+  live.capture(false, 20);
+  // Application completed first, but its pipe is read after the source's pipe.
+  // A private receiver fence must flush it before declaring missing application.
+  const result = await pending;
+  assertEquals(result.kind, 'activity');
+  await fenced.promise;
+});
+
+Deno.test('finite live input does not accept an application completed after source expiry', async () => {
+  const live = liveObservers();
+  const pending = assertRejects(
+    () =>
+      observeLiveInput(
+        live.source,
+        live.receiver,
+        'pair',
+        0,
+        live.matches,
+      ),
+    Error,
+    'input expired before application',
+  );
+  live.application(30);
+  live.capture(false, 20);
+  await pending;
+});
+
+Deno.test('finite live input preserves strict no-op detection and removes competing observations', async () => {
+  const live = liveObservers();
+  let calls = 0;
+  const matches = (raw: unknown) => {
+    calls++;
+    return live.matches(raw);
+  };
+  const pending = observeLiveInput(
+    live.source,
+    live.receiver,
+    'pair',
+    0,
+    matches,
+  );
+  live.application();
+  await pending;
+  const before = calls;
+  live.capture(false);
+  live.application();
+  assertEquals(calls, before, 'settlement removes both observation predicates');
+  await assertRejects(
+    async () => {
+      assertEquals(
+        await Promise.resolve({ present: false }),
+        { present: true },
+        'missing consumer effect',
+      );
+    },
+    Error,
+    'missing consumer effect',
+  );
+  const cancelled = liveObservers(), controller = new AbortController();
+  const aborted = assertRejects(
+    () =>
+      observeLiveInput(
+        cancelled.source,
+        cancelled.receiver,
+        'pair',
+        0,
+        matches,
+        controller.signal,
+      ),
+    Error,
+    'cancelled',
+  );
+  await pause(0);
+  controller.abort(new Error('cancelled'));
+  await aborted;
+  const after = calls;
+  cancelled.capture(false);
+  cancelled.application();
+  assertEquals(
+    calls,
+    after,
+    'cancellation removes both observation predicates',
   );
 });
 

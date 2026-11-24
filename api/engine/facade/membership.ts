@@ -44,6 +44,7 @@ import {
 import {
   type DomainBinding,
   requireAccountExport,
+  requireAccountSelection,
   requireDomainControl,
   requireSelectionReady,
 } from './domain-control.ts';
@@ -357,22 +358,33 @@ export class MembershipOperations {
     if (row?.state !== 'paired' || row.grant_json !== canonicalJson(grant)) {
       mismatch('membership exchange grant changed');
     }
-    if (!this.node) {
+    if (this.node) {
+      const [selected] = await conn.query(
+        'SELECT ready,pending_hash FROM facade_scopes WHERE incarnation=? AND scope=?',
+        [context.id, 'auth:@' + localpart + ':' + context.server],
+      );
+      requireSelectionReady(
+        selected?.ready === 1 && selected.pending_hash === null,
+        'membership account not selected: awaiting auth application',
+      );
+    } else {
       await requireAccountExport(conn, {
         peer: context.node,
         pairing: context.id,
         server: context.server,
         localpart,
       });
-      return;
     }
-    const [selected] = await conn.query(
-      'SELECT 1 FROM facade_scopes WHERE incarnation=? AND scope=? AND ready=1',
-      [context.id, 'auth:@' + localpart + ':' + context.server],
-    );
-    requireSelectionReady(
-      !!selected,
-      'membership account not selected: awaiting applied auth snapshot',
+  }
+
+  private async tenantSelected(grant: Grant, localpart: string) {
+    if (!this.node) return;
+    await (await this.store.tenant(this.tenant.serverName)).tx((conn) =>
+      requireAccountSelection(conn, {
+        localpart,
+        pairing: grant.body.transcript.body.context.id,
+        grantRevision: grant.body.revision,
+      })
     );
   }
 
@@ -427,6 +439,7 @@ export class MembershipOperations {
     if (view.kind === 'membership-history' && !this.node) {
       mismatch('only home may attest membership history');
     }
+    await this.tenantSelected(grant, view.localpart);
     await server.tx(async (conn) => {
       conn.admit(unchanged);
       await this.selected(conn, grant, view.localpart);
@@ -645,6 +658,7 @@ export class MembershipOperations {
   private async exportBinding(localpart: string, pairing?: string) {
     const grant = await this.binding(pairing),
       context = grant.body.transcript.body.context;
+    await this.tenantSelected(grant, localpart);
     const server = await this.store.server();
     const control = await server.tx(async (conn) => {
       await this.selected(conn, grant, localpart);

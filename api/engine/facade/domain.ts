@@ -33,7 +33,14 @@ import {
   importReportOperation,
   reportOperations,
 } from '#engine/server/reports.ts';
-import { importReceiptOperation } from '#engine/server/ephemeral.ts';
+import {
+  importPresenceStatus,
+  importReceiptOperation,
+} from '#engine/server/ephemeral.ts';
+import {
+  capturePresenceStatus,
+  presenceStatusOperations,
+} from '#engine/server/presence-operations.ts';
 import {
   captureNotificationOperations,
   notificationOperations,
@@ -50,7 +57,11 @@ import { appendRecord, type Journal } from './journal.ts';
 import type { OwnerControl } from './ownership.ts';
 import type { Grant, Pairings } from './pairing.ts';
 import { integer, LinkError, object, type Stream, text } from './protocol.ts';
-import { readRegister, type RegisterOperation } from './registers.ts';
+import {
+  causalRegisterOrder,
+  readRegister,
+  type RegisterOperation,
+} from './registers.ts';
 import {
   type DomainBinding,
   type DomainHistory,
@@ -80,6 +91,7 @@ export type DomainBootstrap = DomainBinding & {
   pusherChoices?: Fact[];
   notifications?: Fact[];
   schedules?: Fact[];
+  presenceStatus?: Fact[];
 };
 
 function facts(operations: Fact[]): Fact[] {
@@ -138,6 +150,9 @@ function bootstrapOf(raw: unknown): DomainBootstrap {
       ? { notifications: refs(row.notifications) }
       : {}),
     ...(row.schedules !== undefined ? { schedules: refs(row.schedules) } : {}),
+    ...(row.presenceStatus !== undefined
+      ? { presenceStatus: refs(row.presenceStatus) }
+      : {}),
   };
   if (canonicalJson(view) !== canonicalJson(raw) || view.source !== 'home') {
     mismatch('unexpected domain bootstrap material');
@@ -162,6 +177,7 @@ async function requireFacts(
     | 'pushers'
     | 'pusherChoices'
     | 'notifications'
+    | 'presenceStatus'
     | 'schedules',
 ) {
   const keys = new Set<string>();
@@ -206,6 +222,8 @@ async function requireFacts(
           ? ['pusher-choice']
           : file === 'notifications'
           ? ['notification']
+          : file === 'presenceStatus'
+          ? ['presence-status']
           : file === 'schedules'
           ? ['delayed-event']
           : ['account-data', 'tags', 'profile', 'push-rules']).includes(
@@ -249,6 +267,19 @@ function operationId(view: DomainOperation | DomainHistory | DomainBootstrap) {
       view.ownerRevision,
       view.operation.operationId,
     ])).digest('hex');
+}
+
+// The status kind and its complete bootstrap inventory are not understood by
+// v1 readers. Negotiate them before journal receipt, not after a semantic apply
+// failure. Unchanged kinds retain their original reader requirement.
+function recordVersion(
+  view: DomainOperation | DomainHistory | DomainBootstrap,
+) {
+  return (view.kind === 'domain-bootstrap'
+      ? view.presenceStatus !== undefined
+      : view.operation.kind === 'presence-status')
+    ? 2
+    : 1;
 }
 
 function viewOf(raw: unknown): DomainOperation | DomainHistory {
@@ -312,6 +343,7 @@ function viewOf(raw: unknown): DomainOperation | DomainHistory {
         'pusher',
         'pusher-choice',
         'notification',
+        'presence-status',
         'delayed-event',
       ]
         .includes(
@@ -397,7 +429,10 @@ export class DomainOperations {
   private async publish(
     view: DomainOperation | DomainHistory | DomainBootstrap,
     grant: Grant,
+    reader: 1 | 2,
   ) {
+    const version = recordVersion(view);
+    if (version > reader) mismatch('domain publication exceeds peer reader');
     const context = grant.body.transcript.body.context;
     const signed = {
       body: view,
@@ -413,14 +448,18 @@ export class DomainOperations {
         incarnation: this.node ? view.incarnation : context.id,
         stream: streamName(view.localpart, context.server),
         type: 'domain-operation',
-        version: 1,
+        version,
         operationId: operationId(view),
         payload: signed,
       });
     });
   }
 
-  async export(localpart: string, pairing?: string) {
+  async export(
+    localpart: string,
+    pairing?: string,
+    reader: 1 | 2 = this.node ? 2 : 1,
+  ) {
     const grant = await this.binding(pairing),
       context = grant.body.transcript.body.context;
     await this.tenantSelected(localpart, grant);
@@ -486,14 +525,27 @@ export class DomainOperations {
         notificationOperations(conn, '@' + localpart + ':' + context.server)
       ),
     );
+    if (reader === 2) {
+      operations.push(
+        ...causalRegisterOrder(
+          await db.tx((conn) =>
+            presenceStatusOperations(
+              conn,
+              '@' + localpart + ':' + context.server,
+            )
+          ),
+        ),
+      );
+    }
     const records = [];
     for (const operation of operations) {
-      if (
-        operation.source !== source.node ||
-        operation.incarnation !== source.incarnation
-      ) continue;
+      const own = operation.source === source.node &&
+        operation.incarnation === source.incarnation;
+      // Only home attests retained foreign facts. Status dependencies must
+      // travel in causal order even after the receiver's first bootstrap.
+      if (!own && (this.node || operation.kind !== 'presence-status')) continue;
       const view = viewOf({
-        kind: 'domain-operation',
+        kind: own ? 'domain-operation' : 'domain-history',
         server: context.server,
         pairing: context.id,
         grantRevision: grant.body.revision,
@@ -503,7 +555,9 @@ export class DomainOperations {
         incarnation: source.incarnation,
         operation,
       });
-      records.push(await this.publish(view, grant));
+      if (recordVersion(view) <= reader) {
+        records.push(await this.publish(view, grant, reader));
+      }
     }
     return records;
   }
@@ -512,7 +566,7 @@ export class DomainOperations {
    * source operations, then publish a signed completeness declaration. Suffix
    * writes remain source intent and appear on this same independently drained
    * account stream; neither a copied F1 snapshot nor receipt news is a baseline. */
-  async bootstrap(localpart: string, pairing: string) {
+  async bootstrap(localpart: string, pairing: string, reader: 1 | 2 = 1) {
     if (this.node) mismatch('only home may declare domain bootstrap');
     const grant = await this.binding(pairing),
       context = grant.body.transcript.body.context;
@@ -600,7 +654,17 @@ export class DomainOperations {
         '@' + localpart + ':' + context.server,
       );
     });
-    const records = await this.export(localpart, pairing);
+    const presenceFacts = reader === 2
+      ? await server.tx(async (conn) => {
+        await this.selected(conn, grant, localpart);
+        await requireDomainControl(conn, binding);
+        return await capturePresenceStatus(
+          conn,
+          '@' + localpart + ':' + context.server,
+        );
+      })
+      : [];
+    const records = await this.export(localpart, pairing, reader);
     // Ordinary export never echoes replica intent. Bootstrap separately attests
     // exactly the authentic history home retained, including a receiver's own
     // prior dots and prior incarnations. No dot, payload or context is rebased.
@@ -625,6 +689,7 @@ export class DomainOperations {
             operation,
           }),
           grant,
+          reader,
         ),
       );
     }
@@ -656,9 +721,10 @@ export class DomainOperations {
         tenantFacts.filter((op) => op.kind === 'pusher-choice'),
       ),
       notifications: facts(notificationFacts),
+      ...(reader === 2 ? { presenceStatus: facts(presenceFacts) } : {}),
       schedules: facts(tenantFacts.filter((op) => op.kind === 'delayed-event')),
     });
-    records.push(await this.publish(body, grant));
+    records.push(await this.publish(body, grant, reader));
     return records;
   }
 
@@ -672,13 +738,22 @@ export class DomainOperations {
     const peer = this.node ? 'home' : context.node;
     const record = await journal.next(peer, stream);
     if (!record) return false;
-    if (record.type !== 'domain-operation' || record.version !== 1) {
+    if (
+      record.type !== 'domain-operation' ||
+      (record.version !== 1 && record.version !== 2)
+    ) {
       throw new LinkError('LINK_CAPABILITY_MISMATCH', 'not domain operation');
     }
     const signed = object(record.payload);
     const view = object(signed.body).kind === 'domain-bootstrap'
       ? bootstrapOf(signed.body)
       : viewOf(signed.body);
+    if (record.version < recordVersion(view)) {
+      throw new LinkError(
+        'LINK_CAPABILITY_MISMATCH',
+        'domain operation requires status reader',
+      );
+    }
     const sender = this.node ? 'home' : context.node;
     if (
       view.server !== context.server || view.pairing !== context.id ||
@@ -743,6 +818,16 @@ export class DomainOperations {
         await requireFacts(conn, view, 'reports');
         await requireFacts(conn, view, 'forget');
         await requireFacts(conn, view, 'notifications');
+        await requireFacts(conn, view, 'presenceStatus');
+        await conn.execute(
+          'INSERT INTO facade_scopes(incarnation,scope,source_cut,ready,pending_hash) VALUES(?,?,?,?,NULL) ON CONFLICT(incarnation,scope) DO UPDATE SET source_cut=excluded.source_cut,ready=excluded.ready,pending_hash=NULL',
+          [
+            view.pairing,
+            'presence-status:@' + view.localpart + ':' + view.server,
+            record.sequence,
+            view.presenceStatus !== undefined ? 1 : 0,
+          ],
+        );
         await conn.execute(
           'INSERT INTO facade_scopes(incarnation,scope,source_cut,ready,pending_hash) VALUES(?,?,?,?,NULL) ON CONFLICT(incarnation,scope) DO UPDATE SET source_cut=excluded.source_cut,ready=excluded.ready,pending_hash=NULL',
           [
@@ -829,7 +914,15 @@ export class DomainOperations {
         context.home.publicKey,
       )
       : undefined;
-    if (view.operation.kind === 'notification') {
+    if (view.operation.kind === 'presence-status') {
+      await importPresenceStatus(
+        await this.store.server(),
+        view.operation,
+        view.pairing,
+        check,
+        history,
+      );
+    } else if (view.operation.kind === 'notification') {
       await receiveNotificationOperation(
         await this.store.server(),
         view.operation,

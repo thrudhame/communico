@@ -158,7 +158,7 @@ Deno.test('F2 ownership control is signed, durable, first-ingress and isolated f
     const owner = await f.owner();
     await assertRejects(
       () => owner.ready(),
-      MatrixError,
+      VerificationUnavailable,
       'ownership control unavailable',
     );
     assertEquals(await owner.apply(journal, record), true);

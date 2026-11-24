@@ -48,6 +48,13 @@ for (const migrated of [false, true]) {
         ] as const
       ) {
         if (kind === 'server') {
+          // Receipt evidence survives fresh/upgrade backup cuts. Reading a
+          // restored row must not reset this timestamp to the restore clock.
+          const columns = await db.query('PRAGMA table_info(presence)');
+          assertEquals(
+            columns.some((row) => row.name === 'remote_received_ms'),
+            true,
+          );
           // Index-only publication migration: no new durable table disposition.
           // Register its access paths here for both fresh and upgraded backups.
           const indexes = [

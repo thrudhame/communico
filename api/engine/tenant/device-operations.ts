@@ -7,7 +7,10 @@ import { config } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Conn } from '#engine/store/db.ts';
 import type { DeviceOperation } from '#engine/tenant/device-source.ts';
-import { KeyHistoryProof } from '#engine/tenant/key-bootstrap.ts';
+import {
+  KeyHistoryProof,
+  semanticKeyReader,
+} from '#engine/tenant/key-bootstrap.ts';
 import {
   deviceWireOf,
   retainDeviceWire,
@@ -258,37 +261,20 @@ export async function publicDeviceValues(
   );
 }
 
-/** Current local material needs no export side effect on a read. Registry
- * binding, not local possession or an imported F1 snapshot, controls inclusion. */
-export async function publicDeviceKeys(conn: Conn, localpart: string) {
+/** Current execution rows contribute public metadata only while their exact
+ * local incarnation is live. Reads never manufacture export operations. */
+async function localPublicDevices(conn: Conn, localpart: string) {
   const identity = await tenantAuthority(conn);
-  if (!identity) return null;
-  const [account] = await conn.query(
-    'SELECT deactivated FROM users WHERE localpart=?',
-    [localpart],
-  );
-  if (!account || account.deactivated === 1) return [];
-  const values = new Map<
-    string,
-    {
-      device_id: string;
-      display_name: string | null;
-      key_json: string;
-      generation?: number;
-    }
-  >();
-  for (const operation of await publicDeviceValues(conn, localpart)) {
-    if (operation.value?.keys) {
-      values.set(operation.deviceId, {
-        device_id: operation.deviceId,
-        display_name: operation.value.displayName,
-        key_json: canonicalJson(operation.value.keys),
-      });
-    }
-  }
+  if (!identity) return [];
+  const result: {
+    device_id: string;
+    display_name: string | null;
+    key_json: string | null;
+    generation: number;
+  }[] = [];
   for (
     const row of await conn.query(
-      'SELECT d.device_id,d.display_name,d.generation,k.key_json,a.incarnation FROM devices d JOIN device_keys k ON k.localpart=d.localpart AND k.device_id=d.device_id AND k.generation=d.generation JOIN authority_devices a ON a.localpart=d.localpart AND a.device_id=d.device_id AND a.generation=d.generation WHERE d.localpart=?',
+      'SELECT d.device_id,d.display_name,d.generation,k.key_json,a.incarnation FROM devices d LEFT JOIN device_keys k ON k.localpart=d.localpart AND k.device_id=d.device_id AND k.generation=d.generation JOIN authority_devices a ON a.localpart=d.localpart AND a.device_id=d.device_id AND a.generation=d.generation WHERE d.localpart=?',
       [localpart],
     )
   ) {
@@ -313,6 +299,84 @@ export async function publicDeviceKeys(conn: Conn, localpart: string) {
       creation.node === identity.node &&
       creation.incarnation === identity.incarnation
     ) {
+      result.push({
+        device_id: String(row.device_id),
+        display_name: row.display_name === null
+          ? null
+          : String(row.display_name),
+        key_json: row.key_json === null ? null : String(row.key_json),
+        generation: Number(row.generation),
+      });
+    }
+  }
+  return result;
+}
+
+export async function publicDeviceMetadata(conn: Conn, localpart: string) {
+  const identity = await tenantAuthority(conn);
+  if (!identity) return null;
+  // Metadata is a public consumer, not dependency validation. A partial F2
+  // bootstrap must not turn missing device operations into a complete list.
+  if (!await semanticKeyReader(conn, localpart) && identity.node !== 'home') {
+    throw new MatrixError(503, 'M_UNAVAILABLE', 'key bootstrap unavailable');
+  }
+  const [account] = await conn.query(
+    'SELECT deactivated FROM users WHERE localpart=?',
+    [localpart],
+  );
+  if (!account || account.deactivated === 1) return [];
+  const values = new Map<
+    string,
+    { device_id: string; display_name: string | null }
+  >();
+  for (const operation of await publicDeviceValues(conn, localpart)) {
+    if (operation.value) {
+      values.set(operation.deviceId, {
+        device_id: operation.deviceId,
+        display_name: operation.value.displayName,
+      });
+    }
+  }
+  for (const row of await localPublicDevices(conn, localpart)) {
+    values.set(row.device_id, {
+      device_id: row.device_id,
+      display_name: row.display_name,
+    });
+  }
+  return [...values.values()].sort((a, b) =>
+    a.device_id < b.device_id ? -1 : a.device_id > b.device_id ? 1 : 0
+  );
+}
+
+/** Current local material needs no export side effect on a read. Registry
+ * binding, not local possession or an imported F1 snapshot, controls inclusion. */
+export async function publicDeviceKeys(conn: Conn, localpart: string) {
+  if (!await tenantAuthority(conn)) return null;
+  const [account] = await conn.query(
+    'SELECT deactivated FROM users WHERE localpart=?',
+    [localpart],
+  );
+  if (!account || account.deactivated === 1) return [];
+  const values = new Map<
+    string,
+    {
+      device_id: string;
+      display_name: string | null;
+      key_json: string;
+      generation?: number;
+    }
+  >();
+  for (const operation of await publicDeviceValues(conn, localpart)) {
+    if (operation.value?.keys) {
+      values.set(operation.deviceId, {
+        device_id: operation.deviceId,
+        display_name: operation.value.displayName,
+        key_json: canonicalJson(operation.value.keys),
+      });
+    }
+  }
+  for (const row of await localPublicDevices(conn, localpart)) {
+    if (row.key_json !== null) {
       values.set(String(row.device_id), {
         device_id: String(row.device_id),
         display_name: row.display_name === null

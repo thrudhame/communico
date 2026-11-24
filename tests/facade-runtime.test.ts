@@ -2,7 +2,10 @@ import { DiagnosticCommand } from '#tests/helpers/child-diagnostics.ts';
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import metadata from '#root/deno.json' with { type: 'json' };
 import { adminCall } from './admin-client.ts';
-import { facadeProcess as process } from './helpers/facade-process.ts';
+import {
+  facadeProcess as process,
+  observeLiveInput,
+} from './helpers/facade-process.ts';
 import { type LinkRecord, object } from '#engine/facade/protocol.ts';
 import type { AccountAuth } from '#engine/tenant/account-auth.ts';
 import type { DeviceOperation } from '#engine/tenant/device-source.ts';
@@ -686,9 +689,10 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     token?: string,
     method = body === undefined ? 'GET' : 'POST',
     port = homePort,
+    version = 'v3',
   ) => {
     const response = await fetch(
-      `http://127.0.0.1:${port}/_matrix/client/v3/${path}`,
+      `http://127.0.0.1:${port}/_matrix/client/${version}/${path}`,
       {
         method,
         headers: token ? { authorization: 'Bearer ' + token } : {},
@@ -1086,6 +1090,68 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     facadePort = await edge.port('client');
     await edge.listening(facadePort);
     // Real public authoring while home is absent and federation is disabled.
+    const offlinePresence = 'presence/' + encodeURIComponent(user) + '/status';
+    const offlineTyping = roomPath + '/typing/' + encodeURIComponent(user);
+    assertEquals(
+      await edgeApi(offlinePresence, {
+        presence: 'online',
+        status_msg: 'offline facade status',
+      }, 'PUT'),
+      { status: 200, body: {} },
+    );
+    const offlinePresenceRead = await edgeApi(offlinePresence);
+    assertEquals(offlinePresenceRead.status, 200);
+    assertEquals(offlinePresenceRead.body.presence, 'online');
+    assertEquals(offlinePresenceRead.body.status_msg, 'offline facade status');
+    assertEquals(
+      await edgeApi(offlineTyping, { typing: true, timeout: 30000 }, 'PUT'),
+      { status: 200, body: {} },
+    );
+    const offlineActivitySync = await edgeApi(
+      'sync?timeout=0&set_presence=online',
+    );
+    assertEquals(offlineActivitySync.status, 200);
+    assert(
+      offlineActivitySync.body.rooms.join[roomId].ephemeral.events.some((
+        event: { type: string; content: { user_ids?: string[] } },
+      ) => event.type === 'm.typing' && event.content.user_ids?.includes(user)),
+    );
+    for (
+      const [path, method, body] of [
+        [offlinePresence, 'GET', undefined],
+        [offlinePresence, 'PUT', { presence: 'offline' }],
+        [offlineTyping, 'PUT', { typing: false }],
+      ] as const
+    ) {
+      assertEquals(
+        (await api(path, body, undefined, method, facadePort)).status,
+        401,
+      );
+      assertEquals(
+        (await api(
+          path,
+          body,
+          registered.body.access_token,
+          method,
+          facadePort,
+        )).status,
+        503,
+      );
+    }
+    assertEquals(
+      (await edgeApi('presence/%40other%3Alogical.test/status', {
+        presence: 'online',
+      }, 'PUT')).status,
+      403,
+    );
+    assertEquals(await edgeApi(offlineTyping, { typing: false }, 'PUT'), {
+      status: 200,
+      body: {},
+    });
+    assertEquals(
+      await edgeApi(offlinePresence, { presence: 'offline' }, 'PUT'),
+      { status: 200, body: {} },
+    );
     const forgottenRoom = await edgeApi('createRoom', {
       preset: 'public_chat',
       initial_state: [{
@@ -1283,6 +1349,63 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     const freshEvent = await edgeApi(freshSendPath, freshContent, 'PUT');
     assertEquals(freshEvent.status, 200, JSON.stringify(freshEvent.body));
     assertEquals(await edgeApi(freshSendPath, freshContent, 'PUT'), freshEvent);
+    const readAdapter = (path: string, version = 'v1', bearer = token) =>
+      api(path, undefined, bearer, 'GET', facadePort, version);
+    const freshId = encodeURIComponent(fresh.body.room_id);
+    for (
+      const [version, path] of [
+        ['v1', 'room_summary/' + freshId],
+        ['unstable', 'im.nheko.summary/summary/' + freshId],
+        ['unstable', 'im.nheko.summary/rooms/' + freshId + '/summary'],
+      ]
+    ) {
+      const summary = await readAdapter(path, version);
+      assertEquals(summary.status, 200, JSON.stringify(summary));
+      assertEquals(summary.body.room_id, fresh.body.room_id);
+      assertEquals(summary.body.name, 'facade-domain-context');
+      assertEquals(summary.body.join_rule, 'invite');
+      assertEquals(
+        (await readAdapter(path, version, registered.body.access_token)).status,
+        503,
+      );
+    }
+    const hierarchy = await readAdapter(freshRoomPath + '/hierarchy');
+    assertEquals(hierarchy.status, 200, JSON.stringify(hierarchy));
+    assertEquals(
+      hierarchy.body.rooms.map((room: { room_id: string }) => room.room_id),
+      [fresh.body.room_id],
+    );
+    for (const suffix of ['', '/m.annotation', '/m.annotation/m.reaction']) {
+      const relations = await readAdapter(
+        freshRoomPath + '/relations/' +
+          encodeURIComponent(freshEvent.body.event_id) + suffix,
+      );
+      assertEquals(relations.status, 200, JSON.stringify(relations));
+      assertEquals(relations.body.chunk, []);
+    }
+    const threads = await readAdapter(freshRoomPath + '/threads');
+    assertEquals(threads.status, 200, JSON.stringify(threads));
+    assertEquals(threads.body.chunk, []);
+    const timestamp = await readAdapter(
+      freshRoomPath + '/timestamp_to_event?ts=0&dir=f',
+    );
+    assertEquals(timestamp.status, 200, JSON.stringify(timestamp));
+    assertEquals(typeof timestamp.body.event_id, 'string');
+    const legacyMembers = await readAdapter(
+      freshRoomPath + '/joined_members',
+      'r0',
+    );
+    assertEquals(legacyMembers.status, 200, JSON.stringify(legacyMembers));
+    assertEquals(legacyMembers.body.joined[user] !== undefined, true);
+    const legacyMessages = await readAdapter(
+      freshRoomPath + '/messages?dir=b&limit=1',
+      'r0',
+    );
+    assertEquals(legacyMessages.status, 200, JSON.stringify(legacyMessages));
+    assertEquals(
+      legacyMessages.body.chunk[0].event_id,
+      freshEvent.body.event_id,
+    );
     const preview = await edgeApi(freshRoomPath + '/initialSync');
     const searchContext = await edgeApi('search', {
       search_categories: {
@@ -1444,6 +1567,68 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     );
     assertEquals(freshRead.status, 200);
     assertEquals(freshRead.body.content, freshContent);
+    const pollInitial = await edgeApi(freshRoomPath + '/initialSync');
+    assertEquals(pollInitial.status, 200, JSON.stringify(pollInitial.body));
+    const pollPath = 'events?room_id=' +
+      encodeURIComponent(fresh.body.room_id) + '&timeout=0&from=';
+    const polledContent = {
+      algorithm: 'm.megolm.v1.aes-sha2',
+      ciphertext: 'offline-event-poll',
+    };
+    const polledEvent = await edgeApi(
+      freshRoomPath + '/send/m.room.encrypted/public-event-poll',
+      polledContent,
+      'PUT',
+    );
+    assertEquals(polledEvent.status, 200);
+    const polled = await edgeApi(
+      pollPath + encodeURIComponent(pollInitial.body.messages.end),
+    );
+    assertEquals(polled.status, 200, JSON.stringify(polled.body));
+    assertEquals(polled.body.start, pollInitial.body.messages.end);
+    const observed = polled.body.chunk.find((event: { event_id: string }) =>
+      event.event_id === polledEvent.body.event_id
+    );
+    assert(observed);
+    assertEquals(observed.content, polledContent);
+    assertEquals(
+      (await edgeApi(pollPath + encodeURIComponent(polled.body.end))).body
+        .chunk,
+      [],
+    );
+    assertEquals(await edgeApi('events'), {
+      status: 404,
+      body: { errcode: 'M_UNRECOGNIZED', error: 'Unrecognized request' },
+    });
+    assertEquals(
+      (await api('events', undefined, undefined, 'GET', facadePort)).status,
+      404,
+    );
+    const foreignPoll = await edgeApi(
+      pollPath + encodeURIComponent(formatPosition(
+        crypto.randomUUID(),
+        parsePosition(pollInitial.body.messages.end)!.payload,
+      )),
+    );
+    assertEquals(foreignPoll.status, 400);
+    assertEquals(foreignPoll.body.errcode, 'M_UNKNOWN_POS');
+    for (
+      const [token, status] of [
+        [undefined, 401],
+        [registered.body.access_token, 503],
+      ] as const
+    ) {
+      assertEquals(
+        (await api(
+          pollPath + encodeURIComponent(polled.body.end),
+          undefined,
+          token,
+          'GET',
+          facadePort,
+        )).status,
+        status,
+      );
+    }
     const context = await edgeApi(
       freshRoomPath + '/context/' + encodeURIComponent(edit.body.event_id),
     );
@@ -1489,8 +1674,107 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
       (await edgeApi(roomPath + '/state/m.room.tombstone')).status,
       404,
     );
-    // The remaining B8 inventory still owes these client directory read routes.
-    // Assert their retained owner state at the next stopped cut below instead.
+    const aliasPath = 'directory/room/' +
+      encodeURIComponent('#upgrade-home-boundary:logical.test');
+    assertEquals(
+      await edgeApi('directory/list/room/' + encodeURIComponent(roomId)),
+      {
+        status: 200,
+        body: { visibility: 'public' },
+      },
+    );
+    assertEquals(await edgeApi(aliasPath), {
+      status: 200,
+      body: { room_id: roomId, servers: ['logical.test'] },
+    });
+    assertEquals(await edgeApi(roomPath + '/aliases'), {
+      status: 200,
+      body: { aliases: ['#upgrade-home-boundary:logical.test'] },
+    });
+    assertEquals(await edgeApi(freshRoomPath + '/aliases'), {
+      status: 200,
+      body: { aliases: [] },
+    });
+    assertEquals(
+      (await api(
+        roomPath + '/aliases',
+        undefined,
+        undefined,
+        'GET',
+        facadePort,
+      )).status,
+      401,
+    );
+    assertEquals(
+      (await api(
+        roomPath + '/aliases',
+        undefined,
+        registered.body.access_token,
+        'GET',
+        facadePort,
+      )).status,
+      503,
+    );
+    for (const method of ['GET', 'POST']) {
+      const result = await edgeApi(
+        'publicRooms',
+        method === 'POST' ? {} : undefined,
+        method,
+      );
+      assertEquals(result.status, 200, JSON.stringify(result));
+      assert(
+        result.body.chunk.some((room: { room_id: string }) =>
+          room.room_id === roomId
+        ),
+      );
+      assert(
+        !result.body.chunk.some((room: { room_id: string }) =>
+          room.room_id === fresh.body.room_id
+        ),
+      );
+    }
+    const anonymousAlias = await fetch(
+      `http://127.0.0.1:${facadePort}/_matrix/client/v3/` + aliasPath,
+    );
+    assertEquals(anonymousAlias.status, 200);
+    assertEquals(await anonymousAlias.json(), {
+      room_id: roomId,
+      servers: ['logical.test'],
+    });
+    for (
+      const [path, method, body] of [
+        [aliasPath, 'DELETE', undefined],
+        [
+          'directory/room/' +
+          encodeURIComponent('#must-stay-home:logical.test'),
+          'PUT',
+          { room_id: fresh.body.room_id },
+        ],
+        ['directory/list/room/' + encodeURIComponent(roomId), 'PUT', {
+          visibility: 'private',
+        }],
+      ] as const
+    ) {
+      assertEquals(await edgeApi(path, body, method), {
+        status: 503,
+        body: {
+          errcode: 'M_UNAVAILABLE',
+          error: 'operation requires home ingress',
+        },
+      });
+    }
+    assertEquals((await edgeApi(aliasPath)).body.room_id, roomId);
+    assertEquals(
+      (await edgeApi('directory/list/room/' + encodeURIComponent(roomId))).body
+        .visibility,
+      'public',
+    );
+    assertEquals(
+      (await edgeApi(
+        'directory/room/' + encodeURIComponent('#must-stay-home:logical.test'),
+      )).status,
+      404,
+    );
     const upgradeSeed = await edgeApi('createRoom', {
       room_version: '11',
       initial_state: [{
@@ -2115,6 +2399,165 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
           selector.content.request_id === 'home-runtime-key'
         );
     });
+    // Real processes exchange live observations over the existing home-initiated
+    // link. Ordinary/sliding consumers, not a durable journal ACK, prove receipt.
+    const livePresence = 'presence/' + encodeURIComponent(user) + '/status';
+    const liveTyping = roomPath + '/typing/' + encodeURIComponent(user);
+    const liveMark = edge.observations.mark();
+    assertEquals(
+      (await api(
+        livePresence,
+        { presence: 'unavailable' },
+        registered.body.access_token,
+        'PUT',
+      )).status,
+      200,
+    );
+    assertEquals(
+      (await api(
+        liveTyping,
+        { typing: true, timeout: 30000 },
+        registered.body.access_token,
+        'PUT',
+      )).status,
+      200,
+    );
+    const observeLive = async (
+      child: Awaited<ReturnType<typeof process>>,
+      after: number,
+      snapshotMatches: (snapshot: {
+        presence: { userId: string; presence: string }[];
+        typing: { userId: string; roomId: string }[];
+      }) => boolean,
+      read: () => ReturnType<typeof api>,
+      observed: (body: Awaited<ReturnType<typeof api>>['body']) => boolean,
+    ) => {
+      const source = child === edge ? home : edge;
+      assert(source);
+      await observeLiveInput(
+        source,
+        child,
+        pairing,
+        after,
+        (snapshot) =>
+          snapshotMatches(snapshot as Parameters<typeof snapshotMatches>[0]),
+      );
+      const readScopes = new Set([
+        'auth:' + user,
+        'domain:' + user,
+        'membership:' + user,
+        'room:' + roomId,
+        'directory',
+        'owner-control',
+      ]);
+      let value;
+      for (;;) {
+        const readMark = child.observations.mark();
+        value = await read();
+        if (value.status !== 503 || child !== edge) break;
+        assertEquals(value.body.errcode, 'M_UNAVAILABLE');
+        // Live application does not seal the ordinary reader's separate scope
+        // cut. A refused read waits for real selected-owner application, never
+        // an elapsed retry window or a predicate against a missing effect.
+        await child.observations.wait(
+          (event) =>
+            event.kind === 'applied' && event.peer === 'home' &&
+            event.record.source === 'home' &&
+            event.record.incarnation === pairing &&
+            readScopes.has(event.record.stream),
+          readMark,
+          (scope) =>
+            scope.peer === 'home' && scope.source === 'home' &&
+            scope.incarnation === pairing && readScopes.has(scope.stream),
+        );
+      }
+      assertEquals(value.status, 200, JSON.stringify(value));
+      assert(
+        observed(value.body),
+        'completed live exchange omitted consumer effect: ' +
+          JSON.stringify(value),
+      );
+      return value.body;
+    };
+    const liveSync = await observeLive(
+      edge,
+      liveMark,
+      (snapshot) =>
+        snapshot.presence.some((v) =>
+          v.userId === user && v.presence === 'unavailable'
+        ) &&
+        snapshot.typing.some((v) => v.userId === user && v.roomId === roomId),
+      () => edgeApi('sync?timeout=0&set_presence=offline'),
+      (body) =>
+        body.presence?.events.some((
+          e: { sender: string; content: { presence: string } },
+        ) => e.sender === user && e.content.presence === 'unavailable') &&
+        body.rooms?.join?.[roomId]?.ephemeral?.events.some((
+          e: { type: string; content: { user_ids?: string[] } },
+        ) => e.type === 'm.typing' && e.content.user_ids?.includes(user)),
+    );
+    assertEquals(typeof liveSync.next_batch, 'string');
+    const homeLiveMark = home.observations.mark();
+    const liveSliding = await fetch(
+      `http://127.0.0.1:${facadePort}/_matrix/client/unstable/org.matrix.simplified_msc3575/sync?set_presence=online`,
+      {
+        method: 'POST',
+        headers: { authorization: 'Bearer ' + token },
+        body: JSON.stringify({
+          conn_id: 'cold-live-activity',
+          room_subscriptions: {
+            [roomId]: { timeline_limit: 0, required_state: [] },
+          },
+          extensions: { typing: { enabled: true } },
+        }),
+      },
+    );
+    assertEquals(liveSliding.status, 200);
+    const liveSlidingBody = await liveSliding.json();
+    assertEquals(
+      liveSlidingBody.extensions.typing.rooms[roomId].content.user_ids,
+      [user],
+    );
+    assertEquals(
+      (await api(
+        livePresence,
+        { presence: 'offline' },
+        registered.body.access_token,
+        'PUT',
+      )).status,
+      200,
+    );
+    await observeLive(
+      home,
+      homeLiveMark,
+      (snapshot) =>
+        snapshot.presence.some((v) =>
+          v.userId === user && v.presence === 'online'
+        ),
+      () => api(livePresence, undefined, registered.body.access_token),
+      (body) => body.presence === 'online',
+    );
+    const stopTypingMark = edge.observations.mark();
+    assertEquals(
+      (await api(
+        liveTyping,
+        { typing: false },
+        registered.body.access_token,
+        'PUT',
+      )).status,
+      200,
+    );
+    await observeLive(
+      edge,
+      stopTypingMark,
+      (snapshot) =>
+        !snapshot.typing.some((v) => v.userId === user && v.roomId === roomId),
+      () => edgeApi('sync?timeout=0&set_presence=offline'),
+      (body) =>
+        !body.rooms?.join?.[roomId]?.ephemeral?.events.some((
+          e: { type: string; content: { user_ids?: string[] } },
+        ) => e.type === 'm.typing' && e.content.user_ids?.includes(user)),
+    );
     // The live consumers above serve applied publications while home runs.
     // A separate cold reopen proves private data and upgrade retry retention.
     const backupSuffix = {
@@ -2390,7 +2833,12 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
   let homePort = 0, facadePort = 0, linkPort = 0;
   const bundlefile = tls.dir + '/public-auth-bundle.json';
   const file = (side: string) => tls.dir + '/' + side + '-public-auth.toml';
-  const configure = async (side: string, extra = '', maxDelay = 60000) => {
+  const configure = async (
+    side: string,
+    extra = '',
+    maxDelay = 60000,
+    discovery = false,
+  ) => {
     await Deno.writeTextFile(
       file(side),
       `[server]\nname="logical.test"\nrole="${side}"\nport=${
@@ -2403,7 +2851,10 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
           : '') +
         extra +
         `\n[delayedevents]\nmaxdelayms=${maxDelay}\n` +
-        '\n[push]\ncacerts=["tests/fixtures/tls/ca.crt"]\nallowlist=["127.0.0.1/32"]\n',
+        '\n[push]\ncacerts=["tests/fixtures/tls/ca.crt"]\nallowlist=["127.0.0.1/32"]\n' +
+        (discovery
+          ? '\n[turn]\nuris=["turn:ingress.test:3478"]\nusername="ingress-user"\npassword="ingress-test-password"\nttl=600\n[matrixrtc]\nlivekitserviceurl="https://rtc.ingress.test/"\n'
+          : ''),
     );
   };
   await configure('home');
@@ -2585,6 +3036,12 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
     await homeFact(
       edge,
       pairing,
+      'key-bootstrap:@outside:logical.test',
+      () => true,
+    );
+    await homeFact(
+      edge,
+      pairing,
       'room:' + departureRoom.body.room_id,
       (record) => roomView(record).roomId === departureRoom.body.room_id,
     );
@@ -2596,6 +3053,10 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
     await edge.stop();
     edge = await process(file('facade'), 'facade: link/local admin ready');
     await authTail(['outside', 'departure']);
+    await finiteStreams(edge, tls.dir + '/facade-public-auth.sock', [
+      'key-bootstrap:@outside:logical.test',
+      'devices:@outside:logical.test',
+    ]);
     await finiteTail(edge, tls.dir + '/facade-public-auth.sock', [
       'room:' + departureRoom.body.room_id,
     ]);
@@ -2624,6 +3085,181 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
     const session = await api('facade', 'login', login());
     assertEquals(session.status, 200, JSON.stringify(session));
     assertEquals(session.body.device_id, 'public-device');
+    for (const body of [{}, { display_name: 'foreign rename' }]) {
+      assertEquals(
+        await api(
+          'facade',
+          'devices/home-device',
+          body,
+          session.body.access_token,
+          'PUT',
+        ),
+        {
+          status: 503,
+          body: {
+            errcode: 'M_UNAVAILABLE',
+            error: 'operation owner unavailable at this ingress',
+          },
+        },
+      );
+    }
+    assertEquals(
+      await api(
+        'facade',
+        'devices/home-device',
+        undefined,
+        session.body.access_token,
+      ),
+      {
+        status: 200,
+        body: { device_id: 'home-device', display_name: 'outside' },
+      },
+    );
+    const deviceList = await api(
+      'facade',
+      'devices',
+      undefined,
+      session.body.access_token,
+    );
+    assertEquals(deviceList.status, 200);
+    const whoisPath = 'admin/whois/%40outside%3Alogical.test';
+    assertEquals(
+      await api('facade', whoisPath, undefined, session.body.access_token),
+      {
+        status: 200,
+        body: {
+          user_id: '@outside:logical.test',
+          devices: {
+            'home-device': { sessions: [] },
+            'public-device': { sessions: [{ connections: [] }] },
+          },
+        },
+      },
+    );
+    assertEquals((await api('facade', whoisPath)).status, 401);
+    assertEquals(
+      (await api('facade', whoisPath, undefined, registered.body.access_token))
+        .status,
+      503,
+    );
+    assertEquals(
+      (await api(
+        'facade',
+        'admin/whois/%40unknown%3Alogical.test',
+        undefined,
+        session.body.access_token,
+      )).status,
+      403,
+    );
+    assertEquals(
+      deviceList.body.devices.map((device: { device_id: string }) =>
+        device.device_id
+      ),
+      [
+        'home-device',
+        'public-device',
+      ],
+    );
+    assertEquals(
+      await api(
+        'facade',
+        'devices/public-device',
+        {},
+        session.body.access_token,
+        'PUT',
+      ),
+      { status: 200, body: {} },
+    );
+    assertEquals(
+      (await api(
+        'facade',
+        'devices/unknown',
+        undefined,
+        session.body.access_token,
+      )).status,
+      404,
+    );
+    // These reads use the ingress's existing authenticated adapters. Home is
+    // stopped, and a supplied home-owned token must not bypass owner admission.
+    const rtc = async (token?: string) => {
+      const response = await fetch(
+        `http://127.0.0.1:${facadePort}/_matrix/client/unstable/org.matrix.msc4143/rtc/transports`,
+        { headers: token ? { authorization: 'Bearer ' + token } : {} },
+      );
+      return { status: response.status, body: await response.json() };
+    };
+    for (
+      const [path, body] of [
+        ['account/3pid', { threepids: [] }],
+        ['thirdparty/protocols', {}],
+        ['thirdparty/user?userid=%40outside%3Alogical.test', []],
+        ['thirdparty/user/unknown', []],
+        ['thirdparty/location?alias=%23unknown%3Alogical.test', []],
+        ['thirdparty/location/unknown', []],
+        ['voip/turnServer', {}],
+      ] as const
+    ) {
+      assertEquals(
+        await api('facade', path, undefined, session.body.access_token),
+        {
+          status: 200,
+          body,
+        },
+        path,
+      );
+      assertEquals((await api('facade', path)).status, 401, path);
+      assertEquals(
+        (await api('facade', path, undefined, registered.body.access_token))
+          .status,
+        503,
+        path,
+      );
+    }
+    const discovery = await api(
+      'facade',
+      'capabilities',
+      undefined,
+      session.body.access_token,
+    );
+    assertEquals(discovery.status, 200);
+    assertEquals(discovery.body.capabilities['m.change_password'], {
+      enabled: false,
+    });
+    assertEquals(discovery.body.capabilities['m.profile_fields'], {
+      enabled: true,
+    });
+    assertEquals((await api('facade', 'capabilities')).status, 401);
+    assertEquals(
+      (await api(
+        'facade',
+        'capabilities',
+        undefined,
+        registered.body.access_token,
+      )).status,
+      503,
+    );
+    assertEquals(await rtc(session.body.access_token), {
+      status: 200,
+      body: {},
+    });
+    assertEquals((await rtc()).status, 401);
+    assertEquals((await rtc(registered.body.access_token)).status, 503);
+    assertEquals(
+      (await api(
+        'facade',
+        'thirdparty/protocol/unknown',
+        undefined,
+        session.body.access_token,
+      )).body.errcode,
+      'M_NOT_FOUND',
+    );
+    for (const path of ['thirdparty/user', 'thirdparty/location']) {
+      assertEquals(
+        (await api('facade', path, undefined, session.body.access_token))
+          .status,
+        400,
+      );
+    }
     assertEquals(
       (await api(
         'facade',
@@ -2659,6 +3295,37 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
       401,
     );
     timings.phase('offline push and saved notifications');
+    const joined = await api(
+      'facade',
+      'joined_rooms',
+      undefined,
+      session.body.access_token,
+    );
+    assertEquals(joined, {
+      status: 200,
+      body: { joined_rooms: [departureRoom.body.room_id] },
+    });
+    const userSearch = await api('facade', 'user_directory/search', {
+      search_term: 'departure',
+    }, session.body.access_token);
+    assertEquals(userSearch.status, 200);
+    assertEquals(
+      userSearch.body.results.map((user: { user_id: string }) => user.user_id),
+      ['@departure:logical.test'],
+    );
+    assertEquals(userSearch.body.limited, false);
+    for (
+      const [path, body] of [['joined_rooms', undefined], [
+        'user_directory/search',
+        { search_term: 'departure' },
+      ]] as const
+    ) {
+      assertEquals((await api('facade', path, body)).status, 401);
+      assertEquals(
+        (await api('facade', path, body, registered.body.access_token)).status,
+        503,
+      );
+    }
     await finiteTail(edge, tls.dir + '/facade-public-auth.sock', [
       'domain:@outside:logical.test',
       'domain:@departure:logical.test',
@@ -2891,8 +3558,34 @@ Deno.test('cold F2 public auth uses held authority offline and refuses strict or
     assertEquals(dueWhileStopped.status, 200);
     await edge.stop();
     await new Promise((resolve) => setTimeout(resolve, 2100));
-    await configure('facade', '', 0);
+    await configure('facade', '', 0, true);
     edge = await process(file('facade'), 'facade: link/local admin ready');
+    assertEquals(
+      await api(
+        'facade',
+        'voip/turnServer',
+        undefined,
+        session.body.access_token,
+      ),
+      {
+        status: 200,
+        body: {
+          uris: ['turn:ingress.test:3478'],
+          username: 'ingress-user',
+          password: 'ingress-test-password',
+          ttl: 600,
+        },
+      },
+    );
+    assertEquals(await rtc(session.body.access_token), {
+      status: 200,
+      body: {
+        rtc_transports: [{
+          type: 'livekit',
+          livekit_service_url: 'https://rtc.ingress.test/',
+        }],
+      },
+    });
     await waitDelayedState('cold', 'cold-with-new-scheduling-disabled');
     assertEquals(
       (await api(

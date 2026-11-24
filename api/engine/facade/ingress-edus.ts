@@ -28,6 +28,7 @@ export async function acceptIngressEdu(
   edus: Pick<EduState, 'dispatch'>,
   phase = 'f1',
   toDevice?: (origin: string, raw: unknown) => Promise<ToDeviceIngressReceipt>,
+  receivedMs = Date.now(),
 ): Promise<IngressEduDisposition> {
   const { type, content } = eduEnvelope(raw);
   try {
@@ -70,6 +71,12 @@ export async function acceptIngressEdu(
         return { kind: 'retained', type };
       case 'm.typing':
       case 'm.presence':
+        if (phase === 'f2') {
+          // Only live admission delivers activity. The retained home drain always
+          // expires this tail; retry never supplies a new receipt lifetime.
+          await dispatchTransactionEdu(origin, raw, edus, false, receivedMs);
+          return { kind: 'retained', type };
+        }
         return { kind: 'expired', type };
       default:
         return { kind: 'ignored', type };

@@ -216,6 +216,7 @@ export class Mailbox {
         origin: string,
         raw: unknown,
         phase: 'f1' | 'f2',
+        receivedMs: number,
       ): Promise<unknown>;
       changed(): void;
     },
@@ -488,7 +489,12 @@ export class Mailbox {
               }
               return {
                 index,
-                disposition: await this.options.acceptEdu(origin, raw, phase),
+                disposition: await this.options.acceptEdu(
+                  origin,
+                  raw,
+                  phase,
+                  entry.evidence.admitted,
+                ),
               };
             }),
           );

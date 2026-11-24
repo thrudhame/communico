@@ -12,7 +12,7 @@ import {
 } from '#engine/server/aliases.ts';
 import * as directory from '#engine/server/directory.ts';
 import { membershipOf } from '#engine/server/read.ts';
-import { getProfile } from '#engine/tenant/users.ts';
+import { getPublicProfile } from '#engine/tenant/profiles.ts';
 import { getRulebook } from '#engine/rulebook/index.ts';
 import {
   parsePowerLevels,
@@ -349,6 +349,7 @@ async function requireDirectoryScope(
   else await replica?.requireScope(scope);
 }
 export async function searchUsers(searcher: string, term: string, limit = 10) {
+  const joined = await joinedRooms(searcher);
   const candidates = new Set<string>(),
     publicIds = new Set(await directory.listedRooms(theApp().server));
   for (const id of await directory.allMemberRooms(theApp().server)) {
@@ -364,7 +365,7 @@ export async function searchUsers(searcher: string, term: string, limit = 10) {
       )
     ) publicIds.add(id);
   }
-  for (const id of new Set([...publicIds, ...await joinedRooms(searcher)])) {
+  for (const id of new Set([...publicIds, ...joined])) {
     for (const user of await directory.joinedUsers(theApp().server, id)) {
       candidates.add(user);
     }
@@ -373,10 +374,18 @@ export async function searchUsers(searcher: string, term: string, limit = 10) {
   const needle = term.toLowerCase(), results: Record<string, unknown>[] = [];
   for (const user of candidates) {
     if (!user.endsWith(':' + serverName())) continue;
-    const profile = await getProfile(
-      theApp().tenant,
-      localpartOf(user),
-    );
+    let profile;
+    try {
+      profile = await getPublicProfile(theApp().tenant, localpartOf(user));
+    } catch (error) {
+      // Candidate admission is independent of searcher admission. Do not
+      // expose the candidate via a user-ID match when its read is unproved.
+      if (
+        error instanceof MatrixError && error.status === 503 &&
+        error.errcode === 'M_UNAVAILABLE'
+      ) continue;
+      throw error;
+    }
     if (
       !user.toLowerCase().includes(needle) &&
       !profile?.displayname?.toLowerCase().includes(needle)

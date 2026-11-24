@@ -2,6 +2,10 @@ import { assert, assertEquals, assertRejects, assertThrows } from '@std/assert';
 import { createHash } from 'node:crypto';
 import { canonicalJson } from '#engine/canonical.ts';
 import { setConfigForTests } from '#engine/config.ts';
+import { ActivityExchange } from '#engine/facade/activity.ts';
+import { DeviceOperations } from '#engine/facade/devices.ts';
+import { deleteDevices, upsertDevice } from '#engine/tenant/devices.ts';
+import { deviceIdentity } from '#engine/tenant/txns.ts';
 import {
   importReportOperation,
   listReports,
@@ -75,6 +79,12 @@ import {
 import { queueBadge } from '#engine/server/push-queue.ts';
 import { applyPushPublication } from '#engine/server/notifications.ts';
 import { notificationOperations } from '#engine/server/notification-operations.ts';
+import {
+  capturePresence,
+  getPresence,
+  setPresence,
+  setPresenceValue,
+} from '#engine/server/ephemeral.ts';
 import { onEventStream } from '#engine/server/stream.ts';
 import { DelayedEvents } from '#engine/delayed-events.ts';
 import { startPushSender } from '#engine/push/sender.ts';
@@ -85,6 +95,9 @@ import { ignoredSenders } from '#engine/client/ignored.ts';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { setAvatarUrl, setDisplayName } from '#engine/tenant/users.ts';
 import { Journal } from '#engine/facade/journal.ts';
+import { JournalClient } from '#engine/facade/client.ts';
+import { linkHandler } from '#engine/facade/link.ts';
+import { LinkClient } from '#engine/facade/transport.ts';
 import { exportOwnerControl, OwnerControls } from '#engine/facade/ownership.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
 import { MembershipOperations } from '#engine/facade/membership.ts';
@@ -94,6 +107,7 @@ import {
   LINK_SUPPORTED,
   LinkError,
   type LinkRecord,
+  object,
   recordHash,
 } from '#engine/facade/protocol.ts';
 import { serverSchema } from '#engine/server/schema.ts';
@@ -142,6 +156,7 @@ import {
 } from '#engine/tenant/pushrules.ts';
 import {
   importRegisterOperation,
+  readRegister,
   writeRegister,
 } from '#engine/facade/registers.ts';
 import {
@@ -149,7 +164,10 @@ import {
   recordReceiptOperation,
 } from '#engine/server/receipt-operations.ts';
 
-async function fixture(option: boolean | string = true) {
+async function fixture(
+  option: boolean | string = true,
+  reader: () => 1 | 2 = () => 2,
+) {
   const applyAuth = option !== false;
   const token = typeof option === 'string' ? option : undefined;
   const dir = await Deno.makeTempDir({ prefix: 'facade-domain-link-' });
@@ -229,7 +247,14 @@ async function fixture(option: boolean | string = true) {
   if (applyAuth) {
     await new AccountSnapshots(edge, et, fp, owners).apply(ej, auth);
   }
-  const hs = new DomainOperations(home, ht, hp),
+  const domains = new DomainOperations(home, ht, hp);
+  const hs = {
+      apply: domains.apply.bind(domains),
+      export: (localpart: string, pairing?: string) =>
+        domains.export(localpart, pairing, reader()),
+      bootstrap: (localpart: string, pairing: string) =>
+        domains.bootstrap(localpart, pairing, reader()),
+    },
     es = new DomainOperations(edge, et, fp, node);
   if (token) {
     const hash = await hashToken(token);
@@ -275,6 +300,984 @@ async function fixture(option: boolean | string = true) {
     },
   };
 }
+
+async function activityFixture() {
+  const f = await fixture();
+  await upsertDevice(f.ht, 'alice', 'LAN', 'LAN');
+  const device = await deviceIdentity(f.ht, 'alice', 'LAN');
+  const auth = await exportAccountAuth(
+    f.home,
+    f.ht,
+    f.hp,
+    f.bundle.id,
+    'alice',
+    false,
+  );
+  await f.ej.receive('home', [auth]);
+  await new AccountSnapshots(f.edge, f.et, f.fp, f.owners).apply(f.ej, auth);
+  const keys = new DeviceOperations(f.home, f.ht, f.hp);
+  const edgeKeys = new DeviceOperations(f.edge, f.et, f.fp, f.node);
+  for (const record of await keys.bootstrap('alice', f.bundle.id)) {
+    await f.ej.receive('home', [record]);
+    await edgeKeys.apply(f.ej, record);
+  }
+  await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+  const home = new ActivityExchange(f.home, f.ht, f.hp);
+  const edge = new ActivityExchange(f.edge, f.et, f.fp, f.node);
+  return { ...f, device, homeActivity: home, edgeActivity: edge };
+}
+
+Deno.test('live activity wire binds local generation to retained device creation', async () => {
+  const f = await activityFixture();
+  try {
+    await setPresenceValue(
+      await f.home.server(),
+      '@alice:logical.test',
+      'online',
+      f.device,
+    );
+    const snapshot = object(await f.homeActivity.capture(f.bundle.id));
+    const values = snapshot.presence as Record<string, unknown>[];
+    assertEquals(values.length, 1);
+    assertEquals(values[0].userId, '@alice:logical.test');
+    assertEquals(values[0].deviceId, 'LAN');
+    assertEquals(typeof values[0].deviceIncarnation, 'string');
+    assertEquals(values[0].generation, undefined);
+    assert(
+      snapshot.incarnation !== f.bundle.id,
+      'pairing is not publication incarnation',
+    );
+    await f.edgeActivity.apply(f.bundle.id, snapshot, () => 0);
+    assertEquals(
+      (await getPresence(await f.edge.server(), '@alice:logical.test'))
+        .presence,
+      'online',
+    );
+    assertEquals(
+      object(await f.edgeActivity.capture(f.bundle.id)).presence,
+      [],
+      'no imported observation re-export',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('live activity wire admits even empty views through current grant and control', async () => {
+  const f = await activityFixture();
+  try {
+    const snapshot = await f.homeActivity.capture(f.bundle.id);
+    await (await f.edge.server()).execute(
+      'DELETE FROM facade_owner_activation',
+    );
+    await assertRejects(() =>
+      f.edgeActivity.apply(f.bundle.id, snapshot, () => 0)
+    );
+    await assertRejects(() => f.edgeActivity.capture(f.bundle.id));
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('live activity wire rejects unknown and forged device creations before presence effects', async () => {
+  const f = await activityFixture();
+  try {
+    const snapshot = object(await f.homeActivity.capture(f.bundle.id));
+    const forged = {
+      ...snapshot,
+      presence: [{
+        userId: '@alice:logical.test',
+        deviceId: 'LAN',
+        deviceIncarnation: 'not-a-creation',
+        presence: 'online',
+        remainingMs: 30000,
+        lastActiveAgo: 0,
+      }],
+    };
+    await assertRejects(() =>
+      f.edgeActivity.apply(f.bundle.id, forged, () => 0)
+    );
+    assertEquals(
+      (await getPresence(await f.edge.server(), '@alice:logical.test'))
+        .presence,
+      'offline',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('live activity wire preserves source, account, deletion and expiry boundaries', async (t) => {
+  const f = await activityFixture();
+  try {
+    const user = '@alice:logical.test';
+    const server = await f.edge.server();
+    await setPresenceValue(await f.home.server(), user, 'online', f.device);
+    const snapshot = await f.homeActivity.capture(f.bundle.id);
+    assertEquals(snapshot.presence.length, 1);
+    await t.step(
+      'binding substitution cannot name a different source or grant',
+      async () => {
+        for (
+          const key of [
+            'source',
+            'incarnation',
+            'pairing',
+            'server',
+            'grantRevision',
+            'ownerRevision',
+          ] as const
+        ) {
+          await assertRejects(() =>
+            f.edgeActivity.apply(f.bundle.id, {
+              ...snapshot,
+              [key]: typeof snapshot[key] === 'number'
+                ? Number(snapshot[key]) + 1
+                : 'substituted',
+            }, () => 0)
+          );
+        }
+        assertEquals((await getPresence(server, user)).presence, 'offline');
+      },
+    );
+    await t.step(
+      'wire parser refuses numbers, duplicates and undeclared activity fields',
+      async () => {
+        for (
+          const presence of [
+            [{ ...snapshot.presence[0], remainingMs: 0.1 }],
+            [{ ...snapshot.presence[0], lastActiveAgo: -1 }],
+            [{ ...snapshot.presence[0], generation: 1 }],
+            [snapshot.presence[0], snapshot.presence[0]],
+          ]
+        ) {
+          await assertRejects(() =>
+            f.edgeActivity.apply(
+              f.bundle.id,
+              { ...snapshot, presence },
+              () => 0,
+            )
+          );
+        }
+        assertEquals((await getPresence(server, user)).presence, 'offline');
+      },
+    );
+    await t.step(
+      'missing room proof refuses the whole candidate before presence effects',
+      async () => {
+        await assertRejects(() =>
+          f.edgeActivity.apply(f.bundle.id, {
+            ...snapshot,
+            typing: [{
+              userId: user,
+              deviceId: 'LAN',
+              deviceIncarnation: snapshot.presence[0].deviceIncarnation,
+              roomId: '!missing:logical.test',
+              membership: '$missing',
+              remainingMs: 30000,
+            }],
+          }, () => 0)
+        );
+        assertEquals((await getPresence(server, user)).presence, 'offline');
+      },
+    );
+    await t.step(
+      'unapplied selected account is unavailable, unrelated accounts do not block',
+      async () => {
+        const changed = await exportAccountAuth(
+          f.home,
+          f.ht,
+          f.hp,
+          f.bundle.id,
+          'alice',
+          false,
+        );
+        await f.ej.receive('home', [changed]);
+        await assertRejects(() =>
+          f.edgeActivity.apply(f.bundle.id, snapshot, () => 0)
+        );
+        await new AccountSnapshots(f.edge, f.et, f.fp, f.owners).apply(
+          f.ej,
+          changed,
+        );
+        const other = await exportAccountAuth(
+          f.home,
+          f.ht,
+          f.hp,
+          f.bundle.id,
+          'bob',
+          false,
+        );
+        await f.ej.receive('home', [other]);
+        await f.edgeActivity.apply(f.bundle.id, snapshot, () => 0);
+        assertEquals((await getPresence(server, user)).presence, 'online');
+      },
+    );
+    await t.step(
+      'round trip age and empty source replacement expire the existing owner',
+      async () => {
+        await f.edgeActivity.apply(f.bundle.id, snapshot, () => 31000);
+        assertEquals((await getPresence(server, user)).presence, 'offline');
+        await f.edgeActivity.apply(f.bundle.id, snapshot, () => 0);
+        assertEquals((await getPresence(server, user)).presence, 'online');
+        await f.edgeActivity.apply(
+          f.bundle.id,
+          { ...snapshot, presence: [] },
+          () => 0,
+        );
+        assertEquals((await getPresence(server, user)).presence, 'offline');
+      },
+    );
+    await t.step(
+      'activity ages floor at epoch without renewing expiry',
+      async () => {
+        const before = Date.now();
+        const age = 12;
+        await f.edgeActivity.apply(f.bundle.id, {
+          ...snapshot,
+          presence: [{
+            ...snapshot.presence[0],
+            lastActiveAgo: Number.MAX_SAFE_INTEGER,
+          }],
+        }, () => age);
+        const [held] = await server.query(
+          'SELECT last_active_ms,last_sync_ms FROM presence_observations WHERE user_id=? AND node=?',
+          [user, 'home'],
+        );
+        const after = Date.now();
+        await f.edgeActivity.apply(
+          f.bundle.id,
+          { ...snapshot, presence: [] },
+          () => 0,
+        );
+        const offset = snapshot.presence[0].remainingMs - age - 30000;
+        assertEquals(held.last_active_ms, 0);
+        assert(Number(held.last_sync_ms) >= before + offset);
+        assert(Number(held.last_sync_ms) <= after + offset);
+      },
+    );
+    await t.step(
+      'missing selection is not an empty admitted account',
+      async () => {
+        const db = await f.edge.tenant('logical.test');
+        await db.execute(
+          "DELETE FROM account_auth_snapshots WHERE localpart='alice'",
+        );
+        await assertRejects(() =>
+          f.edgeActivity.apply(f.bundle.id, snapshot, () => 0)
+        );
+        assertEquals((await getPresence(server, user)).presence, 'offline');
+      },
+    );
+    await t.step(
+      'retired local execution generation is never exported',
+      async () => {
+        await deleteDevices(f.ht, 'alice', ['LAN']);
+        await upsertDevice(f.ht, 'alice', 'LAN', 'recreated');
+        assertEquals((await f.homeActivity.capture(f.bundle.id)).presence, []);
+        const current = await deviceIdentity(f.ht, 'alice', 'LAN');
+        await setPresenceValue(await f.home.server(), user, 'online', current);
+        const recreated = await f.homeActivity.capture(f.bundle.id);
+        assertEquals(recreated.presence.length, 1);
+        assert(
+          recreated.presence[0].deviceIncarnation !==
+            snapshot.presence[0].deviceIncarnation,
+        );
+        await (await f.home.server()).execute(
+          'DELETE FROM facade_exports WHERE scope=?',
+          ['auth:' + user],
+        );
+        assertEquals(
+          (await f.homeActivity.capture(f.bundle.id)).presence,
+          [],
+          'unselected local activity is not exported',
+        );
+      },
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('live activity dependencies distinguish absent creation from conflicting creation', async (t) => {
+  const f = await activityFixture();
+  try {
+    const user = '@alice:logical.test';
+    await setPresenceValue(await f.home.server(), user, 'online', f.device);
+    const snapshot = await f.homeActivity.capture(f.bundle.id);
+    const candidate = { ...snapshot.presence[0], deviceId: 'MISSING' };
+    for (const kind of ['presence', 'typing']) {
+      await t.step(kind, async () => {
+        const values = kind === 'presence' ? [candidate] : [{
+          userId: user,
+          deviceId: 'MISSING',
+          deviceIncarnation: candidate.deviceIncarnation,
+          roomId: '!missing:logical.test',
+          membership: '$missing',
+          remainingMs: 30000,
+        }];
+        const error = await assertRejects(
+          () =>
+            f.edgeActivity.apply(f.bundle.id, {
+              ...snapshot,
+              presence: [],
+              [kind]: values,
+            }, () => 0),
+          LinkError,
+        );
+        assertEquals(
+          error.status,
+          503,
+          'missing creation remains a retryable dependency',
+        );
+      });
+    }
+    const conflict = await assertRejects(
+      () =>
+        f.edgeActivity.apply(f.bundle.id, {
+          ...snapshot,
+          presence: [{
+            ...snapshot.presence[0],
+            deviceIncarnation: 'substituted',
+          }],
+        }, () => 0),
+      LinkError,
+    );
+    assertEquals(conflict.status, 403);
+    assertEquals(
+      (await getPresence(await f.edge.server(), user)).presence,
+      'offline',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain rolling readers: status requires its reader before receipt or activation', async () => {
+  const f = await fixture();
+  try {
+    // The pre-status reader supported domain-operation/1. Its journal and
+    // negotiation implementations are unchanged; only the reader set differs.
+    const old = new Journal(
+      await f.edge.server(),
+      LINK_SUPPORTED.filter((cap) =>
+        cap.type !== 'domain-operation' || cap.version === 1
+      ),
+    );
+    const server = await f.home.server();
+    await setPresence(server, '@alice:logical.test', 'online', 'new status');
+    const bootstrap = await f.hs.bootstrap('alice', f.bundle.id);
+    const status = bootstrap.filter((record) => {
+      const body =
+        (record.payload as { body: DomainBootstrap | DomainOperation }).body;
+      return body.kind === 'domain-bootstrap' ||
+        body.operation.kind === 'presence-status';
+    });
+    assertEquals(status.length, 2);
+    const before = await old.heads('home', 'in', bootstrap[0]);
+    await assertRejects(
+      () => old.receive('home', bootstrap),
+      LinkError,
+      'unsupported record type',
+    );
+    assertEquals(status.map((record) => record.version), [2, 2]);
+    assertEquals(await old.heads('home', 'in', bootstrap[0]), before);
+    assertEquals(await old.pending('home', bootstrap[0]), []);
+    await assertRejects(
+      async () => getPresence(await f.edge.server(), '@alice:logical.test'),
+      MatrixError,
+      'presence status unavailable',
+    );
+    await f.toEdge(bootstrap);
+    assertEquals(
+      (await getPresence(await f.edge.server(), '@alice:logical.test'))
+        .statusMsg,
+      'new status',
+    );
+    await putAccountData(f.ht, 'alice', '', 'rolling.control', {
+      unchanged: true,
+    });
+    const legacy = await f.hs.export('alice', f.bundle.id);
+    const account = legacy.filter((record) =>
+      (record.payload as { body: DomainOperation }).body.operation.kind ===
+        'account-data'
+    );
+    assert(account.length > 0);
+    assert(account.every((record) => record.version === 1));
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain rolling upgrade preserves account data and continues after the v1 applied cut', async () => {
+  let client: JournalClient;
+  const f = await fixture(true, () => client.domainReaderVersion ?? 1);
+  try {
+    const legacy = new Journal(
+      await f.edge.server(),
+      LINK_SUPPORTED.filter((cap) =>
+        cap.type !== 'domain-operation' || cap.version === 1
+      ),
+    );
+    const limits = { maxItems: 100, maxBytes: 1_000_000 };
+    let journal = legacy;
+    const endpoint = (journal: Journal) =>
+      linkHandler({
+        server: 'logical.test',
+        node: f.node.node,
+        incarnation: f.node.incarnation,
+        pairings: () => Promise.resolve(f.fp),
+        journal,
+        limits,
+        changed: async () => {
+          for (const stream of await journal.streams('home', 'in')) {
+            if (stream.stream.startsWith('domain:')) {
+              while (await f.es.apply(journal, stream)) { /* drain */ }
+            }
+          }
+        },
+      });
+    let handle = endpoint(legacy);
+    const url = 'https://facade.test';
+    const wire = new LinkClient({ cert: '', key: '', ca: [] }, {
+      url,
+      pin: 'b'.repeat(64),
+    });
+    wire.fetch = async (path, init) => {
+      const response = await handle(
+        new Request(new URL(path, url), init),
+        'a'.repeat(64),
+      );
+      if (journal === legacy && path.endsWith('/hello') && response.ok) {
+        const { supported: _unsupportedByLegacyHello, ...body } = await response
+          .json();
+        return Response.json(body);
+      }
+      return response;
+    };
+    client = new JournalClient(wire, {
+      server: 'logical.test',
+      node: f.node.node,
+      incarnation: f.node.incarnation,
+      pairing: f.bundle.id,
+      revision: (await f.fp.active()).body.revision,
+    }, async () => {
+      assertEquals((await f.hp.connection(f.bundle.id)).state, 'paired');
+    });
+    assertEquals(client.domainReaderVersion, undefined);
+    await client.hello();
+    assertEquals(client.domainReaderVersion, 1);
+    const drain = async (stream: LinkRecord) => {
+      const { applied } = await journal.heads('home', 'in', stream);
+      const { head, records } = await f.hj.page(
+        'edge_a',
+        'out',
+        stream,
+        applied.sequence,
+        limits,
+      );
+      const ack = await client.push(stream, records, applied, undefined, head);
+      assertEquals(ack.applied, head);
+      return records;
+    };
+    await setPresence(
+      await f.home.server(),
+      '@alice:logical.test',
+      'online',
+      'retained status',
+    );
+    await putAccountData(f.ht, 'alice', '', 'rolling.first', { before: 1 });
+    const [stream] = await f.hs.bootstrap('alice', f.bundle.id);
+    await drain(stream);
+    assertEquals(await getAccountData(f.et, 'alice', '', 'rolling.first'), {
+      before: 1,
+    });
+    await putAccountData(f.ht, 'alice', '', 'rolling.second', { before: 2 });
+    await f.hs.bootstrap('alice', f.bundle.id);
+    await drain(stream);
+    assertEquals(await getAccountData(f.et, 'alice', '', 'rolling.second'), {
+      before: 2,
+    });
+    const cut = (await legacy.heads('home', 'in', stream)).applied;
+    const legacySequence = await accountDataMax(f.et, 'alice');
+    const prefix =
+      (await f.hj.page('edge_a', 'out', stream, 0, limits)).records;
+    assert(prefix.every((record) => record.version === 1));
+
+    handle = endpoint(f.ej);
+    journal = f.ej;
+    await f.hs.bootstrap('alice', f.bundle.id);
+    assertEquals(await drain(stream), []);
+    const hello = await client.hello();
+    assertEquals(
+      hello.incoming.find((entry) => entry.stream === stream.stream)?.applied,
+      cut,
+    );
+    assertEquals(client.domainReaderVersion, 2);
+    await f.hs.bootstrap('alice', f.bundle.id);
+    const upgrade = await drain(stream);
+    assertEquals(upgrade[0].sequence, cut.sequence + 1);
+    assertEquals(upgrade[0].previous, cut.hash);
+    assert(upgrade.every((record) => record.version === 2));
+    assertEquals(await accountDataMax(f.et, 'alice'), legacySequence);
+    assertEquals(
+      (await getPresence(await f.edge.server(), '@alice:logical.test'))
+        .statusMsg,
+      'retained status',
+    );
+    await putAccountData(f.ht, 'alice', '', 'rolling.third', { after: 3 });
+    await f.hs.bootstrap('alice', f.bundle.id);
+    const suffix = await drain(stream);
+    assertEquals(await getAccountData(f.et, 'alice', '', 'rolling.third'), {
+      after: 3,
+    });
+    const complete =
+      (await f.hj.page('edge_a', 'out', stream, 0, limits)).records;
+    assertEquals(complete, [...prefix, ...upgrade, ...suffix]);
+    assertEquals(
+      new Set(complete.map((record) => record.operationId)).size,
+      complete.length,
+    );
+    await f.hs.bootstrap('alice', f.bundle.id);
+    assertEquals(await drain(stream), []);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain presence status: bootstrap and causal suffix preserve status without replaying activity', async () => {
+  const f = await fixture();
+  try {
+    const user = '@alice:logical.test';
+    const home = await f.home.server(), edge = await f.edge.server();
+    await setPresence(home, user, 'online', 'home status');
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    await f.toEdge(records);
+    assertEquals((await getPresence(edge, user)).statusMsg, 'home status');
+    assertEquals((await getPresence(edge, user)).presence, 'offline');
+    await setPresenceValue(edge, user, 'unavailable', {
+      deviceId: 'PHONE',
+      generation: 1,
+    });
+    await setPresence(home, user, 'offline', 'new home status');
+    const suffix = await f.hs.export('alice', f.bundle.id);
+    await f.toEdge(suffix);
+    assertEquals((await getPresence(edge, user)).statusMsg, 'new home status');
+    assertEquals((await getPresence(edge, user)).presence, 'unavailable');
+    await setPresence(edge, user, 'offline', 'edge successor');
+    for (const record of await f.es.export('alice', f.bundle.id)) {
+      await f.hj.receive('edge_a', [record]);
+      await f.hs.apply(f.hj, record, f.bundle.id);
+    }
+    assertEquals((await getPresence(home, user)).statusMsg, 'edge successor');
+    assertEquals((await getPresence(home, user)).presence, 'offline');
+    await f.toEdge(records);
+    assertEquals((await getPresence(edge, user)).statusMsg, 'edge successor');
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain presence status: an unrelated control cannot reject the delivering pairing', async () => {
+  const f = await fixture();
+  const second = await f.open('second-edge');
+  try {
+    const user = '@alice:logical.test';
+    const server = await second.server();
+    await bindRole(second, {
+      role: 'facade',
+      server: 'logical.test',
+      node: 'edge_b',
+    });
+    const node = await initializeNode(server, 'logical.test', 'edge_b');
+    const fp = new Pairings(
+      server,
+      node.signer(),
+      node.publicKey,
+      'c'.repeat(64),
+      node,
+    );
+    const randomUUID = crypto.randomUUID;
+    let bundle;
+    try {
+      crypto.randomUUID = () => '00000000-0000-4000-8000-000000000000';
+      bundle = await f.hp.create({
+        node: 'edge_b',
+        url: 'https://second.test',
+        facadePin: 'c'.repeat(64),
+        expires: Date.now() + 60_000,
+        required: [...LINK_CAPABILITIES],
+      });
+    } finally {
+      crypto.randomUUID = randomUUID;
+    }
+    await fp.accept(bundle);
+    await f.hp.confirm(
+      bundle.id,
+      await fp.complete(
+        bundle.id,
+        await f.hp.grant(
+          bundle.id,
+          await fp.challenge(bundle.id, bundle.secret, 'a'.repeat(64)),
+        ),
+        'a'.repeat(64),
+      ),
+    );
+    // Tenant authority supports one selected edge. The second enrollment can
+    // still leave a signed server control installed before tenant refusal.
+    await assertRejects(
+      () => exportOwnerControl(f.home, f.ht, f.hp, bundle.id),
+      MatrixError,
+      'operation owner unavailable',
+    );
+    const home = await f.home.server();
+    await home.tx(async (tx) => {
+      const [held] = await tx.query(
+        'SELECT * FROM facade_owner_activation WHERE pairing=?',
+        [f.bundle.id],
+      );
+      const [signed] = await tx.query(
+        'SELECT * FROM facade_owner_controls WHERE pairing=? AND revision=?',
+        [held.pairing, held.revision],
+      );
+      // Exercise the order in which the unrelated row is encountered first.
+      // Keep the exact activation and all signed controls unchanged.
+      await tx.execute('DELETE FROM facade_owner_activation WHERE pairing=?', [
+        f.bundle.id,
+      ]);
+      await tx.execute(
+        'DELETE FROM facade_owner_controls WHERE pairing=? AND revision=?',
+        [held.pairing, held.revision],
+      );
+      await tx.execute('INSERT INTO facade_owner_controls VALUES(?,?,?,?)', [
+        signed.pairing,
+        signed.revision,
+        signed.body_hash,
+        signed.signed_json,
+      ]);
+      await tx.execute('INSERT INTO facade_owner_activation VALUES(?,?,?)', [
+        held.pairing,
+        held.revision,
+        held.body_hash,
+      ]);
+    });
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    await setPresence(await f.edge.server(), user, 'online', 'admitted edge');
+    const records = await f.es.export('alice');
+    assertEquals(records.length, 1);
+    await f.hj.receive(f.node.node, records);
+    assertEquals(await f.hs.apply(f.hj, records[0], f.bundle.id), true);
+    assertEquals(
+      (await f.hj.heads(f.node.node, 'in', records[0])).applied.hash,
+      records[0].hash,
+    );
+    assertEquals((await getPresence(home, user)).statusMsg, 'admitted edge');
+  } finally {
+    await second.close();
+    await f.close();
+  }
+});
+
+Deno.test('domain rolling readers: legacy bootstrap cannot enable status and downgraded status cannot apply', async () => {
+  const f = await fixture();
+  try {
+    const records = await f.hs.bootstrap('alice', f.bundle.id);
+    await f.toEdge(records);
+    const payload = structuredClone(records.at(-1)!.payload) as {
+      body: DomainBootstrap;
+      signature: string;
+    };
+    delete payload.body.presenceStatus;
+    payload.signature = await f.ht.signer().sign(canonicalJson(payload.body));
+    const legacy = await appendRecordForBackup(f, payload);
+    assertEquals(legacy.version, 1);
+    await f.toEdge([legacy]);
+    assertEquals(
+      await getAccountData(f.et, 'alice', '', 'rolling.absent'),
+      null,
+    );
+    await assertRejects(
+      async () => getPresence(await f.edge.server(), '@alice:logical.test'),
+      MatrixError,
+      'presence status unavailable',
+    );
+    await setPresence(
+      await f.home.server(),
+      '@alice:logical.test',
+      'online',
+      'new status',
+    );
+    const suffix = await f.hs.export('alice', f.bundle.id);
+    const record = suffix.find((record) => record.sequence > legacy.sequence)!;
+    assertEquals(record.version, 2);
+    const { hash: _hash, ...body } = { ...record, version: 1 };
+    const downgraded = { ...body, hash: recordHash(body) };
+    await f.ej.receive('home', [downgraded]);
+    const before = await f.ej.heads('home', 'in', downgraded);
+    await assertRejects(
+      () => f.es.apply(f.ej, downgraded),
+      LinkError,
+      'domain operation requires status reader',
+    );
+    assertEquals(await f.ej.heads('home', 'in', downgraded), before);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain presence status: completeness, concurrent losers, observed clear and cold reopen', async () => {
+  const f = await fixture();
+  let cold: Awaited<ReturnType<typeof f.open>> | undefined;
+  try {
+    const user = '@alice:logical.test';
+    const home = await f.home.server(), edge = await f.edge.server();
+    await assertRejects(
+      () => getPresence(edge, user),
+      MatrixError,
+      'presence status unavailable',
+    );
+    await edge.execute(
+      "INSERT INTO memberships(user,room,membership,event,seq) VALUES(?,?,'join','$join',0)",
+      [user, '!status:logical.test'],
+    );
+    await assertRejects(
+      () => edge.tx((conn) => capturePresence(conn, user, edge)),
+      MatrixError,
+      'presence status unavailable',
+    );
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    assertEquals((await getPresence(edge, user)).statusMsg, null);
+    await setPresence(home, user, 'online', 'concurrent home');
+    await setPresence(edge, user, 'unavailable', 'concurrent edge');
+    const fromHome = await f.hs.export('alice', f.bundle.id);
+    const fromEdge = await f.es.export('alice', f.bundle.id);
+    await f.toEdge(fromHome);
+    for (const record of fromEdge) {
+      await f.hj.receive('edge_a', [record]);
+      await f.hs.apply(f.hj, record, f.bundle.id);
+    }
+    assertEquals((await getPresence(home, user)).statusMsg, 'concurrent home');
+    assertEquals((await getPresence(edge, user)).statusMsg, 'concurrent home');
+    const view = await edge.tx((conn) =>
+      readRegister(conn, JSON.stringify(['presence-status', 'alice']))
+    );
+    assertEquals(view.frontier.length, 2);
+    assert(
+      view.conflicts.some((op) =>
+        JSON.parse(op.payload).status === 'concurrent edge'
+      ),
+    );
+    await setPresence(edge, user, 'offline');
+    assertEquals((await getPresence(edge, user)).statusMsg, null);
+    const cleared = await getPresence(edge, user);
+    await f.toEdge(fromHome);
+    assertEquals(await getPresence(edge, user), cleared);
+    await f.edge.close();
+    cold = await f.open('edge');
+    assertEquals(
+      (await getPresence(await cold.server(), user)).statusMsg,
+      null,
+    );
+  } finally {
+    await cold?.close();
+    await f.close();
+  }
+});
+
+Deno.test('domain presence status: an unready co-member cannot withhold the snapshot or reveal status', async () => {
+  const f = await fixture();
+  try {
+    const edge = await f.edge.server();
+    const alice = '@alice:logical.test', bob = '@bob:logical.test';
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    for (const user of [alice, bob]) {
+      await edge.execute(
+        "INSERT INTO memberships(user,room,membership,event,seq) VALUES(?,?,'join','$join',0)",
+        [user, '!status:logical.test'],
+      );
+    }
+    await edge.execute(
+      "INSERT INTO presence(user_id,presence,status_msg,last_active_ms,seq) VALUES(?,'offline','unproved',0,0)",
+      [bob],
+    );
+    const view = await edge.tx((conn) => capturePresence(conn, alice, edge));
+    assert(view.rows.has(alice));
+    assertEquals(view.rows.get(bob)?.statusMsg, null);
+    await assertRejects(
+      () => getPresence(edge, bob),
+      MatrixError,
+      'presence status unavailable',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain presence status: stale pairing inventory and missing activation cannot authorize a read or write', async () => {
+  const f = await fixture();
+  try {
+    const user = '@alice:logical.test';
+    const edge = await f.edge.server();
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    await edge.execute('UPDATE facade_scopes SET incarnation=? WHERE scope=?', [
+      'retired-pairing',
+      'presence-status:' + user,
+    ]);
+    await assertRejects(
+      () => getPresence(edge, user),
+      MatrixError,
+      'presence status unavailable',
+    );
+    await edge.execute('UPDATE facade_scopes SET incarnation=? WHERE scope=?', [
+      f.bundle.id,
+      'presence-status:' + user,
+    ]);
+    await edge.execute('DELETE FROM facade_owner_activation');
+    await assertRejects(
+      () => getPresence(edge, user),
+      MatrixError,
+      'presence status unavailable',
+    );
+    const read = () =>
+      edge.query('SELECT * FROM presence WHERE user_id=?', [user]);
+    const before = await read();
+    await assertRejects(
+      () => setPresence(edge, user, 'online', 'unreplicated'),
+      MatrixError,
+      'presence status unavailable',
+    );
+    assertEquals(await read(), before);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain presence status: received but unapplied suffix refuses without renewing activity', async () => {
+  const f = await fixture();
+  try {
+    const user = '@alice:logical.test';
+    const home = await f.home.server(), edge = await f.edge.server();
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    await setPresenceValue(edge, user, 'unavailable', {
+      deviceId: 'PHONE',
+      generation: 1,
+    });
+    const before = await getPresence(edge, user);
+    await setPresence(home, user, 'online', 'awaited status');
+    const records = await f.hs.export('alice', f.bundle.id);
+    await f.ej.receive('home', records);
+    await assertRejects(
+      () => getPresence(edge, user),
+      MatrixError,
+      'presence status unavailable',
+    );
+    await f.toEdge(records);
+    const after = await getPresence(edge, user);
+    assertEquals(after.statusMsg, 'awaited status');
+    assertEquals(after.presence, before.presence);
+    assertEquals(after.lastActiveMs, before.lastActiveMs);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain status suffix exports late foreign dependencies before local successors', async () => {
+  const f = await fixture();
+  try {
+    const user = '@alice:logical.test';
+    const home = await f.home.server();
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    const { operation: prior } = await home.tx((tx) =>
+      writeRegister(
+        tx,
+        { source: 'zz_other_edge', incarnation: 'retained-enrollment' },
+        JSON.stringify(['presence-status', 'alice']),
+        'presence-status',
+        JSON.stringify({ user, status: 'foreign' }),
+      )
+    );
+    await setPresence(home, user, 'online', 'successor');
+    const records = (await f.hs.export('alice', f.bundle.id)).filter((record) =>
+      (record.payload as { body: DomainOperation }).body.operation.kind ===
+        'presence-status'
+    );
+    const bodies = records.map((record) =>
+      (record.payload as { body: DomainOperation }).body
+    );
+    const priorIndex = bodies.findIndex((body) =>
+      body.operation.operationId === prior.operationId
+    );
+    const nextIndex = bodies.findIndex((body) =>
+      JSON.parse(body.operation.payload).status === 'successor'
+    );
+    assert(priorIndex >= 0 && nextIndex > priorIndex);
+    assertEquals(bodies[priorIndex].kind, 'domain-history');
+    await f.toEdge(records);
+    assertEquals(
+      (await getPresence(await f.edge.server(), user)).statusMsg,
+      'successor',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain status suffix cannot advance the applied cut without authentic causal history', async () => {
+  const f = await fixture();
+  try {
+    const user = '@alice:logical.test';
+    const home = await f.home.server(), edge = await f.edge.server();
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    const { operation: prior } = await home.tx((tx) =>
+      writeRegister(
+        tx,
+        { source: 'other_edge', incarnation: 'retained-enrollment' },
+        JSON.stringify(['presence-status', 'alice']),
+        'presence-status',
+        JSON.stringify({ user, status: 'foreign' }),
+      )
+    );
+    await setPresence(home, user, 'online', 'successor');
+    const successor = (await f.hs.export('alice', f.bundle.id)).find(
+      (record) => {
+        const { operation } =
+          (record.payload as { body: DomainOperation }).body;
+        return operation.kind === 'presence-status' &&
+          JSON.parse(operation.payload).status === 'successor';
+      },
+    )!;
+    const before = await f.ej.heads('home', 'in', successor);
+    // Exercise a signed old publisher which put the successor in the next
+    // slot instead of sending the required history first.
+    const { hash: _hash, ...body } = {
+      ...successor,
+      sequence: before.received.sequence + 1,
+      previous: before.received.hash,
+    };
+    const record = { ...body, hash: recordHash(body) };
+    await f.ej.receive('home', [record]);
+    await assertRejects(
+      () => f.es.apply(f.ej, record),
+      LinkError,
+      'presence status awaits causal history',
+    );
+    assertEquals(
+      (await f.ej.heads('home', 'in', record)).applied,
+      before.applied,
+    );
+    assertEquals(
+      (await edge.tx((conn) => readRegister(conn, prior.semanticKey))).pending,
+      [],
+    );
+    // Stand in for the independently restored original fact and retry the
+    // same journal record, without changing the pending receipt hash.
+    await edge.tx((conn) => importRegisterOperation(conn, prior));
+    assertEquals(await f.es.apply(f.ej, record), true);
+    assertEquals((await getPresence(edge, user)).statusMsg, 'successor');
+  } finally {
+    await f.close();
+  }
+});
 
 Deno.test('domain bootstrap waits for its retained auth dependency without an identity rejection', async () => {
   const f = await fixture(false);
@@ -856,11 +1859,13 @@ Deno.test('domain pushers: append=false reaches home and affected selected accou
       JSON.stringify(aliceRecords).includes('charlie-private-registration'),
       false,
     );
-    await assertRejects(
+    const pendingSelection = await assertRejects(
       () => f.hs.export('bob', f.bundle.id),
       LinkError,
       'account not selected: awaiting home auth export',
     );
+    assertEquals(pendingSelection.code, 'LINK_UNAVAILABLE');
+    assertEquals(pendingSelection.status, 503);
     const auth = await exportAccountAuth(
       f.home,
       f.ht,
@@ -3082,7 +4087,7 @@ async function appendRecordForBackup(
       incarnation: f.bundle.id,
       stream: 'domain:@alice:logical.test',
       type: 'domain-operation',
-      version: 1,
+      version: payload.body.presenceStatus === undefined ? 1 : 2,
       operationId: 'domain-bootstrap:' +
         createHash('sha256').update(canonicalJson(payload.body)).digest('hex'),
       payload,

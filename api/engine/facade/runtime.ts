@@ -22,6 +22,7 @@ import {
 } from './identity.ts';
 import { Journal } from './journal.ts';
 import { linkHandler } from './link.ts';
+import { ActivityExchange } from './activity.ts';
 import { NoticeHub } from './notices.ts';
 import { Pairings, pairingStatus } from './pairing.ts';
 import { RoomReplicas, startRoomExports } from './replication.ts';
@@ -111,6 +112,7 @@ export async function openFacadeRuntime(
   let node: NodeIdentity | undefined;
   let tenant: Tenant | undefined;
   let initializing: Promise<NodeIdentity> | undefined;
+  let handleLink: ReturnType<typeof linkHandler> | undefined;
   let inbox: ReturnType<typeof startInboxWorker> | undefined;
   let mailbox: Mailbox | undefined;
   let authExports: ReturnType<typeof startAccountExports> | undefined;
@@ -686,7 +688,7 @@ export async function openFacadeRuntime(
         transaction,
         phase: settings.phase as 'f1' | 'f2',
         scopeState: (scope, signal) => directory.scopeState(scope, signal),
-        acceptEdu: (origin, raw, phase) =>
+        acceptEdu: (origin, raw, phase, receivedMs) =>
           acceptIngressEdu(
             origin,
             identity.server,
@@ -704,6 +706,7 @@ export async function openFacadeRuntime(
               return await new ToDeviceOperations(store, tenant, owner, node!)
                 .ingress(origin, raw);
             },
+            receivedMs,
           ),
         changed: () => notices.changed(),
       });
@@ -859,7 +862,8 @@ export async function openFacadeRuntime(
           503,
         );
       }
-      return await linkHandler({
+      // Challenges belong to this runtime lifetime, not one HTTP request.
+      handleLink ??= linkHandler({
         server: identity.server,
         node: node.node,
         incarnation: node.incarnation,
@@ -880,7 +884,38 @@ export async function openFacadeRuntime(
         reconciling: () => authHealth.reconciliation(),
         connected: (pairing, signal) => authHealth.connected(pairing, signal),
         signKeyDocument: async (raw) => await (await keyOwner()).cosign(raw),
-      })(request, peerPin);
+        activity: settings.phase === 'f2'
+          ? {
+            capture: async (pairing) => {
+              if (!tenant) {
+                throw new LinkError(
+                  'LINK_UNAVAILABLE',
+                  'live tenant unavailable',
+                  503,
+                );
+              }
+              return await new ActivityExchange(
+                store,
+                tenant,
+                await pairings(),
+                node,
+              ).capture(pairing);
+            },
+            apply: async (pairing, snapshot, elapsed) => {
+              if (!tenant) {
+                throw new LinkError(
+                  'LINK_UNAVAILABLE',
+                  'live tenant unavailable',
+                  503,
+                );
+              }
+              await new ActivityExchange(store, tenant, await pairings(), node)
+                .apply(pairing, snapshot, elapsed);
+            },
+          }
+          : undefined,
+      });
+      return await handleLink(request, peerPin);
     },
     changed: refresh,
     keyDocument: async () => await (await keyOwner()).document(),

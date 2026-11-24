@@ -20,6 +20,7 @@ Deno.test('presence wire: producer storage to EDU to remote persistence preserve
     }, { schemas: { server: serverSchema } })
   ));
   let stop: (() => Promise<void>) | undefined;
+  const clock = Date.now;
   try {
     const [producer, consumer] = await Promise.all(
       stores.map((s) => s.server()),
@@ -77,11 +78,27 @@ Deno.test('presence wire: producer storage to EDU to remote persistence preserve
       assertEquals(received.statusMsg, status ?? null);
       assert(received.seq > 0);
     }
+    await stop();
+    stop = undefined;
+    // The actual authenticated inbound owner records receipt freshness, even
+    // though the sender's local row has no remote expiry. The outbound reader
+    // must not resurrect a stale remote observation after an outage.
+    const observed = Date.now();
+    const beforeExpiry = await getPresence(consumer, local);
+    Date.now = () => observed + 31 * 60 * 1000;
+    const expired = await receiver.presenceOf(local);
+    assertEquals(expired?.presence, 'offline');
+    assertEquals(
+      (await getPresence(consumer, local)).seq,
+      beforeExpiry.seq + 1,
+    );
+    // The sender's local device also expires, under its own shorter sync grace,
+    // rather than acquiring the receiver's remote-observation lifetime.
+    assertEquals((await getPresence(producer, local)).presence, 'offline');
+    Date.now = clock;
     // Both federation directions use the same current shared-join audience.
     // Once the resident user leaves, later local changes are not queued and
     // inbound updates cannot refresh the old stored remote presence.
-    await stop();
-    stop = undefined;
     for (const server of [producer, consumer]) {
       await server.execute(
         "UPDATE memberships SET membership='leave' WHERE user=?",
@@ -107,6 +124,7 @@ Deno.test('presence wire: producer storage to EDU to remote persistence preserve
     });
     assertEquals(await getPresence(consumer, local), before);
   } finally {
+    Date.now = clock;
     await stop?.();
     await Promise.all(stores.map((s) => s.close()));
     await Promise.all(dirs.map((dir) => Deno.remove(dir, { recursive: true })));

@@ -8,14 +8,18 @@ import {
   type Cut,
   EMPTY_CUT,
   LinkError,
+  type LiveActivity,
   type Stream,
   streamOf,
 } from './protocol.ts';
 
-type Peer = Pick<
-  JournalClient,
-  'peer' | 'hello' | 'pull' | 'push' | 'ack' | 'notices'
->;
+type Peer =
+  & Pick<
+    JournalClient,
+    'peer' | 'hello' | 'pull' | 'push' | 'ack' | 'notices'
+  >
+  & Partial<Pick<JournalClient, 'activity'>>;
+const ACTIVITY_DEADLINE_MS = 1000;
 type Options = {
   journal: Journal;
   client: Peer;
@@ -25,6 +29,7 @@ type Options = {
   apply(stream: Stream): Promise<boolean>;
   failed(error: unknown, stream?: Stream): void;
   acknowledged?(stream: Stream): void;
+  activity?: LiveActivity;
 };
 function key(stream: Stream) {
   return canonicalJson(streamOf(stream));
@@ -71,7 +76,10 @@ export class JournalReconciler {
   private readonly running = new Map<string, Promise<void>>();
   private readonly rerun = new Set<string>();
   private readonly dependencies = new ApplicationDependencies();
-  constructor(private readonly options: Options) {}
+  constructor(
+    private readonly options: Options,
+    private readonly changed: () => void = () => {},
+  ) {}
 
   async reconcile(signal?: AbortSignal): Promise<Hello> {
     const hello = await this.options.client.hello(signal);
@@ -193,6 +201,7 @@ export class JournalReconciler {
       );
       if (next.applied.sequence > ack.applied.sequence) {
         this.options.acknowledged?.(stream);
+        this.changed();
       }
       const progressed = !sameCut(ack.received, next.received) ||
         !sameCut(ack.applied, next.applied);
@@ -271,6 +280,7 @@ export class JournalReconciler {
       held = next;
       track();
       this.dependencies.progressed(stream);
+      this.changed();
       await acknowledge();
     }
     signal?.throwIfAborted();
@@ -287,13 +297,17 @@ export function startHomeLinkWorker(
 ): { wake(): void; close(): Promise<void> } {
   const controller = new AbortController();
   const signal = controller.signal;
-  const reconciler = new JournalReconciler(options);
   let dirty = true;
   let waiting: (() => void) | undefined;
   const wake = () => {
     dirty = true;
     waiting?.();
   };
+  // A live pull may precede its authority's application. Preserve progress in
+  // either direction as a serialized wake, without draining unrelated streams.
+  const reconciler = new JournalReconciler(options, () => {
+    if (options.activity) wake();
+  });
   const periodic = setInterval(wake, options.pollseconds * 1000);
   const loop = (async () => {
     while (!signal.aborted) {
@@ -305,6 +319,34 @@ export function startHomeLinkWorker(
       waiting = undefined;
       if (signal.aborted) break;
       dirty = false;
+      // Activity is a fresh pull once per serialized wake, never a side effect
+      // of the global/per-stream hello reads or a durable journal backlog.
+      // Use the applied cut that woke us before reconciliation can admit a
+      // newer received tail. Otherwise continuous auth freshness can starve it.
+      if (options.activity && !signal.aborted) {
+        const deadline = new AbortController();
+        const timer = setTimeout(() => {
+          deadline.abort(
+            new DOMException('live activity deadline', 'TimeoutError'),
+          );
+        }, ACTIVITY_DEADLINE_MS);
+        try {
+          if (!options.client.activity) {
+            throw new LinkError(
+              'LINK_CAPABILITY_MISMATCH',
+              'live activity client unavailable',
+            );
+          }
+          await options.client.activity(
+            options.activity,
+            AbortSignal.any([signal, deadline.signal]),
+          );
+        } catch (error) {
+          if (!signal.aborted) options.failed(error);
+        } finally {
+          clearTimeout(timer);
+        }
+      }
       try {
         await reconciler.reconcile(signal);
       } catch (error) {

@@ -15,6 +15,7 @@ import { forgetClientCompletions } from './completion.ts';
 import { deletePushersForToken } from '#engine/tenant/pushers.ts';
 import { uiaAction, type UiaAuthorization } from '#engine/tenant/uia.ts';
 import { cancelToDeviceTargets } from './todevice-routing.ts';
+import { publicDeviceMetadata } from './device-operations.ts';
 import {
   assertDeviceOwner,
   recordDeviceCreation,
@@ -122,12 +123,14 @@ export async function renameDevice(
   conn: Conn,
   deviceId: string,
   localpart: string,
-  displayName: string,
+  displayName?: string,
 ): Promise<boolean> {
   await assertDeviceOwner(conn, localpart, deviceId);
   const device = await deviceById(conn, deviceId, localpart);
   if (device === null) return false;
-  if (device.display_name === displayName) return true;
+  if (displayName === undefined || device.display_name === displayName) {
+    return true;
+  }
   await conn.execute(
     'UPDATE devices SET display_name = ? WHERE device_id = ? AND localpart = ?',
     [displayName, deviceId, localpart],
@@ -256,26 +259,31 @@ export async function upsertDevice(
   );
 }
 
-/** One device the localpart owns; null = not found/not owned. */
+/** Public metadata is distinct from possession of mutable execution rows. */
+export async function deviceMetadata(conn: Conn, localpart: string) {
+  return await publicDeviceMetadata(conn, localpart) ??
+    (await devicesOfUser(conn, localpart)).map((row) => ({
+      device_id: row.device_id,
+      display_name: row.display_name,
+    }));
+}
+
+/** One live device in the account's merged public metadata. */
 export async function getDevice(
   tenant: Tenant,
   localpart: string,
   deviceId: string,
 ): Promise<Omit<DeviceRow, 'generation'> | null> {
-  const row = await tenant.tx((tx) => tx.devices.byId(deviceId, localpart));
-  return row === null
-    ? null
-    : { device_id: row.device_id, display_name: row.display_name };
+  return (await listDevices(tenant, localpart)).find((row) =>
+    row.device_id === deviceId
+  ) ?? null;
 }
 
 export async function listDevices(
   tenant: Tenant,
   localpart: string,
 ): Promise<Omit<DeviceRow, 'generation'>[]> {
-  return (await tenant.tx((tx) => tx.devices.ofUser(localpart))).map((row) => ({
-    device_id: row.device_id,
-    display_name: row.display_name,
-  }));
+  return await tenant.tx((tx) => tx.devices.metadata(localpart));
 }
 
 /** Rename a device the localpart owns; false = not owned/not found. */
@@ -283,7 +291,7 @@ export async function updateDeviceName(
   tenant: Tenant,
   localpart: string,
   deviceId: string,
-  displayName: string,
+  displayName?: string,
 ): Promise<boolean> {
   return await tenant.tx((tx) =>
     tx.devices.rename(deviceId, localpart, displayName)

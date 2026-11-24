@@ -118,6 +118,47 @@ suite.test('typing starts/stops/expires, has no room_id, does not leak, and is p
   await call(path, a.access_token!, 'PUT', { typing: false });
 });
 
+suite.test('typing stop is scoped to its authenticated device while sync renders the user union', async () => {
+  const a = await suite.registerTestUser('ep-typing-devices-a', 'pw');
+  const b = await suite.registerTestUser('ep-typing-devices-b', 'pw');
+  const { roomId, base } = await roomFor(a, b);
+  const login = await call('/_matrix/client/v3/login', undefined, 'POST', {
+    type: 'm.login.password',
+    identifier: { type: 'm.id.user', user: a.user_id },
+    password: 'pw',
+    device_id: 'SECOND',
+  });
+  assertEquals(login.status, 200);
+  const second = String(login.body.access_token);
+  const path = base + '/typing/' + encodeURIComponent(a.user_id);
+  for (const token of [a.access_token!, second]) {
+    assertEquals(
+      (await call(path, token, 'PUT', { typing: true, timeout: 30_000 }))
+        .status,
+      200,
+    );
+  }
+  let before = await sync(b.access_token!);
+  assertEquals(
+    (await call(path, a.access_token!, 'PUT', { typing: false })).status,
+    200,
+  );
+  let after = await sync(b.access_token!, '&since=' + before.next_batch);
+  assertEquals((eventOf(after, roomId, 'm.typing')!.content as Json).user_ids, [
+    a.user_id,
+  ]);
+  before = after;
+  assertEquals(
+    (await call(path, second, 'PUT', { typing: false })).status,
+    200,
+  );
+  after = await sync(b.access_token!, '&since=' + before.next_batch);
+  assertEquals(
+    (eventOf(after, roomId, 'm.typing')!.content as Json).user_ids,
+    [],
+  );
+});
+
 suite.test('receipts and read markers round-trip; private receipts stay stored and never broadcast', async () => {
   const a = await suite.registerTestUser('ep-rc-a', 'pw');
   const b = await suite.registerTestUser('ep-rc-b', 'pw');
@@ -491,6 +532,52 @@ suite.test('presence joins fan out both ways; status/set_presence validation and
   assert(presence(result.body).some((e) => e.sender === b.user_id));
 });
 
+suite.test('presence PUT, ordinary sync and sliding sync aggregate the authenticated device observations', async () => {
+  const user = await suite.registerTestUser('ep-presence-devices', 'pw');
+  const login = await call('/_matrix/client/v3/login', undefined, 'POST', {
+    type: 'm.login.password',
+    identifier: { type: 'm.id.user', user: user.user_id },
+    password: 'pw',
+    device_id: 'SECOND',
+  });
+  assertEquals(login.status, 200);
+  assert(login.body.device_id !== user.device_id);
+  const second = String(login.body.access_token);
+  const path = '/_matrix/client/v3/presence/' +
+    encodeURIComponent(user.user_id) + '/status';
+  assertEquals(
+    (await call(path, user.access_token!, 'PUT', {
+      presence: 'online',
+      status_msg: 'per-device status',
+    })).status,
+    200,
+  );
+  await sync(second, '&set_presence=unavailable');
+  assertEquals((await call(path, user.access_token!)).body.presence, 'online');
+  await sync(user.access_token!, '&set_presence=offline');
+  assertEquals(
+    (await call(path, user.access_token!)).body.presence,
+    'unavailable',
+  );
+  const sliding = '/_matrix/client/unstable/org.matrix.simplified_msc3575/sync';
+  const start = await call(sliding + '?set_presence=online', second, 'POST', {
+    conn_id: 'presence-devices',
+  });
+  assertEquals(start.status, 200);
+  assertEquals((await call(path, user.access_token!)).body.presence, 'online');
+  const end = await call(
+    sliding + '?set_presence=offline&pos=' +
+      encodeURIComponent(String(start.body.pos)),
+    second,
+    'POST',
+    { conn_id: 'presence-devices' },
+  );
+  assertEquals(end.status, 200);
+  const offline = await call(path, user.access_token!);
+  assertEquals(offline.body.presence, 'offline');
+  assertEquals(offline.body.status_msg, 'per-device status');
+});
+
 suite.test('sync presence changes preserve status and identical concurrent syncs do not rewrite or wake peers', async () => {
   const a = await suite.registerTestUser('ep-presence-stable-a', 'pw');
   const b = await suite.registerTestUser('ep-presence-stable-b', 'pw');
@@ -693,6 +780,93 @@ suite.test('inbound EDU rows reach HTTP sync; local producers reach the sender, 
       ((inbound.presence as Json).events as Json[]).some((e) =>
         e.sender === remoteUser && (e.content as Json).status_msg === 'remote'
       ),
+    );
+    const [freshPresence] = await app.server.query(
+      'SELECT * FROM presence WHERE user_id=?',
+      [remoteUser],
+    );
+    assert(Number(freshPresence.remote_received_ms) > 0);
+    await app.server.execute(
+      'UPDATE presence SET remote_received_ms=? WHERE user_id=?',
+      [Date.now() - 31 * 60 * 1000, remoteUser],
+    );
+    const expiredPresence = await call(
+      '/_matrix/client/v3/presence/' + encodeURIComponent(remoteUser) +
+        '/status',
+      user.access_token!,
+    );
+    assertEquals(expiredPresence.status, 200);
+    assertEquals(expiredPresence.body.presence, 'offline');
+    assertEquals(expiredPresence.body.status_msg, 'remote');
+    const expiredSync = await sync(
+      user.access_token!,
+      '&since=' + inbound.next_batch,
+    );
+    const expiredEvent = ((expiredSync.presence as Json).events as Json[]).find(
+      (e) => e.sender === remoteUser,
+    );
+    assertEquals((expiredEvent?.content as Json)?.presence, 'offline');
+    assertEquals((expiredEvent?.content as Json)?.status_msg, 'remote');
+    assertEquals(
+      Number(
+        (await app.server.query('SELECT seq FROM presence WHERE user_id=?', [
+          remoteUser,
+        ]))[0].seq,
+      ),
+      Number(freshPresence.seq) + 1,
+    );
+    assertEquals(
+      await fed('PUT', '/_matrix/federation/v1/send/refreshed-presence', {
+        origin: fake.name,
+        origin_server_ts: Date.now(),
+        pdus: [],
+        edus: [{
+          edu_type: 'm.presence',
+          content: {
+            push: [{
+              user_id: remoteUser,
+              presence: 'online',
+              status_msg: 'renewed remote',
+              last_active_ago: 90 * 60 * 1000,
+            }],
+          },
+        }],
+      }),
+      { status: 200, body: { pdus: {} } },
+    );
+    const renewed = await sync(
+      user.access_token!,
+      '&since=' + expiredSync.next_batch,
+    );
+    assert(
+      ((renewed.presence as Json).events as Json[]).some((e) =>
+        e.sender === remoteUser && (e.content as Json).presence === 'online'
+      ),
+    );
+    await app.server.execute(
+      'UPDATE presence SET remote_received_ms=? WHERE user_id=?',
+      [Date.now() - 31 * 60 * 1000, remoteUser],
+    );
+    // No HTTP GET normalizes this observation first: sync owns expiry and its
+    // returned cut must cover that transition exactly once, including timeout=0.
+    const lazyExpiry = await sync(
+      user.access_token!,
+      '&since=' + renewed.next_batch,
+    );
+    assert(
+      ((lazyExpiry.presence as Json).events as Json[]).some((e) =>
+        e.sender === remoteUser && (e.content as Json).presence === 'offline'
+      ),
+    );
+    const afterLazyExpiry = await sync(
+      user.access_token!,
+      '&since=' + lazyExpiry.next_batch,
+    );
+    assertEquals(
+      ((afterLazyExpiry.presence as Json).events as Json[]).some((e) =>
+        e.sender === remoteUser
+      ),
+      false,
     );
     const base = '/_matrix/client/v3/rooms/' + encodeURIComponent(fr.roomId);
     await call(

@@ -37,6 +37,7 @@ import { DomainOperations } from './domain.ts';
 import { DeviceOperations, isKeyStream } from './devices.ts';
 import { isToDeviceStream, ToDeviceOperations } from './todevice.ts';
 import { MembershipOperations, startMembershipExports } from './membership.ts';
+import { ActivityExchange } from './activity.ts';
 
 export async function startHomeLinks(
   app: App,
@@ -234,6 +235,9 @@ export async function startHomeLinks(
       startHomeLinkWorker({
         client,
         journal,
+        activity: settings.phase === 'f2'
+          ? new ActivityExchange(app.store, app.tenant, pairings)
+          : undefined,
         limits: {
           maxItems: settings.batchmaxitems,
           maxBytes: settings.batchmaxbytes,
@@ -320,7 +324,11 @@ export async function startHomeLinks(
               localpart,
               settings.replicatecredentials,
             );
-            await domains.bootstrap(localpart, id);
+            // Negotiate the domain reader without holding account auth or keys.
+            const reader = client.domainReaderVersion;
+            if (reader !== undefined) {
+              await domains.bootstrap(localpart, id, reader);
+            }
           },
           changed: () => workers.get(id)?.wake(),
           failed: (error) => failed(node, error),

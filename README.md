@@ -758,6 +758,18 @@ revocation to sign users out so clients drop these caches on next login. This
 is never automatic.
 The report records sanitation, pending work and these security/RPO implications.
 
+For enrolled deployments, the private report also inventories facade control
+revisions, received/applied and acknowledged journal cuts, retained record and
+mailbox identities, frozen egress digests, membership results and causal
+frontier/conflict identities. Tenant inventories include device-operation
+histories, key-consumption tombstones, routed to-device targets (including ACKed
+and cancelled targets), inbox/ACK cuts, link-application receipts and profile
+fanout progress. Payloads, credentials, signing keys and dispatch/ACK secrets are
+not copied into this inventory. It is an inspection of the captured local cut,
+not proof that a surviving node has reconciled its newer suffix or permission to
+reassign an owner. A facade journal cannot replace a coherent home backup or
+recover data absent from every surviving copy.
+
 ## Operator tools
 
 The tools require the server to be running with the same configuration. They

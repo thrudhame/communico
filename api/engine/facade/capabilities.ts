@@ -11,7 +11,13 @@ export type Scope =
   | 'auth'
   | 'domain'
   | 'clientrooms';
-type Rule = { method: string; path: RegExp; scope: Scope; action?: 'home' };
+type Rule = {
+  method: string;
+  path: RegExp;
+  scope: Scope;
+  action?: 'home';
+  requiredQuery?: string;
+};
 const f = '/_matrix/federation/v1/';
 const k = '/_matrix/key/v2/';
 const literal = (path: string) =>
@@ -71,6 +77,21 @@ const F2_AUTH: readonly Rule[] = [
       route('POST', literal('/_matrix/client/v3/' + name), 'auth')
     ),
   route('GET', literal('/_matrix/client/v3/account/whoami'), 'auth'),
+  route('GET', /^\/_matrix\/client\/v3\/admin\/whois\/[^/]+$/, 'auth'),
+  // Ingress discovery has no home-owned domain read. The ordinary folder auth
+  // still checks the supplied session's owner/freshness before its adapter runs.
+  ...['account/3pid', 'capabilities', 'voip/turnServer', 'thirdparty/protocols']
+    .map((name) => route('GET', literal('/_matrix/client/v3/' + name), 'auth')),
+  route(
+    'GET',
+    /^\/_matrix\/client\/v3\/thirdparty\/(?:protocol\/[^/]+|(?:user|location)(?:\/[^/]+)?)$/,
+    'auth',
+  ),
+  route(
+    'GET',
+    literal('/_matrix/client/unstable/org.matrix.msc4143/rtc/transports'),
+    'auth',
+  ),
   ...['PUT', 'DELETE'].map((method) =>
     route(method, /^\/_matrix\/client\/v3\/devices\/[^/]+$/, 'auth')
   ),
@@ -89,6 +110,9 @@ const F2_AUTH: readonly Rule[] = [
 // additionally require their room cut. These client scopes do not depend on the
 // federation switch; the existing federation public/rooms rules still do.
 const F2_REGISTERS: readonly Rule[] = [
+  ...['GET', 'PUT'].map((method) =>
+    route(method, /^\/_matrix\/client\/v3\/presence\/[^/]+\/status$/, 'domain')
+  ),
   route('GET', /^\/_matrix\/client\/v3\/profile\/[^/]+(?:\/[^/]+)?$/, 'domain'),
   ...['PUT', 'DELETE'].map((method) =>
     route(method, /^\/_matrix\/client\/v3\/profile\/[^/]+\/[^/]+$/, 'domain')
@@ -171,6 +195,63 @@ const F2_SYNC: readonly Rule[] = [
 // B6's client room owners enforce their exact room/account cuts. This is not
 // the federation rooms scope: local clients still work with federation off.
 const F2_ROOMS: readonly Rule[] = [
+  // Only the room-scoped legacy operation is delivered, not global old sync.
+  {
+    ...route('GET', literal('/_matrix/client/v3/events'), 'clientrooms'),
+    requiredQuery: 'room_id',
+  },
+  ...['GET', 'POST'].map((method) =>
+    route(method, literal('/_matrix/client/v3/publicRooms'), 'clientrooms')
+  ),
+  route(
+    'GET',
+    /^\/_matrix\/client\/v3\/directory\/list\/room\/[^/]+$/,
+    'clientrooms',
+  ),
+  route(
+    'GET',
+    /^\/_matrix\/client\/v3\/directory\/room\/[^/]+$/,
+    'clientrooms',
+  ),
+  route('GET', /^\/_matrix\/client\/v3\/rooms\/[^/]+\/aliases$/, 'clientrooms'),
+  ...[
+    /^\/_matrix\/client\/v3\/directory\/list\/room\/[^/]+$/,
+    /^\/_matrix\/client\/v3\/directory\/room\/[^/]+$/,
+  ].map((path) => route('PUT', path, 'clientrooms', 'home')),
+  route('GET', literal('/_matrix/client/v3/joined_rooms'), 'clientrooms'),
+  route(
+    'PUT',
+    /^\/_matrix\/client\/v3\/rooms\/[^/]+\/typing\/[^/]+$/,
+    'clientrooms',
+  ),
+  route(
+    'POST',
+    literal('/_matrix/client/v3/user_directory/search'),
+    'clientrooms',
+  ),
+  // Discovery and graph reads keep the same room/visibility owners as v3.
+  // These are client capabilities even when outbound federation is disabled.
+  route('GET', /^\/_matrix\/client\/v1\/room_summary\/[^/]+$/, 'clientrooms'),
+  route(
+    'GET',
+    /^\/_matrix\/client\/v1\/rooms\/[^/]+\/relations\/[^/]+(?:\/[^/]+(?:\/[^/]+)?)?$/,
+    'clientrooms',
+  ),
+  route(
+    'GET',
+    /^\/_matrix\/client\/v1\/rooms\/[^/]+\/(?:hierarchy|threads|timestamp_to_event)$/,
+    'clientrooms',
+  ),
+  route(
+    'GET',
+    /^\/_matrix\/client\/unstable\/im\.nheko\.summary\/(?:summary\/[^/]+|rooms\/[^/]+\/summary)$/,
+    'clientrooms',
+  ),
+  route(
+    'GET',
+    /^\/_matrix\/client\/r0\/rooms\/[^/]+\/(?:messages|joined_members)$/,
+    'clientrooms',
+  ),
   route('POST', literal('/_matrix/client/v3/createRoom'), 'clientrooms'),
   ...['send', 'redact'].map((name) =>
     route(
@@ -330,7 +411,8 @@ export function capabilities(role: string, phase = 'f1') {
     },
     gate(request: Request, ready: (scope: Scope) => boolean): Response | null {
       if (role === 'home') return null;
-      const path = new URL(request.url).pathname;
+      const url = new URL(request.url);
+      const path = url.pathname;
       const matching = (phase === 'f2'
         ? [
           ...F1_PUBLIC,
@@ -346,11 +428,14 @@ export function capabilities(role: string, phase = 'f1') {
         : F1_PUBLIC)
         .filter((rule) => rule.path.test(path));
       const rule = matching.find((rule) => rule.method === request.method);
-      if (!rule) {
+      if (
+        !rule ||
+        (rule.requiredQuery && !url.searchParams.get(rule.requiredQuery))
+      ) {
         return Response.json({
           errcode: 'M_UNRECOGNIZED',
           error: 'Unrecognized request',
-        }, { status: matching.length ? 405 : 404 });
+        }, { status: rule ? 404 : matching.length ? 405 : 404 });
       }
       if (rule.action === 'home') {
         return Response.json({

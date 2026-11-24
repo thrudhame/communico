@@ -69,5 +69,120 @@ export async function restoredTenantWork(
     unprojected,
     completionReceipts,
     pendingCompletions,
+    // Original owner histories, target/consumption tombstones and per-record
+    // receipts survive independently of mutable projections. Omit all payloads
+    // and bearer/credential material, including the dispatch and ACK secrets.
+    facade: {
+      authority: await inventoryRows(
+        db,
+        'tenant_authority',
+        'node,incarnation,home_incarnation,edge_node,edge_incarnation',
+      ),
+      facts: await inventoryRows(
+        db,
+        'authority_facts',
+        'id,node,incarnation,seq,localpart,kind',
+      ),
+      devices: await inventoryRows(
+        db,
+        'authority_devices',
+        'localpart,device_id,incarnation,generation',
+      ),
+      authSources: await inventoryRows(
+        db,
+        'account_auth_sources',
+        'localpart,revision,captured_ms',
+      ),
+      authSnapshots: await inventoryRows(
+        db,
+        'account_auth_snapshots',
+        'localpart,pairing,grant_revision,owner_revision,source_cut,revision,captured_ms,checked_ms,credentials',
+      ),
+      controls: await inventoryRows(
+        db,
+        'facade_owner_controls',
+        'pairing,revision,body_hash',
+      ),
+      activation: await inventoryRows(
+        db,
+        'facade_owner_activation',
+        'pairing,revision,body_hash',
+      ),
+      operations: await inventoryRows(
+        db,
+        'domain_operations',
+        'operation_id,source,incarnation,stream,sequence,semantic_key,kind,payload_hash,applied',
+      ),
+      frontiers: await inventoryRows(
+        db,
+        'domain_frontiers',
+        'semantic_key,operation_id',
+      ),
+      conflicts: await inventoryRows(
+        db,
+        'domain_conflicts',
+        'semantic_key,operation_id',
+      ),
+      deviceOperations: await inventoryRows(
+        db,
+        'device_operations',
+        'operation_id,source,incarnation,sequence,localpart,device_id,device_incarnation,payload_hash',
+      ),
+      signingOperations: await inventoryRows(
+        db,
+        'signing_operations',
+        'operation_id,source,incarnation,sequence,localpart',
+      ),
+      signatureOperations: await inventoryRows(
+        db,
+        'signature_operations',
+        'operation_id,source,incarnation,sequence,localpart,target_user,target_key',
+      ),
+      consumptions: await inventoryRows(
+        db,
+        'key_consumptions',
+        'localpart,device_id,generation,algorithm,key_id',
+      ),
+      admissions: await inventoryRows(
+        db,
+        'to_device_admissions',
+        'kind,origin,message_id,payload_hash,policy',
+      ),
+      toDeviceOperations: await inventoryRows(
+        db,
+        'to_device_operations',
+        'operation_id,source,incarnation,sequence,localpart,kind,payload_hash',
+      ),
+      routes: await inventoryRows(
+        db,
+        'to_device_routes',
+        'route_id,localpart,expanded',
+      ),
+      targets: await inventoryRows(
+        db,
+        'to_device_targets',
+        'target_id,route_id,localpart,device_id,device_incarnation,generation,state',
+      ),
+      inbox: await inventoryRows(
+        db,
+        'to_device_inbox',
+        'localpart,device_id,generation,msg_pos,source_id',
+      ),
+      acknowledgements: await inventoryRows(
+        db,
+        'device_ack',
+        'localpart,device_id,generation,msg_pos',
+      ),
+      applications: await inventoryRows(
+        db,
+        'facade_link_applications',
+        'peer,source,incarnation,stream,sequence,hash,projection_revision',
+      ),
+      profileFanout: await inventoryRows(
+        db,
+        'profile_fanout_rooms',
+        'localpart,revision,room_id,event_id,completed,accepted',
+      ),
+    },
   };
 }

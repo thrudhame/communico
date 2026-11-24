@@ -1428,6 +1428,16 @@ external effects. This inventory is not an extra operator approval gate; workers
 resume normal semantics only after the completed durable report boundary.
 (`api/engine/backup/work.ts`, `api/engine/{room,tenant,server}/restore-work.ts`)
 
+The same query-only owners inventory distributed continuity metadata: server
+control revisions, facade stream and ACK cuts, retained record/mailbox identities,
+frozen egress digests, membership results and causal frontiers/conflicts; tenant
+authority and operation histories, consuming-key tombstones, routed targets,
+inbox/ACK cuts, per-record link application and profile fanout progress. Terminal
+facts remain visible alongside pending work so a restore cannot hide deletion,
+consumption or completed transfer evidence in a pending-only report. No payload,
+credential, signing key or dispatch/ACK secret is included. Reading this inventory
+neither applies a record nor advances a cut or grants execution authority.
+
 The internal store snapshot owner retains physical file incarnations, opens and
 normalizes inactive/over-cache sources and acquires checkpoint retention outside
 common admission and the pool metadata queue. The common fence drains only native

@@ -3,6 +3,7 @@
 import { createHash } from 'node:crypto';
 import { canonicalJson } from '#engine/canonical.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { VerificationUnavailable } from './signing-authority.ts';
 import {
   importPublicKeyFromRaw,
   matrixBase64,
@@ -18,7 +19,6 @@ import {
   type RemoteSignatureCuts,
 } from '#engine/tenant/signature-bootstrap.ts';
 import type { NodeIdentity } from './identity.ts';
-import { VerificationUnavailable } from './signing-authority.ts';
 import { appendRecord, type Journal } from './journal.ts';
 import type { Grant, Pairings, Signed } from './pairing.ts';
 import {

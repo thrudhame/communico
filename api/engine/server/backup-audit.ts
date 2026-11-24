@@ -27,6 +27,21 @@ export async function auditServer(
 ) {
   return await snapshot.read(server, async (db) => {
     const heads = await counters(db);
+    // presence.remote_received_ms is original receipt evidence, not a restore
+    // timestamp. NULL is a local row; zero is an unobserved historical row.
+    for await (const row of scan(db, 'presence', 'remote_received_ms')) {
+      if (row.remote_received_ms !== null) {
+        nonnegative(row.remote_received_ms, 'remote presence receipt');
+      }
+    }
+    for await (const row of scan(db, 'presence_observations', '*')) {
+      nonnegative(row.generation, 'presence observation generation');
+      nonnegative(row.last_active_ms, 'presence observation activity');
+      nonnegative(row.last_sync_ms, 'presence observation sync');
+      if (
+        !['online', 'offline', 'unavailable'].includes(String(row.presence))
+      ) auditFailure('presence observation state');
+    }
     for await (const row of scan(db, 'room_upgrades', '*')) {
       const plan = JSON.parse(String(row.plan_json));
       if (

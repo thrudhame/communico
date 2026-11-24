@@ -14,6 +14,7 @@ import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
 import { Journal } from '#engine/facade/journal.ts';
 import { exportOwnerControl, OwnerControls } from '#engine/facade/ownership.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
+import { bindRole } from '#engine/facade/role.ts';
 import {
   LINK_CAPABILITIES,
   LINK_SUPPORTED,
@@ -43,6 +44,12 @@ async function fixture() {
     }, { schemas: { server: serverSchema, tenant: tenantSchema } });
   const home = await open('home');
   let edge = await open('edge');
+  await bindRole(home, { role: 'home', server: 'logical.test', node: '' });
+  await bindRole(edge, {
+    role: 'facade',
+    server: 'logical.test',
+    node: 'edge_a',
+  });
   const ht = await openTenant(home, 'logical.test', { create: true });
   await ht.tx((tx) => tx.users.insert('alice', 'Alice'));
   const node = await initializeNode(

@@ -7,6 +7,7 @@ import { completionService } from '#engine/server/completion.ts';
 import { holdPublication } from '#tests/support/hold-publication.ts';
 import { setPresenceValue } from '#engine/server/ephemeral.ts';
 import { parseStreamToken } from '#engine/client/tokens.ts';
+import { lookupToken } from '#engine/tenant/auth.ts';
 
 function guard<T>(
   task: Promise<T>,
@@ -31,6 +32,15 @@ Deno.test('applied reads: foreign publication does not block sync or scoped read
   try {
     const alice = await http.registerTestUser('applied-alice', 'pw');
     const bob = await http.registerTestUser('applied-bob', 'pw');
+    const bobSession = await lookupToken(app.tenant, bob.access_token!);
+    assert(
+      bobSession && bobSession.device_id !== null &&
+        bobSession.generation !== null,
+    );
+    const bobDevice = {
+      deviceId: bobSession.device_id,
+      generation: bobSession.generation,
+    };
     const created = await createRoom(app.store, {
       creator: alice.user_id,
       preset: 'public_chat',
@@ -81,13 +91,19 @@ Deno.test('applied reads: foreign publication does not block sync or scoped read
       'PUT',
     ));
     await guard(hold.entered);
-    const presence = setPresenceValue(app.server, bob.user_id, 'online');
+    const presence = setPresenceValue(
+      app.server,
+      bob.user_id,
+      'online',
+      bobDevice,
+    );
     jobs.push(presence);
     await guard(presence, 'unchanged presence queued behind publication');
     const changedPresence = setPresenceValue(
       app.server,
       bob.user_id,
       'unavailable',
+      bobDevice,
     );
     jobs.push(changedPresence);
     await guard(changedPresence, 'presence mutation queued behind publication');

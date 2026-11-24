@@ -15,7 +15,7 @@ import {
   publicationIdentity,
 } from '#engine/facade/ownership.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
-import { JournalReconciler } from '#engine/facade/worker.ts';
+import { JournalReconciler, startInboxWorker } from '#engine/facade/worker.ts';
 import {
   LINK_CAPABILITIES,
   LINK_SUPPORTED,
@@ -55,12 +55,113 @@ import { PASSWORD_FLOWS, requireUia, uiaAction } from '#engine/tenant/uia.ts';
 import { historicalTenantSchema } from './fixtures/tenant-schema-history.ts';
 import { exportKeyRoster, FacadeKeys } from '#engine/facade/control.ts';
 import { VerificationUnavailable } from '#engine/facade/signing-authority.ts';
-import { facadeFailure, FacadeObservations } from './helpers/facade-process.ts';
+import {
+  applicationScope,
+  facadeFailure,
+  FacadeObservations,
+  observeJournalApplication,
+} from './helpers/facade-process.ts';
 import {
   pendingTenantProjection,
   recordTenantProjection,
   setTenantProjector,
 } from '#engine/tenant/hooks.ts';
+
+Deno.test('auth import waits for mixed ownership activation and resumes on its applied cut', async () => {
+  const f = await fixture();
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const attempt = Promise.withResolvers<ReturnType<typeof facadeFailure>>();
+  const observations = new FacadeObservations();
+  const tenant = await f.edge.tenant('logical.test');
+  // Store views are independent capabilities; hold the exact owner's view.
+  const owners = new OwnerControls(await f.edge.server(), tenant, f.fp, f.node);
+  const receiver = new AccountSnapshots(f.edge, f.et, f.fp, owners);
+  const tx = tenant.tx;
+  let worker: ReturnType<typeof startInboxWorker> | undefined;
+  try {
+    const control = await f.nextOwner(false);
+    const account = await f.emit();
+    await f.journal.receive('home', [account]);
+    let held = false;
+    tenant.tx = new Proxy(tx, {
+      async apply(target, receiver, args) {
+        if (!held) {
+          held = true;
+          entered.resolve();
+          await release.promise; // Hold only the owner write, not readiness reads.
+        }
+        return await Reflect.apply(target, receiver, args);
+      },
+    });
+    const report = (...args: Parameters<typeof facadeFailure>) => {
+      const event = facadeFailure(...args);
+      observations.accept(event);
+      if (args[2]?.stream === account.stream) attempt.resolve(event);
+    };
+    f.journal.apply = observeJournalApplication(
+      f.journal.apply,
+      (peer, record) => observations.accept({ kind: 'applied', peer, record }),
+      report,
+    );
+    let completed = false;
+    const outcome = observations.fact(
+      { peer: 'home', ...account },
+      (record) => record.hash === account.hash,
+    ).then((record) => {
+      completed = true;
+      return record;
+    }, (error) => error);
+    worker = startInboxWorker({
+      journal: f.journal,
+      peer: 'home',
+      pollseconds: 60,
+      changed: () => {},
+      apply: async (stream) => {
+        if (stream.stream === control.stream) {
+          return await owners.apply(f.journal, stream);
+        }
+        await entered.promise;
+        return await receiver.apply(f.journal, stream);
+      },
+      failed: (error, stream, after) =>
+        report(
+          'inbox',
+          error,
+          stream ? applicationScope('home', stream, after) : undefined,
+        ),
+    });
+    const pending = await bounded(attempt.promise);
+    assertEquals(pending.kind, 'blocked');
+    assertEquals(completed, false);
+    assertEquals(
+      (await f.journal.heads('home', 'in', account)).applied.sequence,
+      0,
+    );
+    release.resolve(); // Only owner application progress re-drives the auth stream.
+    const result = await bounded(outcome);
+    assertEquals(completed, true);
+    assertEquals(result.hash, account.hash);
+    assertEquals(await verifyUserPassword(f.et, 'alice', 'pw'), true);
+    await worker.close();
+    worker = undefined;
+    tenant.tx = tx;
+    // Corrupt, consistently stored control hashes are not pending activation.
+    for (const db of [await f.edge.server(), tenant]) {
+      await db.execute(
+        'UPDATE facade_owner_activation SET body_hash=? WHERE pairing=?',
+        ['0'.repeat(64), f.bundle.id],
+      );
+    }
+    const corrupt = await assertRejects(() => owners.ready(), MatrixError);
+    assertEquals(facadeFailure('ownership', corrupt).kind, 'failure');
+  } finally {
+    release.resolve();
+    tenant.tx = tx;
+    await worker?.close();
+    await f.close();
+  }
+});
 
 Deno.test('auth publication migration upgrades tenant27 without inventing a publication for older snapshots', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'auth-publication-upgrade-' });

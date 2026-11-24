@@ -9,7 +9,7 @@ import {
 } from '#engine/signing-primitives.js';
 import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
 import { exportOwnerControl, OwnerControls } from '#engine/facade/ownership.ts';
-import { openJournalClient } from '#engine/facade/client.ts';
+import { JournalClient, openJournalClient } from '#engine/facade/client.ts';
 import {
   JournalReconciler,
   startHomeLinkWorker,
@@ -276,7 +276,19 @@ Deno.test('journal result polling is read-only and does not echo another reconci
   }
 });
 
-async function fixture(supported = LINK_CAPABILITIES) {
+async function fixture(
+  supported = LINK_CAPABILITIES,
+  activityOptions: {
+    activity?: {
+      capture(pairing: string): Promise<unknown>;
+      apply(
+        pairing: string,
+        snapshot: unknown,
+        elapsed: () => number,
+      ): Promise<void>;
+    };
+  } = {},
+) {
   const tls = await facadeTls();
   const open = (side: string) =>
     openStore({
@@ -314,6 +326,7 @@ async function fixture(supported = LINK_CAPABILITIES) {
   const notices = new NoticeHub();
   const handler = () =>
     linkHandler({
+      ...activityOptions,
       server: 'logical.test',
       node: node.node,
       incarnation: node.incarnation,
@@ -334,13 +347,14 @@ async function fixture(supported = LINK_CAPABILITIES) {
         return Promise.resolve();
       },
     });
+  let handle = handler();
   const transport = await startLinkTransport({
     hostname: '127.0.0.1',
     port: 0,
     tls: tls.facade,
     authorize: (pin) => fp.allowsHome(pin),
     handle: async (request, pin) => {
-      const response = await handler()(request, pin);
+      const response = await handle(request, pin);
       if (dropReceipt && request.url.endsWith('/complete')) {
         dropReceipt = false;
         throw new Error('receipt response lost after durable completion');
@@ -382,6 +396,9 @@ async function fixture(supported = LINK_CAPABILITIES) {
     dropReceipt() {
       dropReceipt = true;
     },
+    restartLink() {
+      handle = handler();
+    },
     create: () =>
       hp.create({
         node: 'edge_a',
@@ -418,6 +435,7 @@ async function fixture(supported = LINK_CAPABILITIES) {
       );
       hj = new Journal(await home.server(), supported);
       fj = new Journal(await facade.server(), supported);
+      handle = handler();
     },
     async close() {
       await transport.close();
@@ -427,6 +445,599 @@ async function fixture(supported = LINK_CAPABILITIES) {
     },
   };
 }
+
+Deno.test('live link: receiver challenge ages delayed answers, is single-use and is lost on restart', async () => {
+  let now = 1_000;
+  const clock = performance.now;
+  Object.defineProperty(performance, 'now', {
+    configurable: true,
+    value: () => now,
+  });
+  const applied: { pairing: string; snapshot: unknown; age: number }[] = [];
+  const f = await fixture(LINK_SUPPORTED, {
+    activity: {
+      capture: () => Promise.resolve({ remainingMs: 30_000 }),
+      apply: (pairing, snapshot, elapsed) => {
+        applied.push({ pairing, snapshot, age: elapsed() });
+        return Promise.resolve();
+      },
+    },
+  });
+  try {
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+    const envelope = {
+      protocol: LINK_VERSION,
+      server: bundle.server,
+      required: [...LINK_CAPABILITIES, { type: 'live-activity', version: 1 }],
+      source: 'home',
+      incarnation: bundle.id,
+      pairing: bundle.id,
+    };
+    const call = async (challenge: string, answer?: unknown) => {
+      const response = await f.client().fetch('/_communico/link/v1/activity', {
+        method: 'POST',
+        body: JSON.stringify({ ...envelope, challenge, answer }),
+      });
+      assertEquals(response.status, 200);
+      return await response.json();
+    };
+    const first = await call('home-1');
+    assertEquals(first.challenge, 'home-1');
+    assertEquals(first.snapshot, { remainingMs: 30_000 });
+    assertEquals(applied, []);
+    now += 40_000;
+    const answer = {
+      challenge: first.nextChallenge,
+      snapshot: { remainingMs: 30_000 },
+    };
+    const second = await call('home-2', answer);
+    assertEquals(applied, [{
+      pairing: bundle.id,
+      snapshot: { remainingMs: 30_000 },
+      age: 40_000,
+    }]);
+    await call('home-3', answer);
+    assertEquals(applied.length, 1, 'replay must not import activity again');
+    f.restartLink();
+    await call('home-4', {
+      challenge: second.nextChallenge,
+      snapshot: { remainingMs: 30_000 },
+    });
+    assertEquals(
+      applied.length,
+      1,
+      'restart cannot retain a freshness challenge',
+    );
+    assertEquals(await f.fj.streams('home', 'in'), []);
+    assertEquals(await f.fj.streams('home', 'out'), []);
+  } finally {
+    Object.defineProperty(performance, 'now', {
+      configurable: true,
+      value: clock,
+    });
+    await f.close();
+  }
+});
+
+Deno.test('live link: capability and active pairing are checked before activity callbacks', async () => {
+  let captured = 0;
+  const f = await fixture(LINK_SUPPORTED, {
+    activity: {
+      capture: () => {
+        captured++;
+        return Promise.resolve({});
+      },
+      apply: () => Promise.resolve(),
+    },
+  });
+  try {
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+    for (
+      const [patch, expected] of [
+        [{ required: LINK_CAPABILITIES }, 409],
+        [{ incarnation: 'another-pairing' }, 403],
+        [{ source: 'edge_a' }, 403],
+      ] as const
+    ) {
+      const response = await f.client().fetch('/_communico/link/v1/activity', {
+        method: 'POST',
+        body: JSON.stringify({
+          protocol: LINK_VERSION,
+          server: bundle.server,
+          required: [...LINK_CAPABILITIES, {
+            type: 'live-activity',
+            version: 1,
+          }],
+          source: 'home',
+          incarnation: bundle.id,
+          pairing: bundle.id,
+          challenge: 'home-1',
+          ...patch,
+        }),
+      });
+      assertEquals(response.status, expected);
+      await response.body?.cancel();
+      assertEquals(captured, 0);
+    }
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('live link: home pull subtracts its own round trip and answers only a facade challenge', async () => {
+  let now = 1_000;
+  const clock = performance.now;
+  Object.defineProperty(performance, 'now', {
+    configurable: true,
+    value: () => now,
+  });
+  const facadeAges: number[] = [], homeAges: number[] = [];
+  const f = await fixture(LINK_SUPPORTED, {
+    activity: {
+      capture: () => {
+        now += 40_000;
+        return Promise.resolve({ remainingMs: 30_000 });
+      },
+      apply: (_pairing, snapshot, elapsed) => {
+        assertEquals(snapshot, { from: 'home' });
+        facadeAges.push(elapsed());
+        return Promise.resolve();
+      },
+    },
+  });
+  try {
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+    const client = await openJournalClient(f.hp, bundle.id, f.tls.home);
+    let captures = 0;
+    const activity = {
+      capture: () => {
+        captures++;
+        now += 5_000;
+        return Promise.resolve({ from: 'home' });
+      },
+      apply: (_pairing: string, snapshot: unknown, elapsed: () => number) => {
+        assertEquals(snapshot, { remainingMs: 30_000 });
+        // The transport's receiver clock includes time waiting inside the owner.
+        now += 1_000;
+        homeAges.push(elapsed());
+        return Promise.resolve();
+      },
+    };
+    await client.activity(activity);
+    assertEquals(
+      captures,
+      1,
+      'answer the receiver challenge within the exchange',
+    );
+    assertEquals(homeAges, [46_000]);
+    assertEquals(facadeAges, [6_000]);
+    now += 2_000;
+    await client.activity(activity);
+    assertEquals(captures, 2);
+    assertEquals(facadeAges, [6_000, 6_000]);
+    assertEquals(homeAges, [46_000, 46_000]);
+    f.restartLink();
+    await client.activity(activity);
+    assertEquals(facadeAges.length, 3, 'a fresh challenge works after restart');
+  } finally {
+    Object.defineProperty(performance, 'now', {
+      configurable: true,
+      value: clock,
+    });
+    await f.close();
+  }
+});
+
+Deno.test('live link: unrelated idle time never expires a fresh home snapshot', async () => {
+  let now = 1_000;
+  const clock = performance.now;
+  Object.defineProperty(performance, 'now', {
+    configurable: true,
+    value: () => now,
+  });
+  let visible = false;
+  const f = await fixture(LINK_SUPPORTED, {
+    activity: {
+      capture: () => Promise.resolve({}),
+      apply: (_pairing, snapshot, elapsed) => {
+        visible =
+          elapsed() < Number((snapshot as { remainingMs: number }).remainingMs);
+        return Promise.resolve();
+      },
+    },
+  });
+  try {
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+    const client = await openJournalClient(f.hp, bundle.id, f.tls.home);
+    let remainingMs = 0;
+    const owner = {
+      capture: () => Promise.resolve({ remainingMs }),
+      apply: () => Promise.resolve(),
+    };
+    await client.activity(owner);
+    assertEquals(visible, false);
+    now += 60_000;
+    remainingMs = 30_000;
+    await client.activity(owner);
+    assertEquals(visible, true, 'fresh snapshot after an idle period');
+  } finally {
+    Object.defineProperty(performance, 'now', {
+      configurable: true,
+      value: clock,
+    });
+    await f.close();
+  }
+});
+
+Deno.test('live link: client refuses substituted, unnegotiated and superseded answers', async () => {
+  const f = await fixture(LINK_SUPPORTED);
+  try {
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+    const peer = (await openJournalClient(f.hp, bundle.id, f.tls.home)).peer;
+    const wire = f.client();
+    let mode = 'old';
+    let applied = 0;
+    const pending: { answer: Response; resolve(value: Response): void }[] = [];
+    wire.fetch = (_path, init) => {
+      const request = JSON.parse(String(init?.body));
+      const answer = Response.json({
+        protocol: LINK_VERSION,
+        server: peer.server,
+        source: mode === 'identity' ? 'another-node' : peer.node,
+        incarnation: peer.incarnation,
+        pairing: peer.pairing,
+        required: mode === 'old'
+          ? LINK_CAPABILITIES
+          : [...LINK_CAPABILITIES, { type: 'live-activity', version: 1 }],
+        challenge: mode === 'challenge' ? 'substituted' : request.challenge,
+        nextChallenge: crypto.randomUUID(),
+        snapshot: {},
+      });
+      if (mode !== 'held' || request.finish === true) {
+        return Promise.resolve(answer);
+      }
+      const wait = Promise.withResolvers<Response>();
+      pending.push({ answer, resolve: wait.resolve });
+      return wait.promise;
+    };
+    const client = new JournalClient(wire, peer, () => Promise.resolve());
+    const activity = {
+      capture: () => Promise.resolve({}),
+      apply: () => {
+        applied++;
+        return Promise.resolve();
+      },
+    };
+    for (mode of ['old', 'identity', 'challenge']) {
+      await assertRejects(() => client.activity(activity), LinkError);
+      assertEquals(applied, 0);
+    }
+    mode = 'held';
+    const first = client.activity(activity);
+    const second = client.activity(activity);
+    // Both calls enter their async authorization before reaching the wire.
+    await Promise.resolve();
+    await Promise.resolve();
+    assertEquals(pending.length, 2);
+    pending[1].resolve(pending[1].answer);
+    await second;
+    assertEquals(applied, 1);
+    pending[0].resolve(pending[0].answer);
+    await first;
+    assertEquals(
+      applied,
+      1,
+      'old in-flight answer cannot replace a newer pull',
+    );
+    await assertRejects(async () => {
+      const revoked = new JournalClient(wire, peer, () => {
+        throw new LinkError('LINK_UNPAIRED', 'revoked', 403);
+      });
+      await revoked.activity(activity);
+    }, LinkError);
+    assertEquals(applied, 1);
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('live link: existing worker serializes pulls, preserves a wake and keeps hello read-only', async () => {
+  const f = await fixture(LINK_SUPPORTED);
+  const entered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  const successor = Promise.withResolvers<void>();
+  let worker: ReturnType<typeof startHomeLinkWorker> | undefined;
+  let pulls = 0, active = 0, maximum = 0;
+  const failures: unknown[] = [];
+  try {
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+    const client = await openJournalClient(f.hp, bundle.id, f.tls.home);
+    client.activity = async () => {
+      pulls++;
+      maximum = Math.max(maximum, ++active);
+      if (pulls === 1) {
+        entered.resolve();
+        await release.promise;
+      } else successor.resolve();
+      active--;
+    };
+    worker = startHomeLinkWorker({
+      client,
+      journal: f.hj,
+      limits: { maxItems: 1, maxBytes: 1000 },
+      notify: 'poll',
+      pollseconds: 60,
+      reconnectmaxseconds: 60,
+      failed: (error) => failures.push(error),
+      apply: () => Promise.resolve(false),
+      activity: {
+        capture: () => Promise.resolve({}),
+        apply: () => Promise.resolve(),
+      },
+    });
+    await testDeadline(entered.promise);
+    await client.hello();
+    assertEquals(pulls, 1);
+    worker.wake();
+    worker.wake();
+    assertEquals(pulls, 1);
+    release.resolve();
+    await testDeadline(successor.promise);
+    await worker.close();
+    assertEquals(pulls, 2);
+    assertEquals(maximum, 1);
+    assertEquals(failures, []);
+  } finally {
+    release.resolve();
+    await worker?.close();
+    await f.close();
+  }
+});
+
+Deno.test('live link: applied authority re-drives pending activity without a notice or poll', async (t) => {
+  for (const direction of ['in', 'out'] as const) {
+    await t.step(direction, async () => {
+      const f = await fixture(LINK_SUPPORTED);
+      const entered = Promise.withResolvers<void>();
+      const release = Promise.withResolvers<void>();
+      const pending = Promise.withResolvers<void>();
+      const delivered = Promise.withResolvers<void>();
+      const failures: unknown[] = [];
+      let worker: ReturnType<typeof startHomeLinkWorker> | undefined;
+      try {
+        const bundle = await f.create();
+        await f.fp.accept(bundle);
+        await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+        const client = await openJournalClient(f.hp, bundle.id, f.tls.home);
+        const stream = direction === 'in'
+          ? {
+            source: 'edge_a',
+            incarnation: client.peer.incarnation,
+            stream: 'authority:@alice:logical.test',
+          }
+          : {
+            source: 'home',
+            incarnation: bundle.id,
+            stream: 'auth:@alice:logical.test',
+          };
+        const record = await (direction === 'in' ? f.fj : f.hj).append(
+          direction === 'in' ? 'home' : 'edge_a',
+          {
+            ...stream,
+            type: 'control',
+            version: 1,
+            operationId: 'held-authority',
+            payload: {},
+          },
+        );
+        const push = client.push.bind(client);
+        client.push = async (...args) => {
+          await push(...args); // Durable receipt is not application.
+          entered.resolve();
+          await release.promise;
+          await f.fj.complete('home', stream, record, {});
+          return await push(...args);
+        };
+        client.activity = async () => {
+          const heads = direction === 'in'
+            ? await f.hj.heads('edge_a', 'in', stream)
+            : await f.hj.acknowledged('edge_a', stream);
+          if (heads.applied.sequence !== record.sequence) {
+            pending.resolve();
+            throw new LinkError(
+              'LINK_UNAVAILABLE',
+              'live activity awaits applied authority',
+              503,
+            );
+          }
+          delivered.resolve();
+        };
+        worker = startHomeLinkWorker({
+          client,
+          journal: f.hj,
+          limits: { maxItems: 1, maxBytes: 1000 },
+          notify: 'poll',
+          pollseconds: 60,
+          reconnectmaxseconds: 60,
+          failed: (error) => failures.push(error),
+          apply: async (source) => {
+            const next = await f.hj.next('edge_a', source);
+            if (!next) return false;
+            entered.resolve();
+            await release.promise;
+            await f.hj.complete('edge_a', source, next, {});
+            return true;
+          },
+          activity: {
+            capture: () => Promise.resolve({}),
+            apply: () => Promise.resolve(),
+          },
+        });
+        await testDeadline(Promise.all([entered.promise, pending.promise]));
+        assert(
+          failures.every((error) =>
+            error instanceof LinkError && error.code === 'LINK_UNAVAILABLE'
+          ),
+        );
+        release.resolve(); // No explicit wake, notice, reconnect or periodic tick.
+        await testDeadline(delivered.promise);
+      } finally {
+        release.resolve();
+        await worker?.close();
+        await f.close();
+      }
+    });
+  }
+});
+
+Deno.test('live link: a ready wake exchanges before admitting a newer authority tail', async () => {
+  const f = await fixture(LINK_SUPPORTED);
+  const observed = Promise.withResolvers<boolean>();
+  let worker: ReturnType<typeof startHomeLinkWorker> | undefined;
+  try {
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+    const client = await openJournalClient(f.hp, bundle.id, f.tls.home);
+    const stream = {
+      source: 'edge_a',
+      incarnation: client.peer.incarnation,
+      stream: 'authority:@alice:logical.test',
+    };
+    const append = (id: string) =>
+      f.fj.append('home', {
+        ...stream,
+        type: 'control',
+        version: 1,
+        operationId: id,
+        payload: {},
+      });
+    const applied = await append('applied-authority');
+    await f.hj.receive('edge_a', [applied]);
+    await f.hj.complete('edge_a', stream, applied, {});
+    const future = await append('future-authority');
+    const hello = client.hello.bind(client);
+    client.hello = async (signal) => {
+      // Reconciliation can receive a fresh auth declaration on every wake. It
+      // must not invalidate the applied cut before the pending live attempt.
+      await f.hj.receive('edge_a', [future]);
+      return await hello(signal);
+    };
+    client.activity = async () => {
+      const heads = await f.hj.heads('edge_a', 'in', stream);
+      observed.resolve(heads.received.sequence === heads.applied.sequence);
+    };
+    worker = startHomeLinkWorker({
+      client,
+      journal: f.hj,
+      limits: { maxItems: 1, maxBytes: 1000 },
+      notify: 'poll',
+      pollseconds: 60,
+      reconnectmaxseconds: 60,
+      failed: () => {},
+      apply: () => Promise.resolve(false),
+      activity: {
+        capture: () => Promise.resolve({}),
+        apply: () => Promise.resolve(),
+      },
+    });
+    assertEquals(await testDeadline(observed.promise), true);
+  } finally {
+    await worker?.close();
+    await f.close();
+  }
+});
+
+Deno.test('live link: a stalled activity exchange does not hold journal reconciliation', async () => {
+  const f = await fixture(LINK_SUPPORTED);
+  const delivered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let worker: ReturnType<typeof startHomeLinkWorker> | undefined;
+  let active = 0;
+  let expired = false;
+  try {
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+    const client = await openJournalClient(f.hp, bundle.id, f.tls.home);
+    const stream = {
+      source: 'edge_a',
+      incarnation: client.peer.incarnation,
+      stream: 'activity-independent',
+    };
+    const record = await f.fj.append('home', {
+      ...stream,
+      type: 'control',
+      version: 1,
+      operationId: 'while-activity-stalled',
+      payload: {},
+    });
+    client.activity = async (_owner, signal) => {
+      assertEquals(++active, 1);
+      let abort: (() => void) | undefined;
+      try {
+        await Promise.race([
+          release.promise,
+          new Promise<never>((_, reject) => {
+            abort = () => reject(signal?.reason);
+            signal?.addEventListener('abort', abort, { once: true });
+          }),
+        ]);
+      } catch (error) {
+        if (
+          signal?.reason instanceof DOMException &&
+          signal.reason.name === 'TimeoutError'
+        ) expired = true;
+        throw error;
+      } finally {
+        if (abort) signal?.removeEventListener('abort', abort);
+        active--;
+      }
+    };
+    worker = startHomeLinkWorker({
+      client,
+      journal: f.hj,
+      limits: { maxItems: 1, maxBytes: 1000 },
+      notify: 'poll',
+      pollseconds: 60,
+      reconnectmaxseconds: 60,
+      failed: () => {},
+      apply: async (stream) => {
+        const next = await f.hj.next('edge_a', stream);
+        if (!next) return false;
+        await f.hj.complete('edge_a', stream, next, {});
+        delivered.resolve();
+        return true;
+      },
+      activity: {
+        capture: () => Promise.resolve({}),
+        apply: () => Promise.resolve(),
+      },
+    });
+    await testDeadline(delivered.promise);
+    assert(expired);
+    assertEquals(
+      (await f.hj.heads('edge_a', 'in', stream)).applied.hash,
+      record.hash,
+    );
+  } finally {
+    release.resolve();
+    await worker?.close();
+    await f.close();
+  }
+});
 
 Deno.test('F1 enrollment upgrades ownership over the same authenticated link, with apply ACK after both files', async () => {
   const f = await fixture(LINK_SUPPORTED);

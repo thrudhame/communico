@@ -1,7 +1,7 @@
 import { parseJson } from '#engine/operation-body.ts';
 import { theApp } from '#engine/app.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
-import { getDevice, updateDeviceName } from '#engine/tenant/devices.ts';
+import { updateDeviceName } from '#engine/tenant/devices.ts';
 import { localpartOf } from '#engine/tenant/auth.ts';
 import type { Context, PathfinderRequest } from '@pathfinder/pathfinder';
 
@@ -14,15 +14,9 @@ export default async function (request: PathfinderRequest, context: Context) {
   const userId = context.state.user as string;
   const localpart = localpartOf(userId);
   const deviceId = request.params.deviceId as string;
-  if (body.display_name === undefined) {
-    // Spec: name unchanged — ownership still decides 200 vs 404.
-    const device = await getDevice(theApp().tenant, localpart, deviceId);
-    if (device === null) {
-      throw new MatrixError(404, 'M_NOT_FOUND', 'unknown device');
-    }
-    return {};
-  }
-  if (typeof body.display_name !== 'string') {
+  if (
+    body.display_name !== undefined && typeof body.display_name !== 'string'
+  ) {
     throw new MatrixError(400, 'M_BAD_JSON', 'display_name must be a string');
   }
   const ok = await updateDeviceName(
