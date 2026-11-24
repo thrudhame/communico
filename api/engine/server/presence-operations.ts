@@ -18,9 +18,10 @@ import {
   writeRegister,
 } from '#engine/facade/registers.ts';
 
-async function authority(conn: Pick<Conn, 'query'>) {
+async function authority(conn: Pick<Conn, 'query'>, pairing?: string) {
   const [row] = await conn.query(
-    'SELECT c.signed_json,p.node FROM facade_owner_activation a JOIN facade_owner_controls c ON c.pairing=a.pairing AND c.revision=a.revision CROSS JOIN publication_domain p WHERE p.singleton=1',
+    'SELECT c.signed_json,p.node FROM facade_owner_activation a JOIN facade_owner_controls c ON c.pairing=a.pairing AND c.revision=a.revision CROSS JOIN publication_domain p WHERE p.singleton=1 AND (? IS NULL OR a.pairing=?)',
+    [pairing ?? null, pairing ?? null],
   );
   if (!row) return null;
   const body = JSON.parse(String(row.signed_json)).body;
@@ -116,9 +117,10 @@ export async function capturePresenceStatus(conn: Conn, user: string) {
 export async function acceptPresenceStatus(
   conn: Conn,
   operation: RegisterOperation,
+  pairing: string,
   history?: DomainHistoryProof,
 ) {
-  const source = await authority(conn);
+  const source = await authority(conn, pairing);
   const value = JSON.parse(operation.payload);
   if (
     !source || !value || typeof value.user !== 'string' ||

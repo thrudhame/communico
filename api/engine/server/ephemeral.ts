@@ -597,12 +597,13 @@ export async function getPresence(
 export async function importPresenceStatus(
   server: Db,
   operation: RegisterOperation,
+  pairing: string,
   check: (conn: Conn) => Promise<void>,
   history?: DomainHistoryProof,
 ) {
   const change = await server.tx(async (tx) => {
     await check(tx);
-    const value = await acceptPresenceStatus(tx, operation, history);
+    const value = await acceptPresenceStatus(tx, operation, pairing, history);
     if (!value.available) return null;
     const [current] = await tx.query('SELECT * FROM presence WHERE user_id=?', [
       value.user,

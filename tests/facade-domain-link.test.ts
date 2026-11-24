@@ -878,6 +878,106 @@ Deno.test('domain presence status: bootstrap and causal suffix preserve status w
   }
 });
 
+Deno.test('domain presence status: an unrelated control cannot reject the delivering pairing', async () => {
+  const f = await fixture();
+  const second = await f.open('second-edge');
+  try {
+    const user = '@alice:logical.test';
+    const server = await second.server();
+    await bindRole(second, {
+      role: 'facade',
+      server: 'logical.test',
+      node: 'edge_b',
+    });
+    const node = await initializeNode(server, 'logical.test', 'edge_b');
+    const fp = new Pairings(
+      server,
+      node.signer(),
+      node.publicKey,
+      'c'.repeat(64),
+      node,
+    );
+    const randomUUID = crypto.randomUUID;
+    let bundle;
+    try {
+      crypto.randomUUID = () => '00000000-0000-4000-8000-000000000000';
+      bundle = await f.hp.create({
+        node: 'edge_b',
+        url: 'https://second.test',
+        facadePin: 'c'.repeat(64),
+        expires: Date.now() + 60_000,
+        required: [...LINK_CAPABILITIES],
+      });
+    } finally {
+      crypto.randomUUID = randomUUID;
+    }
+    await fp.accept(bundle);
+    await f.hp.confirm(
+      bundle.id,
+      await fp.complete(
+        bundle.id,
+        await f.hp.grant(
+          bundle.id,
+          await fp.challenge(bundle.id, bundle.secret, 'a'.repeat(64)),
+        ),
+        'a'.repeat(64),
+      ),
+    );
+    // Tenant authority supports one selected edge. The second enrollment can
+    // still leave a signed server control installed before tenant refusal.
+    await assertRejects(
+      () => exportOwnerControl(f.home, f.ht, f.hp, bundle.id),
+      MatrixError,
+      'operation owner unavailable',
+    );
+    const home = await f.home.server();
+    await home.tx(async (tx) => {
+      const [held] = await tx.query(
+        'SELECT * FROM facade_owner_activation WHERE pairing=?',
+        [f.bundle.id],
+      );
+      const [signed] = await tx.query(
+        'SELECT * FROM facade_owner_controls WHERE pairing=? AND revision=?',
+        [held.pairing, held.revision],
+      );
+      // Exercise the order in which the unrelated row is encountered first.
+      // Keep the exact activation and all signed controls unchanged.
+      await tx.execute('DELETE FROM facade_owner_activation WHERE pairing=?', [
+        f.bundle.id,
+      ]);
+      await tx.execute(
+        'DELETE FROM facade_owner_controls WHERE pairing=? AND revision=?',
+        [held.pairing, held.revision],
+      );
+      await tx.execute('INSERT INTO facade_owner_controls VALUES(?,?,?,?)', [
+        signed.pairing,
+        signed.revision,
+        signed.body_hash,
+        signed.signed_json,
+      ]);
+      await tx.execute('INSERT INTO facade_owner_activation VALUES(?,?,?)', [
+        held.pairing,
+        held.revision,
+        held.body_hash,
+      ]);
+    });
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    await setPresence(await f.edge.server(), user, 'online', 'admitted edge');
+    const records = await f.es.export('alice');
+    assertEquals(records.length, 1);
+    await f.hj.receive(f.node.node, records);
+    assertEquals(await f.hs.apply(f.hj, records[0], f.bundle.id), true);
+    assertEquals(
+      (await f.hj.heads(f.node.node, 'in', records[0])).applied.hash,
+      records[0].hash,
+    );
+    assertEquals((await getPresence(home, user)).statusMsg, 'admitted edge');
+  } finally {
+    await second.close();
+    await f.close();
+  }
+});
+
 Deno.test('domain rolling readers: legacy bootstrap cannot enable status and downgraded status cannot apply', async () => {
   const f = await fixture();
   try {

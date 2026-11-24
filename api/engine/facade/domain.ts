@@ -918,6 +918,7 @@ export class DomainOperations {
       await importPresenceStatus(
         await this.store.server(),
         view.operation,
+        view.pairing,
         check,
         history,
       );

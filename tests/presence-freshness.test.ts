@@ -322,18 +322,23 @@ Deno.test('presence transactions do not queue behind a held event writer', async
       ['causal status admission', () =>
         assertRejects(
           () =>
-            importPresenceStatus(server, {
-              source: 'edge',
-              incarnation: 'one',
-              sequence: 1,
-              operationId: 'unused',
-              stream: 'unused',
-              semanticKey: 'unused',
-              kind: 'presence-status',
-              context: [],
-              payloadHash: 'unused',
-              payload: '{}',
-            }, () => Promise.reject(admissionError)),
+            importPresenceStatus(
+              server,
+              {
+                source: 'edge',
+                incarnation: 'one',
+                sequence: 1,
+                operationId: 'unused',
+                stream: 'unused',
+                semanticKey: 'unused',
+                kind: 'presence-status',
+                context: [],
+                payloadHash: 'unused',
+                payload: '{}',
+              },
+              'unused',
+              () => Promise.reject(admissionError),
+            ),
           Error,
           admissionError.message,
         )],
