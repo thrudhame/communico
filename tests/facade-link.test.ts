@@ -916,6 +916,85 @@ Deno.test('live link: a ready wake exchanges before admitting a newer authority 
   }
 });
 
+Deno.test('live link: a stalled activity exchange does not hold journal reconciliation', async () => {
+  const f = await fixture(LINK_SUPPORTED);
+  const delivered = Promise.withResolvers<void>();
+  const release = Promise.withResolvers<void>();
+  let worker: ReturnType<typeof startHomeLinkWorker> | undefined;
+  let active = 0;
+  let expired = false;
+  try {
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+    const client = await openJournalClient(f.hp, bundle.id, f.tls.home);
+    const stream = {
+      source: 'edge_a',
+      incarnation: client.peer.incarnation,
+      stream: 'activity-independent',
+    };
+    const record = await f.fj.append('home', {
+      ...stream,
+      type: 'control',
+      version: 1,
+      operationId: 'while-activity-stalled',
+      payload: {},
+    });
+    client.activity = async (_owner, signal) => {
+      assertEquals(++active, 1);
+      let abort: (() => void) | undefined;
+      try {
+        await Promise.race([
+          release.promise,
+          new Promise<never>((_, reject) => {
+            abort = () => reject(signal?.reason);
+            signal?.addEventListener('abort', abort, { once: true });
+          }),
+        ]);
+      } catch (error) {
+        if (
+          signal?.reason instanceof DOMException &&
+          signal.reason.name === 'TimeoutError'
+        ) expired = true;
+        throw error;
+      } finally {
+        if (abort) signal?.removeEventListener('abort', abort);
+        active--;
+      }
+    };
+    worker = startHomeLinkWorker({
+      client,
+      journal: f.hj,
+      limits: { maxItems: 1, maxBytes: 1000 },
+      notify: 'poll',
+      pollseconds: 60,
+      reconnectmaxseconds: 60,
+      failed: () => {},
+      apply: async (stream) => {
+        const next = await f.hj.next('edge_a', stream);
+        if (!next) return false;
+        await f.hj.complete('edge_a', stream, next, {});
+        delivered.resolve();
+        return true;
+      },
+      activity: {
+        capture: () => Promise.resolve({}),
+        apply: () => Promise.resolve(),
+      },
+    });
+    await testDeadline(delivered.promise);
+    assert(expired);
+    assertEquals(
+      (await f.hj.heads('edge_a', 'in', stream)).applied.hash,
+      record.hash,
+    );
+  } finally {
+    release.resolve();
+    await worker?.close();
+    await f.close();
+  }
+});
+
 Deno.test('F1 enrollment upgrades ownership over the same authenticated link, with apply ACK after both files', async () => {
   const f = await fixture(LINK_SUPPORTED);
   try {

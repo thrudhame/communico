@@ -263,12 +263,14 @@ export class JournalClient {
           snapshot: await owner.capture(this.peer.pairing),
         }
         : undefined;
+      signal?.throwIfAborted();
       const value = await this.call('activity', {
         required: [...LINK_CAPABILITIES, LIVE_ACTIVITY_CAPABILITY],
         challenge,
         ...(answer ? { answer } : {}),
       }, signal);
       await this.authorized();
+      signal?.throwIfAborted();
       if (this.activityRequest !== challenge) return;
       if (
         !negotiate(value, this.peer.server, LINK_SUPPORTED).required.some((

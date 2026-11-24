@@ -19,6 +19,7 @@ type Peer =
     'peer' | 'hello' | 'pull' | 'push' | 'ack' | 'notices'
   >
   & Partial<Pick<JournalClient, 'activity'>>;
+const ACTIVITY_DEADLINE_MS = 1000;
 type Options = {
   journal: Journal;
   client: Peer;
@@ -323,6 +324,12 @@ export function startHomeLinkWorker(
       // Use the applied cut that woke us before reconciliation can admit a
       // newer received tail. Otherwise continuous auth freshness can starve it.
       if (options.activity && !signal.aborted) {
+        const deadline = new AbortController();
+        const timer = setTimeout(() => {
+          deadline.abort(
+            new DOMException('live activity deadline', 'TimeoutError'),
+          );
+        }, ACTIVITY_DEADLINE_MS);
         try {
           if (!options.client.activity) {
             throw new LinkError(
@@ -330,9 +337,14 @@ export function startHomeLinkWorker(
               'live activity client unavailable',
             );
           }
-          await options.client.activity(options.activity, signal);
+          await options.client.activity(
+            options.activity,
+            AbortSignal.any([signal, deadline.signal]),
+          );
         } catch (error) {
           if (!signal.aborted) options.failed(error);
+        } finally {
+          clearTimeout(timer);
         }
       }
       try {
