@@ -24,6 +24,7 @@ import { getRulebook } from '#engine/rulebook/index.ts';
 import { ruleId } from '#engine/rulebook/rule-ids.ts';
 import { membershipOf } from '#engine/server/read.ts';
 import { lookupAlias, registerAlias } from '#engine/server/aliases.ts';
+import { setVisibility } from '#engine/server/directory.ts';
 import { deviceIdentity, transactionSubmission } from '#engine/tenant/txns.ts';
 import { localpartOf } from '#engine/ids.ts';
 import { getProfile } from '#engine/tenant/users.ts';
@@ -66,10 +67,7 @@ export async function createRoom(opts: CreateRoomOptions) {
     await registerAlias(app.server, res.roomAlias, res.roomId, opts.creator);
   }
   if (opts.visibility === 'public') {
-    await app.server.execute(
-      'INSERT INTO visibility(room_id, visibility) VALUES(?,?)',
-      [res.roomId, 'public'],
-    );
+    await setVisibility(app.server, res.roomId, 'public');
   }
   for (const u of opts.invite ?? []) {
     if (domainOf(u) !== serverName()) {

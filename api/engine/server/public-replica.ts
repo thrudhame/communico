@@ -5,6 +5,7 @@ import { validRoomId } from '#engine/room/identity.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Conn } from '#engine/store/db.ts';
 import { changedColumns } from '#engine/store/changed.ts';
+import { setRankedVisibility } from './directory-rank.ts';
 
 export type DirectoryFacts = {
   aliases: { alias: string; roomId: string; creator: string | null }[];
@@ -166,11 +167,7 @@ export async function installDirectoryFacts(
     }
   }
   for (const entry of facts.publication) {
-    await conn.execute(
-      'INSERT INTO visibility(room_id,visibility) VALUES(?,?) ON CONFLICT(room_id) DO UPDATE SET visibility=excluded.visibility WHERE ' +
-        changedColumns('visibility', 'visibility'),
-      [entry.roomId, entry.visibility],
-    );
+    await setRankedVisibility(conn, entry.roomId, entry.visibility);
     if (f2) {
       // Home publishes visibility, not this receiver's participation/forget cut.
       await conn.execute(

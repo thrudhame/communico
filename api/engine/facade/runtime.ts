@@ -741,6 +741,19 @@ export async function openFacadeRuntime(
         identity.server,
       ).requireReadScope(scope, allowAbsent);
     },
+    async rankedDirectoryPage(
+      offset: number,
+      limit: number,
+      signal?: AbortSignal,
+    ) {
+      return await new DirectoryReplicas(
+        server,
+        await pairings(),
+        identity.server,
+        settings.phase as 'f1' | 'f2',
+        readiness,
+      ).rankedDirectoryPage(offset, limit, signal);
+    },
     async prepareReadRoomScope(roomId: string, allowAbsent?: boolean) {
       return await new DirectoryReplicas(
         server,
@@ -788,20 +801,11 @@ export async function openFacadeRuntime(
       ).prepareRoomScope(roomId, allowAbsent, localUser, signal);
     },
     async publicRooms() {
-      const owner = new DirectoryReplicas(
+      return await new DirectoryReplicas(
         server,
         await pairings(),
         identity.server,
-      );
-      const view = await owner.snapshot('applied');
-      if (!view) {
-        throw new MatrixError(
-          503,
-          'M_UNAVAILABLE',
-          'directory replica not ready',
-        );
-      }
-      return view.publicRooms;
+      ).appliedPublicRooms();
     },
     async initialize() {
       const pending = initializing ??= initializeNode(

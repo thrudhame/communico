@@ -22,5 +22,6 @@ export default async function (
   return await queryDirectory(
     decodeDirectoryRequest(request.query),
     destination,
+    request._raw.signal,
   );
 }

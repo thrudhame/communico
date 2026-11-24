@@ -90,7 +90,11 @@ import {
   registerAlias,
   removeAlias,
 } from '#engine/server/aliases.ts';
-import { listedRooms, setVisibility } from '#engine/server/directory.ts';
+import {
+  joinedUsers,
+  listedRooms,
+  setVisibility,
+} from '#engine/server/directory.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { setReceipt as writeClientReceipt } from '#engine/receipts.ts';
 import { appendRecord, Journal } from '#engine/facade/journal.ts';
@@ -5785,6 +5789,93 @@ Deno.test('PAIR503: public federation reads serve the applied publication', asyn
     await http?.shutdown();
     await closeApp();
     setConfigForTests({});
+    await f.close();
+  }
+});
+
+Deno.test('CHECKLISTSLOW: only a returned unapplied directory room waits', async () => {
+  const f = await fixture();
+  const observed = Promise.withResolvers<void>();
+  const readiness = new ReplicaReadiness({
+    canDeliver: () => {
+      observed.resolve();
+      return true;
+    },
+    onDeliveryLoss: () => () => {},
+  });
+  const abort = new AbortController();
+  let result: Promise<unknown> | undefined;
+  try {
+    const server = await f.edgeServer();
+    const directory = new DirectoryReplicas(
+      server,
+      await f.edgePairings(),
+      f.tenant.serverName,
+      'f1',
+      readiness,
+    );
+    const journal = new Journal(
+      server,
+      LINK_CAPABILITIES,
+      (_, stream) => readiness.receiving(stream.incarnation, stream.stream),
+    );
+    const rooms = await f.replicas();
+    const pending = await makeFakeRoom({
+      roomId: '!z-pending:logical.test',
+      server: f.signing,
+      version: f.source.version,
+    });
+    const [create, join] = pending.events.values();
+    const keys = fakeKeyResolver(f.signing);
+    await importReplicaGenesis(f.home, {
+      roomId: pending.roomId,
+      roomVersion: pending.version,
+      self: f.signing.name,
+      keys,
+      create,
+      join,
+    });
+    const home = await f.home.server();
+    await setVisibility(home, f.source.roomId, 'public');
+    await setVisibility(home, pending.roomId, 'public');
+    const initial = await f.exports(), inventory = await f.directoryExport();
+    const delayed = await exportRoomReplica(
+      f.home,
+      await openRoom(f.home, pending.roomId),
+      f.signing.name,
+      f.node.node,
+      f.bundle.id,
+    );
+    assert(initial && inventory && delayed);
+    await journal.receive('home', [initial]);
+    await journal.receive('home', [inventory]);
+    assert(await rooms.apply(journal, initial));
+    assert(await directory.apply(journal, inventory));
+    const signal = AbortSignal.any([abort.signal, AbortSignal.timeout(8000)]);
+    const first = await directory.rankedDirectoryPage(0, 1, signal);
+    assertEquals(first.total, 2);
+    assertEquals(first.rooms.map(({ id }) => id), [f.source.roomId]);
+    let completed = false;
+    const page = directory.rankedDirectoryPage(1, 1, signal).finally(() => {
+      completed = true;
+    });
+    result = page;
+    await Promise.race([observed.promise, page]);
+    assert(!completed, 'the selected unapplied room should wait');
+    await journal.receive('home', [delayed]);
+    assert(await rooms.apply(journal, delayed));
+    readiness.applied(delayed.incarnation, delayed.stream);
+    assertEquals(await page, {
+      total: 2,
+      rooms: [{
+        id: pending.roomId,
+        joined: (await joinedUsers(server, pending.roomId)).length,
+      }],
+    });
+  } finally {
+    abort.abort();
+    await result?.catch(() => {});
+    readiness.close();
     await f.close();
   }
 });

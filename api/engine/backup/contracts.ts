@@ -172,6 +172,13 @@ export const tableContracts = {
       'receipts',
       'edu_outbox',
     ],
+    // Derived from the captured directory, memberships and applied facade
+    // journal. Preserve the coherent cut and cursor for startup to resume.
+    directoryRank: [
+      'directory_rank',
+      'directory_rank_state',
+      'directory_rank_replica',
+    ],
     // Retain local authoritative facts, frozen obligations and their results;
     // no replica may replace these with another node's allocator positions.
     retained: [
