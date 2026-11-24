@@ -39,16 +39,9 @@ export async function reservePublicationCounter(
   if (!Number.isSafeInteger(count) || count <= 0) {
     throw new TypeError('publication counter count must be a positive integer');
   }
-  await tx.execute(
-    'INSERT INTO counters(name,value) VALUES(?,0) ON CONFLICT DO NOTHING',
-    [name],
+  const [row] = await tx.query(
+    'INSERT INTO counters(name,value) VALUES(?,?) ON CONFLICT(name) DO UPDATE SET value=counters.value+excluded.value RETURNING value',
+    [name, count],
   );
-  await tx.execute('UPDATE counters SET value=value+? WHERE name=?', [
-    count,
-    name,
-  ]);
-  return Number(
-    (await tx.query('SELECT value FROM counters WHERE name=?', [name]))[0]
-      .value,
-  ) - count + 1;
+  return Number(row.value) - count + 1;
 }

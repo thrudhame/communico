@@ -19,7 +19,12 @@ import { projectTenant } from '#engine/server/project-tenant.ts';
 import { setReceipt } from '#engine/server/ephemeral.ts';
 import { finishRoomRemoval } from '#engine/server/removal.ts';
 import { advanceNotificationRead } from '#engine/server/notifications.ts';
-import { syncStreamHeads } from '#engine/server/stream.ts';
+import {
+  nextEventSeq,
+  reserveEventSeqs,
+  syncStreamHeads,
+} from '#engine/server/stream.ts';
+import { reservePublicationCounter } from '#engine/server/publication-rows.ts';
 import { initializeNode } from '#engine/facade/identity.ts';
 import { exportOwnerControl } from '#engine/facade/ownership.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
@@ -795,6 +800,55 @@ for (
         Date.now = now;
       }
     }, variant);
+  });
+}
+
+for (const allocations of [4, 12]) {
+  Deno.test(`publication batching: ${allocations} counter allocations each take one statement`, async () => {
+    await fixture(async (store) => {
+      const db = await store.server();
+      const heads = await syncStreamHeads(db);
+      const abort = new Error('roll back allocations');
+      const statements: number[] = [];
+      const reserve = () =>
+        db.tx(async (tx) => {
+          const query = tx.query.bind(tx);
+          const execute = tx.execute.bind(tx);
+          let calls = 0;
+          tx.query = (sql, values) => {
+            calls++;
+            return query(sql, values);
+          };
+          tx.execute = (sql, values) => {
+            calls++;
+            return execute(sql, values);
+          };
+          for (let at = 0; at < allocations / 2; at++) {
+            const start = calls;
+            const first = at % 2 === 0
+              ? await nextEventSeq(tx)
+              : await reserveEventSeqs(tx, 3);
+            assertEquals(first, heads.events + at * 2 + 1 - at % 2);
+            statements.push(calls - start);
+            const before = calls;
+            assertEquals(
+              await reservePublicationCounter(tx, 'publication-test-fresh', 2),
+              at * 2 + 1,
+            );
+            statements.push(calls - before);
+          }
+          throw abort;
+        });
+      assertEquals(await assertRejects(reserve), abort);
+      assertEquals(await syncStreamHeads(db), heads);
+      assertEquals(
+        await db.query(
+          "SELECT value FROM counters WHERE name='publication-test-fresh'",
+        ),
+        [],
+      );
+      assertEquals(statements, Array<number>(allocations).fill(1));
+    });
   });
 }
 
