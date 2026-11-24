@@ -36,7 +36,7 @@ import type { Room } from '#engine/room/index.ts';
 import { formatCursor } from '#engine/room/segments.ts';
 import { formatPosition } from '#engine/client/tokens.ts';
 import {
-  feedAfter,
+  changedJoinedRooms,
   feedBefore,
   relevantFeedChanged,
   roomsFor,
@@ -370,6 +370,7 @@ async function assembleSync(
   sweepTyping();
   await waitForRelevant(i, device);
   sweepTyping();
+  const incremental = i.since !== null && !i.fullState;
   // One server transaction selects events, receipts, memberships and counts.
   // Rendering afterward may be slow, but cannot mix a later count/receipt cut.
   const snapshot = await app.server.tx(async (tx) => {
@@ -379,22 +380,33 @@ async function assembleSync(
       ) => [String(r.name), Number(r.value)]),
     );
     const memberships = await roomsFor(tx, i.userId);
+    const changed = incremental
+      ? await changedJoinedRooms(
+        tx,
+        i.userId,
+        i.since!.eSeq,
+        counters.get('events') ?? 0,
+      )
+      : new Set<string>();
+    const purgeable = i.since === null || i.fullState
+      ? new Set((await tx.query(
+        `SELECT m.room FROM memberships m JOIN directory d ON d.room_id=m.room
+         WHERE m.user=? AND m.membership IN ('leave','ban') AND d.purgeable_ms IS NOT NULL`,
+        [i.userId],
+      )).map((r) => String(r.room)))
+      : new Set<string>();
     const notifications = await notificationSnapshot(
       tx,
       i.userId,
       i.since?.nSeq ?? 0,
     );
-    const rooms = new Map<
-      string,
-      { receipts: Record<string, unknown>[]; members: Row[] }
-    >();
     const receipts = await receiptSnapshot(tx, i.userId, i.since?.rSeq ?? 0);
     const members = new Map<string, Row[]>();
     for (
       const row of await tx.query(
         `SELECT m.room,m.user,m.membership,m.seq FROM memberships m
       WHERE m.membership IN ('join','invite') AND EXISTS (
-        SELECT 1 FROM memberships mine WHERE mine.user=? AND mine.room=m.room
+        SELECT 1 FROM memberships mine WHERE mine.user=? AND mine.room=m.room AND mine.membership='join'
       ) ORDER BY m.room,CASE m.membership WHEN 'join' THEN 0 ELSE 1 END,m.user`,
         [i.userId],
       )
@@ -403,19 +415,22 @@ async function assembleSync(
       if (!members.has(room)) members.set(room, []);
       members.get(room)!.push(row);
     }
-    for (const membership of memberships) {
-      rooms.set(membership.roomId, {
-        receipts: receipts.get(membership.roomId) ?? [],
-        members: members.get(membership.roomId) ?? [],
-      });
-    }
     const oob = await tx.query(
       `SELECT * FROM prejoin_memberships p WHERE user_id=? AND ${
         visiblePrejoin('p')
       } ORDER BY seq`,
       [i.userId],
     );
-    return { counters, memberships, notifications, rooms, oob };
+    return {
+      counters,
+      memberships,
+      changed,
+      purgeable,
+      notifications,
+      receipts,
+      members,
+      oob,
+    };
   });
   const accountSnapshot = await app.tenant.tx((tx) =>
     captureAccountData(tx, lp, app.tenant.serverName, i.since?.aSeq ?? null)
@@ -449,9 +464,6 @@ async function assembleSync(
   const nextBatch = encodeStreamToken(delivery.token);
   const roomAccountData = accountSnapshot.rooms;
   const memberships = snapshot.memberships;
-  const receiptRooms = new Set(
-    [...snapshot.rooms].filter(([, r]) => r.receipts.length).map(([id]) => id),
-  );
   const join: Record<string, unknown> = {},
     invite: Record<string, unknown> = {},
     knock: Record<string, unknown> = {},
@@ -536,10 +548,32 @@ async function assembleSync(
   const allJoiners = new Set<string>();
   for (const m of memberships) {
     if (oobRooms.has(m.roomId) || !roomIncluded(m.roomId)) continue;
+    const prejoin = m.membership === 'invite' || m.membership === 'knock';
+    const left = m.membership === 'leave' || m.membership === 'ban';
+    if (prejoin) {
+      if (incremental && m.seq <= i.since!.eSeq) continue;
+    } else if (left) {
+      if (
+        (m.forgotten || snapshot.purgeable.has(m.roomId)) &&
+        (i.since === null || i.fullState)
+      ) continue;
+      if (
+        !(i.since === null
+          ? i.filter.includeLeave || recoveryReset
+          : m.seq > i.since.eSeq)
+      ) continue;
+    } else if (incremental) {
+      if (
+        !snapshot.changed.has(m.roomId) &&
+        !snapshot.receipts.get(m.roomId)?.length &&
+        !roomAccountData.has(m.roomId) &&
+        !snapshot.notifications.changed.has(m.roomId) &&
+        (typingSnapshot.rooms.get(m.roomId)?.changed ?? 0) <= i.since!.tSeq
+      ) continue;
+    }
     const room = await heldRoom(m.roomId);
     if (room === null) continue;
-    if (m.membership === 'invite' || m.membership === 'knock') {
-      if (i.since !== null && !i.fullState && m.seq <= i.since.eSeq) continue;
+    if (prejoin) {
       const at = await stateAtSeq(room, m.seq);
       const member = at.find((r) =>
         r.type === 'm.room.member' && r.stateKey === i.userId
@@ -561,37 +595,6 @@ async function assembleSync(
       };
       continue;
     }
-    const left = m.membership === 'leave' || m.membership === 'ban';
-    if (left) {
-      const purgeable = await app.server.query(
-        'SELECT 1 FROM directory WHERE room_id = ? AND purgeable_ms IS NOT NULL',
-        [m.roomId],
-      );
-      if (
-        (m.forgotten || purgeable.length) && (i.since === null || i.fullState)
-      ) continue;
-      if (
-        !(i.since === null
-          ? i.filter.includeLeave || recoveryReset
-          : m.seq > i.since.eSeq)
-      ) {
-        continue;
-      }
-    } else if (i.since !== null && !i.fullState) {
-      const changed = await feedAfter(
-        app.server,
-        m.roomId,
-        i.since.eSeq,
-        1,
-        now.eSeq,
-      );
-      if (
-        !changed.length && !receiptRooms.has(m.roomId) &&
-        !roomAccountData.has(m.roomId) &&
-        !snapshot.notifications.changed.has(m.roomId) &&
-        (typingSnapshot.rooms.get(m.roomId)?.changed ?? 0) <= i.since.tSeq
-      ) continue;
-    }
     const result = await roomTimeline(
       room,
       i,
@@ -600,7 +603,8 @@ async function assembleSync(
       !left,
       recoveryReset,
       {
-        ...snapshot.rooms.get(m.roomId)!,
+        receipts: snapshot.receipts.get(m.roomId) ?? [],
+        members: snapshot.members.get(m.roomId) ?? [],
         accountData: roomAccountData.get(m.roomId) ?? [],
         typing: typingSnapshot.rooms.get(m.roomId) ??
           { userIds: [], changed: 0 },
