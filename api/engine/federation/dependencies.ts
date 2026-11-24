@@ -7,7 +7,10 @@ import { productionKeyResolver } from './keyresolver.ts';
 import type { MembershipSendDeps } from './joins.ts';
 import type { TransactionDeps } from './transactions.ts';
 
-export function inviteDependencies(app: App): MembershipSendDeps {
+export function inviteDependencies(
+  app: App,
+  signal?: AbortSignal,
+): MembershipSendDeps {
   const signer = app.replica ? app.replica.signer : app.tenant.signer();
   return {
     store: app.store,
@@ -17,11 +20,11 @@ export function inviteDependencies(app: App): MembershipSendDeps {
     self: app.tenant.serverName,
     wake: (destination) => app.sender?.wake(destination),
     requireDirectoryScope: app.replica
-      ? () => app.replica!.requireScope('directory')
+      ? () => app.replica!.requireScope('directory', false, signal)
       : undefined,
     prepareRoomScope: app.replica
       ? (roomId, allowAbsent, localUser) =>
-        app.replica!.prepareRoomScope(roomId, allowAbsent, localUser)
+        app.replica!.prepareRoomScope(roomId, allowAbsent, localUser, signal)
       : undefined,
   };
 }

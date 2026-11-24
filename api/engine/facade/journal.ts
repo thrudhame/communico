@@ -201,6 +201,10 @@ export class Journal {
   constructor(
     private readonly db: Database,
     private readonly supported: readonly Capability[],
+    private readonly receiving?: (
+      peer: string,
+      stream: Stream,
+    ) => (() => void) | undefined,
   ) {}
 
   async append(peer: string, record: Append): Promise<LinkRecord> {
@@ -262,6 +266,7 @@ export class Journal {
     // while receive is pending must not become valid when it commits or fails.
     state.writing++;
     state.revision++;
+    const finished = this.receiving?.(peer, stream);
     try {
       return await this.db.tx(async (conn) => {
         let head = (await headsInTx(conn, peer, 'in', stream)).received;
@@ -306,6 +311,7 @@ export class Journal {
       // The path registry is weak; the pending owner must retain the whole map,
       // not merely this stream's state, across the asynchronous transaction.
       fence.set(id, state);
+      finished?.();
     }
   }
 

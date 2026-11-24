@@ -121,3 +121,48 @@ Deno.test('inbox reports the original pre-apply rejection without blocking anoth
     await worker.close();
   }
 });
+
+Deno.test('inbox notifies durable application after recovering a failed head read', async () => {
+  const unavailable = new Error('head read unavailable after commit');
+  const failed = Promise.withResolvers<unknown>();
+  const retried = Promise.withResolvers<void>();
+  const stream = { source: 'home', incarnation: 'pair', stream: 'directory' };
+  const cut = { sequence: 1, hash: 'a'.repeat(64) };
+  let applied = EMPTY_CUT;
+  let readFailed = false;
+  const heads = () => ({ ...stream, received: cut, applied });
+  const notifications: Stream[] = [];
+  const worker = startInboxWorker({
+    peer: 'home',
+    pollseconds: 3600,
+    journal: {
+      streams: () => Promise.resolve([heads()]),
+      heads: () => {
+        if (applied === cut && !readFailed) {
+          readFailed = true;
+          return Promise.reject(unavailable);
+        }
+        return Promise.resolve(heads());
+      },
+    },
+    apply: () => {
+      if (applied === cut) {
+        retried.resolve();
+        return Promise.resolve(false);
+      }
+      applied = cut;
+      return Promise.resolve(true);
+    },
+    changed: (stream) => notifications.push(stream),
+    failed: (error) => failed.resolve(error),
+  });
+  try {
+    assertEquals(await failed.promise, unavailable);
+    assertEquals(notifications, []);
+    worker.wake();
+    await retried.promise;
+  } finally {
+    await worker.close();
+  }
+  assertEquals(notifications.length, 1);
+});

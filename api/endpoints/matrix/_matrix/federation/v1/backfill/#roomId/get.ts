@@ -24,6 +24,6 @@ export default async function (
     v,
     limit,
     origin,
-    serveDeps(),
+    serveDeps(request._raw.signal),
   );
 }

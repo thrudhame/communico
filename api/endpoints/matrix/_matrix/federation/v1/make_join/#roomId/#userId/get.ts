@@ -22,6 +22,6 @@ export default async function (
     request.params.userId as string,
     origin,
     request.query.getAll('ver'),
-    inviteDeps(),
+    inviteDeps(request._raw.signal),
   );
 }

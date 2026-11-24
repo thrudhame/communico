@@ -10,13 +10,7 @@ import {
   localDiscoverySummary,
   remoteDiscoveryHierarchy,
 } from './discovery.ts';
-import {
-  lookupRoom,
-  lookupRoomForAdmission,
-  requireRoom,
-  requireRoomForAdmission,
-  type RoomAccess,
-} from './room.ts';
+import { lookupRoom, requireRoom } from './room.ts';
 import { renderStateEvents } from './render.ts';
 import { admitState } from './state-admission.ts';
 
@@ -79,13 +73,10 @@ function childrenOf(summary: Json, suggested: boolean): Child[] {
 async function withChildren(
   summary: Json,
   suggested: boolean,
-  access: RoomAccess = 'read',
 ): Promise<Json> {
   const out = { ...summary, children_state: [] as Child[] };
   if (summary.room_type === 'm.space') {
-    const room = access === 'admission'
-      ? await requireRoomForAdmission(String(summary.room_id))
-      : await requireRoom(String(summary.room_id));
+    const room = await requireRoom(String(summary.room_id));
     const admission = await admitState(room, { userId: null, discovery: true });
     const rows = admission.rows.filter((row) => row.type === 'm.space.child');
     const events = await renderStateEvents(
@@ -292,14 +283,14 @@ export async function federationHierarchy(
   if (summary === null) {
     throw new MatrixError(404, 'M_NOT_FOUND', 'room not accessible');
   }
-  const room = await withChildren(summary, suggested, 'admission'),
+  const room = await withChildren(summary, suggested),
     children: Json[] = [],
     inaccessible: string[] = [];
   const seen = new Set<string>();
   for (const edge of childrenOf(room, suggested)) {
     if (seen.has(edge.state_key)) continue;
     seen.add(edge.state_key);
-    if (await lookupRoomForAdmission(edge.state_key) === null) continue;
+    if (await lookupRoom(edge.state_key) === null) continue;
     const child = await localDiscoverySummary(edge.state_key, { origin });
     if (child === null) inaccessible.push(edge.state_key);
     else children.push(child);

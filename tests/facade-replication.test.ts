@@ -25,13 +25,19 @@ import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
 import { startFakeServer } from './federation/fake-server.ts';
 import { serveDeps } from '#engine/federation/context.ts';
 import { serveEvent } from '#engine/federation/serve.ts';
+import { ReplicaReadiness } from '#engine/facade/readiness.ts';
 import { admit } from '#engine/federation/gate.ts';
 import { federationPolicy } from '#engine/federation/policy.ts';
 import { keyStore } from '#engine/federation/keys.ts';
 import { inviteDependencies } from '#engine/federation/dependencies.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
 import { exportKeyRoster, FacadeKeys } from '#engine/facade/control.ts';
+import { exportAccountAuth } from '#engine/facade/accounts.ts';
+import { MembershipOperations } from '#engine/facade/membership.ts';
+import { exportOwnerControl, OwnerControls } from '#engine/facade/ownership.ts';
 import { startInboxWorker } from '#engine/facade/worker.ts';
+import { JournalClient } from '#engine/facade/client.ts';
+import { LinkClient } from '#engine/facade/transport.ts';
 import * as serving from '#engine/federation/serve.ts';
 import { pathfinder } from '@pathfinder/pathfinder';
 import {
@@ -148,6 +154,7 @@ async function fixture(
   seedServer = serverSchema,
   version = '11',
   facadePin = 'b'.repeat(64),
+  homePin = 'a'.repeat(64),
 ) {
   const dir = await Deno.makeTempDir({ prefix: 'facade-replication-' });
   const open = (name: string, schema = serverSchema) =>
@@ -172,7 +179,7 @@ async function fixture(
     await home.server(),
     tenant.signer(),
     tenant.publicB64,
-    'a'.repeat(64),
+    homePin,
   );
   const edgePairings = async () =>
     new Pairings(
@@ -193,11 +200,11 @@ async function fixture(
   await fp.accept(bundle);
   const grant = await hp.grant(
     bundle.id,
-    await fp.challenge(bundle.id, bundle.secret, 'a'.repeat(64)),
+    await fp.challenge(bundle.id, bundle.secret, homePin),
   );
   await hp.confirm(
     bundle.id,
-    await fp.complete(bundle.id, grant, 'a'.repeat(64)),
+    await fp.complete(bundle.id, grant, homePin),
   );
   const signing = await makeRemoteServer(tenant.serverName);
   const source = await makeFakeRoom({
@@ -1172,10 +1179,10 @@ function appliedReadTests() {
             MatrixError,
             'replica unavailable',
           );
-          await assertRejects(
-            () => federationHierarchy(f.source.roomId, 'logical.test', false),
-            MatrixError,
-            'replica unavailable',
+          assertEquals(
+            (await federationHierarchy(f.source.roomId, 'logical.test', false))
+              .room.room_id,
+            f.source.roomId,
           );
           await (await f.edgeServer()).tx((conn) => readAdmission.check(conn));
           const before = await journal.heads('home', 'in', room);
@@ -1295,7 +1302,7 @@ function appliedReadTests() {
     }
   });
 
-  Deno.test('applied read split preserves federation hierarchy child admission', async () => {
+  Deno.test('PAIR503: federation hierarchy serves the applied child publication', async () => {
     const f = await fixture();
     try {
       const root = await createRoom(f.home, {
@@ -1358,31 +1365,46 @@ function appliedReadTests() {
         keyDocument: () => Promise.reject(new Error('unused')),
         publicRooms: async () => (await directory.snapshot())!.publicRooms,
       });
-      assertEquals(
-        (await federationHierarchy(root.roomId, 'logical.test', false)).children
-          .length,
-        1,
+      const initial = await federationHierarchy(
+        root.roomId,
+        'remote.test',
+        false,
       );
+      assertEquals(initial.children.map((child) => child.room_id), [
+        f.source.roomId,
+      ]);
       const next = await f.source.addEvent({
-        type: 'm.room.join_rules',
+        type: 'm.room.server_acl',
         state_key: '',
-        content: { join_rule: 'invite' },
+        content: { allow: ['*'], deny: ['remote.test'] },
       });
       await f.ingest([next]);
       const suffix = await f.exports();
       assert(suffix);
       await journal.receive('home', [suffix]);
-      await assertRejects(
-        () => federationHierarchy(root.roomId, 'logical.test', false),
-        MatrixError,
-        'replica unavailable',
+      const held = await journal.heads('home', 'in', suffix);
+      assertEquals(held.received.sequence, suffix.sequence);
+      assertEquals(held.applied.sequence, childRecord.sequence);
+      assertEquals(
+        await federationHierarchy(root.roomId, 'remote.test', false),
+        initial,
       );
+      assertEquals(await journal.heads('home', 'in', suffix), held);
       const client = await clientHierarchy(
         root.roomId,
         f.source.creator,
         hierarchyQuery(new URLSearchParams('limit=10')),
       );
       assert(client.rooms.some((room) => room.room_id === f.source.roomId));
+      assert(await (await f.replicas()).apply(journal, suffix));
+      const applied = await federationHierarchy(
+        root.roomId,
+        'remote.test',
+        false,
+      );
+      assertEquals(applied.room, initial.room);
+      assertEquals(applied.children, []);
+      assertEquals(applied.inaccessible_children, [f.source.roomId]);
     } finally {
       await closeApp();
       await f.close();
@@ -1660,10 +1682,12 @@ Deno.test('PAIR503: signed membership validation precedes pending facade cuts', 
     const waiting = await child.holdPublication(directoryHold);
     await bounded(waiting.held(), 5000);
     const base = `http://127.0.0.1:${await child.port('client')}`;
-    const call = fedCaller((request) => {
-      const url = new URL(request.url);
-      return fetch(new Request(base + url.pathname, request));
-    }, guest);
+    const caller = (signal?: AbortSignal) =>
+      fedCaller((request) => {
+        const url = new URL(request.url);
+        return fetch(new Request(base + url.pathname, request), { signal });
+      }, guest);
+    const observations = child.observations;
     const event = async (membership: string) => {
       const sender = '@guest:guest.test';
       return await signTemplate({
@@ -1677,29 +1701,65 @@ Deno.test('PAIR503: signed membership validation precedes pending facade cuts', 
         auth_events: [],
       }, guest);
     };
-    const check = async (endpoint: string, membership: string) => {
+    const check = async (
+      endpoint: string,
+      membership: string,
+      stream: string,
+    ) => {
       const valid = await event(membership);
       const uri = '/_matrix/federation/' + endpoint + '/' +
         encodeURIComponent(f.source.roomId) + '/' +
         encodeURIComponent(String(valid.event_id));
-      const pending = await call('PUT', uri, valid);
-      assertEquals([pending.status, pending.body.errcode], [
-        503,
-        'M_UNAVAILABLE',
-      ]);
       const malformed = { ...valid, type: 'm.room.message' };
       const unsigned = await fetch(base + uri, {
         method: 'PUT',
         body: JSON.stringify(malformed),
       });
       await unsigned.body?.cancel();
-      const bad = await call('PUT', uri, malformed);
+      const bad = await caller()('PUT', uri, malformed);
       assertEquals([bad.status, bad.body.errcode], [400, 'M_BAD_JSON']);
       assertEquals(unsigned.status, 401);
+
+      const abort = new AbortController();
+      const mark = observations.mark();
+      const pending = caller(abort.signal)('PUT', uri, valid);
+      try {
+        await bounded(
+          Promise.race([
+            observations.wait(
+              (o) =>
+                o.kind === 'readiness' && o.stream === stream &&
+                o.state === 'pending',
+              mark,
+            ),
+            pending.then(({ status }) => {
+              throw new Error(`membership answered before apply: ${status}`);
+            }),
+          ]),
+          5000,
+        );
+        abort.abort();
+        await bounded(
+          assertRejects(() => pending, DOMException, 'aborted'),
+          5000,
+        );
+        // The server's wait must unwind without releasing the publication.
+        await bounded(
+          observations.wait(
+            (o) =>
+              o.kind === 'readiness' && o.stream === stream &&
+              o.state === 'cancelled',
+            mark,
+          ),
+          5000,
+        );
+      } finally {
+        abort.abort();
+      }
     };
     await t.step(
       'send_join with pending directory',
-      () => check('v2/send_join', 'join'),
+      () => check('v2/send_join', 'join', next.stream),
     );
     await waiting.release();
     await bounded(
@@ -1712,7 +1772,296 @@ Deno.test('PAIR503: signed membership validation precedes pending facade cuts', 
     await bounded((await child.holdPublication(roomHold)).held(), 5000);
     await t.step(
       'send_knock with pending room',
-      () => check('v1/send_knock', 'knock'),
+      () => check('v1/send_knock', 'knock', room.stream),
+    );
+  } finally {
+    await child?.dispose();
+    await tls.close();
+    await f.close();
+    setConfigForTests({});
+  }
+});
+
+for (const dependency of ['directory', 'account'] as const) {
+  Deno.test(`PAIR503: federation admission waits for held ${dependency} publication`, async () => {
+    setConfigForTests({
+      server: { name: 'logical.test' },
+      federation: { enabled: true, mode: 'open' },
+      facade: { phase: 'f2' },
+    });
+    const tls = await facadeTls();
+    const f = await fixture(serverSchema, '11', tls.facadePin);
+    let child: Awaited<ReturnType<typeof facadeProcess>> | undefined;
+    try {
+      const pairings = await f.edgePairings(), server = await f.edgeServer();
+      const journal = new Journal(server, LINK_SUPPORTED);
+      const directory = await f.directoryOwner();
+      const guest = await makeRemoteServer('guest.test');
+      await seedServer(server, guest);
+      const publishDirectory = async () => {
+        await recoverServer(f.home);
+        const record = await exportDirectoryReplica(
+          f.home,
+          f.tenant,
+          f.node.node,
+          f.bundle.id,
+          2,
+        );
+        assert(record);
+        await journal.receive('home', [record]);
+        return record;
+      };
+      let request: Parameters<ReturnType<typeof fedCaller>>;
+      let publication;
+      if (dependency === 'directory') {
+        const room = await f.exports();
+        assert(room);
+        await journal.receive('home', [room]);
+        assert(await (await f.replicas()).apply(journal, room));
+        assert(await directory.apply(journal, await publishDirectory()));
+        await setVisibility(await f.home.server(), f.source.roomId, 'public');
+        publication = await publishDirectory();
+        request = [
+          'GET',
+          '/_matrix/federation/v1/make_knock/' +
+          encodeURIComponent(f.source.roomId) + '/%40guest%3Aguest.test?ver=11',
+        ];
+      } else {
+        const keyOwner = new FacadeKeys(
+          server,
+          f.node.signer(),
+          f.node.publicKey,
+          pairings,
+        );
+        const roster = await exportKeyRoster(
+          f.home,
+          f.tenant,
+          f.node.node,
+          f.bundle.id,
+          (_id, doc) => keyOwner.cosign(doc),
+        );
+        assert(roster);
+        await journal.receive('home', [roster]);
+        assert(await keyOwner.apply(journal, roster));
+        await f.tenant.tx((tx) => tx.users.insert('alice', 'Alice'));
+        const control = await exportOwnerControl(
+          f.home,
+          f.tenant,
+          f.homePairings,
+          f.bundle.id,
+        );
+        await enrolledTenant(
+          f.edgeStore(),
+          pairings,
+          'logical.test',
+          f.node.node,
+        );
+        const controls = new OwnerControls(
+          server,
+          await f.edgeStore().tenant('logical.test'),
+          pairings,
+          f.node,
+        );
+        await journal.receive('home', [control]);
+        assert(await controls.apply(journal, control));
+        publication = await exportAccountAuth(
+          f.home,
+          f.tenant,
+          f.homePairings,
+          f.bundle.id,
+          'alice',
+          false,
+        );
+        assertEquals(
+          await new MembershipOperations(f.home, f.tenant, f.homePairings)
+            .bootstrap('alice', f.bundle.id),
+          [],
+        );
+        assert(await directory.apply(journal, await publishDirectory()));
+        await journal.receive('home', [publication]);
+        const roomId = '!inbound-invite:guest.test';
+        const invite = await signTemplate({
+          room_id: roomId,
+          type: 'm.room.member',
+          sender: '@guest:guest.test',
+          state_key: '@alice:logical.test',
+          content: { membership: 'invite' },
+          depth: 5,
+          prev_events: [],
+          auth_events: [],
+        }, guest);
+        request = [
+          'PUT',
+          '/_matrix/federation/v2/invite/' + encodeURIComponent(roomId) + '/' +
+          encodeURIComponent(String(invite.event_id)),
+          { room_version: '11', event: invite, invite_room_state: [] },
+        ];
+      }
+      const before = await journal.heads('home', 'in', publication);
+      assertEquals(before.received.sequence, publication.sequence);
+      assertEquals(before.applied.sequence, publication.sequence - 1);
+      assert(publication.hash);
+      await f.edgeStore().close();
+      const path = tls.dir + '/readiness.toml';
+      await Deno.writeTextFile(
+        path,
+        `[server]\nname="logical.test"\nrole="facade"\nport=0\n[store]\ndir="${f.dir}/edge"\n[media]\nroot="${f.dir}/media"\n[admin]\nsocket="${tls.dir}/ready.sock"\n[federation]\nenabled=true\nport=0\ncert="${tls.dir}/facade.crt"\nkey="${tls.dir}/facade.key"\n[facade]\nphase="f2"\nnodeid="edge_a"\nurl="https://facade.test"\nlinkport=0\nlinkcert="${tls.dir}/facade.crt"\nlinkkey="${tls.dir}/facade.key"\nlinkcacerts=["${tls.dir}/ca.crt"]\npollseconds=1\n`,
+      );
+      const hold = 'apply:' + publication.stream;
+      child = await facadeProcess(path, 'facade: link/local admin ready', [
+        hold,
+      ]);
+      const waiting = await child.holdPublication(hold);
+      await bounded(waiting.held(), 5000);
+      const base = `http://127.0.0.1:${await child.port('client')}`;
+      const call = fedCaller((request) => {
+        const url = new URL(request.url);
+        return fetch(new Request(base + url.pathname + url.search, request));
+      }, guest);
+      const pending = call(...request);
+      const early = await Promise.race([
+        pending.then((result) => [result.status, result.body.errcode]),
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 750)),
+      ]);
+      await waiting.release();
+      await bounded(
+        child.observations.tail('home', [{
+          ...publication,
+          received: { sequence: publication.sequence, hash: publication.hash },
+        }]),
+        5000,
+      );
+      // A baseline early refusal must not hide an invalid fixture. Check the
+      // exact signed operation after actual apply before asserting the wait.
+      const result = await bounded(
+        early === null ? pending : call(...request),
+        5000,
+      );
+      if (dependency === 'directory') {
+        assertEquals([result.status, result.body.errcode], [
+          403,
+          'M_FORBIDDEN',
+        ]);
+      } else {
+        assertEquals(result.status, 200, JSON.stringify(result.body));
+        assert(object(object(result.body.event).signatures)['logical.test']);
+      }
+      assertEquals(
+        early,
+        null,
+        'admission answered before the required cut applied',
+      );
+    } finally {
+      await child?.dispose();
+      await tls.close();
+      await f.close();
+      setConfigForTests({});
+    }
+  });
+}
+
+Deno.test('PAIR503: missing room delivery waits until poll reconciliation expires', async () => {
+  setConfigForTests({
+    server: { name: 'logical.test' },
+    federation: { enabled: true, mode: 'open' },
+    facade: { phase: 'f2' },
+  });
+  const tls = await facadeTls();
+  const f = await fixture(serverSchema, '11', tls.facadePin, tls.homePin);
+  let child: Awaited<ReturnType<typeof facadeProcess>> | undefined;
+  try {
+    const journal = await f.journal(), directory = await f.directoryOwner();
+    const first = await f.exports(), initial = await f.directoryExport();
+    assert(first?.hash && initial);
+    await journal.receive('home', [first]);
+    await journal.receive('home', [initial]);
+    assert(await (await f.replicas()).apply(journal, first));
+    assert(await directory.apply(journal, initial));
+
+    const message = await f.source.addEvent({
+      type: 'm.room.message',
+      content: { body: 'advertised but not yet delivered' },
+    });
+    await f.ingest([message]);
+    const inventory = await f.directoryExport(), suffix = await f.exports();
+    assert(inventory && suffix?.hash);
+    await journal.receive('home', [inventory]);
+    assert(await directory.apply(journal, inventory));
+    const guest = await makeRemoteServer('guest.test');
+    await seedServer(await f.edgeServer(), guest);
+    await f.edgeStore().close();
+
+    const path = tls.dir + '/expiry.toml';
+    const pollSeconds = 3;
+    await Deno.writeTextFile(
+      path,
+      `[server]\nname="logical.test"\nrole="facade"\nport=0\n[store]\ndir="${f.dir}/edge"\n[media]\nroot="${f.dir}/media"\n[admin]\nsocket="${tls.dir}/expiry.sock"\n[federation]\nenabled=true\nport=0\ncert="${tls.dir}/facade.crt"\nkey="${tls.dir}/facade.key"\n[facade]\nphase="f2"\nnodeid="edge_a"\nurl="https://facade.test"\nlinkport=0\nlinkcert="${tls.dir}/facade.crt"\nlinkkey="${tls.dir}/facade.key"\nlinkcacerts=["${tls.dir}/ca.crt"]\nnotify="poll"\npollseconds=${pollSeconds}\n`,
+    );
+    child = await facadeProcess(path, 'facade: link/local admin ready');
+    const base = `http://127.0.0.1:${await child.port('client')}`;
+    const uri = '/_matrix/federation/v1/make_knock/' +
+      encodeURIComponent(f.source.roomId) + '/%40guest%3Aguest.test?ver=11';
+    const call = fedCaller((request) => {
+      const url = new URL(request.url);
+      return fetch(new Request(base + url.pathname + url.search, request));
+    }, guest);
+    const peer = await f.homePairings.connection(f.bundle.id);
+    assert(peer.grant);
+    const client = new JournalClient(
+      new LinkClient(tls.home, {
+        url: `https://127.0.0.1:${await child.port('link')}`,
+        pin: tls.facadePin,
+      }),
+      {
+        server: peer.context.server,
+        node: peer.context.node,
+        pairing: f.bundle.id,
+        incarnation: peer.grant.body.transcript.body.incarnation,
+        revision: peer.grant.body.revision,
+      },
+      () => Promise.resolve(),
+    );
+    const began = performance.now();
+    const hello = await client.hello();
+    const before = { sequence: first.sequence, hash: first.hash };
+    assertEquals(
+      hello.incoming.find(({ stream }) => stream === suffix.stream)?.received,
+      before,
+    );
+    // No polling or delivery until this request returns. The facade knows the
+    // room needs a higher cut from the installed directory inventory.
+    const mark = child.observations.mark();
+    const pending = call('GET', uri);
+    await bounded(
+      Promise.race([
+        child.observations.wait(
+          (o) =>
+            o.kind === 'readiness' && o.stream === suffix.stream &&
+            o.state === 'pending',
+          mark,
+        ),
+        pending.then(({ status }) => {
+          throw new Error(`federation answered before readiness: ${status}`);
+        }),
+      ]),
+      5000,
+    );
+    const expired = await bounded(pending, pollSeconds * 1000 + 5000);
+    assertEquals([expired.status, expired.body.errcode], [
+      503,
+      'M_UNAVAILABLE',
+    ]);
+    assert(
+      performance.now() - began >= pollSeconds * 1000,
+      'admission answered before the poll freshness window expired',
+    );
+
+    // The expiry was not a publication: the next hello still sees the old cut.
+    assertEquals(
+      (await client.hello()).incoming.find(({ stream }) =>
+        stream === suffix.stream
+      )?.received,
+      before,
     );
   } finally {
     await child?.dispose();
@@ -4419,6 +4768,144 @@ Deno.test('replica service acquisition releases a failed composition before retr
   }
 });
 
+Deno.test('PAIR503: event lookup and ACL answer follow the current replica cut', async (t) => {
+  const f = await fixture();
+  const readiness = new ReplicaReadiness({
+    canDeliver: () => false,
+    onDeliveryLoss: () => () => {},
+  });
+  try {
+    const server = await f.edgeServer(), pairings = await f.edgePairings();
+    const journal = new Journal(
+      server,
+      LINK_CAPABILITIES,
+      (_, stream) => readiness.receiving(stream.incarnation, stream.stream),
+    );
+    const directory = new DirectoryReplicas(
+      server,
+      pairings,
+      f.tenant.serverName,
+      'f1',
+      readiness,
+    );
+    const rooms = await f.replicas();
+    const apply = async (
+      record: NonNullable<Awaited<ReturnType<typeof f.exports>>>,
+    ) => {
+      assert(await rooms.apply(journal, record));
+      readiness.applied(record.incarnation, record.stream);
+    };
+    const initial = await f.exports(), inventory = await f.directoryExport();
+    assert(initial && inventory);
+    await journal.receive('home', [initial]);
+    await apply(initial);
+    await journal.receive('home', [inventory]);
+    assert(await directory.apply(journal, inventory));
+    const tenant = await f.edgeTenant();
+    setConfigForTests({
+      server: { name: 'logical.test', role: 'facade' },
+      facade: { nodeid: 'edge_a' },
+    });
+    await openReplicaApp(f.edgeStore(), tenant, {
+      requireReadScope: (scope, absent) =>
+        directory.requireReadScope(scope, absent),
+      prepareReadRoomScope: (id, absent) =>
+        directory.prepareReadRoomScope(id, absent),
+      requireScope: (scope, absent, signal) =>
+        directory.requireScope(scope, absent, signal),
+      prepareRoomScope: (id, absent) => directory.prepareRoomScope(id, absent),
+      keys: keyStore(server, { signer: f.node.signer() }),
+      signer: f.node.signer(),
+      keyDocument: () => Promise.reject(new Error('unused')),
+      publicRooms: async () => (await directory.snapshot())!.publicRooms,
+    });
+
+    const message = await f.source.addEvent({
+      type: 'm.room.message',
+      content: { msgtype: 'm.text', body: 'new publication' },
+    });
+    await f.ingest([message]);
+    const eventId = String(message.event_id);
+    const suffix = await f.exports();
+    assert(suffix);
+    await journal.receive('home', [suffix]);
+    const entered = Promise.withResolvers<void>();
+    await t.step(
+      'a not-yet-indexed event becomes visible after apply',
+      async () => {
+        const signal = AbortSignal.timeout(5000);
+        const answer = serveEvent(eventId, f.signing.name, {
+          store: f.edgeStore(),
+          server,
+          self: f.tenant.serverName,
+          withCurrentScopes: (read) =>
+            directory.withCurrentScopes(
+              (requireScope) =>
+                read(async (scope) => {
+                  try {
+                    await requireScope(scope);
+                  } finally {
+                    if (scope === 'rooms') entered.resolve();
+                  }
+                }),
+              signal,
+            ),
+        });
+        const result = answer.then((value) => value, (error: unknown) => error);
+        await bounded(entered.promise, 1000);
+        assertEquals(await roomOf(server, eventId), null);
+        await apply(suffix);
+        const found = await result;
+        if (found instanceof Error) throw found;
+        assertEquals(
+          (found as Awaited<typeof answer>).pdus[0].content,
+          message.content,
+        );
+      },
+    );
+
+    await t.step(
+      'an ACL publication replaces a stale success before reply',
+      async () => {
+        const acl = await f.source.addEvent({
+          type: 'm.room.server_acl',
+          state_key: '',
+          content: { allow: ['*'], deny: [f.signing.name] },
+        });
+        await f.ingest([acl]);
+        const suffix = await f.exports();
+        assert(suffix);
+        let reads = 0;
+        await assertRejects(
+          () =>
+            serveEvent(eventId, f.signing.name, {
+              store: f.edgeStore(),
+              server,
+              self: f.tenant.serverName,
+              withCurrentScopes: (read) =>
+                directory.withCurrentScopes(async (requireScope) => {
+                  reads++;
+                  const value = await read(requireScope);
+                  assertEquals(reads, 1);
+                  await journal.receive('home', [suffix]);
+                  await apply(suffix);
+                  return value;
+                }, AbortSignal.timeout(5000)),
+            }),
+          MatrixError,
+          'ACL',
+        );
+        assertEquals(reads, 2);
+      },
+    );
+  } finally {
+    readiness.close();
+    await closeApp();
+    await f.close();
+    setConfigForTests({});
+  }
+});
+
 Deno.test('enrolled replica app composes ordinary reads and recovery without creating home-only workers or a home identity', async () => {
   const f = await fixture();
   try {
@@ -4719,7 +5206,7 @@ Deno.test('directory and peer policy exports use the published server cut withou
   }
 });
 
-Deno.test('real replica HTTP reads distinguish required cuts from absence and bind home directory policy', async () => {
+Deno.test('PAIR503: public federation reads serve the applied publication', async (t) => {
   const f = await fixture();
   let http: Deno.HttpServer<Deno.NetAddr> | undefined;
   setConfigForTests({
@@ -4761,7 +5248,8 @@ Deno.test('real replica HTTP reads distinguish required cuts from absence and bi
         Promise.reject(new Error('unused key-document callback')),
       keys: keyStore(await f.edgeServer(), { signer: f.node.signer() }),
       signer: f.node.signer(),
-      publicRooms: async () => (await directory.snapshot())!.publicRooms,
+      publicRooms: async () =>
+        (await directory.snapshot('applied'))!.publicRooms,
     });
     http = Deno.serve(
       { hostname: '127.0.0.1', port: 0, onListen: () => {} },
@@ -4828,20 +5316,66 @@ Deno.test('real replica HTTP reads distinguish required cuts from absence and bi
     const next = await f.directoryExport();
     assert(next);
     await journal.receive('home', [next]);
-    assertEquals((await call('GET', profile)).status, 503);
     assert(await directory.apply(journal, next));
-    setConfigForTests({
-      server: { name: 'logical.test', role: 'facade' },
-      federation: { enabled: true, publicrooms: false },
-    });
-    const published = await call('GET', p + 'publicRooms');
-    assertEquals(published.status, 200);
-    assertEquals(
-      (published.body.chunk as { room_id: string }[]).map((room) =>
-        room.room_id
-      ),
-      [f.source.roomId],
+    await f.tenant.tx((tx) =>
+      tx.profiles.set('alice', 'displayname', 'New Alice')
     );
+    const newUser = await f.publicExport();
+    assert(newUser);
+    setConfigForTests({
+      server: { name: 'logical.test' },
+      federation: { enabled: true, mode: 'open', publicrooms: false },
+    });
+    const newInventory = await f.directoryExport();
+    assert(newInventory);
+    await journal.receive('home', [newUser]);
+    await journal.receive('home', [newInventory]);
+    const readers = [
+      { name: 'profile', get: () => call('GET', profile) },
+      { name: 'alias', get: () => call('GET', alias) },
+      { name: 'devices', get: () => call('GET', devices) },
+      {
+        name: 'keys query',
+        get: () => call('POST', p + 'user/keys/query', query),
+      },
+    ];
+    for (const { name, get } of readers) {
+      await t.step(name, async () => {
+        const result = await get();
+        assertEquals(result.status, 200, JSON.stringify(result.body));
+        if (name === 'profile') {
+          assertEquals(result.body, { displayname: 'Linked Alice' });
+        } else if (name === 'alias') {
+          assertEquals(result.body, {
+            room_id: f.source.roomId,
+            servers: ['logical.test'],
+          });
+        }
+      });
+    }
+    for (const method of ['GET', 'POST'] as const) {
+      await t.step(method + ' publicRooms', async () => {
+        const result = await call(
+          method,
+          p + 'publicRooms',
+          method === 'POST' ? {} : undefined,
+        );
+        assertEquals(result.status, 200, JSON.stringify(result.body));
+        assertEquals(
+          (result.body.chunk as { room_id: string }[]).map((room) =>
+            room.room_id
+          ),
+          [f.source.roomId],
+        );
+      });
+    }
+    assert(await directory.apply(journal, newInventory));
+    assert(await (await f.publicOwner()).apply(journal, newUser));
+    assertEquals((await call('GET', p + 'publicRooms')).status, 403);
+    assertEquals(await call('GET', profile), {
+      status: 200,
+      body: { displayname: 'New Alice' },
+    });
   } finally {
     await http?.shutdown();
     await closeApp();

@@ -18,6 +18,6 @@ export default async function (request: PathfinderRequest, context: Context) {
     request.params.userId as string,
     origin,
     request.query.getAll('ver'),
-    inviteDeps(),
+    inviteDeps(request._raw.signal),
   );
 }

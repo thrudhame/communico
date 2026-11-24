@@ -50,7 +50,11 @@ export type TransactionDeps = {
 export type TxnResult = { status: number; body: Record<string, unknown> };
 export type TransactionIngress = {
   stage(txnId: string, evidence: RequestEvidence): Promise<void>;
-  receive(origin: string, txnId: string): Promise<TxnResult>;
+  receive(
+    origin: string,
+    txnId: string,
+    signal?: AbortSignal,
+  ): Promise<TxnResult>;
 };
 export type PduResults = Record<
   string,
