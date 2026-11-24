@@ -32,9 +32,33 @@ export function receiptMembership(
     : null;
 }
 
+const publicationReceiptModes = new WeakMap<Conn, () => Promise<boolean>>();
+
+/** Scope the lazy read to one ordered publication attempt. The native server
+ * transaction owns the snapshot, including activation committed by the owner
+ * control writer on a different Conn. Publication only reads that table.
+ * Db.tx supplies a fresh Conn on retry; other receipt writers do not opt in. */
+export function withPublicationReceiptMode<T>(
+  apply: (tx: Conn) => Promise<T>,
+): (tx: Conn) => Promise<T> {
+  return async (tx) => {
+    let mode: Promise<boolean> | undefined;
+    publicationReceiptModes.set(tx, () => mode ??= readGraphReceiptsMode(tx));
+    try {
+      return await apply(tx);
+    } finally {
+      publicationReceiptModes.delete(tx);
+    }
+  };
+}
+
 /** A negotiated F2 activation changes the read contract. F1/standalone keeps
  * its existing stream contract; merely installing this schema does not opt in. */
-export async function graphReceiptsEnabled(tx: Conn): Promise<boolean> {
+export function graphReceiptsEnabled(tx: Conn): Promise<boolean> {
+  return publicationReceiptModes.get(tx)?.() ?? readGraphReceiptsMode(tx);
+}
+
+async function readGraphReceiptsMode(tx: Conn): Promise<boolean> {
   return (await tx.query('SELECT 1 FROM facade_owner_activation LIMIT 1'))
     .length > 0;
 }
