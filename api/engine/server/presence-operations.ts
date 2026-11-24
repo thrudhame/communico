@@ -4,6 +4,7 @@ import type { Conn, Database } from '#engine/store/db.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { domainOf } from '#engine/ids.ts';
 import { receivedFence } from '#engine/facade/journal.ts';
+import { LinkError } from '#engine/facade/protocol.ts';
 import {
   type DomainHistoryProof,
   requireDomainSources,
@@ -148,7 +149,15 @@ export async function acceptPresenceStatus(
     await capturePresenceStatus(conn, value.user);
   }
   const result = await importRegisterOperation(conn, operation);
-  const winner = (await readRegister(conn, operation.semanticKey)).winner;
+  const { winner, pending } = await readRegister(conn, operation.semanticKey);
+  if (pending.some((fact) => fact.operationId === operation.operationId)) {
+    // Roll back this semantic import; the durable journal owns the retry.
+    throw new LinkError(
+      'LINK_UNAVAILABLE',
+      'presence status awaits causal history',
+      503,
+    );
+  }
   return {
     user: value.user as string,
     status: winner ? JSON.parse(winner.payload).status as string | null : null,

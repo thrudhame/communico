@@ -57,7 +57,11 @@ import { appendRecord, type Journal } from './journal.ts';
 import type { OwnerControl } from './ownership.ts';
 import type { Grant, Pairings } from './pairing.ts';
 import { integer, LinkError, object, type Stream, text } from './protocol.ts';
-import { readRegister, type RegisterOperation } from './registers.ts';
+import {
+  causalRegisterOrder,
+  readRegister,
+  type RegisterOperation,
+} from './registers.ts';
 import {
   type DomainBinding,
   type DomainHistory,
@@ -520,18 +524,28 @@ export class DomainOperations {
       ...await db.tx((conn) =>
         notificationOperations(conn, '@' + localpart + ':' + context.server)
       ),
-      ...await db.tx((conn) =>
-        presenceStatusOperations(conn, '@' + localpart + ':' + context.server)
-      ),
     );
+    if (reader === 2) {
+      operations.push(
+        ...causalRegisterOrder(
+          await db.tx((conn) =>
+            presenceStatusOperations(
+              conn,
+              '@' + localpart + ':' + context.server,
+            )
+          ),
+        ),
+      );
+    }
     const records = [];
     for (const operation of operations) {
-      if (
-        operation.source !== source.node ||
-        operation.incarnation !== source.incarnation
-      ) continue;
+      const own = operation.source === source.node &&
+        operation.incarnation === source.incarnation;
+      // Only home attests retained foreign facts. Status dependencies must
+      // travel in causal order even after the receiver's first bootstrap.
+      if (!own && (this.node || operation.kind !== 'presence-status')) continue;
       const view = viewOf({
-        kind: 'domain-operation',
+        kind: own ? 'domain-operation' : 'domain-history',
         server: context.server,
         pairing: context.id,
         grantRevision: grant.body.revision,
@@ -661,7 +675,6 @@ export class DomainOperations {
         ...reportFacts,
         ...forgetFacts,
         ...notificationFacts,
-        ...presenceFacts,
       ]
     ) {
       if (

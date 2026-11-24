@@ -1081,6 +1081,104 @@ Deno.test('domain presence status: received but unapplied suffix refuses without
   }
 });
 
+Deno.test('domain status suffix exports late foreign dependencies before local successors', async () => {
+  const f = await fixture();
+  try {
+    const user = '@alice:logical.test';
+    const home = await f.home.server();
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    const { operation: prior } = await home.tx((tx) =>
+      writeRegister(
+        tx,
+        { source: 'zz_other_edge', incarnation: 'retained-enrollment' },
+        JSON.stringify(['presence-status', 'alice']),
+        'presence-status',
+        JSON.stringify({ user, status: 'foreign' }),
+      )
+    );
+    await setPresence(home, user, 'online', 'successor');
+    const records = (await f.hs.export('alice', f.bundle.id)).filter((record) =>
+      (record.payload as { body: DomainOperation }).body.operation.kind ===
+        'presence-status'
+    );
+    const bodies = records.map((record) =>
+      (record.payload as { body: DomainOperation }).body
+    );
+    const priorIndex = bodies.findIndex((body) =>
+      body.operation.operationId === prior.operationId
+    );
+    const nextIndex = bodies.findIndex((body) =>
+      JSON.parse(body.operation.payload).status === 'successor'
+    );
+    assert(priorIndex >= 0 && nextIndex > priorIndex);
+    assertEquals(bodies[priorIndex].kind, 'domain-history');
+    await f.toEdge(records);
+    assertEquals(
+      (await getPresence(await f.edge.server(), user)).statusMsg,
+      'successor',
+    );
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain status suffix cannot advance the applied cut without authentic causal history', async () => {
+  const f = await fixture();
+  try {
+    const user = '@alice:logical.test';
+    const home = await f.home.server(), edge = await f.edge.server();
+    await f.toEdge(await f.hs.bootstrap('alice', f.bundle.id));
+    const { operation: prior } = await home.tx((tx) =>
+      writeRegister(
+        tx,
+        { source: 'other_edge', incarnation: 'retained-enrollment' },
+        JSON.stringify(['presence-status', 'alice']),
+        'presence-status',
+        JSON.stringify({ user, status: 'foreign' }),
+      )
+    );
+    await setPresence(home, user, 'online', 'successor');
+    const successor = (await f.hs.export('alice', f.bundle.id)).find(
+      (record) => {
+        const { operation } =
+          (record.payload as { body: DomainOperation }).body;
+        return operation.kind === 'presence-status' &&
+          JSON.parse(operation.payload).status === 'successor';
+      },
+    )!;
+    const before = await f.ej.heads('home', 'in', successor);
+    // Exercise a signed old publisher which put the successor in the next
+    // slot instead of sending the required history first.
+    const { hash: _hash, ...body } = {
+      ...successor,
+      sequence: before.received.sequence + 1,
+      previous: before.received.hash,
+    };
+    const record = { ...body, hash: recordHash(body) };
+    await f.ej.receive('home', [record]);
+    await assertRejects(
+      () => f.es.apply(f.ej, record),
+      LinkError,
+      'presence status awaits causal history',
+    );
+    assertEquals(
+      (await f.ej.heads('home', 'in', record)).applied,
+      before.applied,
+    );
+    assertEquals(
+      (await edge.tx((conn) => readRegister(conn, prior.semanticKey))).pending,
+      [],
+    );
+    // Stand in for the independently restored original fact and retry the
+    // same journal record, without changing the pending receipt hash.
+    await edge.tx((conn) => importRegisterOperation(conn, prior));
+    assertEquals(await f.es.apply(f.ej, record), true);
+    assertEquals((await getPresence(edge, user)).statusMsg, 'successor');
+  } finally {
+    await f.close();
+  }
+});
+
 Deno.test('domain bootstrap waits for its retained auth dependency without an identity rejection', async () => {
   const f = await fixture(false);
   try {
