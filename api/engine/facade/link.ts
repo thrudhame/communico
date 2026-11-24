@@ -287,6 +287,7 @@ export function linkHandler(options: {
         ? undefined
         : object(body.answer);
       const held = challenges.get(id);
+      const finish = body.finish === true;
       if (answer && held && answer.challenge === held.token) {
         // Consume before awaiting an owner. A replay, late answer or restarted
         // handler cannot grant an imported observation another fresh lifetime.
@@ -296,6 +297,14 @@ export function linkHandler(options: {
           answer.snapshot,
           () => Math.max(0, performance.now() - held.started),
         );
+      } else if (finish) {
+        throw new LinkError('LINK_DIVERGED', 'live activity challenge expired');
+      }
+      if (finish) {
+        return response({
+          required: [...LINK_CAPABILITIES, LIVE_ACTIVITY_CAPABILITY],
+          challenge,
+        });
       }
       const snapshot = await options.activity.capture(id);
       const nextChallenge = crypto.randomUUID();

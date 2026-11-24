@@ -106,7 +106,6 @@ export async function openJournalClient(
 }
 
 export class JournalClient {
-  private activityChallenge?: string;
   private activityRequest?: string;
   #domainReaderVersion?: 1 | 2;
 
@@ -250,28 +249,15 @@ export class JournalClient {
     return hello;
   }
 
-  /** One home-initiated pull also answers the facade receiver's previous pull.
-   * Neither challenge nor snapshot is a journal record or durable retry item. */
+  /** Both legs use a receiver challenge from this attempt, never from a
+   * previous wake. Receiver-local age bounds the flight without wall-clock
+   * synchronization or subtracting an unrelated poll/reconnect interval. */
   async activity(owner: LiveActivity, signal?: AbortSignal): Promise<void> {
     const challenge = crypto.randomUUID();
     const started = performance.now();
     this.activityRequest = challenge;
-    try {
-      const answer = this.activityChallenge
-        ? {
-          challenge: this.activityChallenge,
-          snapshot: await owner.capture(this.peer.pairing),
-        }
-        : undefined;
-      signal?.throwIfAborted();
-      const value = await this.call('activity', {
-        required: [...LINK_CAPABILITIES, LIVE_ACTIVITY_CAPABILITY],
-        challenge,
-        ...(answer ? { answer } : {}),
-      }, signal);
-      await this.authorized();
-      signal?.throwIfAborted();
-      if (this.activityRequest !== challenge) return;
+    const required = [...LINK_CAPABILITIES, LIVE_ACTIVITY_CAPABILITY];
+    const validate = (value: Record<string, unknown>, expected: string) => {
       if (
         !negotiate(value, this.peer.server, LINK_SUPPORTED).required.some((
           entry,
@@ -285,22 +271,51 @@ export class JournalClient {
           'live activity response not negotiated',
         );
       }
-      if (value.challenge !== challenge) {
+      if (value.challenge !== expected) {
         throw new LinkError('LINK_DIVERGED', 'wrong live activity challenge');
       }
-      this.activityChallenge = text(value.nextChallenge);
-      this.activityRequest = undefined;
-      await owner.apply(
-        this.peer.pairing,
-        value.snapshot,
-        () => Math.max(0, performance.now() - started),
+    };
+    try {
+      const value = await this.call(
+        'activity',
+        { required, challenge },
+        signal,
       );
-    } catch (error) {
+      await this.authorized();
+      signal?.throwIfAborted();
+      if (this.activityRequest !== challenge) return;
+      validate(value, challenge);
+      const next = text(value.nextChallenge);
+      const send = async () => {
+        const snapshot = await owner.capture(this.peer.pairing);
+        signal?.throwIfAborted();
+        if (this.activityRequest !== challenge) return;
+        const finish = crypto.randomUUID();
+        // Older listeners treat this as an ordinary answer and return an
+        // extra snapshot. It is never applied or kept for the next wake.
+        const reply = await this.call('activity', {
+          required,
+          challenge: finish,
+          answer: { challenge: next, snapshot },
+          finish: true,
+        }, signal);
+        validate(reply, finish);
+      };
+      const results = await Promise.allSettled([
+        send(),
+        owner.apply(
+          this.peer.pairing,
+          value.snapshot,
+          () => Math.max(0, performance.now() - started),
+        ),
+      ]);
+      for (const result of results) {
+        if (result.status === 'rejected') throw result.reason;
+      }
+    } finally {
       if (this.activityRequest === challenge) {
         this.activityRequest = undefined;
-        this.activityChallenge = undefined;
       }
-      throw error;
     }
   }
 

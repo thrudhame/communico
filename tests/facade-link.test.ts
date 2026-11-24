@@ -610,22 +610,64 @@ Deno.test('live link: home pull subtracts its own round trip and answers only a 
       },
     };
     await client.activity(activity);
-    assertEquals(captures, 0, 'unsolicited home observations are not pushed');
-    assertEquals(homeAges, [41_000]);
+    assertEquals(
+      captures,
+      1,
+      'answer the receiver challenge within the exchange',
+    );
+    assertEquals(homeAges, [46_000]);
+    assertEquals(facadeAges, [6_000]);
     now += 2_000;
     await client.activity(activity);
-    assertEquals(captures, 1);
-    assertEquals(facadeAges, [8_000]);
-    assertEquals(homeAges, [41_000, 46_000]);
+    assertEquals(captures, 2);
+    assertEquals(facadeAges, [6_000, 6_000]);
+    assertEquals(homeAges, [46_000, 46_000]);
     f.restartLink();
     await client.activity(activity);
-    assertEquals(
-      facadeAges.length,
-      1,
-      'restart discards the pending challenge',
-    );
-    await client.activity(activity);
-    assertEquals(facadeAges.length, 2, 'fresh pull recovers after restart');
+    assertEquals(facadeAges.length, 3, 'a fresh challenge works after restart');
+  } finally {
+    Object.defineProperty(performance, 'now', {
+      configurable: true,
+      value: clock,
+    });
+    await f.close();
+  }
+});
+
+Deno.test('live link: unrelated idle time never expires a fresh home snapshot', async () => {
+  let now = 1_000;
+  const clock = performance.now;
+  Object.defineProperty(performance, 'now', {
+    configurable: true,
+    value: () => now,
+  });
+  let visible = false;
+  const f = await fixture(LINK_SUPPORTED, {
+    activity: {
+      capture: () => Promise.resolve({}),
+      apply: (_pairing, snapshot, elapsed) => {
+        visible =
+          elapsed() < Number((snapshot as { remainingMs: number }).remainingMs);
+        return Promise.resolve();
+      },
+    },
+  });
+  try {
+    const bundle = await f.create();
+    await f.fp.accept(bundle);
+    await enrollLink(f.hp, bundle.id, f.tls.home, bundle.secret);
+    const client = await openJournalClient(f.hp, bundle.id, f.tls.home);
+    let remainingMs = 0;
+    const owner = {
+      capture: () => Promise.resolve({ remainingMs }),
+      apply: () => Promise.resolve(),
+    };
+    await client.activity(owner);
+    assertEquals(visible, false);
+    now += 60_000;
+    remainingMs = 30_000;
+    await client.activity(owner);
+    assertEquals(visible, true, 'fresh snapshot after an idle period');
   } finally {
     Object.defineProperty(performance, 'now', {
       configurable: true,
@@ -661,7 +703,9 @@ Deno.test('live link: client refuses substituted, unnegotiated and superseded an
         nextChallenge: crypto.randomUUID(),
         snapshot: {},
       });
-      if (mode !== 'held') return Promise.resolve(answer);
+      if (mode !== 'held' || request.finish === true) {
+        return Promise.resolve(answer);
+      }
       const wait = Promise.withResolvers<Response>();
       pending.push({ answer, resolve: wait.resolve });
       return wait.promise;
