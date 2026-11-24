@@ -86,6 +86,11 @@ export async function startFacade(
           }
           if (required === 'public' || required === 'rooms') {
             await runtime.requireScope('directory');
+          }
+          if (
+            required === 'public' || required === 'rooms' ||
+            required === 'membership-send'
+          ) {
             if (
               !(await federationPolicy(runtime.server)).enabled
             ) {

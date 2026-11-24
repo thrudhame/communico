@@ -6,6 +6,7 @@ export type Scope =
   | 'keys'
   | 'public'
   | 'rooms'
+  | 'membership-send'
   | 'ingress'
   | 'auth'
   | 'domain'
@@ -286,15 +287,20 @@ const F2_MEMBERSHIP: readonly Rule[] = [
     route('GET', new RegExp('^' + f + name + '/[^/]+/[^/]+$'), 'rooms')
   ),
   ...['send_join', 'send_knock', 'send_leave'].map((name) =>
-    route('PUT', new RegExp('^' + f + name + '/[^/]+/[^/]+$'), 'rooms')
+    route(
+      'PUT',
+      new RegExp('^' + f + name + '/[^/]+/[^/]+$'),
+      'membership-send',
+    )
   ),
-  ...['send_join', 'send_leave', 'invite'].map((name) =>
+  ...['send_join', 'send_leave'].map((name) =>
     route(
       'PUT',
       new RegExp('^/_matrix/federation/v2/' + name + '/[^/]+/[^/]+$'),
-      'rooms',
+      'membership-send',
     )
   ),
+  route('PUT', /^\/_matrix\/federation\/v2\/invite\/[^/]+\/[^/]+$/, 'rooms'),
   ...['join', 'knock'].map((name) =>
     route(
       'POST',

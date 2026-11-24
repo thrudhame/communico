@@ -4,7 +4,9 @@ import { Journal } from '#engine/facade/journal.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
 import { AuthLinkHealth } from '#engine/facade/auth.ts';
 import { FacadeKeys } from '#engine/facade/control.ts';
+import { DirectoryReplicas } from '#engine/facade/directory.ts';
 import { HomeEgress } from '#engine/facade/home-egress.ts';
+import { RoomReplicas } from '#engine/facade/replication.ts';
 import { InboxWorker } from '#engine/facade/worker.ts';
 import { ActivityExchange } from '#engine/facade/activity.ts';
 import { noticeHeads } from '#engine/facade/notices.ts';
@@ -158,6 +160,18 @@ Journal.prototype.apply = observeJournalApplication(
   completed,
   failure,
 );
+// Keep the durable receipt visible without entering the application's write
+// transaction or changing how the replica evaluates readiness.
+const directoryApply = DirectoryReplicas.prototype.apply;
+DirectoryReplicas.prototype.apply = async function (...args) {
+  await beforeFacadePublication('apply:' + args[1].stream);
+  return await directoryApply.apply(this, args);
+};
+const roomApply = RoomReplicas.prototype.apply;
+RoomReplicas.prototype.apply = async function (...args) {
+  await beforeFacadePublication('apply:' + args[1].stream);
+  return await roomApply.apply(this, args);
+};
 
 // Hold publication of already committed bytes outside every transaction. The
 // private proof controller arms this before its source mutation. No product

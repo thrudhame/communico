@@ -55,7 +55,7 @@ import {
   makeServer,
   seedServer,
 } from './federation/doc-helper.ts';
-import { fedCaller } from './http-federation.ts';
+import { fedCaller, signTemplate } from './http-federation.ts';
 import {
   certificatePin,
   enrolledTenant,
@@ -1635,6 +1635,105 @@ Deno.test('directory inventory rejects malformed room identities', async (t) => 
         await f.close();
       }
     });
+  }
+});
+
+Deno.test('PAIR503: signed membership validation precedes pending facade cuts', async (t) => {
+  setConfigForTests({
+    server: { name: 'logical.test' },
+    federation: { enabled: true, mode: 'open' },
+    facade: { phase: 'f2' },
+  });
+  const tls = await facadeTls();
+  const f = await fixture(serverSchema, '11', certificatePin(tls.facade.cert));
+  let child: Awaited<ReturnType<typeof facadeProcess>> | undefined;
+  try {
+    const journal = await f.journal(), directory = await f.directoryOwner();
+    const initial = await f.directoryExport();
+    assert(initial);
+    await journal.receive('home', [initial]);
+    assert(await directory.apply(journal, initial));
+    const guest = await makeRemoteServer('guest.test');
+    await seedServer(await f.edgeServer(), guest);
+    await setVisibility(await f.home.server(), f.source.roomId, 'public');
+    const room = await f.exports(), next = await f.directoryExport();
+    assert(next?.hash && room);
+    await journal.receive('home', [next]);
+    await journal.receive('home', [room]);
+    await f.edgeStore().close();
+    const path = tls.dir + '/membership.toml';
+    await Deno.writeTextFile(
+      path,
+      `[server]\nname="logical.test"\nrole="facade"\nport=0\n[store]\ndir="${f.dir}/edge"\n[media]\nroot="${f.dir}/media"\n[admin]\nsocket="${tls.dir}/mem.sock"\n[federation]\nenabled=true\nport=0\ncert="${tls.dir}/facade.crt"\nkey="${tls.dir}/facade.key"\n[facade]\nphase="f2"\nnodeid="edge_a"\nurl="https://facade.test"\nlinkport=0\nlinkcert="${tls.dir}/facade.crt"\nlinkkey="${tls.dir}/facade.key"\nlinkcacerts=["${tls.dir}/ca.crt"]\npollseconds=1\n`,
+    );
+    const directoryHold = 'apply:' + next.stream;
+    const roomHold = 'apply:' + room.stream;
+    child = await facadeProcess(path, 'facade: link/local admin ready', [
+      directoryHold,
+      roomHold,
+    ]);
+    const waiting = await child.holdPublication(directoryHold);
+    await bounded(waiting.held(), 5000);
+    const base = `http://127.0.0.1:${await child.port('client')}`;
+    const call = fedCaller((request) => {
+      const url = new URL(request.url);
+      return fetch(new Request(base + url.pathname, request));
+    }, guest);
+    const event = async (membership: string) => {
+      const sender = '@guest:guest.test';
+      return await signTemplate({
+        room_id: f.source.roomId,
+        type: 'm.room.member',
+        sender,
+        state_key: sender,
+        content: { membership },
+        depth: 5,
+        prev_events: [],
+        auth_events: [],
+      }, guest);
+    };
+    const check = async (endpoint: string, membership: string) => {
+      const valid = await event(membership);
+      const uri = '/_matrix/federation/' + endpoint + '/' +
+        encodeURIComponent(f.source.roomId) + '/' +
+        encodeURIComponent(String(valid.event_id));
+      const pending = await call('PUT', uri, valid);
+      assertEquals([pending.status, pending.body.errcode], [
+        503,
+        'M_UNAVAILABLE',
+      ]);
+      const malformed = { ...valid, type: 'm.room.message' };
+      const unsigned = await fetch(base + uri, {
+        method: 'PUT',
+        body: JSON.stringify(malformed),
+      });
+      await unsigned.body?.cancel();
+      const bad = await call('PUT', uri, malformed);
+      assertEquals([bad.status, bad.body.errcode], [400, 'M_BAD_JSON']);
+      assertEquals(unsigned.status, 401);
+    };
+    await t.step(
+      'send_join with pending directory',
+      () => check('v2/send_join', 'join'),
+    );
+    await waiting.release();
+    await bounded(
+      child.observations.tail('home', [{
+        ...next,
+        received: { sequence: next.sequence, hash: next.hash },
+      }]),
+      5000,
+    );
+    await bounded((await child.holdPublication(roomHold)).held(), 5000);
+    await t.step(
+      'send_knock with pending room',
+      () => check('v1/send_knock', 'knock'),
+    );
+  } finally {
+    await child?.dispose();
+    await tls.close();
+    await f.close();
+    setConfigForTests({});
   }
 });
 

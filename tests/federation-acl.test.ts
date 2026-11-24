@@ -105,6 +105,19 @@ Deno.test('ACL: all resident serving and membership template classes use current
     ];
     for (const read of readers) await read();
     await deny(g);
+    const member = (kind: 'join' | 'leave' | 'knock') => ({
+      room_id: g.roomId,
+      type: 'm.room.member',
+      sender: '@bob:remote.test',
+      state_key: '@bob:remote.test',
+      content: { membership: kind },
+      depth: 1,
+      origin_server_ts: 0,
+      prev_events: [],
+      auth_events: [],
+      hashes: { sha256: 'A'.repeat(43) },
+      signatures: {},
+    });
     for (
       const deniedKnock of [
         () =>
@@ -115,13 +128,27 @@ Deno.test('ACL: all resident serving and membership template classes use current
             ['11'],
             membership,
           ),
-        () => sendKnock(g.roomId, '$missing', {}, 'remote.test', membership),
+        () =>
+          sendKnock(
+            g.roomId,
+            '$missing',
+            member('knock'),
+            'remote.test',
+            membership,
+          ),
       ]
     ) {
       const error = await assertRejects(deniedKnock, MatrixError);
       assertEquals(error.status, 403);
       assertEquals(error.message, 'M_FORBIDDEN: server denied by room ACL');
     }
+    // PAIR503 ruling (2026-11-23): intrinsic errors take precedence over ACL
+    // because their rejection neither admits the origin nor reads room state.
+    const malformed = await assertRejects(
+      () => sendKnock(g.roomId, '$missing', {}, 'remote.test', membership),
+      MatrixError,
+    );
+    assertEquals([malformed.status, malformed.errcode], [400, 'M_BAD_JSON']);
     for (const read of readers) {
       const error = await assertRejects(read, MatrixError);
       assertEquals(error.status, 403);
@@ -129,13 +156,17 @@ Deno.test('ACL: all resident serving and membership template classes use current
     }
     for (const v of ['v1', 'v2'] as const) {
       for (const send of [sendJoin, sendLeave]) {
-        assertEquals(
-          (await assertRejects(
-            () => send(g.roomId, '$missing', {}, 'remote.test', v, membership),
-            MatrixError,
-          )).status,
-          403,
+        const bad = await assertRejects(
+          () => send(g.roomId, '$missing', {}, 'remote.test', v, membership),
+          MatrixError,
         );
+        assertEquals([bad.status, bad.errcode], [400, 'M_BAD_JSON']);
+        const body = member(send === sendJoin ? 'join' : 'leave');
+        const denied = await assertRejects(
+          () => send(g.roomId, '$missing', body, 'remote.test', v, membership),
+          MatrixError,
+        );
+        assertEquals([denied.status, denied.errcode], [403, 'M_FORBIDDEN']);
       }
     }
     assertEquals(

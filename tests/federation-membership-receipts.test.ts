@@ -28,6 +28,22 @@ const self = 'logical.test';
 const creator = '@alice:' + self;
 const guest = '@zoe:remote.test';
 
+function membershipWireShape(roomId: string, membership: string) {
+  return {
+    room_id: roomId,
+    type: 'm.room.member',
+    sender: guest,
+    state_key: guest,
+    content: { membership },
+    depth: 1,
+    origin_server_ts: 0,
+    prev_events: [],
+    auth_events: [],
+    hashes: { sha256: 'A'.repeat(43) },
+    signatures: {},
+  };
+}
+
 async function fixture(knock = false) {
   const dir = await Deno.makeTempDir({ prefix: 'membership-receipt-' });
   const options = {
@@ -485,7 +501,7 @@ Deno.test('resident knock and leave new work requires scope while exact results 
   }
 });
 
-Deno.test('resident new work cannot classify incomplete room evidence as a malformed event', async () => {
+Deno.test('PAIR503: intrinsic membership validation precedes pending room admission', async (t) => {
   const f = await fixture();
   try {
     const deps = {
@@ -497,31 +513,32 @@ Deno.test('resident new work cannot classify incomplete room evidence as a malfo
     };
     const head = await f.changes();
     for (const membership of ['join', 'knock', 'leave'] as const) {
-      const error = await assertRejects(
-        () =>
-          membership === 'knock'
-            ? sendKnock(f.roomId, '$new', {}, f.remote.name, deps)
-            : membership === 'join'
-            ? sendJoin(f.roomId, '$new', {}, f.remote.name, 'v2', deps)
-            : sendLeave(f.roomId, '$new', {}, f.remote.name, 'v2', deps),
-        MatrixError,
-      );
-      assertEquals(error.status, 503);
-      const absent = '!absent:logical.test';
-      const missing = await assertRejects(
-        () =>
-          membership === 'knock'
-            ? sendKnock(absent, '$new', {}, f.remote.name, deps)
-            : membership === 'join'
-            ? sendJoin(absent, '$new', {}, f.remote.name, 'v2', deps)
-            : sendLeave(absent, '$new', {}, f.remote.name, 'v2', deps),
-        MatrixError,
-      );
-      assertEquals(
-        missing.status,
-        503,
-        'a missing required file is not known absence',
-      );
+      await t.step(membership, async () => {
+        for (const roomId of [f.roomId, '!absent:logical.test']) {
+          const valid = membershipWireShape(roomId, membership);
+          const send = (body: unknown) =>
+            membership === 'knock'
+              ? sendKnock(roomId, '$new', body, f.remote.name, deps)
+              : membership === 'join'
+              ? sendJoin(roomId, '$new', body, f.remote.name, 'v2', deps)
+              : sendLeave(roomId, '$new', body, f.remote.name, 'v2', deps);
+          const pending = await assertRejects(() => send(valid), MatrixError);
+          assertEquals(pending.status, 503);
+          assertEquals(pending.errcode, 'M_UNAVAILABLE');
+          for (
+            const body of [
+              null,
+              [],
+              { ...valid, type: 'm.room.message' },
+              { ...valid, content: [] },
+              { ...valid, content: { membership, reason: 'x'.repeat(65536) } },
+            ]
+          ) {
+            const bad = await assertRejects(() => send(body), MatrixError);
+            assertEquals([bad.status, bad.errcode], [400, 'M_BAD_JSON']);
+          }
+        }
+      });
     }
     assertEquals(await f.changes(), head);
   } finally {
@@ -554,13 +571,14 @@ Deno.test('resident membership distinguishes directory-proved absence from a mis
         assertEquals(error.status, knownAbsent ? 404 : 503);
       }
       for (const membership of ['join', 'knock', 'leave'] as const) {
+        const body = membershipWireShape(absent, membership);
         const error = await assertRejects(
           () =>
             membership === 'knock'
-              ? sendKnock(absent, '$new', {}, f.remote.name, deps)
+              ? sendKnock(absent, '$new', body, f.remote.name, deps)
               : membership === 'join'
-              ? sendJoin(absent, '$new', {}, f.remote.name, 'v2', deps)
-              : sendLeave(absent, '$new', {}, f.remote.name, 'v2', deps),
+              ? sendJoin(absent, '$new', body, f.remote.name, 'v2', deps)
+              : sendLeave(absent, '$new', body, f.remote.name, 'v2', deps),
           MatrixError,
         );
         assertEquals(error.status, knownAbsent ? 404 : 503);
@@ -833,7 +851,14 @@ Deno.test('completed membership replays survive later ACL changes while new oper
     const reopened = await f.deps();
     const refused = await assertRejects(
       () =>
-        sendJoin(f.roomId, '$new-operation', {}, f.remote.name, 'v2', reopened),
+        sendJoin(
+          f.roomId,
+          '$new-operation',
+          wire,
+          f.remote.name,
+          'v2',
+          reopened,
+        ),
       MatrixError,
     );
     assertEquals(refused.status, 403);
