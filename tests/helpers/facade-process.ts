@@ -41,6 +41,7 @@ export type FacadeObservation =
     hash?: string;
   }
   | { kind: 'publication'; name: string; state: 'armed' | 'held' | 'released' }
+  | { kind: 'readiness'; stream: string; state: 'pending' | 'cancelled' }
   | {
     kind: 'failure' | 'blocked';
     operation: string;

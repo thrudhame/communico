@@ -29,6 +29,7 @@ import { RoomReplicas, startRoomExports } from './replication.ts';
 import { replicationProgress } from './progress.ts';
 import { PublicReplicas } from './public.ts';
 import { DirectoryReplicas } from './directory.ts';
+import { ReplicaReadiness } from './readiness.ts';
 import { LINK_SUPPORTED, LinkError } from './protocol.ts';
 import { OwnerControls } from './ownership.ts';
 import { bindRole } from './role.ts';
@@ -79,6 +80,7 @@ export async function openFacadeRuntime(
   const settings = config().facade;
   const caps = capabilities(config().server.role, settings.phase);
   const authHealth = new AuthLinkHealth(settings);
+  const readiness = new ReplicaReadiness(authHealth);
   if (!caps.service('link-server')) {
     throw new LinkError(
       'LINK_IDENTITY_MISMATCH',
@@ -98,7 +100,14 @@ export async function openFacadeRuntime(
     beforeStartup: (store) => bindRole(store, identity),
   });
   const server = await store.server();
-  const journal = new Journal(server, LINK_SUPPORTED);
+  const journal = new Journal(
+    server,
+    LINK_SUPPORTED,
+    (peer, stream) =>
+      peer === 'home' && stream.source === 'home'
+        ? readiness.receiving(stream.incarnation, stream.stream)
+        : undefined,
+  );
   const notices = new NoticeHub();
   let node: NodeIdentity | undefined;
   let tenant: Tenant | undefined;
@@ -168,6 +177,7 @@ export async function openFacadeRuntime(
     );
   const refreshBinding = async () => {
     if (closed) return;
+    readiness.bindingChanged();
     notices.changed();
     inbox?.wake();
     if (!node) return;
@@ -463,8 +473,17 @@ export async function openFacadeRuntime(
               ),
           ).apply(journal, stream)
           : await apply(journal, stream),
-      changed: () => notices.changed(),
-      failed: (error, stream, after) =>
+      changed: (stream) => {
+        readiness.applied(stream.incarnation, stream.stream);
+        notices.changed();
+      },
+      failed: (error, stream, after) => {
+        if (
+          stream && after !== undefined && error instanceof LinkError &&
+          ['LINK_BAD_RECORD', 'LINK_CAPABILITY_MISMATCH'].includes(error.code)
+        ) {
+          readiness.refused(stream.incarnation, stream.stream, after);
+        }
         inboxFailure(
           {
             server: identity.server,
@@ -477,7 +496,8 @@ export async function openFacadeRuntime(
           error,
           stream,
           after,
-        ),
+        );
+      },
     });
   }
   const releaseServices = async () => {
@@ -654,14 +674,20 @@ export async function openFacadeRuntime(
       if (mailbox) return mailbox;
       const owner = await pairings();
       await owner.active();
-      const directory = new DirectoryReplicas(server, owner, identity.server);
+      const directory = new DirectoryReplicas(
+        server,
+        owner,
+        identity.server,
+        settings.phase as 'f1' | 'f2',
+        readiness,
+      );
       mailbox = new Mailbox(server, {
         self: identity.server,
         node: node!,
         pairings: owner,
         transaction,
         phase: settings.phase as 'f1' | 'f2',
-        scopeState: (scope) => directory.scopeState(scope),
+        scopeState: (scope, signal) => directory.scopeState(scope, signal),
         acceptEdu: (origin, raw, phase, receivedMs) =>
           acceptIngressEdu(
             origin,
@@ -722,23 +748,44 @@ export async function openFacadeRuntime(
         identity.server,
       ).prepareReadRoomScope(roomId, allowAbsent);
     },
-    async requireScope(scope: string, allowAbsent?: boolean) {
+    async withCurrentScopes<T>(
+      read: (requireScope: (scope: string) => Promise<void>) => Promise<T>,
+      signal: AbortSignal,
+    ): Promise<T> {
       return await new DirectoryReplicas(
         server,
         await pairings(),
         identity.server,
-      ).requireScope(scope, allowAbsent);
+        settings.phase as 'f1' | 'f2',
+        readiness,
+      ).withCurrentScopes(read, signal);
     },
-    async prepareRoomScope(
-      roomId: string,
+    async requireScope(
+      scope: string,
       allowAbsent?: boolean,
-      localUser?: string,
+      signal?: AbortSignal,
     ) {
       return await new DirectoryReplicas(
         server,
         await pairings(),
         identity.server,
-      ).prepareRoomScope(roomId, allowAbsent, localUser);
+        settings.phase as 'f1' | 'f2',
+        readiness,
+      ).requireScope(scope, allowAbsent, signal);
+    },
+    async prepareRoomScope(
+      roomId: string,
+      allowAbsent?: boolean,
+      localUser?: string,
+      signal?: AbortSignal,
+    ) {
+      return await new DirectoryReplicas(
+        server,
+        await pairings(),
+        identity.server,
+        settings.phase as 'f1' | 'f2',
+        readiness,
+      ).prepareRoomScope(roomId, allowAbsent, localUser, signal);
     },
     async publicRooms() {
       const owner = new DirectoryReplicas(
@@ -746,7 +793,7 @@ export async function openFacadeRuntime(
         await pairings(),
         identity.server,
       );
-      const view = await owner.snapshot();
+      const view = await owner.snapshot('applied');
       if (!view) {
         throw new MatrixError(
           503,
@@ -828,6 +875,11 @@ export async function openFacadeRuntime(
         },
         notices,
         changed: refresh,
+        received: () => {
+          notices.changed();
+          inbox?.wake();
+        },
+        reconciled: (pairing) => authHealth.reconciled(pairing),
         contacted: () => contacts.observe(server.path, Date.now()),
         reconciling: () => authHealth.reconciliation(),
         connected: (pairing, signal) => authHealth.connected(pairing, signal),
@@ -869,6 +921,7 @@ export async function openFacadeRuntime(
     keyDocument: async () => await (await keyOwner()).document(),
     close: () =>
       closed ??= (async () => {
+        readiness.close();
         await refreshing;
         await releaseRoomExports();
         await authExports?.close();

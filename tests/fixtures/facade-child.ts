@@ -5,8 +5,13 @@ import { Pairings } from '#engine/facade/pairing.ts';
 import { AuthLinkHealth } from '#engine/facade/auth.ts';
 import { FacadeKeys } from '#engine/facade/control.ts';
 import { DirectoryReplicas } from '#engine/facade/directory.ts';
+import { AccountSnapshots } from '#engine/facade/accounts.ts';
 import { HomeEgress } from '#engine/facade/home-egress.ts';
 import { RoomReplicas } from '#engine/facade/replication.ts';
+import {
+  ReplicaCutPending,
+  ReplicaReadiness,
+} from '#engine/facade/readiness.ts';
 import { InboxWorker } from '#engine/facade/worker.ts';
 import { ActivityExchange } from '#engine/facade/activity.ts';
 import { noticeHeads } from '#engine/facade/notices.ts';
@@ -172,6 +177,11 @@ RoomReplicas.prototype.apply = async function (...args) {
   await beforeFacadePublication('apply:' + args[1].stream);
   return await roomApply.apply(this, args);
 };
+const accountApply = AccountSnapshots.prototype.apply;
+AccountSnapshots.prototype.apply = async function (...args) {
+  await beforeFacadePublication('apply:' + args[1].stream);
+  return await accountApply.apply(this, args);
+};
 
 // Hold publication of already committed bytes outside every transaction. The
 // private proof controller arms this before its source mutation. No product
@@ -251,6 +261,34 @@ Pairings.prototype.retire = async function (...args) {
   } catch (error) {
     failure('pairing retire', error);
     throw error;
+  }
+};
+
+const waitForReadiness = ReplicaReadiness.prototype.wait;
+ReplicaReadiness.prototype.wait = async function <T>(
+  read: (observe: (pairing: string, stream: string) => void) => Promise<T>,
+  signal: AbortSignal,
+): Promise<T> {
+  let stream: string | undefined;
+  const observedRead = async (
+    observe: (pairing: string, stream: string) => void,
+  ) => {
+    try {
+      return await read(observe);
+    } catch (error) {
+      if (error instanceof ReplicaCutPending && stream === undefined) {
+        stream = error.stream;
+        emit({ kind: 'readiness', stream, state: 'pending' });
+      }
+      throw error;
+    }
+  };
+  try {
+    return await waitForReadiness.call(this, observedRead, signal) as T;
+  } finally {
+    if (stream !== undefined && signal.aborted) {
+      emit({ kind: 'readiness', stream, state: 'cancelled' });
+    }
   }
 };
 

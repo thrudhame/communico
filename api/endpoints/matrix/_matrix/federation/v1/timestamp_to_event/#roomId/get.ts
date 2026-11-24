@@ -19,6 +19,6 @@ export default async function (request: PathfinderRequest, context: Context) {
     request.params.roomId as string,
     parseTimestampQuery(request.query),
     origin,
-    serveDeps(),
+    serveDeps(request._raw.signal),
   );
 }

@@ -43,6 +43,7 @@ export async function startFacade(
           requireReadScope: runtime.requireReadScope,
           prepareReadRoomScope: runtime.prepareReadRoomScope,
           requireScope: runtime.requireScope,
+          withCurrentScopes: runtime.withCurrentScopes,
           prepareRoomScope: runtime.prepareRoomScope,
           keyDocument: runtime.keyDocument,
           publicRooms: runtime.publicRooms,
@@ -85,7 +86,9 @@ export async function startFacade(
             );
           }
           if (required === 'public' || required === 'rooms') {
-            await runtime.requireScope('directory');
+            // Require the applied bootstrap only. Endpoint owners decide if
+            // an admission also needs a particular current cut.
+            await runtime.requireReadScope('directory');
           }
           if (
             required === 'public' || required === 'rooms' ||

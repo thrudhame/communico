@@ -22,7 +22,11 @@ export default async function (
   const app = theApp();
   const ingress = app.federationIngress;
   if (ingress) {
-    return (await ingress.receive(origin, request.params.txnId as string)).body;
+    return (await ingress.receive(
+      origin,
+      request.params.txnId as string,
+      request._raw.signal,
+    )).body;
   }
   if (app.replica) {
     throw new MatrixError(503, 'M_UNAVAILABLE', 'durable ingress unavailable');
