@@ -19,6 +19,7 @@ export function inviteDependencies(
     keys: productionKeyResolver(app.federationKeys),
     self: app.tenant.serverName,
     wake: (destination) => app.sender?.wake(destination),
+    admissionSignal: app.replica ? signal : undefined,
     requireDirectoryScope: app.replica
       ? () => app.replica!.requireScope('directory', false, signal)
       : undefined,
