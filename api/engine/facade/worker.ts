@@ -385,6 +385,9 @@ export class InboxWorker {
     const running = new Map<string, Promise<void>>();
     const rerun = new Set<string>();
     const dependencies = new ApplicationDependencies();
+    // Keep the pre-apply head until a read can verify durable advancement,
+    // even if the first read after application fails and the scan ends.
+    const unconfirmed = new Map<string, number>();
     let dirty = false;
     const start = (stream: Stream) => {
       if (stopped) return;
@@ -399,29 +402,29 @@ export class InboxWorker {
             rerun.delete(id);
             let applied: number | undefined;
             try {
-              const heads = await options.journal.heads(
-                options.peer,
-                'in',
-                stream,
-              );
-              applied = heads.applied.sequence;
-              dependencies.track(stream, heads, () => start(stream));
-              while (!stopped && await options.apply(stream)) {
-                const next = await options.journal.heads(
+              while (true) {
+                const heads = await options.journal.heads(
                   options.peer,
                   'in',
                   stream,
                 );
-                if (next.applied.sequence <= applied) {
+                const before = unconfirmed.get(id);
+                unconfirmed.delete(id);
+                applied = before ?? heads.applied.sequence;
+                if (before !== undefined && heads.applied.sequence <= before) {
                   throw new LinkError(
                     'LINK_DIVERGED',
                     'domain reported application without durable completion',
                   );
                 }
-                applied = next.applied.sequence;
-                dependencies.track(stream, next, () => start(stream));
-                dependencies.progressed(stream);
-                options.changed(stream);
+                applied = heads.applied.sequence;
+                dependencies.track(stream, heads, () => start(stream));
+                if (before !== undefined) {
+                  dependencies.progressed(stream);
+                  options.changed(stream);
+                }
+                if (stopped || !await options.apply(stream)) break;
+                unconfirmed.set(id, applied);
               }
             } catch (error) {
               this.failed(error, stream, applied);
