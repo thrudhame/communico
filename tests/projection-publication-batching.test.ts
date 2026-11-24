@@ -19,6 +19,11 @@ import { projectTenant } from '#engine/server/project-tenant.ts';
 import { setReceipt } from '#engine/server/ephemeral.ts';
 import { finishRoomRemoval } from '#engine/server/removal.ts';
 import { advanceNotificationRead } from '#engine/server/notifications.ts';
+import { syncStreamHeads } from '#engine/server/stream.ts';
+import { initializeNode } from '#engine/facade/identity.ts';
+import { exportOwnerControl } from '#engine/facade/ownership.ts';
+import { Pairings } from '#engine/facade/pairing.ts';
+import { LINK_CAPABILITIES } from '#engine/facade/protocol.ts';
 import { bobJoins, genesis } from '#tests/fixtures/genesis.ts';
 
 async function fixture(
@@ -793,97 +798,217 @@ for (
   });
 }
 
-Deno.test('publication batching: same-room dependent effects equal ordered unit commits', async () => {
-  await fixture(async (baseline, rooms, dir) => {
-    const { g, event } = rooms[0];
-    const events = [event];
-    events.push(
-      await sendLocal(g.room, {
-        type: 'm.room.message',
-        sender: '@bob:test',
-        content: {
-          body: 'reply',
-          msgtype: 'm.text',
-          'm.relates_to': { rel_type: 'm.thread', event_id: event.eventId },
-        },
-      }, g.signer),
-    );
-    events.push(
-      await sendLocal(g.room, {
-        type: 'm.room.redaction',
-        sender: g.creator,
-        content: { redacts: events[1].eventId },
-      }, g.signer),
-    );
-    events.push(
-      await sendLocal(g.room, {
-        type: 'm.room.member',
-        sender: g.creator,
-        state_key: '@bob:test',
-        content: { membership: 'leave' },
-      }, g.signer),
-    );
-    events.push(
-      await sendLocal(g.room, {
-        type: 'm.room.encryption',
-        sender: g.creator,
-        state_key: '',
-        content: { algorithm: 'm.megolm.v1.aes-sha2' },
-      }, g.signer),
-    );
-    await setReceipt(
-      await baseline.server(),
-      g.roomId,
-      '@bob:test',
-      'm.read',
-      events[1].eventId,
-    );
-    await baseline.close();
-    const now = Date.now;
-    Date.now = () => 1800000000000;
-    const results = [];
-    try {
-      for (const grouped of [false, true]) {
-        const copy = dir +
-          (grouped ? '-dependent-group' : '-dependent-ordered');
-        await cp(dir, copy, { recursive: true });
-        const store = await openStore({
-          dir: copy,
-          library: './.native/libturso_ffi.so',
-          checkpointlogbytes: 65536,
-          maxopenfiles: 16,
-          idleseconds: 300,
-        }, {
-          schemas: {
-            room: roomSchema,
-            server: serverSchema,
-            tenant: tenantSchema,
+for (const extra of [0, 8]) {
+  Deno.test(`publication batching: one receipt mode probe for ${extra + 5} dependent events`, async () => {
+    await fixture(async (baseline, rooms, dir) => {
+      const { g, event } = rooms[0];
+      const events = [event];
+      events.push(
+        await sendLocal(g.room, {
+          type: 'm.room.message',
+          sender: '@bob:test',
+          content: {
+            body: 'reply',
+            msgtype: 'm.text',
+            'm.relates_to': { rel_type: 'm.thread', event_id: event.eventId },
           },
-        });
-        try {
-          if (grouped) await projectThrough(store, events.at(-1)!.completion!);
-          else {for (const entry of events) {
-              await projectThrough(store, entry.completion!);
-            }}
-          results.push(await durableTables(store));
-          await projectThrough(store, events.at(-1)!.completion!);
-          assertEquals(
-            await durableTables(store),
-            results.at(-1),
-            'replay changes no durable dependent facts',
-          );
-        } finally {
-          await store.close();
-          await Deno.remove(copy, { recursive: true });
-        }
-      }
-      assertEquals(
-        results[1],
-        results[0],
-        'feed, receipts, notifications, redactions, relations, membership and device facts match the ordered baseline',
+        }, g.signer),
       );
+      for (let n = 0; n < extra; n++) {
+        events.push(
+          await sendLocal(g.room, {
+            type: 'm.room.message',
+            sender: n % 2 ? g.creator : '@bob:test',
+            content: { body: `dependent ${n}`, msgtype: 'm.text' },
+          }, g.signer),
+        );
+      }
+      events.push(
+        await sendLocal(g.room, {
+          type: 'm.room.redaction',
+          sender: g.creator,
+          content: { redacts: events[1].eventId },
+        }, g.signer),
+      );
+      events.push(
+        await sendLocal(g.room, {
+          type: 'm.room.member',
+          sender: g.creator,
+          state_key: '@bob:test',
+          content: { membership: 'leave' },
+        }, g.signer),
+      );
+      events.push(
+        await sendLocal(g.room, {
+          type: 'm.room.encryption',
+          sender: g.creator,
+          state_key: '',
+          content: { algorithm: 'm.megolm.v1.aes-sha2' },
+        }, g.signer),
+      );
+      await setReceipt(
+        await baseline.server(),
+        g.roomId,
+        '@bob:test',
+        'm.read',
+        events[1].eventId,
+      );
+      await baseline.close();
+      const now = Date.now;
+      Date.now = () => 1800000000000;
+      const results = [];
+      const groupedProbes: number[] = [];
+      try {
+        for (const grouped of [false, true]) {
+          const copy = dir +
+            (grouped ? '-dependent-group' : '-dependent-ordered');
+          await cp(dir, copy, { recursive: true });
+          const store = await openStore({
+            dir: copy,
+            library: './.native/libturso_ffi.so',
+            checkpointlogbytes: 65536,
+            maxopenfiles: 16,
+            idleseconds: 300,
+          }, {
+            schemas: {
+              room: roomSchema,
+              server: serverSchema,
+              tenant: tenantSchema,
+            },
+          });
+          try {
+            const db = await store.server();
+            if (grouped) {
+              const original = db.tx.bind(db);
+              db.tx = (fn, options) =>
+                original(async (tx) => {
+                  const query = tx.query.bind(tx);
+                  let probes = 0;
+                  tx.query = (sql, values) => {
+                    if (
+                      sql === 'SELECT 1 FROM facade_owner_activation LIMIT 1'
+                    ) {
+                      probes++;
+                    }
+                    return query(sql, values);
+                  };
+                  try {
+                    return await fn(tx);
+                  } finally {
+                    if (probes) groupedProbes.push(probes);
+                  }
+                }, options);
+            }
+            if (grouped) {
+              await projectThrough(store, events.at(-1)!.completion!);
+            } else {for (const entry of events) {
+                await projectThrough(store, entry.completion!);
+              }}
+            const outcome = async () => ({
+              tables: await durableTables(store),
+              tokenHeads: await syncStreamHeads(db),
+            });
+            results.push(await outcome());
+            await projectThrough(store, events.at(-1)!.completion!);
+            assertEquals(
+              await outcome(),
+              results.at(-1),
+              'replay changes no durable dependent facts',
+            );
+          } finally {
+            await store.close();
+            await Deno.remove(copy, { recursive: true });
+          }
+        }
+        assertEquals(
+          results[1],
+          results[0],
+          'feed, receipts, notifications, redactions, relations, membership and device facts match the ordered baseline',
+        );
+        assertEquals(
+          groupedProbes,
+          [1],
+          'one native probe in one writer attempt',
+        );
+      } finally {
+        Date.now = now;
+      }
+    });
+  });
+}
+
+Deno.test('publication batching: native snapshot fences owner activation until the next attempt', async () => {
+  await fixture(async (home, rooms, dir) => {
+    const server = await home.server();
+    const tenant = await openTenant(home, 'test');
+    const edge = await openStore({
+      dir: dir + '/edge',
+      library: './.native/libturso_ffi.so',
+      checkpointlogbytes: 65536,
+      maxopenfiles: 8,
+      idleseconds: 300,
+    }, { schemas: { server: serverSchema } });
+    try {
+      const edgeDb = await edge.server();
+      const node = await initializeNode(edgeDb, 'test', 'edge_a');
+      const homePin = 'a'.repeat(64);
+      const edgePin = 'b'.repeat(64);
+      const hp = new Pairings(
+        server,
+        tenant.signer(),
+        tenant.publicB64,
+        homePin,
+      );
+      const fp = new Pairings(
+        edgeDb,
+        node.signer(),
+        node.publicKey,
+        edgePin,
+        node,
+      );
+      const bundle = await hp.create({
+        node: 'edge_a',
+        url: 'https://facade.test',
+        facadePin: edgePin,
+        expires: Date.now() + 60000,
+        required: [...LINK_CAPABILITIES],
+      });
+      await fp.accept(bundle);
+      const challenge = await fp.challenge(bundle.id, bundle.secret, homePin);
+      const grant = await hp.grant(bundle.id, challenge);
+      await hp.confirm(bundle.id, await fp.complete(bundle.id, grant, homePin));
+
+      const probe = 'SELECT 1 FROM facade_owner_activation LIMIT 1';
+      const observed: boolean[] = [];
+      const original = server.tx.bind(server);
+      server.tx = (fn, options) =>
+        original(async (tx) => {
+          const query = tx.query.bind(tx);
+          tx.query = async (sql, values) => {
+            const rows = await query(sql, values);
+            if (sql !== probe) return rows;
+            observed.push(rows.length > 0);
+            if (observed.length === 1) {
+              assertEquals(rows.length, 0);
+              // Commit through the real activation owner on another connection
+              // while publication is suspended inside its native transaction.
+              await exportOwnerControl(home, tenant, hp, bundle.id);
+              assertEquals((await server.query(probe)).length, 1);
+              assertEquals(
+                (await query(probe)).length,
+                0,
+                'same native snapshot',
+              );
+            }
+            return rows;
+          };
+          return await fn(tx);
+        }, options);
+      await projectThrough(home, rooms[0].event.completion!);
+      await projectThrough(home, rooms[1].event.completion!);
+      assertEquals(observed, [false, true]);
     } finally {
-      Date.now = now;
+      await edge.close();
     }
   });
 });
