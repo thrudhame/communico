@@ -6,6 +6,35 @@ import { splitId } from '#engine/ids.ts';
 import type { ErasureCut } from '#engine/room/state.ts';
 import { openRoom } from '#engine/room/index.ts';
 
+/** Exact intent facts across hosted domains, not a count or a feed position.
+ * The caller must check stable() after the reads it intends to certify. */
+export async function captureErasureInputs(store: Store, viewerDomain: string) {
+  const directory = store.tenantDirectoryCut();
+  if (directory === undefined) return;
+  const domains = [...new Set([viewerDomain, ...await store.tenants()])].sort();
+  const databases = await Promise.all(domains.map((id) => store.tenant(id)));
+  const revision = await store.revisionProbe('tenants', domains);
+  const cuts = domains.map(revision);
+  if (cuts.some((cut) => cut === undefined)) return;
+  const stable = () =>
+    store.tenantDirectoryCut() === directory &&
+    domains.every((id, i) => revision(id) === cuts[i]);
+  const facts = await Promise.all(
+    databases.map((db) =>
+      db.query(
+        'SELECT localpart,room_cuts FROM erased_users ORDER BY localpart',
+      )
+    ),
+  );
+  const hash = new Uint8Array(
+    await crypto.subtle.digest(
+      'SHA-256',
+      new TextEncoder().encode(JSON.stringify([domains, facts])),
+    ),
+  ).toHex();
+  if (stable()) return { hash, stable };
+}
+
 export async function captureErasureCuts(
   store: Store,
 ): Promise<Record<string, ErasureCut>> {

@@ -74,6 +74,8 @@ export class Store implements StartupStore {
   private closing?: Promise<void>;
   private readonly maintenance = new Set<Promise<unknown>>();
   private readonly serverOperations: Database;
+  private tenantDirectoryRevision = 0n;
+  private tenantCreations = 0;
   constructor(
     private readonly ffi: Turso,
     private readonly serverDb: Db,
@@ -89,6 +91,20 @@ export class Store implements StartupStore {
 
   server(): Promise<Database> {
     return Promise.resolve(this.serverOperations);
+  }
+
+  serverRevision(): string | undefined {
+    return this.serverDb.stableRevision;
+  }
+
+  revisionProbe(kind: FileKind, ids: readonly string[]) {
+    return this.pool.revisionProbe(kind, ids);
+  }
+
+  tenantDirectoryCut(): bigint | undefined {
+    return this.tenantCreations === 0
+      ? this.tenantDirectoryRevision
+      : undefined;
   }
 
   // Logical multi-file writes outlive their HTTP request and retain storage
@@ -163,7 +179,14 @@ export class Store implements StartupStore {
     id: string,
     options: { create?: boolean } = {},
   ): Promise<Database> {
-    return await this.database('tenants', id, options);
+    if (!options.create) return await this.database('tenants', id, options);
+    this.tenantCreations++;
+    try {
+      return await this.database('tenants', id, options);
+    } finally {
+      this.tenantDirectoryRevision++;
+      this.tenantCreations--;
+    }
   }
 
   // Explicit multi-transaction operation (e.g. a checkpoint-observed bulk

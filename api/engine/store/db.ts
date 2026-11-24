@@ -52,6 +52,7 @@ export class Conn {
     private readonly ffi: Turso,
     private readonly handle: number,
     private readonly checks = new Set<CommitCheck>(),
+    private readonly beginWrite = () => {},
   ) {}
 
   /** Retain a dependency for this attempt's actual native commit. */
@@ -69,6 +70,12 @@ export class Conn {
 
   query(sql: string, values: readonly Value[] = []): Promise<Row[]> {
     this.check();
+    // query also accepts row-producing writes (for example RETURNING).
+    // WITH can lead to a SELECT or DML. Err toward a write for any ambiguous
+    // statement (including keywords inside strings/comments).
+    const readOnly = /^\s*(SELECT|WITH)\b[^;]*;?\s*$/is.test(sql) &&
+      !/\b(INSERT|UPDATE|DELETE|REPLACE)\b/i.test(sql);
+    if (!readOnly) this.beginWrite();
     return this.ffi.query(this.handle, sql, values);
   }
 
@@ -81,6 +88,7 @@ export class Conn {
 
   execute(sql: string, values: readonly Value[] = []): Promise<number> {
     this.check();
+    this.beginWrite();
     return this.ffi.execute(this.handle, sql, values).then((affected) => {
       if (affected > 0) this.writeVersion++;
       return affected;
@@ -89,6 +97,7 @@ export class Conn {
 
   exec(sql: string): Promise<void> {
     this.check();
+    this.beginWrite();
     return this.ffi.exec(this.handle, sql);
   }
 
@@ -122,6 +131,15 @@ export function operations(tx: Database['tx'], path: string): Database {
 
 export class Db {
   readonly gate: Gate;
+  private readonly lifetime = crypto.randomUUID();
+  private revision = 0n;
+  private writers = 0;
+
+  /** A process/open-file lifetime and commit revision, not a durable cursor. */
+  get stableRevision(): string | undefined {
+    if (this.closing || this.closed || this.writers !== 0) return undefined;
+    return `${this.lifetime}:${this.revision}`;
+  }
   private static readonly openFiles = new Map<string, Promise<Db>>();
   private idle: number[] = [];
   private connections = 0;
@@ -294,10 +312,15 @@ export class Db {
     let connection: Conn | undefined;
     let reusable = true;
     let committed = false;
+    let writing = false;
     try {
       handle = await this.acquire();
       const checks = new Set<CommitCheck>();
-      connection = new Conn(this.ffi, handle, checks);
+      connection = new Conn(this.ffi, handle, checks, () => {
+        if (writing) return;
+        writing = true;
+        this.writers++;
+      });
       try {
         await this.ffi.begin(handle, options.mode ?? 'concurrent');
         if (options.admit) connection.admit(options.admit);
@@ -309,6 +332,7 @@ export class Db {
         } else {
           await commit();
         }
+        if (writing) this.revision++;
         committed = true;
         return { committed: true, value: result };
       } catch (error) {
@@ -327,6 +351,7 @@ export class Db {
         throw error;
       }
     } finally {
+      if (writing) this.writers--;
       connection?.release();
       try {
         if (handle !== undefined) {

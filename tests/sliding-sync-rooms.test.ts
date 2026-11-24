@@ -29,15 +29,22 @@ type Json = Record<string, unknown>;
 const events = (value: unknown) => (value ?? []) as Json[];
 const ids = (value: unknown) => events(value).map((e) => e.event_id);
 const content = (event: Json) => event.content as Json;
-async function fixture(prefix: string) {
+async function fixture(prefix: string, earlierAuthor = false) {
   const app = theApp();
   const alice = await suite.registerTestUser(prefix + '-a', 'pw');
   const bob = await suite.registerTestUser(prefix + '-b', 'pw');
   const signer = app.tenant.signer();
   const { roomId } = await createRoom(app.store, {
-    creator: alice.user_id,
+    creator: earlierAuthor ? bob.user_id : alice.user_id,
     preset: 'public_chat',
     name: 'Original',
+    ...(earlierAuthor && {
+      initial_state: [{
+        type: 'm.room.history_visibility',
+        state_key: '',
+        content: { history_visibility: 'joined' },
+      }],
+    }),
   }, signer);
   const room = await openRoom(app.store, roomId);
   const send = async (
@@ -100,6 +107,221 @@ async function fixture(prefix: string) {
   };
   return { app, alice, bob, roomId, room, send, sync };
 }
+
+suite.test('ignore changes refresh the delivered bump without advancing the room feed', async () => {
+  const { app, alice, bob, roomId, room, send, sync } = await fixture(
+    'bump-ignore',
+  );
+  await join(room, bob.user_id, app.tenant.signer());
+  await send('m.room.message', { body: 'earlier' });
+  const earlier = (await captureLists(alice.user_id)).eventCut;
+  await send('m.room.message', { body: 'latest' }, undefined, bob.user_id);
+  const initial = await sync();
+  assertEquals(initial.entry.bump_stamp, initial.cut);
+  assert(initial.sent[roomId].display);
+  const ignore = (ignored_users: Json) =>
+    putAccountData(
+      app.tenant,
+      localpartOf(alice.user_id),
+      '',
+      'm.ignored_user_list',
+      {
+        ignored_users,
+      },
+    );
+  await ignore({ [bob.user_id]: {} });
+  const hidden = await sync({ previous: initial.sent, since: initial.cut });
+  assertEquals(hidden.cut, initial.cut);
+  assertEquals(hidden.entry.bump_stamp, earlier);
+  await ignore({});
+  const restored = await sync({
+    previous: { ...initial.sent, ...hidden.sent },
+    since: hidden.cut,
+  });
+  assertEquals(restored.cut, hidden.cut);
+  assertEquals(restored.rooms[roomId]?.bump_stamp, initial.cut);
+});
+
+suite.test('new erasure facts refresh delivered display without advancing the room feed', async () => {
+  const { app, alice, bob, roomId, room, sync } = await fixture(
+    'display-erase',
+    true,
+  );
+  const cut = await room.tx((tx) => tx.state.erasureCut());
+  await join(room, alice.user_id, app.tenant.signer());
+  const initial = await sync();
+  assertEquals(initial.entry.name, 'Original');
+  assert(initial.sent[roomId].display);
+
+  // Publish the captured erasure view after the viewer's join.
+  await app.tenant.tx((tx) =>
+    tx.erasure.mark(localpartOf(bob.user_id), { [roomId]: cut })
+  );
+  const erased = await sync({ previous: initial.sent, since: initial.cut });
+  assertEquals(erased.cut, initial.cut);
+  assertEquals(erased.entry.name, '');
+});
+
+suite.test('an unavailable unrelated erasure owner does not block room delivery', async () => {
+  const { app, roomId, send, sync } = await fixture('display-optional');
+  const first = await sync();
+  assert(first.sent[roomId].display);
+  const eventId = await send('m.room.message', { body: 'still delivered' });
+
+  const tenants = app.store.tenants;
+  const tenant = app.store.tenant;
+  const unrelated = 'unrelated.example';
+  let attempts = 0;
+  app.store.tenants = async function () {
+    return [...await tenants.call(this), unrelated];
+  };
+  app.store.tenant = function (id, options) {
+    if (id === unrelated) {
+      attempts++;
+      return Promise.reject(new Error('fixture: erasure owner unavailable'));
+    }
+    return tenant.call(this, id, options);
+  };
+  try {
+    const next = await sync({ since: first.cut, previous: first.sent });
+    assertEquals(attempts, 1);
+    assertEquals(ids(next.entry.timeline), [eventId]);
+    assertEquals(next.sent[roomId].display, undefined);
+  } finally {
+    app.store.tenants = tenants;
+    app.store.tenant = tenant;
+  }
+});
+
+suite.test('unchanged joined rooms do not enter the payload room reader', async () => {
+  const { app, alice, roomId, send } = await fixture('payload-work');
+  const signer = app.tenant.signer();
+  for (let i = 0; i < 5; i++) {
+    await createRoom(app.store, { creator: alice.user_id }, signer);
+  }
+  const request = slidingSyncRequest(
+    {
+      lists: {
+        all: { ranges: [[0, 5]], required_state: [], timeline_limit: 1 },
+      },
+    },
+    new URLSearchParams(),
+    30000,
+  );
+  const viewer = {
+    userId: alice.user_id,
+    deviceId: alice.device_id,
+    tenant: app.tenant,
+  };
+  const initial = await captureLists(alice.user_id);
+  const first = await roomPayloads(
+    viewer,
+    await selectLists(alice.user_id, request, { snapshot: initial }),
+    {
+      eventCut: initial.eventCut,
+      requestSince: null,
+      direct: initial.direct,
+      previous: {},
+    },
+  );
+  assertEquals(Object.keys(first.rooms).length, 6);
+  assert(Object.values(first.sent).every((room) => room.display));
+  const changed = await send('m.room.message', { body: 'new' });
+  const snapshot = await captureLists(alice.user_id);
+  const selection = await selectLists(alice.user_id, request, {
+    snapshot,
+    since: initial.eventCut,
+    previousRooms: new Set(Object.keys(first.sent)),
+  });
+  assertEquals(selection.rooms.size, 6);
+  const original = app.store.room;
+  const accesses = new Set<string>();
+  app.store.room = function (id, options) {
+    accesses.add(id);
+    return original.call(this, id, options);
+  };
+  try {
+    const next = await roomPayloads(viewer, selection, {
+      eventCut: snapshot.eventCut,
+      requestSince: initial.eventCut,
+      direct: snapshot.direct,
+      previous: first.sent,
+    });
+    assertEquals(Object.keys(next.rooms), [roomId]);
+    assertEquals(ids(next.rooms[roomId].timeline), [changed]);
+    assertEquals([...accesses], [roomId]);
+    for (const [id, sent] of Object.entries(first.sent)) {
+      if (id !== roomId) assertEquals(next.sent[id], sent);
+    }
+  } finally {
+    app.store.room = original;
+  }
+});
+
+suite.test('a held room write forces payload rendering and cannot certify the result', async () => {
+  const { app, roomId, sync } = await fixture('payload-held');
+  const db = await app.store.room(roomId);
+  await db.exec('CREATE TABLE display_proof_fixture(value INTEGER)');
+  const first = await sync();
+  assert(first.sent[roomId].display);
+  const held = Promise.withResolvers<void>(),
+    release = Promise.withResolvers<void>();
+  const writer = db.tx(async (tx) => {
+    await tx.execute('INSERT INTO display_proof_fixture VALUES(1)');
+    held.resolve();
+    await release.promise;
+  });
+  const original = app.store.room;
+  let accessed = false;
+  try {
+    await Promise.race([held.promise, writer]);
+    app.store.room = function (id, options) {
+      if (id === roomId) accessed = true;
+      return original.call(this, id, options);
+    };
+    const next = await sync({ since: first.cut, previous: first.sent });
+    assert(accessed);
+    assertEquals(next.sent[roomId].display, undefined);
+  } finally {
+    app.store.room = original;
+    release.resolve();
+    await writer;
+  }
+  const after = await sync({ since: first.cut, previous: first.sent });
+  assert(after.sent[roomId].display);
+  assert(
+    after.sent[roomId].display.roomRevision !==
+      first.sent[roomId].display.roomRevision,
+  );
+});
+
+suite.test('reopening a pooled room file invalidates the delivered proof', async () => {
+  const { app, bob, roomId, sync } = await fixture('payload-reopen');
+  const first = await sync();
+  assert(first.sent[roomId].display);
+  const revision = await app.store.revisionProbe('rooms', [roomId]);
+  assertEquals(revision(roomId), first.sent[roomId].display.roomRevision);
+  // The HTTP fixture's pool holds eight files, including its tenant.
+  for (let i = 0; i < 9; i++) {
+    await createRoom(app.store, { creator: bob.user_id }, app.tenant.signer());
+  }
+  assertEquals(revision(roomId), undefined);
+  await app.store.room(roomId);
+  assert(revision(roomId) !== first.sent[roomId].display.roomRevision);
+  const original = app.store.room;
+  let accessed = false;
+  app.store.room = function (id, options) {
+    if (id === roomId) accessed = true;
+    return original.call(this, id, options);
+  };
+  try {
+    const next = await sync({ since: first.cut, previous: first.sent });
+    assert(accessed);
+    assertEquals(next.sent[roomId].display?.roomRevision, revision(roomId));
+  } finally {
+    app.store.room = original;
+  }
+});
 
 suite.test('initial windows use captured state and real pagination; expansions reload history without inventing live events', async () => {
   const { alice, roomId, send, sync } = await fixture('payload-cut');
