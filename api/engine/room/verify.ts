@@ -108,15 +108,26 @@ export async function prepareReceiptPack<T>(
   });
 }
 
-// Check 1: the wire bounds and the per-version format checks (old
-// federation/pdu.ts checkRemoteFormat). A hard failure throws; the
-// lenient size case is returned. The backfill count exemption
-// (backfill.yaml's note: prev/auth counts MUST NOT be validated on a
-// backfill response) is the caller's option — /backfill answers only.
+// The wire checks that do not need room state or a room version.
+export function checkPduWireFormat(pdu: unknown): asserts pdu is Pdu {
+  validatePduFormat(pdu);
+}
+
+// Check 1: wire bounds and per-version format. A hard failure throws; the
+// lenient size case is returned. Only /backfill answers exempt prev/auth counts.
 export function checkPduFormat(
   pdu: Pdu,
   spec: RoomVersionSpec,
   exemptPrevAuthLimits: boolean,
+): boolean {
+  return validatePduFormat(pdu, { spec, exemptPrevAuthLimits });
+}
+
+// Keep the versioned verifier's error precedence. The early wire pass skips
+// checks that depend on the room version or the caller's count exemption.
+function validatePduFormat(
+  pdu: unknown,
+  versioned?: { spec: RoomVersionSpec; exemptPrevAuthLimits: boolean },
 ): boolean {
   const object = (value: unknown): value is Record<string, unknown> =>
     value !== null && typeof value === 'object' && !Array.isArray(value);
@@ -137,22 +148,16 @@ export function checkPduFormat(
   } catch (cause) {
     invalidEvent('M_BAD_EVENT: invalid SHA-256 content hash encoding', cause);
   }
-  for (const list of [pdu.prev_events, pdu.auth_events]) {
-    if (
-      !Array.isArray(list) || list.some((id) => typeof id !== 'string')
-    ) {
-      invalidEvent(
-        'M_BAD_EVENT: prev_events/auth_events must be string arrays',
-      );
-    }
+  const eventIds = (list: unknown): list is string[] =>
+    Array.isArray(list) && list.every((id) => typeof id === 'string');
+  if (!eventIds(pdu.prev_events) || !eventIds(pdu.auth_events)) {
+    invalidEvent('M_BAD_EVENT: prev_events/auth_events must be string arrays');
   }
-  const prevIds = pdu.prev_events ?? [];
-  const declaredAuth = pdu.auth_events ?? [];
-  if (!exemptPrevAuthLimits) {
-    if (prevIds.length > 20) {
+  if (versioned && !versioned.exemptPrevAuthLimits) {
+    if (pdu.prev_events.length > 20) {
       invalidEvent('M_TOO_MANY_PREV_EVENTS: v11 allows at most 20');
     }
-    if (declaredAuth.length > 10) {
+    if (pdu.auth_events.length > 10) {
       invalidEvent('M_TOO_MANY_AUTH_EVENTS: v11 allows at most 10');
     }
   }
@@ -169,17 +174,20 @@ export function checkPduFormat(
   if (pdu.state_key !== undefined && typeof pdu.state_key !== 'string') {
     invalidEvent('M_BAD_EVENT: state_key must be a string when present');
   }
-  if (!spec.roomIdFromCreateEvent && typeof pdu.room_id !== 'string') {
-    invalidEvent('M_BAD_EVENT: room_id required before v12');
-  }
-  // depth bounded only (components/depth_v6.yaml:19-25 — the only MUST)
-  const depthBound = spec.depthLimit === 'int53' ? 2 ** 53 - 1 : 2 ** 63 - 1;
-  if (pdu.depth > depthBound) {
-    invalidEvent('M_BAD_EVENT: depth exceeds the room version limit');
+  const spec = versioned?.spec;
+  if (spec) {
+    if (!spec.roomIdFromCreateEvent && typeof pdu.room_id !== 'string') {
+      invalidEvent('M_BAD_EVENT: room_id required before v12');
+    }
+    // depth bounded only (components/depth_v6.yaml:19-25 — the only MUST)
+    const depthBound = spec.depthLimit === 'int53' ? 2 ** 53 - 1 : 2 ** 63 - 1;
+    if (pdu.depth > depthBound) {
+      invalidEvent('M_BAD_EVENT: depth exceeds the room version limit');
+    }
   }
   let canonical: string;
   try {
-    canonical = canonicalJson(pdu as unknown as Record<string, unknown>);
+    canonical = canonicalJson(pdu);
   } catch (e) {
     invalidEvent('M_BAD_EVENT: event cannot be canonicalized', e);
   }
@@ -187,18 +195,19 @@ export function checkPduFormat(
   if (new TextEncoder().encode(canonical).length > 65536) {
     invalidEvent('M_TOO_LARGE: event exceeds the 65536-byte limit');
   }
-  // per-key limits: type/state_key ≤ 255 — BYTES for strictByteLimits
-  // versions (v11+), codepoints for ≤ v10 (CS:2874-2877)
-  const measure = (s: string): number =>
-    spec.strictByteLimits ? new TextEncoder().encode(s).length : [...s].length;
-  const keyFail = measure(pdu.type) > 255 ||
-    (pdu.state_key !== undefined && measure(String(pdu.state_key)) > 255);
   let oversized = false;
-  if (keyFail) {
-    if (spec.strictByteLimits) {
+  if (spec) {
+    // per-key limits: type/state_key ≤ 255 — BYTES for strictByteLimits
+    // versions (v11+), codepoints for ≤ v10 (CS:2874-2877)
+    const measure = (s: string): number =>
+      spec.strictByteLimits
+        ? new TextEncoder().encode(s).length
+        : [...s].length;
+    oversized = measure(pdu.type) > 255 ||
+      (pdu.state_key !== undefined && measure(pdu.state_key) > 255);
+    if (oversized && spec.strictByteLimits) {
       invalidEvent('M_BAD_EVENT: type/state_key exceed 255 bytes');
     }
-    oversized = true;
   }
   // sender/room_id/event_id bounded by their identifier grammars
   for (const id of [pdu.sender, pdu.room_id, pdu.event_id]) {

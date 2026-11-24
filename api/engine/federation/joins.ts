@@ -22,6 +22,7 @@ import {
   serverInState,
 } from './room.ts';
 import {
+  checkPduWireFormat,
   eventMaterial,
   verify,
   verifyJoinForCountersign,
@@ -253,6 +254,10 @@ export function makeKnock(
   return template(roomId, userId, origin, ver, 'knock', deps);
 }
 
+export type MembershipSendDeps = InviteDeps & {
+  requireDirectoryScope?: () => Promise<void>;
+};
+
 async function sendMembership(
   roomId: string,
   eventId: string,
@@ -260,25 +265,18 @@ async function sendMembership(
   origin: string,
   membership: 'join' | 'leave' | 'knock',
   apiVersion: 'v1' | 'v2',
-  deps: InviteDeps,
+  deps: MembershipSendDeps,
   omitMembers = false,
 ) {
-  const room = await membershipRoom(deps, roomId);
-  const operation = canonicalJson([origin, membership, eventId]);
-  // Presence of a room file proves no replica cut. Only completed operation
-  // identities may reach authentication/replay without new-work admission.
-  const completed = await room.tx((tx) => tx.membershipReceipts.has(operation));
-  let admission = completed ? undefined : await deps.prepareRoomScope?.(roomId);
-  const version = await room.tx(async (tx) => {
-    // A completed operation is replayable after an ACL update. New work keeps
-    // the normal current-ACL admission order, including malformed requests.
-    // Existence alone exposes no saved result; authentication remains below.
-    if (!await tx.membershipReceipts.has(operation)) {
-      await assertAcl(tx, origin);
-    }
-    return (await currentSnapshot(tx)).version;
-  });
-  const pdu = raw as Pdu;
+  // Transport authentication and hard peer policy have already run. Reject
+  // intrinsic mistakes without consulting the replica cuts or the room ACL.
+  try {
+    checkPduWireFormat(raw);
+  } catch (error) {
+    if (!recoverableUpstream(error)) throw error;
+    throw new MatrixError(400, 'M_BAD_JSON', String(error));
+  }
+  const pdu = raw;
   if (pdu.room_id !== roomId) {
     throw new MatrixError(400, 'M_BAD_JSON', 'room_id does not match the path');
   }
@@ -292,6 +290,21 @@ async function sendMembership(
       `expected an m.room.member ${membership} with state_key === sender`,
     );
   }
+  await deps.requireDirectoryScope?.();
+  const room = await membershipRoom(deps, roomId);
+  const operation = canonicalJson([origin, membership, eventId]);
+  // Presence of a room file proves no replica cut. Only completed operation
+  // identities may reach authentication/replay without new-work admission.
+  const completed = await room.tx((tx) => tx.membershipReceipts.has(operation));
+  let admission = completed ? undefined : await deps.prepareRoomScope?.(roomId);
+  const version = await room.tx(async (tx) => {
+    // A completed operation is replayable after an ACL update. Existence
+    // alone exposes no saved result; event authentication remains below.
+    if (!await tx.membershipReceipts.has(operation)) {
+      await assertAcl(tx, origin);
+    }
+    return (await currentSnapshot(tx)).version;
+  });
   if (domainOf(String(pdu.sender)) !== origin) {
     throw new MatrixError(
       403,
@@ -500,7 +513,7 @@ export function sendJoin(
   pdu: unknown,
   origin: string,
   apiVersion: 'v1' | 'v2',
-  deps: InviteDeps,
+  deps: MembershipSendDeps,
   omitMembers = false,
 ) {
   return sendMembership(
@@ -521,7 +534,7 @@ export function sendLeave(
   pdu: unknown,
   origin: string,
   apiVersion: 'v1' | 'v2',
-  deps: InviteDeps,
+  deps: MembershipSendDeps,
 ) {
   return sendMembership(
     roomId,
@@ -539,7 +552,7 @@ export function sendKnock(
   eventId: string,
   pdu: unknown,
   origin: string,
-  deps: InviteDeps,
+  deps: MembershipSendDeps,
 ) {
   return sendMembership(roomId, eventId, pdu, origin, 'knock', 'v1', deps);
 }
