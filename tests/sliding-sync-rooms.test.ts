@@ -162,6 +162,37 @@ suite.test('new erasure facts refresh delivered display without advancing the ro
   assertEquals(erased.entry.name, '');
 });
 
+suite.test('an unavailable unrelated erasure owner does not block room delivery', async () => {
+  const { app, roomId, send, sync } = await fixture('display-optional');
+  const first = await sync();
+  assert(first.sent[roomId].display);
+  const eventId = await send('m.room.message', { body: 'still delivered' });
+
+  const tenants = app.store.tenants;
+  const tenant = app.store.tenant;
+  const unrelated = 'unrelated.example';
+  let attempts = 0;
+  app.store.tenants = async function () {
+    return [...await tenants.call(this), unrelated];
+  };
+  app.store.tenant = function (id, options) {
+    if (id === unrelated) {
+      attempts++;
+      return Promise.reject(new Error('fixture: erasure owner unavailable'));
+    }
+    return tenant.call(this, id, options);
+  };
+  try {
+    const next = await sync({ since: first.cut, previous: first.sent });
+    assertEquals(attempts, 1);
+    assertEquals(ids(next.entry.timeline), [eventId]);
+    assertEquals(next.sent[roomId].display, undefined);
+  } finally {
+    app.store.tenants = tenants;
+    app.store.tenant = tenant;
+  }
+});
+
 suite.test('unchanged joined rooms do not enter the payload room reader', async () => {
   const { app, alice, roomId, send } = await fixture('payload-work');
   const signer = app.tenant.signer();

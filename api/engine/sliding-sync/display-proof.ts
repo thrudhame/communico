@@ -11,26 +11,35 @@ export type DisplayProof = {
   ignored: string;
   erasure: string;
 };
+type ProofFor = (id: string) => DisplayProof | undefined;
+const noProof: ProofFor = () => undefined;
 
 /** Observe the same owners as the normal renderer. A proof is valid only if
  * all their revisions bracket rendering (or still match at a skip decision).
  * Projection includes non-feed publication effects such as live redactions. */
-export async function captureDisplayProof(viewer: Viewer, joined: string[]) {
+export async function captureDisplayProof(
+  viewer: Viewer,
+  joined: string[],
+): Promise<ProofFor> {
+  // Proof acquisition is an optimization, not a prerequisite for delivery.
+  // The normal renderer still owns its reads and their error handling.
+  return await observeDisplayInputs(viewer, joined).catch(() => noProof);
+}
+
+async function observeDisplayInputs(
+  viewer: Viewer,
+  joined: string[],
+): Promise<ProofFor> {
   const { store, server } = theApp();
-  if (!joined.length) return () => undefined;
+  if (!joined.length) return noProof;
   const serverCut = store.serverRevision();
-  if (serverCut === undefined) return () => undefined;
+  if (serverCut === undefined) return noProof;
   const [room, projections, erasure] = await Promise.all([
     store.revisionProbe('rooms', joined),
     getAll(server, joined.map((id) => roomSource('room', id))),
-    captureErasureInputs(store, viewer.tenant.serverName).catch((error) => {
-      // A tenant being attached may not have an erasure owner yet. This input
-      // is optional; normal rendering still resolves only its actual senders.
-      if (error instanceof Deno.errors.NotFound) return undefined;
-      throw error;
-    }),
+    captureErasureInputs(store, viewer.tenant.serverName),
   ]);
-  if (erasure === undefined) return () => undefined;
+  if (erasure === undefined) return noProof;
   const ignored = JSON.stringify([...await ignoredSenders(viewer)].sort());
   const projection = new Map(joined.map((id, i) => [id, projections[i]]));
   return (id: string): DisplayProof | undefined => {
