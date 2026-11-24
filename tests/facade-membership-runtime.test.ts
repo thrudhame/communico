@@ -200,6 +200,7 @@ async function membershipRuntime(kind: 'invite' | 'knock') {
       const domain of await new DomainOperations(home, ht, hp).bootstrap(
         'alice',
         bundle.id,
+        2,
       )
     ) {
       await journal.receive('home', [domain]);

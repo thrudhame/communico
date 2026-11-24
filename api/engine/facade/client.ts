@@ -13,6 +13,7 @@ import type { Pairings } from './pairing.ts';
 import {
   type Cut,
   cutOf,
+  DOMAIN_OPERATION_V2_CAPABILITY,
   integer,
   LINK_CAPABILITIES,
   LINK_SUPPORTED,
@@ -107,6 +108,12 @@ export async function openJournalClient(
 export class JournalClient {
   private activityChallenge?: string;
   private activityRequest?: string;
+  #domainReaderVersion?: 1 | 2;
+
+  get domainReaderVersion(): 1 | 2 | undefined {
+    return this.#domainReaderVersion;
+  }
+
   constructor(
     private readonly wire: LinkClient,
     readonly peer: {
@@ -216,13 +223,31 @@ export class JournalClient {
     if (revision < this.peer.revision) {
       throw new LinkError('LINK_DIVERGED', 'regressing control revision');
     }
-    return {
+    const hello = {
       revision,
       scopes: list(value.scopes).map(text),
       incoming: heads(value.incoming, true),
       outgoing: heads(value.outgoing, false),
       exportAcks: heads(value.exportAcks, false),
     };
+    const supported = value.supported === undefined
+      ? []
+      : list(value.supported);
+    const readers = supported.map((raw) => {
+      const entry = object(raw);
+      return { type: text(entry.type), version: integer(entry.version, 1) };
+    });
+    const v2 = DOMAIN_OPERATION_V2_CAPABILITY;
+    // A concurrent hello started before the reader upgraded may arrive late.
+    // The supported rolling direction for this enrollment is v1 to v2.
+    if (
+      readers.some((entry) =>
+        entry.type === v2.type && entry.version === v2.version
+      )
+    ) {
+      this.#domainReaderVersion = 2;
+    } else this.#domainReaderVersion ??= 1;
+    return hello;
   }
 
   /** One home-initiated pull also answers the facade receiver's previous pull.

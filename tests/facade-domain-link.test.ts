@@ -95,6 +95,9 @@ import { ignoredSenders } from '#engine/client/ignored.ts';
 import { pathfinder } from '@pathfinder/pathfinder';
 import { setAvatarUrl, setDisplayName } from '#engine/tenant/users.ts';
 import { Journal } from '#engine/facade/journal.ts';
+import { JournalClient } from '#engine/facade/client.ts';
+import { linkHandler } from '#engine/facade/link.ts';
+import { LinkClient } from '#engine/facade/transport.ts';
 import { exportOwnerControl, OwnerControls } from '#engine/facade/ownership.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
 import { MembershipOperations } from '#engine/facade/membership.ts';
@@ -161,7 +164,10 @@ import {
   recordReceiptOperation,
 } from '#engine/server/receipt-operations.ts';
 
-async function fixture(option: boolean | string = true) {
+async function fixture(
+  option: boolean | string = true,
+  reader: () => 1 | 2 = () => 2,
+) {
   const applyAuth = option !== false;
   const token = typeof option === 'string' ? option : undefined;
   const dir = await Deno.makeTempDir({ prefix: 'facade-domain-link-' });
@@ -241,7 +247,14 @@ async function fixture(option: boolean | string = true) {
   if (applyAuth) {
     await new AccountSnapshots(edge, et, fp, owners).apply(ej, auth);
   }
-  const hs = new DomainOperations(home, ht, hp),
+  const domains = new DomainOperations(home, ht, hp);
+  const hs = {
+      apply: domains.apply.bind(domains),
+      export: (localpart: string, pairing?: string) =>
+        domains.export(localpart, pairing, reader()),
+      bootstrap: (localpart: string, pairing: string) =>
+        domains.bootstrap(localpart, pairing, reader()),
+    },
     es = new DomainOperations(edge, et, fp, node);
   if (token) {
     const hash = await hashToken(token);
@@ -663,6 +676,142 @@ Deno.test('domain rolling readers: status requires its reader before receipt or 
     );
     assert(account.length > 0);
     assert(account.every((record) => record.version === 1));
+  } finally {
+    await f.close();
+  }
+});
+
+Deno.test('domain rolling upgrade preserves account data and continues after the v1 applied cut', async () => {
+  let client: JournalClient;
+  const f = await fixture(true, () => client.domainReaderVersion ?? 1);
+  try {
+    const legacy = new Journal(
+      await f.edge.server(),
+      LINK_SUPPORTED.filter((cap) =>
+        cap.type !== 'domain-operation' || cap.version === 1
+      ),
+    );
+    const limits = { maxItems: 100, maxBytes: 1_000_000 };
+    let journal = legacy;
+    const endpoint = (journal: Journal) =>
+      linkHandler({
+        server: 'logical.test',
+        node: f.node.node,
+        incarnation: f.node.incarnation,
+        pairings: () => Promise.resolve(f.fp),
+        journal,
+        limits,
+        changed: async () => {
+          for (const stream of await journal.streams('home', 'in')) {
+            if (stream.stream.startsWith('domain:')) {
+              while (await f.es.apply(journal, stream)) { /* drain */ }
+            }
+          }
+        },
+      });
+    let handle = endpoint(legacy);
+    const url = 'https://facade.test';
+    const wire = new LinkClient({ cert: '', key: '', ca: [] }, {
+      url,
+      pin: 'b'.repeat(64),
+    });
+    wire.fetch = async (path, init) => {
+      const response = await handle(
+        new Request(new URL(path, url), init),
+        'a'.repeat(64),
+      );
+      if (journal === legacy && path.endsWith('/hello') && response.ok) {
+        const { supported: _unsupportedByLegacyHello, ...body } = await response
+          .json();
+        return Response.json(body);
+      }
+      return response;
+    };
+    client = new JournalClient(wire, {
+      server: 'logical.test',
+      node: f.node.node,
+      incarnation: f.node.incarnation,
+      pairing: f.bundle.id,
+      revision: (await f.fp.active()).body.revision,
+    }, async () => {
+      assertEquals((await f.hp.connection(f.bundle.id)).state, 'paired');
+    });
+    assertEquals(client.domainReaderVersion, undefined);
+    await client.hello();
+    assertEquals(client.domainReaderVersion, 1);
+    const drain = async (stream: LinkRecord) => {
+      const { applied } = await journal.heads('home', 'in', stream);
+      const { head, records } = await f.hj.page(
+        'edge_a',
+        'out',
+        stream,
+        applied.sequence,
+        limits,
+      );
+      const ack = await client.push(stream, records, applied, undefined, head);
+      assertEquals(ack.applied, head);
+      return records;
+    };
+    await setPresence(
+      await f.home.server(),
+      '@alice:logical.test',
+      'online',
+      'retained status',
+    );
+    await putAccountData(f.ht, 'alice', '', 'rolling.first', { before: 1 });
+    const [stream] = await f.hs.bootstrap('alice', f.bundle.id);
+    await drain(stream);
+    assertEquals(await getAccountData(f.et, 'alice', '', 'rolling.first'), {
+      before: 1,
+    });
+    await putAccountData(f.ht, 'alice', '', 'rolling.second', { before: 2 });
+    await f.hs.bootstrap('alice', f.bundle.id);
+    await drain(stream);
+    assertEquals(await getAccountData(f.et, 'alice', '', 'rolling.second'), {
+      before: 2,
+    });
+    const cut = (await legacy.heads('home', 'in', stream)).applied;
+    const legacySequence = await accountDataMax(f.et, 'alice');
+    const prefix =
+      (await f.hj.page('edge_a', 'out', stream, 0, limits)).records;
+    assert(prefix.every((record) => record.version === 1));
+
+    handle = endpoint(f.ej);
+    journal = f.ej;
+    await f.hs.bootstrap('alice', f.bundle.id);
+    assertEquals(await drain(stream), []);
+    const hello = await client.hello();
+    assertEquals(
+      hello.incoming.find((entry) => entry.stream === stream.stream)?.applied,
+      cut,
+    );
+    assertEquals(client.domainReaderVersion, 2);
+    await f.hs.bootstrap('alice', f.bundle.id);
+    const upgrade = await drain(stream);
+    assertEquals(upgrade[0].sequence, cut.sequence + 1);
+    assertEquals(upgrade[0].previous, cut.hash);
+    assert(upgrade.every((record) => record.version === 2));
+    assertEquals(await accountDataMax(f.et, 'alice'), legacySequence);
+    assertEquals(
+      (await getPresence(await f.edge.server(), '@alice:logical.test'))
+        .statusMsg,
+      'retained status',
+    );
+    await putAccountData(f.ht, 'alice', '', 'rolling.third', { after: 3 });
+    await f.hs.bootstrap('alice', f.bundle.id);
+    const suffix = await drain(stream);
+    assertEquals(await getAccountData(f.et, 'alice', '', 'rolling.third'), {
+      after: 3,
+    });
+    const complete =
+      (await f.hj.page('edge_a', 'out', stream, 0, limits)).records;
+    assertEquals(complete, [...prefix, ...upgrade, ...suffix]);
+    assertEquals(
+      new Set(complete.map((record) => record.operationId)).size,
+      complete.length,
+    );
+    await f.hs.bootstrap('alice', f.bundle.id);
+    assertEquals(await drain(stream), []);
   } finally {
     await f.close();
   }

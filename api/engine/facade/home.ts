@@ -324,7 +324,11 @@ export async function startHomeLinks(
               localpart,
               settings.replicatecredentials,
             );
-            await domains.bootstrap(localpart, id);
+            // Negotiate the domain reader without holding account auth or keys.
+            const reader = client.domainReaderVersion;
+            if (reader !== undefined) {
+              await domains.bootstrap(localpart, id, reader);
+            }
           },
           changed: () => workers.get(id)?.wake(),
           failed: (error) => failed(node, error),

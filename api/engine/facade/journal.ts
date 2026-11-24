@@ -200,7 +200,7 @@ export async function appendRecord(
 export class Journal {
   constructor(
     private readonly db: Database,
-    private readonly supported: readonly Capability[],
+    readonly supported: readonly Capability[],
   ) {}
 
   async append(peer: string, record: Append): Promise<LinkRecord> {

@@ -375,6 +375,7 @@ export function linkHandler(options: {
       const outgoing = await activeStreams('out');
       return response({
         revision: grant.body.revision,
+        supported: journal.supported,
         scopes: [],
         outgoing,
         incoming: await activeStreams('in'),

@@ -425,7 +425,10 @@ export class DomainOperations {
   private async publish(
     view: DomainOperation | DomainHistory | DomainBootstrap,
     grant: Grant,
+    reader: 1 | 2,
   ) {
+    const version = recordVersion(view);
+    if (version > reader) mismatch('domain publication exceeds peer reader');
     const context = grant.body.transcript.body.context;
     const signed = {
       body: view,
@@ -441,14 +444,18 @@ export class DomainOperations {
         incarnation: this.node ? view.incarnation : context.id,
         stream: streamName(view.localpart, context.server),
         type: 'domain-operation',
-        version: recordVersion(view),
+        version,
         operationId: operationId(view),
         payload: signed,
       });
     });
   }
 
-  async export(localpart: string, pairing?: string) {
+  async export(
+    localpart: string,
+    pairing?: string,
+    reader: 1 | 2 = this.node ? 2 : 1,
+  ) {
     const grant = await this.binding(pairing),
       context = grant.body.transcript.body.context;
     await this.tenantSelected(localpart, grant);
@@ -534,7 +541,9 @@ export class DomainOperations {
         incarnation: source.incarnation,
         operation,
       });
-      records.push(await this.publish(view, grant));
+      if (recordVersion(view) <= reader) {
+        records.push(await this.publish(view, grant, reader));
+      }
     }
     return records;
   }
@@ -543,7 +552,7 @@ export class DomainOperations {
    * source operations, then publish a signed completeness declaration. Suffix
    * writes remain source intent and appear on this same independently drained
    * account stream; neither a copied F1 snapshot nor receipt news is a baseline. */
-  async bootstrap(localpart: string, pairing: string) {
+  async bootstrap(localpart: string, pairing: string, reader: 1 | 2 = 1) {
     if (this.node) mismatch('only home may declare domain bootstrap');
     const grant = await this.binding(pairing),
       context = grant.body.transcript.body.context;
@@ -631,15 +640,17 @@ export class DomainOperations {
         '@' + localpart + ':' + context.server,
       );
     });
-    const presenceFacts = await server.tx(async (conn) => {
-      await this.selected(conn, grant, localpart);
-      await requireDomainControl(conn, binding);
-      return await capturePresenceStatus(
-        conn,
-        '@' + localpart + ':' + context.server,
-      );
-    });
-    const records = await this.export(localpart, pairing);
+    const presenceFacts = reader === 2
+      ? await server.tx(async (conn) => {
+        await this.selected(conn, grant, localpart);
+        await requireDomainControl(conn, binding);
+        return await capturePresenceStatus(
+          conn,
+          '@' + localpart + ':' + context.server,
+        );
+      })
+      : [];
+    const records = await this.export(localpart, pairing, reader);
     // Ordinary export never echoes replica intent. Bootstrap separately attests
     // exactly the authentic history home retained, including a receiver's own
     // prior dots and prior incarnations. No dot, payload or context is rebased.
@@ -665,6 +676,7 @@ export class DomainOperations {
             operation,
           }),
           grant,
+          reader,
         ),
       );
     }
@@ -696,10 +708,10 @@ export class DomainOperations {
         tenantFacts.filter((op) => op.kind === 'pusher-choice'),
       ),
       notifications: facts(notificationFacts),
-      presenceStatus: facts(presenceFacts),
+      ...(reader === 2 ? { presenceStatus: facts(presenceFacts) } : {}),
       schedules: facts(tenantFacts.filter((op) => op.kind === 'delayed-event')),
     });
-    records.push(await this.publish(body, grant));
+    records.push(await this.publish(body, grant, reader));
     return records;
   }
 
