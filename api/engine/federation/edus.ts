@@ -24,6 +24,7 @@ import {
   sharedUsers,
 } from '#engine/server/ephemeral.ts';
 import type { Database as Db } from '#engine/store/db.ts';
+import { receiveRemotePresence } from '#engine/facade/remote-presence.ts';
 import { setTyping, typingIn } from '#engine/typing.ts';
 import { domainOf } from './pdu.ts';
 import { recordPending } from './peers.ts';
@@ -253,6 +254,7 @@ export type EduHandler = (
   origin: string,
   content: Record<string, unknown>,
   receivedMs: number,
+  relayPresence?: boolean,
 ) => Promise<void>;
 
 export type EduState = {
@@ -261,6 +263,7 @@ export type EduState = {
     raw: unknown,
     required?: boolean,
     receivedMs?: number,
+    relayPresence?: boolean,
   ): Promise<void>;
   register(type: string, handler: EduHandler, reliable?: boolean): void;
   // Reads share the durable stream owner; typing remains ephemeral.
@@ -362,34 +365,45 @@ export function eduState(server: Db, self: string, store: Store): EduState {
     }
   });
 
-  handlers.set('m.presence', async (origin, content, receivedMs) => {
-    const push = arrayOf(content.push, (entry) => entry, 'presence');
-    for (const entry of push) {
-      let p: ReturnType<typeof presenceContent>;
-      try {
-        p = presenceContent(entry);
-      } catch (error) {
-        if (!malformedEntry(error)) throw error;
-        continue;
+  handlers.set(
+    'm.presence',
+    async (origin, content, receivedMs, relayPresence) => {
+      const push = arrayOf(content.push, (entry) => entry, 'presence');
+      for (const entry of push) {
+        let p: ReturnType<typeof presenceContent>;
+        try {
+          p = presenceContent(entry);
+        } catch (error) {
+          if (!malformedEntry(error)) throw error;
+          continue;
+        }
+        if (domainOf(p.userId) !== origin) continue;
+        if (relayPresence && origin !== self) {
+          receiveRemotePresence(server, {
+            ...p,
+            status: p.status === undefined ? null : p.status,
+            origin,
+            receivedMs,
+          });
+        }
+        // only for users sharing a room with a local user
+        const shares = await sharedUsers(server, p.userId);
+        if (!shares.some((user) => domainOf(user) === self)) continue;
+        await setPresence(
+          server,
+          p.userId,
+          p.presence,
+          p.status,
+          {
+            lastActiveAgo: p.lastActiveAgo,
+            currentlyActive: p.currentlyActive,
+            remote: true,
+            receivedMs,
+          },
+        );
       }
-      if (domainOf(p.userId) !== origin) continue;
-      // only for users sharing a room with a local user
-      const shares = await sharedUsers(server, p.userId);
-      if (!shares.some((user) => domainOf(user) === self)) continue;
-      await setPresence(
-        server,
-        p.userId,
-        p.presence,
-        p.status,
-        {
-          lastActiveAgo: p.lastActiveAgo,
-          currentlyActive: p.currentlyActive,
-          remote: true,
-          receivedMs,
-        },
-      );
-    }
-  });
+    },
+  );
 
   return {
     dispatch: async (
@@ -397,6 +411,7 @@ export function eduState(server: Db, self: string, store: Store): EduState {
       raw,
       required = false,
       receivedMs = Date.now(),
+      relayPresence = false,
     ) => {
       const { type, content } = eduEnvelope(raw);
       const handler = handlers.get(type);
@@ -416,7 +431,7 @@ export function eduState(server: Db, self: string, store: Store): EduState {
         return;
       }
       try {
-        await handler(origin, content, receivedMs);
+        await handler(origin, content, receivedMs, relayPresence);
       } catch (error) {
         if (malformedEntry(error)) return;
         if (error instanceof PermanentEduRefusal) {

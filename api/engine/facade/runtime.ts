@@ -907,7 +907,7 @@ export async function openFacadeRuntime(
         signKeyDocument: async (raw) => await (await keyOwner()).cosign(raw),
         activity: settings.phase === 'f2'
           ? {
-            capture: async (pairing) => {
+            capture: async (pairing, relayPresence) => {
               if (!tenant) {
                 throw new LinkError(
                   'LINK_UNAVAILABLE',
@@ -920,7 +920,7 @@ export async function openFacadeRuntime(
                 tenant,
                 await pairings(),
                 node,
-              ).capture(pairing);
+              ).capture(pairing, relayPresence);
             },
             apply: async (pairing, snapshot, elapsed) => {
               if (!tenant) {

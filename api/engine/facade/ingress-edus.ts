@@ -74,7 +74,14 @@ export async function acceptIngressEdu(
         if (phase === 'f2') {
           // Only live admission delivers activity. The retained home drain always
           // expires this tail; retry never supplies a new receipt lifetime.
-          await dispatchTransactionEdu(origin, raw, edus, false, receivedMs);
+          await dispatchTransactionEdu(
+            origin,
+            raw,
+            edus,
+            false,
+            receivedMs,
+            type === 'm.presence',
+          );
           return { kind: 'retained', type };
         }
         return { kind: 'expired', type };

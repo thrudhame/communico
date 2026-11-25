@@ -1,6 +1,7 @@
 // Durable presence and receipt streams, shared by client writes and inbound EDUs.
 // Counters and rows commit together; notifications only follow a commit.
 import { MatrixError } from '#engine/matrix-error.ts';
+import { domainOf } from '#engine/ids.ts';
 import type { Conn, Database as Db } from '#engine/store/db.ts';
 import type { Row } from '#engine/store/ffi.ts';
 import { integerParameter, invalidParameter } from '#engine/operation.ts';
@@ -31,7 +32,7 @@ import {
 const MAX_UNKNOWN_THREADS = 100;
 // Synapse's FEDERATION_TIMEOUT: remote liveness expires from authenticated
 // receipt, never from the independently reported age of the user's activity.
-const REMOTE_PRESENCE_FRESHNESS_MS = 30 * 60 * 1000;
+export const REMOTE_PRESENCE_FRESHNESS_MS = 30 * 60 * 1000;
 const LOCAL_SYNC_GRACE_MS = 30_000;
 const LOCAL_IDLE_MS = 5 * 60 * 1000;
 const LOCAL_ACTIVITY_GRANULARITY_MS = 60_000;
@@ -43,6 +44,45 @@ export type LivePresenceObservation = PresenceDevice & {
   remainingMs: number;
   lastActiveAgo: number;
 };
+export type RemotePresenceObservation = {
+  origin: string;
+  userId: string;
+  presence: string;
+  status: string | null;
+  receivedMs: number;
+  lastActiveAgo: number;
+  currentlyActive: boolean;
+};
+
+/** A live link preserves the federation receipt; home owns the audience. */
+export async function publishRelayedPresence(
+  server: Db,
+  self: string,
+  value: RemotePresenceObservation,
+  authorize: (tx: Conn) => Promise<void>,
+): Promise<void> {
+  if (value.origin === self || domainOf(value.userId) !== value.origin) return;
+  await writePresence(
+    server,
+    value.userId,
+    value.presence,
+    value.status,
+    {
+      ...value,
+      remote: true,
+    },
+    false,
+    async (tx, current) => {
+      await authorize(tx);
+      return Date.now() - value.receivedMs < REMOTE_PRESENCE_FRESHNESS_MS &&
+        (current?.remote_received_ms == null ||
+          Number(current.remote_received_ms) < value.receivedMs) &&
+        (await sharedUsers(tx, value.userId)).some((user) =>
+          domainOf(user) === self
+        );
+    },
+  );
+}
 
 // Presence owns its counter. Use server transactions with MVCC retries, not
 // the event allocator's queue; only receipt paths below share that queue.
@@ -437,6 +477,7 @@ async function writePresence(
     device?: PresenceDevice;
   },
   skipUnchanged: boolean,
+  admit?: (tx: Conn, current: Row | undefined) => Promise<boolean>,
 ): Promise<void> {
   if (!['online', 'offline', 'unavailable'].includes(presence)) {
     throw new MatrixError(400, 'M_INVALID_PARAM', 'bad presence: ' + presence);
@@ -447,6 +488,7 @@ async function writePresence(
     const [current] = await tx.query('SELECT * FROM presence WHERE user_id=?', [
       userId,
     ]);
+    if (admit && !await admit(tx, current)) return null;
     if (
       opts.remote && current?.remote_received_ms != null &&
       Number(current.remote_received_ms) > receivedMs

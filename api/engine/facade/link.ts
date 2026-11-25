@@ -306,7 +306,11 @@ export function linkHandler(options: {
           challenge,
         });
       }
-      const snapshot = await options.activity.capture(id);
+      // A v1 home does not offer the extension and gets the exact old shape.
+      const snapshot = await options.activity.capture(
+        id,
+        body.relayPresence === true,
+      );
       const nextChallenge = crypto.randomUUID();
       challenges.set(id, { token: nextChallenge, started: performance.now() });
       return response({

@@ -24,6 +24,11 @@ import {
   requireDomainControl,
 } from './domain-control.ts';
 import { DirectoryReplicas } from './directory.ts';
+import { captureRemotePresence } from './remote-presence.ts';
+import {
+  publishRelayedPresence,
+  type RemotePresenceObservation,
+} from '#engine/server/ephemeral.ts';
 import type { NodeIdentity } from './identity.ts';
 import { receivedFence } from './journal.ts';
 import type { OwnerControl } from './ownership.ts';
@@ -43,7 +48,11 @@ type Presence =
   & Device
   & Omit<LivePresenceObservation, 'deviceId' | 'generation'>;
 type Typing = Device & Omit<LiveTypingObservation, 'deviceId' | 'generation'>;
-type Snapshot = Binding & { presence: Presence[]; typing: Typing[] };
+type Snapshot = Binding & {
+  presence: Presence[];
+  typing: Typing[];
+  remotePresence?: RemotePresenceObservation[];
+};
 
 function mismatch(message: string): never {
   throw new LinkError('LINK_IDENTITY_MISMATCH', message, 403);
@@ -64,7 +73,37 @@ function snapshotOf(raw: unknown): Snapshot {
       deviceIncarnation: text(value.deviceIncarnation),
     };
   };
+  let remotePresence: RemotePresenceObservation[] | undefined;
+  if (row.remotePresence !== undefined) {
+    if (!Array.isArray(row.remotePresence)) {
+      throw new LinkError('LINK_BAD_RECORD', 'invalid remote presence', 400);
+    }
+    remotePresence = row.remotePresence.map((raw) => {
+      const value = object(raw), presence = text(value.presence);
+      if (
+        !['online', 'unavailable', 'offline'].includes(presence) ||
+        (value.status !== null && typeof value.status !== 'string') ||
+        typeof value.currentlyActive !== 'boolean'
+      ) throw new LinkError('LINK_BAD_RECORD', 'invalid remote presence', 400);
+      return {
+        origin: text(value.origin),
+        userId: text(value.userId),
+        presence,
+        status: value.status,
+        receivedMs: integer(value.receivedMs),
+        lastActiveAgo: integer(value.lastActiveAgo),
+        currentlyActive: value.currentlyActive,
+      };
+    });
+    if (
+      new Set(remotePresence.map((v) => v.userId)).size !==
+        remotePresence.length
+    ) {
+      throw new LinkError('LINK_BAD_RECORD', 'duplicate remote presence', 400);
+    }
+  }
   const view: Snapshot = {
+    ...(remotePresence === undefined ? {} : { remotePresence }),
     server: text(row.server),
     pairing: text(row.pairing),
     grantRevision: integer(row.grantRevision, 1),
@@ -272,7 +311,7 @@ export class ActivityExchange implements LiveActivity {
     });
   }
 
-  async capture(pairing: string): Promise<Snapshot> {
+  async capture(pairing: string, relay = true): Promise<Snapshot> {
     const authority = await this.authority(pairing, true);
     const selected = new Set(
       this.node
@@ -338,6 +377,9 @@ export class ActivityExchange implements LiveActivity {
       ...authority.binding,
       presence: wire(presence),
       typing: wire(typing),
+      ...(this.node && relay
+        ? { remotePresence: captureRemotePresence(authority.server) }
+        : {}),
     };
   }
 
@@ -348,6 +390,9 @@ export class ActivityExchange implements LiveActivity {
   ): Promise<void> {
     const snapshot = snapshotOf(raw),
       authority = await this.authority(pairing, false);
+    if (this.node && snapshot.remotePresence !== undefined) {
+      mismatch('remote presence is only relayed to home');
+    }
     for (const key of Object.keys(authority.binding) as (keyof Binding)[]) {
       if (snapshot[key] !== authority.binding[key]) {
         mismatch('live activity source differs');
@@ -396,5 +441,13 @@ export class ActivityExchange implements LiveActivity {
       elapsed,
       check,
     );
+    for (const value of snapshot.remotePresence ?? []) {
+      await publishRelayedPresence(
+        authority.server,
+        authority.binding.server,
+        value,
+        (tx) => authority.check(tx, []),
+      );
+    }
   }
 }

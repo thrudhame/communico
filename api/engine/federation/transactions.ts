@@ -139,9 +139,10 @@ export async function dispatchTransactionEdu(
   edus: TransactionDeps['edus'],
   required = false,
   receivedMs?: number,
+  relayPresence?: boolean,
 ): Promise<void> {
   try {
-    await edus.dispatch(origin, raw, required, receivedMs);
+    await edus.dispatch(origin, raw, required, receivedMs, relayPresence);
   } catch (error) {
     if (error instanceof ReliableEduError) throw error;
     if (
