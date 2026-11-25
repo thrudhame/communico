@@ -1,4 +1,5 @@
 import type { Database } from '#engine/store/db.ts';
+import { setRankedVisibility } from './directory-rank.ts';
 export async function purgeable(db: Database, roomId: string) {
   return (await db.query(
     'SELECT 1 FROM directory WHERE room_id = ? AND purgeable_ms IS NOT NULL',
@@ -20,10 +21,7 @@ export async function setVisibility(
   roomId: string,
   value: string,
 ) {
-  await db.execute(
-    'INSERT INTO visibility(room_id,visibility) VALUES(?,?) ON CONFLICT(room_id) DO UPDATE SET visibility=excluded.visibility',
-    [roomId, value],
-  );
+  await db.tx((tx) => setRankedVisibility(tx, roomId, value));
 }
 export async function listedRooms(db: Database) {
   return (await db.query(

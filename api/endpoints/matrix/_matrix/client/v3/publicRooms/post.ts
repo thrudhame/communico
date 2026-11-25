@@ -13,5 +13,6 @@ export default async function (
   return await queryDirectory(
     decodeDirectoryRequest(request.query, await parseJson(request)),
     directoryDestination(request.query),
+    request._raw.signal,
   );
 }

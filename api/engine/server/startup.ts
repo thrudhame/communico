@@ -14,6 +14,7 @@ import type { Store } from '#engine/store/index.ts';
 import { onStartup, type StartupStore } from '#engine/store/watermark.ts';
 import { installJoinAdmission } from '#engine/server/join-attempts.ts';
 import { completionService } from './completion.ts';
+import { backfillDirectoryRanks } from './directory-rank.ts';
 import { assertRestoreReport } from '#engine/backup/report.ts';
 import { roomProjectionSources } from '#engine/store/projection-sources.ts';
 
@@ -79,5 +80,8 @@ export async function recoverServer(store: StartupStore): Promise<void> {
     )).map((r) => String(r.subject));
     await reconcileDeviceSubscriptions(tx, subjects, localServers);
   });
+  for await (const _ of backfillDirectoryRanks(server)) {
+    // One durable page per transaction.
+  }
   await completionService(concrete).discover(localServers[0] ?? '');
 }

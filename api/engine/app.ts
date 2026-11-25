@@ -99,6 +99,11 @@ export type App = {
 /** Granted read dependencies are supplied by the node composition root. The
  * endpoint tree never reconstructs a home identity or reaches into a link owner. */
 export type ReplicaAccess = {
+  rankedDirectoryPage?(
+    offset: number,
+    limit: number,
+    signal?: AbortSignal,
+  ): Promise<import('./server/directory-rank.ts').RankedDirectoryPage>;
   withCurrentScopes?<T>(
     read: (requireScope: (scope: string) => Promise<void>) => Promise<T>,
     signal: AbortSignal,

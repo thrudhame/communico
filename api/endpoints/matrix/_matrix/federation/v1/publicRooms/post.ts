@@ -17,5 +17,7 @@ export default async function (request: PathfinderRequest) {
       await parseJson(request),
       'federation',
     ),
+    'read',
+    request._raw.signal,
   );
 }

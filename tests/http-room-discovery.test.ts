@@ -2,6 +2,10 @@ import { assertEquals } from '@std/assert';
 import { httpSuite } from '#tests/http-app.ts';
 import { fedCaller, remoteServer } from '#tests/http-federation.ts';
 import { setConfigForTests } from '#engine/config.ts';
+import { theApp } from '#engine/app.ts';
+import { joinedUsers, listedRooms } from '#engine/server/directory.ts';
+import { rankedDirectoryPage } from '#engine/server/directory-rank.ts';
+import { project } from '#engine/server/project.ts';
 
 type Json = Record<string, unknown>;
 const suite = httpSuite('HTTP room discovery');
@@ -34,6 +38,111 @@ async function create(token: string, content: Json) {
   return String((await ok('v3/createRoom', token, content)).room_id);
 }
 const roomPath = (room: string) => 'v3/rooms/' + encodeURIComponent(room);
+
+suite.test('CHECKLISTSLOW: rank equals live recomputation after each publication change', async () => {
+  const { server, store } = theApp();
+  const check = async (
+    change: string,
+    perform: () => Promise<unknown>,
+    expected: [string, number][],
+  ) => {
+    try {
+      await perform();
+      const rooms = await Promise.all(
+        (await listedRooms(server)).map(async (id) => ({
+          id,
+          joined: (await joinedUsers(server, id)).length,
+        })),
+      );
+      rooms.sort((a, b) => b.joined - a.joined || a.id.localeCompare(b.id));
+      assertEquals(rooms, expected.map(([id, joined]) => ({ id, joined })));
+      assertEquals(await rankedDirectoryPage(server, 0, 10), {
+        total: rooms.length,
+        rooms,
+      });
+    } catch (cause) {
+      throw new Error(`after ${change}`, { cause });
+    }
+  };
+  await check('fresh install', () => Promise.resolve(), []);
+  const owner = await suite.registerTestUser('rank-owner', 'pw');
+  const member = await suite.registerTestUser('rank-member', 'pw');
+  const a = owner.access_token!, b = member.access_token!;
+  const room = await create(a, { preset: 'public_chat' });
+  const visible = (id: string, visibility: string) =>
+    ok(
+      'v3/directory/list/room/' + encodeURIComponent(id),
+      a,
+      { visibility },
+      'PUT',
+    );
+  const action = (route: string, token: string, body: Json = {}) =>
+    ok(roomPath(room) + '/' + route, token, body);
+  await check('publish', () => visible(room, 'public'), [[room, 1]]);
+  await check('join', () => action('join', b), [[room, 2]]);
+  await check('leave', () => action('leave', b), [[room, 1]]);
+  await action('join', b);
+  await check('kick', () => action('kick', a, { user_id: member.user_id }), [[
+    room,
+    1,
+  ]]);
+  await action('join', b);
+  await check('ban', () => action('ban', a, { user_id: member.user_id }), [[
+    room,
+    1,
+  ]]);
+  await check('name and topic edits', async () => {
+    await ok(
+      roomPath(room) + '/state/m.room.name',
+      a,
+      { name: 'Ranked name' },
+      'PUT',
+    );
+    await ok(roomPath(room) + '/state/m.room.topic', a, {
+      topic: 'Ranked topic',
+    }, 'PUT');
+    const body = await ok('v3/publicRooms', a, {
+      filter: { generic_search_term: 'Ranked topic' },
+    });
+    assertEquals((body.chunk as Json[]).map((r) => r.name), ['Ranked name']);
+  }, [[room, 1]]);
+  await check('unpublish', () => visible(room, 'private'), []);
+  await check('republish', () => visible(room, 'public'), [[room, 1]]);
+  await check('publication replay', async () => {
+    await project(store, room);
+    await visible(room, 'public');
+  }, [[room, 1]]);
+  // Room type is immutable in Matrix; a space has a different create state.
+  const space = await create(a, {
+    preset: 'public_chat',
+    creation_content: { type: 'm.space' },
+  });
+  const expected = [room, space].sort((x, y) => x.localeCompare(y)).map((
+    id,
+  ): [string, number] => [id, 1]);
+  await check('publish a different room type', async () => {
+    await visible(space, 'public');
+    const body = await ok('v3/publicRooms', a, {
+      filter: { room_types: ['m.space'] },
+    });
+    assertEquals((body.chunk as Json[]).map((r) => r.room_id), [space]);
+  }, expected);
+  await check(
+    'last member leaves',
+    () => ok(roomPath(space) + '/leave', a, {}),
+    [[room, 1], [space, 0]],
+  );
+  await check(
+    'purge marker after last member forgets',
+    () => ok(roomPath(space) + '/forget', a, {}),
+    [[room, 1]],
+  );
+  await check(
+    'unpublish the remaining fixture',
+    () => visible(room, 'private'),
+    [],
+  );
+});
 
 suite.test('room summaries share published metadata and enforce user or anonymous access without joining', async () => {
   const a = await suite.registerTestUser('summary-owner', 'pw');

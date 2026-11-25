@@ -9,6 +9,10 @@
 // the transaction they stamp (no sequences). The store owns the id row,
 // the meta table and the watermarks; this provider owns everything else.
 import type { SchemaProvider } from '#engine/store/create.ts';
+import {
+  DIRECTORY_RANK_SQL,
+  initDirectoryRankState,
+} from './directory-rank.ts';
 import { FEDERATION_POLICY_SQL } from '#engine/federation/policy.ts';
 import { KEY_DECISIONS_SQL } from '#engine/federation/key-decisions.ts';
 import { FACADE_EGRESS_SQL } from '#engine/facade/egress.ts';
@@ -491,7 +495,7 @@ CREATE TABLE presence_observations(user_id TEXT NOT NULL,node TEXT NOT NULL,inca
 `;
 
 export const serverSchema: SchemaProvider = {
-  version: 60,
+  version: 61,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -558,6 +562,8 @@ export const serverSchema: SchemaProvider = {
     await db.exec(NOTIFICATION_ROOM_RETIREMENT_SQL);
     await db.exec(PRESENCE_FRESHNESS_SQL);
     await db.exec(PRESENCE_OBSERVATIONS_SQL);
+    await db.exec(DIRECTORY_RANK_SQL);
+    await initDirectoryRankState(db, true);
   },
   migrations: {
     3: (conn) => conn.exec(DEVICE_CHANGES_SQL),
@@ -649,5 +655,16 @@ INSERT INTO device_publication_predecessors SELECT DISTINCT p.subject,p.destinat
     57: (conn) => conn.exec(NOTIFICATION_ROOM_RETIREMENT_SQL),
     58: (conn) => conn.exec(PRESENCE_FRESHNESS_SQL),
     59: (conn) => conn.exec(PRESENCE_OBSERVATIONS_SQL),
+    60: async (conn) => {
+      await conn.exec(DIRECTORY_RANK_SQL);
+      await initDirectoryRankState(conn, false);
+      await conn.execute(
+        `INSERT INTO directory_rank_replica(pairing,source_cut,public_rooms)
+        SELECT s.incarnation,v.source_cut,json_extract(r.record_json,'$.payload.view.publicRooms')
+        FROM facade_streams s JOIN facade_scopes v ON v.incarnation=s.incarnation AND v.scope=s.stream
+        JOIN facade_records r ON r.peer=s.peer AND r.direction=s.direction AND r.source=s.source AND r.incarnation=s.incarnation AND r.stream=s.stream AND r.sequence=s.applied
+        WHERE s.peer='home' AND s.direction='in' AND s.source='home' AND s.stream='directory' AND v.ready=1`,
+      );
+    },
   },
 };

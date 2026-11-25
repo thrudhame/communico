@@ -13,6 +13,7 @@ import {
 import { splitId } from '#engine/ids.ts';
 import { validRoomId } from '#engine/room/identity.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { rankedDirectoryPageAt } from '#engine/server/directory-rank.ts';
 import {
   type DirectoryFacts,
   directoryFactsOf,
@@ -325,8 +326,96 @@ export class DirectoryReplicas {
     private readonly readiness?: ReplicaReadiness,
   ) {}
 
-  private async snapshotAt(pairing: string, access: ScopeAccess) {
-    const [row] = await this.db.query(
+  private async appliedDirectoryAt(conn: Conn, pairing: string) {
+    const [row] = await conn.query(
+      "SELECT s.received,s.applied,v.ready,p.public_rooms FROM facade_streams s LEFT JOIN facade_scopes v ON v.incarnation=s.incarnation AND v.scope=s.stream LEFT JOIN directory_rank_replica p ON p.pairing=s.incarnation AND p.source_cut=v.source_cut WHERE s.peer='home' AND s.direction='in' AND s.source='home' AND s.incarnation=? AND s.stream='directory'",
+      [pairing],
+    );
+    if (!row || Number(row.applied) === 0) {
+      throw new ReplicaCutPending(pairing, 'directory', !pendingSuffix(row));
+    }
+    if (Number(row.ready) !== 1 || row.public_rooms == null) {
+      throw new MatrixError(
+        503,
+        'M_UNAVAILABLE',
+        'directory replica not ready',
+      );
+    }
+    return Number(row.public_rooms) === 1;
+  }
+
+  async appliedPublicRooms() {
+    const pairing =
+      (await this.pairings.active()).body.transcript.body.context.id;
+    return await this.db.tx((conn) => this.appliedDirectoryAt(conn, pairing), {
+      mode: 'deferred',
+    });
+  }
+
+  async rankedDirectoryPage(
+    offset: number,
+    limit: number,
+    signal?: AbortSignal,
+  ) {
+    const read = async () => {
+      const grant = await this.pairings.active();
+      const pairing = grant.body.transcript.body.context.id;
+      return await this.db.tx(async (conn) => {
+        await this.appliedDirectoryAt(conn, pairing);
+        const page = await rankedDirectoryPageAt(conn, offset, limit);
+        for (const room of page.rooms) {
+          const scope = 'room:' + room.id;
+          const held = await this.heldScopeAt(conn, pairing, scope);
+          if (appliedRoomReady(held)) continue;
+          // Only a returned row without a completed room cut needs the
+          // inventory's required cut or the locally owned scope fallback.
+          const { view } = await this.snapshotAt(pairing, 'applied', conn);
+          await this.scopeStateAt(
+            conn,
+            scope,
+            pairing,
+            grant.body.revision,
+            view.cuts[scope],
+            'applied',
+          );
+        }
+        return page;
+      }, { mode: 'deferred' });
+    };
+    try {
+      // Do not join a wait for newer receives when a completed page is ready.
+      return await read();
+    } catch (first) {
+      if (!(first instanceof ReplicaCutPending) || !signal) throw first;
+      return await this.admit(async (observe) => {
+        // Observe before re-reading so completion cannot be lost in the
+        // interval between deciding to wait and registering the dependency.
+        let pending = first;
+        const watched = new Set<string>();
+        while (true) {
+          watched.add(JSON.stringify([pending.pairing, pending.stream]));
+          observe?.(pending.pairing, 'directory');
+          observe?.(pending.pairing, pending.stream);
+          try {
+            return await read();
+          } catch (next) {
+            if (
+              !(next instanceof ReplicaCutPending) || !observe ||
+              watched.has(JSON.stringify([next.pairing, next.stream]))
+            ) throw next;
+            pending = next;
+          }
+        }
+      }, signal);
+    }
+  }
+
+  private async snapshotAt(
+    pairing: string,
+    access: ScopeAccess,
+    db: Pick<Conn, 'query'> = this.db,
+  ) {
+    const [row] = await db.query(
       "SELECT s.received,s.applied,v.ready,r.record_json FROM facade_streams s LEFT JOIN facade_records r ON r.peer=s.peer AND r.direction=s.direction AND r.source=s.source AND r.incarnation=s.incarnation AND r.stream=s.stream AND r.sequence=s.applied LEFT JOIN facade_scopes v ON v.incarnation=s.incarnation AND v.scope=s.stream WHERE s.peer='home' AND s.direction='in' AND s.source='home' AND s.incarnation=? AND s.stream='directory'",
       [pairing],
     );
@@ -636,6 +725,14 @@ export class DirectoryReplicas {
     );
   }
 
+  private async heldScopeAt(conn: Conn, pairing: string, scope: string) {
+    const [held] = await conn.query(
+      "SELECT s.received,s.received_hash,s.applied,s.applied_hash,v.source_cut,v.ready,v.pending_hash FROM facade_streams s LEFT JOIN facade_scopes v ON v.incarnation=s.incarnation AND v.scope=s.stream WHERE s.peer='home' AND s.direction='in' AND s.source='home' AND s.incarnation=? AND s.stream=?",
+      [pairing, scope],
+    );
+    return held;
+  }
+
   private async scopeStateAt(
     conn: Conn,
     scope: string,
@@ -647,10 +744,7 @@ export class DirectoryReplicas {
     observe?: ObserveCut,
   ): Promise<'ready' | 'absent'> {
     observe?.(pairing, scope);
-    const [held] = await conn.query(
-      "SELECT s.received,s.received_hash,s.applied,s.applied_hash,v.source_cut,v.ready,v.pending_hash FROM facade_streams s LEFT JOIN facade_scopes v ON v.incarnation=s.incarnation AND v.scope=s.stream WHERE s.peer='home' AND s.direction='in' AND s.source='home' AND s.incarnation=? AND s.stream=?",
-      [pairing, scope],
-    );
+    const held = await this.heldScopeAt(conn, pairing, scope);
     if (scope.startsWith('membership:')) {
       // Membership's exact application receipt precedes journal completion; it
       // has no facade_scopes row. An absent stream proves only declared zero.
@@ -681,11 +775,7 @@ export class DirectoryReplicas {
     // Pending application does not erase the prior completed source cut. Room
     // transactions publish semantic steps through the ordinary completion owner;
     // this does not mark the suffix complete or advance the journal's ACK.
-    if (
-      access === 'applied' && held && Number(held.applied) > 0 &&
-      Number(held.source_cut) > 0 &&
-      (Number(held.ready) === 1 || held.pending_hash !== null)
-    ) return 'ready';
+    if (access === 'applied' && appliedRoomReady(held)) return 'ready';
     if (
       held && Number(held.ready) === 1 &&
       Number(held.received) === Number(held.applied) &&
@@ -801,6 +891,10 @@ export class DirectoryReplicas {
           await installPeerPolicy(conn, view.policy);
           await installKeys(conn);
           await conn.execute(
+            'INSERT INTO directory_rank_replica(pairing,source_cut,public_rooms) VALUES(?,?,?) ON CONFLICT(pairing) DO UPDATE SET source_cut=excluded.source_cut,public_rooms=excluded.public_rooms',
+            [context.id, cut, view.publicRooms ? 1 : 0],
+          );
+          await conn.execute(
             "INSERT INTO facade_scopes(incarnation,scope,source_cut,ready,pending_hash) VALUES(?,'directory',?,1,NULL) ON CONFLICT(incarnation,scope) DO UPDATE SET source_cut=excluded.source_cut,ready=1,pending_hash=NULL",
             [context.id, cut],
           );
@@ -808,4 +902,9 @@ export class DirectoryReplicas {
         }),
     );
   }
+}
+
+function appliedRoomReady(held: Record<string, unknown> | undefined) {
+  return !!held && Number(held.applied) > 0 && Number(held.source_cut) > 0 &&
+    (Number(held.ready) === 1 || held.pending_hash !== null);
 }

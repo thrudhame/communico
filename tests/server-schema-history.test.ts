@@ -184,9 +184,7 @@ Deno.test('presence migrations append after v58 and retain historical rows witho
     assertEquals(await at59.query('SELECT * FROM presence'), [presence]);
     assertEquals(await at59.query(observations), []);
     await old.close();
-    old = await openStore(settings('old'), {
-      schemas: { server: serverSchema },
-    });
+    old = await openOld(60);
     const at60 = await old.server();
     assertEquals(await at60.query('SELECT * FROM presence'), [presence]);
     assertEquals(await at60.query('SELECT * FROM presence_observations'), []);
@@ -197,10 +195,24 @@ Deno.test('presence migrations append after v58 and retain historical rows witho
       await at60.query("SELECT v FROM meta WHERE k='schema_version'"),
       [{ v: '60' }],
     );
+    await old.close();
+    old = await openStore(settings('old'), {
+      schemas: { server: serverSchema },
+    });
+    const current = await old.server();
+    assertEquals(await current.query('SELECT * FROM presence'), [presence]);
+    assertEquals(
+      await current.query('SELECT * FROM presence_observations'),
+      [],
+    );
+    assertEquals(
+      await current.query("SELECT v FROM meta WHERE k='schema_version'"),
+      [{ v: String(serverSchema.version) }],
+    );
     const schema =
       "SELECT type,name,tbl_name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso%' ORDER BY type,name";
     assertEquals(
-      await at60.query(schema),
+      await current.query(schema),
       await (await fresh.server()).query(schema),
     );
   } finally {

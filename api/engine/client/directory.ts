@@ -3,6 +3,7 @@ import { bindPaginationToken, localPaginationToken } from './positions.ts';
 import { config, serverName } from '#engine/config.ts';
 import { localpartOf, splitId } from '#engine/ids.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { rankedDirectoryPage } from '#engine/server/directory-rank.ts';
 import {
   aliasRecord,
   lookupAlias,
@@ -29,7 +30,7 @@ import { joinedRooms, serversInRoom } from './membership.ts';
 import { writeStateKey } from './write.ts';
 import { discoveryRequest } from '#engine/federation/discovery.ts';
 import { directoryResponse } from '#engine/federation/discovery-response.ts';
-import { publicRoomSummary } from './summary.ts';
+import { publicRoomSummary, rankedPublicRoomSummary } from './summary.ts';
 import {
   type DirectoryRequest,
   directoryWireRequest,
@@ -221,9 +222,10 @@ export async function setVisibility(
 export async function queryDirectory(
   opts: DirectoryRequest,
   destination?: string,
+  signal?: AbortSignal,
 ) {
   if (destination === undefined || destination === serverName()) {
-    return await listLocalPublishedRooms(opts);
+    return await listLocalPublishedRooms(opts, 'read', signal);
   }
   const fed = config().federation;
   if (!fed.enabled || fed.lookups !== 'all') {
@@ -276,8 +278,16 @@ export async function assertFederationDirectoryAllowed() {
 export async function listLocalPublishedRooms(
   opts: DirectoryRequest,
   access: 'read' | 'admission' = 'read',
+  signal?: AbortSignal,
 ) {
-  await requireDirectoryScope('directory', access);
+  const app = theApp(),
+    roomTypes = opts.filter?.room_types,
+    search = opts.filter?.generic_search_term;
+  const useRank = roomTypes === undefined && search === undefined;
+  const replicaRank = access === 'read' && useRank &&
+    opts.network.kind !== 'instance' &&
+    app.replica?.rankedDirectoryPage !== undefined;
+  if (!replicaRank) await requireDirectoryScope('directory', access);
   const limit = opts.limit != null && opts.limit > 0
       ? Math.min(opts.limit, 100)
       : 100,
@@ -289,14 +299,26 @@ export async function listLocalPublishedRooms(
   if (opts.network.kind === 'instance') {
     return { chunk: [], total_room_count_estimate: 0 };
   }
-  const roomTypes = opts.filter?.room_types,
-    search = opts.filter?.generic_search_term;
   const all: Record<string, unknown>[] = [];
-  for (const id of await directory.listedRooms(theApp().server)) {
+  const ranked = replicaRank
+    ? await app.replica!.rankedDirectoryPage!(offset, limit, signal)
+    : useRank
+    ? await rankedDirectoryPage(app.server, offset, limit)
+    : undefined;
+  const ids = ranked?.rooms.map((room) => room.id) ??
+    await directory.listedRooms(app.server);
+  for (const [index, id] of ids.entries()) {
     if (access === 'admission') {
       await theApp().replica?.requireScope('room:' + id);
     }
-    const chunk = await publicRoomSummary(id, access);
+    const useRankedSummary = ranked !== undefined &&
+      (replicaRank || app.replica === undefined);
+    const chunk = useRankedSummary
+      ? await rankedPublicRoomSummary(id, ranked.rooms[index].joined)
+      : await publicRoomSummary(id, access);
+    if (ranked !== undefined && !useRankedSummary) {
+      chunk.num_joined_members = ranked.rooms[index].joined;
+    }
     if (
       roomTypes !== undefined &&
       !roomTypes.includes(
@@ -312,20 +334,23 @@ export async function listLocalPublishedRooms(
     ) continue;
     all.push(chunk);
   }
-  all.sort((a, b) =>
-    Number(b.num_joined_members) - Number(a.num_joined_members) ||
-    String(a.room_id).localeCompare(String(b.room_id))
-  );
+  if (ranked === undefined) {
+    all.sort((a, b) =>
+      Number(b.num_joined_members) - Number(a.num_joined_members) ||
+      String(a.room_id).localeCompare(String(b.room_id))
+    );
+  }
+  const total = ranked?.total ?? all.length;
   const out: {
     chunk: Record<string, unknown>[];
     total_room_count_estimate: number;
     next_batch?: string;
     prev_batch?: string;
   } = {
-    chunk: all.slice(offset, offset + limit),
-    total_room_count_estimate: all.length,
+    chunk: ranked === undefined ? all.slice(offset, offset + limit) : all,
+    total_room_count_estimate: total,
   };
-  if (offset + limit < all.length) {
+  if (offset + limit < total) {
     out.next_batch = await bindPaginationToken(
       theApp().server,
       String(offset + limit),
