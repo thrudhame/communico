@@ -26,6 +26,10 @@ export type EgressEnvelope = {
   body: string;
   mode: 'direct' | 'facade';
 };
+export type DevicePublicationCheck = (
+  user: string,
+  streamId: number,
+) => Promise<boolean>;
 function diverged(message: string): never {
   throw new LinkError('LINK_DIVERGED', message);
 }
@@ -44,7 +48,11 @@ function envelopeOf(raw: unknown): EgressEnvelope {
 function responseOf(raw: unknown) {
   return { pdus: sendVerdicts(raw) };
 }
-async function held(conn: Conn, destination: string, txnId: string) {
+async function held(
+  conn: Pick<Conn, 'query'>,
+  destination: string,
+  txnId: string,
+) {
   return (await conn.query(
     'SELECT * FROM facade_egress WHERE destination=? AND txn_id=?',
     [destination, txnId],
@@ -56,6 +64,7 @@ export class EgressOwner {
     private readonly db: Database,
     private readonly pairings: Pairings,
     private readonly dispatch: Dispatch,
+    private readonly devicePublished: DevicePublicationCheck,
   ) {}
 
   private async authorize(record: LinkRecord) {
@@ -98,6 +107,28 @@ export class EgressOwner {
       !Array.isArray(body.pdus) ||
       (body.edus !== undefined && !Array.isArray(body.edus))
     ) diverged('invalid frozen federation envelope');
+    // A retained result is already public. New grants (including direct
+    // dispatch from home) must not advertise beyond the facade's served view.
+    // Check outside the server transaction: the public snapshot is tenant-owned.
+    const prior = await held(this.db, envelope.destination, envelope.txnId);
+    if (prior?.result_json == null && Array.isArray(body.edus)) {
+      for (const raw of body.edus) {
+        const edu = object(raw);
+        if (edu.edu_type !== 'm.device_list_update') continue;
+        const content = object(edu.content);
+        const user = text(content.user_id), id = content.stream_id;
+        if (
+          typeof id !== 'number' || !Number.isSafeInteger(id) || id < 0
+        ) diverged('invalid local device publication');
+        if (!await this.devicePublished(user, id)) {
+          throw new LinkError(
+            'LINK_UNAVAILABLE',
+            'egress awaits its public device snapshot',
+            503,
+          );
+        }
+      }
+    }
     const fence = crypto.randomUUID();
     return await this.db.tx(async (conn) => {
       await this.check(conn, auth);

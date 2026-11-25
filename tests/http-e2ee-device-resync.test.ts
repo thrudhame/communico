@@ -180,7 +180,7 @@ Deno.test('device recovery: cancellation is subscriber-owned and does not back o
     resetCaCertsForTests();
   }
 });
-suite.test('device-list EDU invalidates the shared peer at sync, ignores origin spoofing', async () => {
+suite.test('a device-list gap invalidates the shared peer without a premature sync notice and ignores spoofing', async () => {
   const a = await suite.registerTestUser('resync-client', 'pw');
   const remote = await remoteServer();
   const user = '@bob:' + remote.name;
@@ -220,10 +220,139 @@ suite.test('device-list EDU invalidates the shared peer at sync, ignores origin 
   };
   await send(user, 'real');
   const after = await sync(before.next_batch);
-  assert(after.device_lists.changed.includes(user));
+  // Like Synapse's DeviceListUpdater, a gap marks the cache stale; only
+  // publication of a recovered view notifies sync. This peer cannot resync.
+  assertEquals(after.device_lists.changed, []);
+  const [stale] = await theApp().server.query(
+    'SELECT stale FROM remote_device_users WHERE user_id=?',
+    [user],
+  );
+  assertEquals(stale, { stale: 1 });
   await send(a.user_id, 'spoof');
   const spoof = await sync(after.next_batch);
   assertEquals(spoof.device_lists.changed, []);
+});
+
+Deno.test('PAIR503: querying a stale device list attempts recovery and reports an unavailable origin', async () => {
+  const previous = config().federation;
+  setConfigForTests({ federation: { cacerts: ['tests/fixtures/tls/ca.crt'] } });
+  resetCaCertsForTests();
+  const http = await startHttp();
+  let user = '', available = true, snapshots = 0, queries = 0;
+  const unavailable = () =>
+    Response.json({ errcode: 'M_UNAVAILABLE' }, { status: 503 });
+  const fake = await startFakeServer({
+    ourKeyDoc: () =>
+      Promise.resolve({
+        server_name: http.app.tenant.serverName,
+        verify_keys: {
+          [http.app.tenant.keyId]: { key: http.app.tenant.publicB64 },
+        },
+      }),
+    handlers: (req) => {
+      if (req.path.includes('/user/devices/')) {
+        snapshots++;
+        return available
+          ? Response.json({
+            user_id: user,
+            stream_id: 2,
+            devices: [{
+              device_id: 'D',
+              device_display_name: 'Old',
+              keys: {
+                user_id: user,
+                device_id: 'D',
+                algorithms: [],
+                keys: { 'ed25519:D': wireKey('old') },
+                signatures: {},
+              },
+            }],
+          })
+          : unavailable();
+      }
+      if (req.path.endsWith('/user/keys/query')) {
+        assert(
+          snapshots >= 2,
+          'demand must attempt recovery before falling back',
+        );
+        queries++;
+        return unavailable();
+      }
+      return null;
+    },
+  });
+  let demand: ReturnType<typeof deviceListService> | undefined;
+  try {
+    user = '@bob:' + fake.name;
+    const local = await http.registerTestUser('stale-keys-client', 'pw');
+    const query = async () => {
+      const response = await http.matrix(
+        new Request('http://x/_matrix/client/v3/keys/query', {
+          method: 'POST',
+          headers: { authorization: 'Bearer ' + local.access_token },
+          body: JSON.stringify({ device_keys: { [user]: [] } }),
+        }),
+      );
+      assertEquals(response.status, 200);
+      return await response.json();
+    };
+    await http.app.deviceLists.stop();
+    demand = deviceListService(
+      http.app.server,
+      http.app.tenant,
+      http.app.federationEdus,
+    );
+    http.app.deviceLists.recover = demand.recover;
+    await http.app.server.tx((tx) =>
+      reconcileDeviceRoom(
+        tx,
+        '!stale:local',
+        [local.user_id, user],
+        false,
+        null,
+        1,
+        [http.app.tenant.serverName],
+      )
+    );
+    assertEquals(
+      (await query()).device_keys[user].D.unsigned.device_display_name,
+      'Old',
+    );
+    assertEquals(snapshots, 1);
+    available = false;
+    await acceptDeviceDelta(
+      http.app.server,
+      deviceDelta({
+        user_id: user,
+        device_id: 'D',
+        stream_id: 5,
+        prev_id: [3],
+        device_display_name: 'New',
+      }, config().e2ee),
+      config().e2ee,
+    );
+    const result = await query();
+    assertEquals(result.device_keys, {});
+    assertEquals(result.failures[fake.name].errcode, 'M_UNAVAILABLE');
+    assertEquals([snapshots, queries], [2, 1]);
+    assertEquals(
+      await cachedDeviceKeys(http.app.server, user, [], local.user_id),
+      null,
+    );
+    assertEquals(
+      await http.app.server.query(
+        'SELECT stale FROM remote_device_users WHERE user_id=?',
+        [user],
+      ),
+      [{ stale: 1 }],
+    );
+  } finally {
+    await demand?.stop();
+    await http.close();
+    await fake.close();
+    setConfigForTests({ federation: previous });
+    resetCaCertsForTests();
+  }
 });
 
 Deno.test('lazy device recovery: membership is dormant; query demand and an EDU gap each fetch once', async () => {

@@ -202,6 +202,68 @@ Deno.test('remote cache survives restart stale, replaces authoritative lists and
   }
 });
 
+Deno.test('PAIR503: a gapped update wakes sync once, when its recovery publishes the new keys', async () => {
+  const dir = await Deno.makeTempDir();
+  const store = await openStore(options(dir), {
+    schemas: { server: serverSchema },
+  });
+  try {
+    const db = await store.server();
+    await db.tx((tx) =>
+      reconcileDeviceRoom(
+        tx,
+        '!shared:local',
+        [observer, user],
+        false,
+        null,
+        1,
+        ['local.test'],
+      )
+    );
+    const initial = await recoveryCut(db, user);
+    assert(initial);
+    assert(await installDeviceSnapshot(db, initial, snapshot(2), limits()));
+    const before = await deviceStreamMax(db);
+
+    // The update arrives before its predecessor, and recovery is held. This
+    // gap cannot publish a second change when the same update is recovered.
+    await acceptDeviceDelta(db, delta(5, [3]), limits());
+    assertEquals(await deviceStreamMax(db), before);
+    assertEquals(await cachedDeviceKeys(db, user, [], observer), null);
+    const recovered = await recoveryCut(db, user);
+    assert(recovered);
+    assert(await installDeviceSnapshot(db, recovered, snapshot(5), limits()));
+    const announced = await deviceStreamMax(db);
+    assertEquals(announced, before + 1);
+    assertEquals(
+      (await deviceListsBetween(db, observer, before, announced, 'sync'))
+        .changed,
+      [user],
+    );
+
+    // A client that sampled that wake cannot mistake recovery of the first
+    // update for the next one. Only release the rename after that read.
+    await acceptDeviceDelta(db, delta(9, [5]), limits());
+    assertEquals(
+      (await deviceListsBetween(
+        db,
+        observer,
+        announced,
+        await deviceStreamMax(db),
+        'sync',
+      )).changed,
+      [user],
+    );
+    assertEquals((await cachedDeviceKeys(db, user, [], observer))?.D, {
+      ...key('D', '9'),
+      unsigned: {},
+    });
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test('v9 lazy-recovery upgrade retains hinted retries and leaves membership-only state dormant', async () => {
   const dir = await Deno.makeTempDir();
   const previous = {

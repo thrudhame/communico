@@ -478,6 +478,26 @@ export async function deviceSnapshot(
   return response;
 }
 
+/** Test a locally authored wire identity against the exact public reader.
+ * The F1 snapshot is a copy of the serial home owner's stream. In F2 a
+ * snapshot can cover both authoring lanes; prove ancestry, not numeric order. */
+export async function coversDevicePublication(
+  conn: Conn,
+  localpart: string,
+  owner: string,
+  streamId: number,
+): Promise<boolean> {
+  const replica = await readPublicReplica(conn, localpart);
+  if (replica) return Number(replica.devices.stream_id) >= streamId;
+  const snapshot = await deviceSnapshot(conn, localpart, owner, config().e2ee);
+  const stream = Number(snapshot.stream_id);
+  if (stream === streamId) return true;
+  return (await conn.query(
+    'WITH RECURSIVE ancestors(id) AS (SELECT ? UNION SELECT p.previous_id FROM device_stream_predecessors p JOIN ancestors a ON p.stream_id=a.id WHERE p.localpart=?) SELECT 1 FROM ancestors WHERE id=? LIMIT 1',
+    [stream, localpart, streamId],
+  )).length > 0;
+}
+
 /** Shared consuming primitive for C-S and federation; empty means exhaustion. */
 export async function claimKey(
   conn: Conn,

@@ -312,10 +312,10 @@ export async function acceptDeviceDelta(
       }
     }
     await writeState(tx, d.user, s);
-    // An empty predecessor set asks for an authoritative reset. Its contents
-    // may merely repeat the subscription cut already announced by room sharing.
-    // Publish that reset only when the snapshot establishes changed material.
-    if (d.prev.length > 0) await notify(tx, d.user);
+    // A gapped update only invalidates the cache. Recovery publishes changed
+    // material and its notice together; announcing the hint here would let
+    // sync report this update twice, including before the keys are queryable.
+    if (!s.stale) await notify(tx, d.user);
   });
 }
 

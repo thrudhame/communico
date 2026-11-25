@@ -2,6 +2,7 @@
 // public Matrix listener, or home-only worker is needed for local enrollment.
 import { config, serverName } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { splitId } from '#engine/ids.ts';
 import { drainResources } from '#engine/lifetime.ts';
 import { ContactObservations } from '#engine/federation/pending-contacts.ts';
 import { inboxFailure, workerFailure } from '#engine/request-diagnostics.ts';
@@ -111,6 +112,20 @@ export async function openFacadeRuntime(
   const notices = new NoticeHub();
   let node: NodeIdentity | undefined;
   let tenant: Tenant | undefined;
+  const devicePublished = async (user: string, id: number) => {
+    const { localpart, server } = splitId(user);
+    if (!user.startsWith('@') || !localpart || server !== identity.server) {
+      return false;
+    }
+    try {
+      return await tenant?.tx((tx) =>
+        tx.e2ee.coversDevicePublication(localpart, user, id)
+      ) ?? false;
+    } catch (error) {
+      if (error instanceof MatrixError && error.status === 503) return false;
+      throw error;
+    }
+  };
   let initializing: Promise<NodeIdentity> | undefined;
   let handleLink: ReturnType<typeof linkHandler> | undefined;
   let inbox: ReturnType<typeof startInboxWorker> | undefined;
@@ -471,6 +486,7 @@ export async function openFacadeRuntime(
                 await (await keyOwner()).requestSigner(),
                 envelope,
               ),
+            devicePublished,
           ).apply(journal, stream)
           : await apply(journal, stream),
       changed: (stream) => {
@@ -605,6 +621,7 @@ export async function openFacadeRuntime(
         server,
         binding,
         (envelope) => dispatchBatch(server, signer, envelope),
+        devicePublished,
       );
       sender = startSender({
         store,

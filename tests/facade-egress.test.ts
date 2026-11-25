@@ -1,4 +1,4 @@
-import { assertEquals, assertRejects } from '@std/assert';
+import { assert, assertEquals, assertRejects } from '@std/assert';
 import {
   enqueueEdu,
   freezeBatch,
@@ -8,10 +8,15 @@ import { serverSchema } from '#engine/server/schema.ts';
 import { historicalServerSchema } from './fixtures/server-schema-history.ts';
 import { openStore } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
-import { initializeNode } from '#engine/facade/identity.ts';
+import { enrolledTenant, initializeNode } from '#engine/facade/identity.ts';
+import { exportPublicReplica, PublicReplicas } from '#engine/facade/public.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
 import { Journal } from '#engine/facade/journal.ts';
-import { type EgressEnvelope, EgressOwner } from '#engine/facade/egress.ts';
+import {
+  type DevicePublicationCheck,
+  type EgressEnvelope,
+  EgressOwner,
+} from '#engine/facade/egress.ts';
 import { LINK_CAPABILITIES } from '#engine/facade/protocol.ts';
 import type { Database } from '#engine/store/db.ts';
 import { HomeEgress } from '#engine/facade/home-egress.ts';
@@ -19,7 +24,8 @@ import type { Dispatch } from '#engine/server/delivery.ts';
 import { startSender } from '#engine/federation/sender.ts';
 import { bounded } from './helpers/server-process.ts';
 import { config } from '#engine/config.ts';
-import { upsertDevice } from '#engine/tenant/devices.ts';
+import { updateDeviceName, upsertDevice } from '#engine/tenant/devices.ts';
+import { validateUpload } from '#engine/tenant/e2ee.ts';
 import { deviceIdentity } from '#engine/tenant/txns.ts';
 import { projectTenant } from '#engine/server/project-tenant.ts';
 
@@ -87,12 +93,14 @@ async function fixture(seedServer = serverSchema) {
   );
   const sent: unknown[] = [];
   let failure = false;
-  const owner = async () =>
+  const owner = async (
+    devicePublished: DevicePublicationCheck = () => Promise.resolve(true),
+  ) =>
     new EgressOwner(await edge.server(), await fp(), (envelope) => {
       sent.push(envelope);
       if (failure) return Promise.reject(new Error('uncertain dispatch'));
       return Promise.resolve({ pdus: {} });
-    });
+    }, devicePublished);
   const journal = async () =>
     new Journal(await edge.server(), LINK_CAPABILITIES);
   const hj = new Journal(await home.server(), LINK_CAPABILITIES);
@@ -126,6 +134,8 @@ async function fixture(seedServer = serverSchema) {
   return {
     dir,
     home,
+    tenant,
+    edgePairings: fp,
     node,
     bundle,
     hp,
@@ -150,6 +160,114 @@ async function fixture(seedServer = serverSchema) {
     },
   };
 }
+
+Deno.test('PAIR503: a home device update cannot egress before the public replica covers it', async (t) => {
+  for (const mode of ['direct', 'facade'] as const) {
+    await t.step(mode, async () => {
+      const f = await fixture();
+      try {
+        const user = '@alice:logical.test';
+        const limits = config().e2ee;
+        await f.tenant.tx((tx) => tx.users.insert('alice', 'Alice'));
+        await upsertDevice(f.tenant, 'alice', 'PHONE', 'Old');
+        const device = await deviceIdentity(f.tenant, 'alice', 'PHONE');
+        assert(device);
+        const keys = {
+          user_id: user,
+          device_id: 'PHONE',
+          algorithms: [],
+          keys: {},
+          signatures: {},
+        };
+        await f.tenant.tx((tx) =>
+          tx.e2ee.upload(
+            device,
+            validateUpload(
+              { device_keys: keys },
+              user,
+              'PHONE',
+              limits,
+            ),
+          )
+        );
+        const edge = f.store(), pairings = await f.edgePairings();
+        const serving = await enrolledTenant(
+          edge,
+          pairings,
+          'logical.test',
+          f.node.node,
+        );
+        const journal = await f.journal();
+        const published = new PublicReplicas(edge, serving, pairings);
+        const exportView = () =>
+          exportPublicReplica(
+            f.home,
+            f.tenant,
+            'alice',
+            f.node.node,
+            f.bundle.id,
+          );
+        const initial = await exportView();
+        assert(initial);
+        await journal.receive('home', [initial]);
+        assert(await published.apply(journal, initial));
+        const snapshot = () =>
+          serving.tx((tx) => tx.e2ee.snapshot('alice', user, limits));
+        const name = async () => {
+          const { devices } = await snapshot();
+          return (devices as { device_display_name?: string }[])[0]
+            ?.device_display_name;
+        };
+        assertEquals(await name(), 'Old');
+
+        assert(await updateDeviceName(f.tenant, 'alice', 'PHONE', 'New'));
+        const [rename] = await (await f.home.tenant('logical.test')).query(
+          "SELECT stream_id FROM e2ee_changes WHERE localpart='alice' ORDER BY pos DESC LIMIT 1",
+        );
+        const suffix = await exportView();
+        assert(suffix);
+        await journal.receive('home', [suffix]);
+        const owner = await f.owner((user, id) =>
+          serving.tx((tx) => tx.e2ee.coversDevicePublication('alice', user, id))
+        );
+        const proposal = await f.append({
+          ...f.envelope,
+          kind: 'propose',
+          mode,
+          body: JSON.stringify({
+            origin: 'logical.test',
+            origin_server_ts: 1,
+            pdus: [],
+            edus: [{
+              edu_type: 'm.device_list_update',
+              content: {
+                user_id: user,
+                device_id: 'PHONE',
+                device_display_name: 'New',
+                keys,
+                stream_id: rename.stream_id,
+                prev_id: [(await snapshot()).stream_id],
+              },
+            }],
+          }),
+        });
+        await owner.apply(journal, proposal).catch(() => {});
+        assertEquals(
+          (await journal.heads('home', 'in', proposal)).applied.sequence,
+          0,
+        );
+        assertEquals(f.sent.length, 0);
+        assertEquals(await name(), 'Old');
+        assert(await published.apply(journal, suffix));
+        assertEquals(await name(), 'New');
+        assert(await owner.apply(journal, proposal));
+        assertEquals(f.sent.length, mode === 'facade' ? 1 : 0);
+      } finally {
+        await f.close();
+      }
+    });
+  }
+});
 
 Deno.test('facade local egress waits for the exact home result, then publishes through the same destination slot', async () => {
   const f = await fixture();

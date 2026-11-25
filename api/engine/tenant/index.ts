@@ -457,6 +457,11 @@ function bind(
       status: (device: devices.DeviceIdentity) => e2ee.keyStatus(conn, device),
       snapshot: (localpart: string, owner: string, limits: e2ee.KeyLimits) =>
         e2ee.deviceSnapshot(conn, localpart, owner, limits),
+      coversDevicePublication: (
+        localpart: string,
+        owner: string,
+        cut: number,
+      ) => e2ee.coversDevicePublication(conn, localpart, owner, cut),
     },
     erasure: {
       mark: (localpart: string, cuts: Record<string, ErasureCut>) =>
