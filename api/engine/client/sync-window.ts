@@ -38,14 +38,12 @@ export async function syncWindow(
     if (!page.length) break;
     cursor = page.at(-1)!.seq - 1;
     const { stored, boundaries } = await room.tx(async (tx) => {
-      const stored = await tx.events.list(page.map((r) => r.event));
-      const boundaries = new Set<string>();
-      for (const row of page) {
-        if (
-          (await tx.state.eventStateBefore(row.event))?.provenance ===
-            'imported'
-        ) boundaries.add(row.event);
-      }
+      const ids = page.map((r) => r.event);
+      const stored = await tx.events.list(ids);
+      const refs = await tx.state.eventStateRefs(ids);
+      const boundaries = new Set(
+        ids.filter((id) => refs.get(id)?.before?.provenance === 'imported'),
+      );
       return { stored, boundaries };
     });
     const candidates: FeedRow[] = [];

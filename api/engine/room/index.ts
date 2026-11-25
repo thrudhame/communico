@@ -179,11 +179,17 @@ function bind(
       groupMap: (group: number) => groups.map(group),
       groupKey: (group: number, type: string, stateKey: string) =>
         groups.key(group, type, stateKey),
+      groupKeys: (keys: readonly state.GroupKey[]) =>
+        state.groupKeys(conn, keys),
+      eventStateRefs: (events: readonly string[]) =>
+        state.eventStateRefs(conn, events),
       eventStateBefore: (event: string) => state.eventStateBefore(conn, event),
       eventStateAfter: (event: string) => state.eventStateAfter(conn, event),
       eventReadState: (event: string) => state.eventReadState(conn, event),
       publishedGroupsAfter: (event: string, cut?: ErasureCut) =>
         state.publishedGroupsAfter(conn, event, cut),
+      publishedGroupsAfterMany: (events: readonly string[]) =>
+        state.publishedGroupsAfterMany(conn, events),
       hasJoinedBefore: (userId: string, changePos: number) =>
         state.hasJoinedBefore(conn, userId, changePos),
       participationAt: (userId: string, through: number, stay: number) =>
@@ -200,6 +206,8 @@ function bind(
       ) => state.changedByOther(conn, type, stateKey, sender, after, initial),
       publishedAt: (stay: number, pos: number) =>
         state.publishedAt(conn, stay, pos),
+      publishedAtMany: (points: readonly (readonly [number, number])[]) =>
+        state.publishedAtMany(conn, points),
       current: (stay: number) => state.current(conn, stay),
     },
     materialize: {

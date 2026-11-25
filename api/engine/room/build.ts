@@ -63,10 +63,11 @@ export async function roomCreateId(
 export async function roomVersionOf(
   tx: RoomTx,
   stayId: number,
+  readKey = tx.state.groupKey,
 ): Promise<string> {
   const group = await tx.state.current(stayId);
   if (group === null) throw new Error('E_NO_STATE: stay has no current state');
-  const createId = await tx.state.groupKey(group, 'm.room.create', '');
+  const createId = await readKey(group, 'm.room.create', '');
   if (createId === null) {
     throw new Error('M_NO_CREATE: current state has no create event');
   }
