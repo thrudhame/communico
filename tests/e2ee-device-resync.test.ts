@@ -281,6 +281,60 @@ Deno.test('PAIR503: recovery cannot publish a snapshot behind a held device rena
   }
 });
 
+Deno.test('a replaced device cut remembers applied deltas without using them as replay predecessors', async () => {
+  const dir = await Deno.makeTempDir();
+  let store = await openStore(options(dir), {
+    schemas: { server: serverSchema },
+  });
+  try {
+    let db = await store.server();
+    const recover = async (stream: number, ids: string[]) => {
+      const cut = await recoveryCut(db, user);
+      assert(cut);
+      return await installDeviceSnapshot(
+        db,
+        cut,
+        snapshot(stream, ids),
+        limits(),
+      );
+    };
+    await acceptDeviceDelta(db, delta(10, []), limits());
+    assert(await recover(10, ['OLD']));
+    const applied = delta(20, [10], 'OLD');
+    await acceptDeviceDelta(db, applied, limits());
+    const old = (await cachedDeviceKeys(db, user, [], observer))?.OLD;
+    assertEquals((old as { keys: unknown }).keys, {
+      'ed25519:OLD': wireKey('20'),
+    });
+    await acceptDeviceDelta(db, delta(40, [30]), limits());
+    assert(await recover(40, ['D']));
+    await store.close();
+    store = await openStore(options(dir), {
+      schemas: { server: serverSchema },
+    });
+    db = await store.server();
+    const head = await deviceStreamMax(db);
+
+    // The duplicate must not enqueue recovery or resurrect the removed key.
+    await acceptDeviceDelta(db, applied, limits());
+    assertEquals(await recoveryCut(db, user), null);
+    assertEquals(await deviceStreamMax(db), head);
+    const cached = await cachedDeviceKeys(db, user, [], observer);
+    assert(cached);
+    assertEquals(Object.keys(cached), ['D']);
+
+    // Deduplication must not make a different update linked only to a retired
+    // cut safe to apply or replay over the current snapshot.
+    await acceptDeviceDelta(db, delta(25, [20], 'OLD'), limits());
+    assertEquals(await cachedDeviceKeys(db, user, [], observer), null);
+    assertEquals(await recover(40, ['D']), false);
+    assert(await recover(45, ['D']));
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test('v9 lazy-recovery upgrade retains hinted retries and leaves membership-only state dormant', async () => {
   const dir = await Deno.makeTempDir();
   const previous = {

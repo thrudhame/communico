@@ -157,6 +157,7 @@ type State = {
   revision: number;
   pending: Pending[];
   seen: string[];
+  retired: string[];
 };
 /** A relationship boundary also invalidates any in-flight snapshot generation. */
 export async function invalidateDeviceCache(
@@ -176,15 +177,19 @@ async function state(tx: Conn, user: string): Promise<State | null> {
     (await tx.query('SELECT * FROM remote_device_users WHERE user_id=?', [
       user,
     ]))[0];
-  return r
-    ? {
-      anchor: r.anchor === null ? null : String(r.anchor),
-      stale: Number(r.stale) === 1,
-      revision: Number(r.revision),
-      pending: JSON.parse(String(r.pending)),
-      seen: JSON.parse(String(r.seen)),
-    }
-    : null;
+  if (!r) return null;
+  // Keep the current cut as top-level IDs. Older readers of this private cache
+  // can still match them, but cannot mistake the nested history for ancestors.
+  const history: (string | string[])[] = JSON.parse(String(r.seen));
+  const retired = history[0];
+  return {
+    anchor: r.anchor === null ? null : String(r.anchor),
+    stale: Number(r.stale) === 1,
+    revision: Number(r.revision),
+    pending: JSON.parse(String(r.pending)),
+    seen: history.filter((id): id is string => typeof id === 'string'),
+    retired: Array.isArray(retired) ? retired : [],
+  };
 }
 async function writeState(tx: Conn, user: string, s: State): Promise<void> {
   await tx.execute(
@@ -194,7 +199,7 @@ async function writeState(tx: Conn, user: string, s: State): Promise<void> {
       s.stale ? 1 : 0,
       s.revision,
       JSON.stringify(s.pending),
-      JSON.stringify(s.seen),
+      JSON.stringify(s.retired.length ? [s.retired, ...s.seen] : s.seen),
       user,
     ],
   );
@@ -246,6 +251,19 @@ function compatible(d: DeviceDelta, seen: string[]): boolean {
   return d.prev.length > 0 && d.prev.every((p) => seen.includes(p));
 }
 
+// An authoritative replacement resets the proof used to apply later updates,
+// not duplicate detection. Bound both windows without promoting retired IDs
+// to valid predecessors of the replacement cut.
+function advanceDeviceCut(s: State, next: string[], max: number): void {
+  const seen = next.slice(-max);
+  const current = new Set(seen);
+  s.retired = [...new Set([...s.retired, ...s.seen, ...next])].filter((id) =>
+    !current.has(id)
+  ).slice(-max);
+  s.anchor = next.at(-1)!;
+  s.seen = seen;
+}
+
 /** The caller has already checked origin and the current all-room subscription. */
 export async function acceptDeviceDelta(
   db: Database,
@@ -267,6 +285,7 @@ export async function acceptDeviceDelta(
     const s = (await state(tx, d.user))!;
     if (
       s.seen.includes(d.stream) ||
+      s.retired.includes(d.stream) ||
       s.pending.some((p) => p.delta.stream === d.stream)
     ) return;
     s.revision++;
@@ -284,8 +303,7 @@ export async function acceptDeviceDelta(
           { devices: keys.map((r) => JSON.parse(String(r.key_json))), signing },
           limits.maxrequestbytes,
         );
-        s.anchor = d.stream;
-        s.seen = [...s.seen, d.stream].slice(-limits.maxkeys);
+        advanceDeviceCut(s, [...s.seen, d.stream], limits.maxkeys);
       } catch (error) {
         if (!(error instanceof UpstreamError && error.context.resourceLimit)) {
           throw error;
@@ -456,10 +474,9 @@ export async function installDeviceSnapshot(
         for (const [id, key] of keys) {
           await writeDeviceKey(tx, cut.user, id, key, previous.get(id));
         }
-        s.anchor = seen.at(-1)!;
+        advanceDeviceCut(s, seen, limits.maxkeys);
         s.stale = false;
         s.pending = [];
-        s.seen = seen.slice(-limits.maxkeys);
         await writeState(tx, cut.user, s);
         await tx.execute(
           'DELETE FROM device_recovery_requests WHERE user_id=?',
