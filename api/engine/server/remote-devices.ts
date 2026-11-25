@@ -371,6 +371,11 @@ export async function installDeviceSnapshot(
       eventStreamTx(db, async (tx) => {
         const s = await state(tx, cut.user);
         if (!s?.stale || snapshot.user !== cut.user) return false;
+        // This view predates some already applied deltas. Only pending deltas
+        // are retained for replay, so rebuilding from it would lose that work.
+        if (snapshot.stream !== s.anchor && s.seen.includes(snapshot.stream)) {
+          return false;
+        }
         // Signing EDUs have no causal stream IDs. Reject the old whole snapshot
         // rather than let it overwrite an independently committed key rotation.
         if (
@@ -384,11 +389,14 @@ export async function installDeviceSnapshot(
           newer.some((p, i) => p.revision !== cut.revision + i + 1)
         ) return false;
         const seen = [snapshot.stream];
-        // The fetch can include mutations accepted after its local recovery cut.
-        // Walk the snapshot's known causal ancestry, not numeric stream ordering:
-        // all of those hints are already represented by the authoritative cut.
+        // Walk known ancestry, not numeric stream ordering. If this snapshot
+        // repeats a held cut or is an ancestor of a pending update, even hints
+        // received before the fetch may not be represented in it. Require
+        // replay through those hints rather than clearing them on install.
         const covered = new Set([snapshot.stream]);
-        const byStream = new Map(newer.map((p) => [p.delta.stream, p.delta]));
+        const byStream = new Map(
+          s.pending.map((p) => [p.delta.stream, p.delta]),
+        );
         const visit = [snapshot.stream];
         while (visit.length) {
           const d = byStream.get(visit.pop()!);
@@ -399,7 +407,15 @@ export async function installDeviceSnapshot(
             visit.push(predecessor);
           }
         }
-        const remaining = newer.filter((p) => !covered.has(p.delta.stream));
+        const knownEarlier = snapshot.stream === s.anchor ||
+          s.pending.some(({ revision, delta }) =>
+            revision <= cut.revision && delta.prev.includes(snapshot.stream)
+          );
+        // For an unfamiliar cut, keep the normal authoritative resync on a
+        // gap: the peer may have included updates whose links we never saw.
+        const remaining = (knownEarlier ? s.pending : newer).filter((p) =>
+          !covered.has(p.delta.stream)
+        );
         const ordered: DeviceDelta[] = [];
         while (remaining.length) {
           const i = remaining.findIndex((p) => compatible(p.delta, seen));

@@ -78,11 +78,11 @@ Deno.test('remote signing revision rejects a late device snapshot over rotation;
       )
     );
     const first = await master(), second = await master();
-    const snapshot = (key?: Record<string, unknown>) =>
+    const snapshot = (key?: Record<string, unknown>, stream = 10) =>
       remoteDeviceSnapshot(
         {
           user_id: user,
-          stream_id: 10,
+          stream_id: stream,
           devices: [],
           ...(key ? { master_key: key } : {}),
         },
@@ -145,7 +145,7 @@ Deno.test('remote signing revision rejects a late device snapshot over rotation;
       await installDeviceSnapshot(
         db,
         (await recoveryCut(db, user))!,
-        snapshot(),
+        snapshot(undefined, 20),
         limits,
       ),
     );

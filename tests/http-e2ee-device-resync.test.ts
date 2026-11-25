@@ -263,7 +263,7 @@ Deno.test('lazy device recovery: membership is dormant; query demand and an EDU 
           await new Promise((r) => setTimeout(r, 80));
           return Response.json({
             user_id: user,
-            stream_id: 10,
+            stream_id: snapshots === 1 ? 10 : 20,
             devices: [{ device_id: 'D', keys: key }],
           });
         })();
