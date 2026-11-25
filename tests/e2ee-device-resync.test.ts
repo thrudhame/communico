@@ -202,6 +202,148 @@ Deno.test('remote cache survives restart stale, replaces authoritative lists and
   }
 });
 
+Deno.test('PAIR503: recovery cannot publish a snapshot behind a held device rename', async () => {
+  const dir = await Deno.makeTempDir();
+  const store = await openStore(options(dir), {
+    schemas: { server: serverSchema },
+  });
+  const named = (stream: number, name: string) =>
+    remoteDeviceSnapshot(
+      {
+        user_id: user,
+        stream_id: stream,
+        devices: [{
+          device_id: 'D',
+          device_display_name: name,
+          keys: key('D'),
+        }],
+      },
+      user,
+      limits(),
+    );
+  const rename = (stream: number, prev: number, name: string) =>
+    deviceDelta({
+      user_id: user,
+      device_id: 'D',
+      stream_id: stream,
+      prev_id: [prev],
+      device_display_name: name,
+      keys: key('D'),
+    }, limits());
+  try {
+    const db = await store.server();
+    await db.tx((tx) =>
+      reconcileDeviceRoom(
+        tx,
+        '!shared:local',
+        [observer, user],
+        false,
+        null,
+        1,
+        ['local.test'],
+      )
+    );
+    const initial = await recoveryCut(db, user);
+    assert(initial);
+    assert(await installDeviceSnapshot(db, initial, named(2, 'Old'), limits()));
+    // The sender is ahead of the facade serving the snapshot. Hold the
+    // missing predecessor 3, and finish recovery only after receiving 5.
+    await acceptDeviceDelta(db, rename(5, 3, 'New'), limits());
+    const cut = await recoveryCut(db, user);
+    assert(cut);
+    assertEquals(
+      await installDeviceSnapshot(db, cut, named(2, 'Old'), limits()),
+      false,
+    );
+    assertEquals(await cachedDeviceKeys(db, user, [], observer), null);
+    const name = async () => {
+      const cached = await cachedDeviceKeys(db, user, [], observer);
+      return (cached?.D as { unsigned: unknown })?.unsigned;
+    };
+    // A snapshot at the pending rename's predecessor can catch up by replay.
+    assert(await installDeviceSnapshot(db, cut, named(3, 'Old'), limits()));
+    assertEquals(await name(), { device_display_name: 'New' });
+
+    await acceptDeviceDelta(db, rename(8, 7, 'Newest'), limits());
+    const gap = await recoveryCut(db, user);
+    assert(gap);
+    assertEquals(
+      await installDeviceSnapshot(db, gap, named(3, 'Old'), limits()),
+      false,
+    );
+    // Unfamiliar stream IDs can be authoritative after a gap, even if their
+    // numeric value is smaller. Matrix uses predecessor IDs, not arithmetic.
+    assert(await installDeviceSnapshot(db, gap, named(1, 'Newest'), limits()));
+    assertEquals(await name(), { device_display_name: 'Newest' });
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
+Deno.test('a replaced device cut remembers applied deltas without using them as replay predecessors', async () => {
+  const dir = await Deno.makeTempDir();
+  let store = await openStore(options(dir), {
+    schemas: { server: serverSchema },
+  });
+  try {
+    let db = await store.server();
+    const recover = async (stream: number, ids: string[]) => {
+      const cut = await recoveryCut(db, user);
+      assert(cut);
+      return await installDeviceSnapshot(
+        db,
+        cut,
+        snapshot(stream, ids),
+        limits(),
+      );
+    };
+    await acceptDeviceDelta(db, delta(10, []), limits());
+    assert(await recover(10, ['OLD']));
+    const applied = delta(20, [10], 'OLD');
+    await acceptDeviceDelta(db, applied, limits());
+    const old = (await cachedDeviceKeys(db, user, [], observer))?.OLD;
+    assertEquals((old as { keys: unknown }).keys, {
+      'ed25519:OLD': wireKey('20'),
+    });
+    await acceptDeviceDelta(db, delta(40, [30]), limits());
+    assert(await recover(40, ['D']));
+    await store.close();
+    store = await openStore(options(dir), {
+      schemas: { server: serverSchema },
+    });
+    db = await store.server();
+    const head = await deviceStreamMax(db);
+
+    // The duplicate must not enqueue recovery or resurrect the removed key.
+    await acceptDeviceDelta(db, applied, limits());
+    assertEquals(await recoveryCut(db, user), null);
+    assertEquals(await deviceStreamMax(db), head);
+    const cached = await cachedDeviceKeys(db, user, [], observer);
+    assert(cached);
+    assertEquals(Object.keys(cached), ['D']);
+
+    // Deduplication must not make a different update linked only to a retired
+    // cut safe to apply or replay over the current snapshot.
+    await acceptDeviceDelta(db, delta(25, [20], 'OLD'), limits());
+    assertEquals(await cachedDeviceKeys(db, user, [], observer), null);
+    assertEquals(await recover(20, ['OLD']), false);
+    assertEquals(await cachedDeviceKeys(db, user, [], observer), null);
+    assertEquals(await recover(40, ['D']), false);
+    // An unfamiliar cut can still be authoritative, regardless of its order.
+    assert(await recover(5, ['D']));
+    assertEquals(
+      Object.keys((await cachedDeviceKeys(db, user, [], observer))!),
+      [
+        'D',
+      ],
+    );
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test('v9 lazy-recovery upgrade retains hinted retries and leaves membership-only state dormant', async () => {
   const dir = await Deno.makeTempDir();
   const previous = {
