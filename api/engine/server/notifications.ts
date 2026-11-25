@@ -90,17 +90,8 @@ export async function removeNotificationFacts(
   }
 }
 
-async function next(tx: Conn): Promise<number> {
-  await tx.execute(
-    "INSERT INTO counters(name,value) VALUES('notifications',0) ON CONFLICT DO NOTHING",
-  );
-  await tx.execute(
-    "UPDATE counters SET value=value+1 WHERE name='notifications'",
-  );
-  return Number(
-    (await tx.query("SELECT value FROM counters WHERE name='notifications'"))[0]
-      .value,
-  );
+function next(tx: Conn): Promise<number> {
+  return reservePublicationCounter(tx, 'notifications', 1);
 }
 
 async function delta(
