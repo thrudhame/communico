@@ -222,24 +222,31 @@ async function writeDeviceKey(
   );
 }
 
-async function apply(tx: Conn, d: DeviceDelta): Promise<void> {
+async function applyDeviceDelta(
+  tx: Conn,
+  d: DeviceDelta,
+  limits: KeyLimits,
+): Promise<void> {
+  const keys = new Map<string, Json>((await tx.query(
+    'SELECT device_id,key_json FROM remote_device_keys WHERE user_id=?',
+    [d.user],
+  )).map((r) => [String(r.device_id), JSON.parse(String(r.key_json))]));
+  const previous = keys.get(d.id);
+  if (d.deleted || d.key === null) keys.delete(d.id);
+  else keys.set(d.id, d.key);
+  const signing = (await signingState(tx, d.user)).keys;
+  limitEntries(keys.size + Object.keys(signing).length, limits.maxkeys);
+  bounded({ devices: [...keys.values()], signing }, limits.maxrequestbytes);
+
+  // Persist only a publishable view. On overflow, recovery still compares
+  // against the material clients could query before the cache became stale.
   if (d.deleted || d.key === null) {
     await tx.execute(
       'DELETE FROM remote_device_keys WHERE user_id=? AND device_id=?',
       [d.user, d.id],
     );
   } else {
-    const previous = (await tx.query(
-      'SELECT key_json FROM remote_device_keys WHERE user_id=? AND device_id=?',
-      [d.user, d.id],
-    ))[0];
-    await writeDeviceKey(
-      tx,
-      d.user,
-      d.id,
-      d.key,
-      previous ? JSON.parse(String(previous.key_json)) : undefined,
-    );
+    await writeDeviceKey(tx, d.user, d.id, d.key, previous);
   }
 }
 function compatible(d: DeviceDelta, seen: string[]): boolean {
@@ -271,19 +278,9 @@ export async function acceptDeviceDelta(
     ) return;
     s.revision++;
     if (!s.stale && compatible(d, s.seen)) {
-      await apply(tx, d);
-      const keys = await tx.query(
-        'SELECT key_json FROM remote_device_keys WHERE user_id=?',
-        [d.user],
-      );
       // Cache overflow is invalidation, never a truncated authoritative list.
       try {
-        const signing = (await signingState(tx, d.user)).keys;
-        limitEntries(keys.length + Object.keys(signing).length, limits.maxkeys);
-        bounded(
-          { devices: keys.map((r) => JSON.parse(String(r.key_json))), signing },
-          limits.maxrequestbytes,
-        );
+        await applyDeviceDelta(tx, d, limits);
         s.anchor = d.stream;
         s.seen = [...s.seen, d.stream].slice(-limits.maxkeys);
       } catch (error) {

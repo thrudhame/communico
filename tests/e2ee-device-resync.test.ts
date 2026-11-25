@@ -264,6 +264,63 @@ Deno.test('PAIR503: a gapped update wakes sync once, when its recovery publishes
   }
 });
 
+Deno.test('PAIR503: an oversized delta notifies only when its keys become queryable', async () => {
+  const dir = await Deno.makeTempDir();
+  const store = await openStore(options(dir), {
+    schemas: { server: serverSchema },
+  });
+  try {
+    const db = await store.server();
+    const small = { ...limits(), maxkeys: 1 };
+    await db.tx((tx) =>
+      reconcileDeviceRoom(
+        tx,
+        '!shared:local',
+        [observer, user],
+        false,
+        null,
+        1,
+        [
+          'local.test',
+        ],
+      )
+    );
+    const first = await recoveryCut(db, user);
+    assert(first);
+    assert(await installDeviceSnapshot(db, first, snapshot(10), small));
+    const published = await deviceStreamMax(db);
+    const initialKeys = await cachedDeviceKeys(db, user, [], observer);
+    assert(initialKeys);
+
+    await acceptDeviceDelta(db, delta(20, [10], 'B'), small);
+    assertEquals(await cachedDeviceKeys(db, user, [], observer), null);
+    assertEquals(await deviceStreamMax(db), published);
+    const cut = await recoveryCut(db, user);
+    assert(cut);
+    // Recovery now has room to publish the same candidate rejected on ingress.
+    const next = snapshot(20, ['B']);
+    next.devices.push(snapshot(10).devices[0]);
+    assert(await installDeviceSnapshot(db, cut, next, limits()));
+    const current = await deviceStreamMax(db);
+    assertEquals(current, published + 1);
+    assertEquals(
+      (await deviceListsBetween(db, observer, published, current, 'sync'))
+        .changed,
+      [user],
+    );
+    const currentKeys = await cachedDeviceKeys(db, user, [], observer);
+    assert(currentKeys);
+    assertEquals(Object.keys(currentKeys).sort(), ['B', 'D']);
+    assertEquals(currentKeys.D, initialKeys.D);
+    assertEquals((currentKeys.B as { keys: unknown }).keys, {
+      'ed25519:B': wireKey('20'),
+    });
+  } finally {
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test('v9 lazy-recovery upgrade retains hinted retries and leaves membership-only state dormant', async () => {
   const dir = await Deno.makeTempDir();
   const previous = {
