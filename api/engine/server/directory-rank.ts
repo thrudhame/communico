@@ -8,6 +8,7 @@ const orderVersion =
 const maxKey = (1n << 128n) - 1n;
 const encodeOrder = (key: bigint) => key.toString(16).padStart(32, '0');
 const decodeOrder = (key: string) => BigInt('0x' + key);
+const firstKey = encodeOrder(0n), lastKey = encodeOrder(maxKey);
 
 export const DIRECTORY_RANK_SQL = `
 CREATE TABLE directory_rank_state(
@@ -97,37 +98,54 @@ async function insertRank(tx: Conn, roomId: string) {
     (await tx.query('SELECT 1 FROM directory_rank WHERE room_id=?', [roomId]))
       .length
   ) return;
-  // Allocate a durable label under the writer transaction. Never sort room IDs
-  // or rebuild ranks on the read path. Membership changes leave labels alone.
-  const ranks = await tx.query(
-    'SELECT room_id,order_key FROM directory_rank ORDER BY order_key',
-  );
-  let lo = 0, hi = ranks.length;
-  while (lo < hi) {
-    const middle = (lo + hi) >>> 1;
-    if (compareRoomIds(String(ranks[middle].room_id), roomId) < 0) {
-      lo = middle + 1;
-    } else hi = middle;
-  }
-  let left = lo === 0 ? 0n : decodeOrder(String(ranks[lo - 1].order_key));
-  let right = lo === ranks.length
-    ? maxKey
-    : decodeOrder(String(ranks[lo].order_key));
-  if (right - left <= 1n) {
-    const step = maxKey / BigInt(ranks.length + 2);
-    for (const [i, row] of ranks.entries()) {
-      await tx.execute(
-        'UPDATE directory_rank SET order_key=? WHERE room_id=?',
-        [
-          encodeOrder(BigInt(i + 1) * step),
-          String(row.room_id),
-        ],
-      );
+  // Probe the label space, not row offsets: each seek reads at most one index
+  // entry. Two entries straddling the probe are actual adjacent labels, so
+  // comparing their IDs either finds the insertion gap or narrows the search.
+  let lo = firstKey, hi = lastKey;
+  while (true) {
+    const pivot = between(lo, hi);
+    const [right] = await tx.query(
+      'SELECT room_id,order_key FROM directory_rank WHERE order_key>=? ORDER BY order_key LIMIT 1',
+      [pivot],
+    );
+    if (right && compareRoomIds(String(right.room_id), roomId) < 0) {
+      lo = String(right.order_key);
+      continue;
     }
-    left = BigInt(lo) * step;
-    right = left + step;
+    const [left] = await tx.query(
+      'SELECT room_id,order_key FROM directory_rank WHERE order_key<? ORDER BY order_key DESC LIMIT 1',
+      [right?.order_key ?? pivot],
+    );
+    if (left && compareRoomIds(String(left.room_id), roomId) > 0) {
+      hi = String(left.order_key);
+      continue;
+    }
+    await insertRankAt(
+      tx,
+      roomId,
+      between(
+        String(left?.order_key ?? firstKey),
+        String(right?.order_key ?? lastKey),
+      ),
+    );
+    return;
   }
-  await insertRankAt(tx, roomId, encodeOrder((left + right) / 2n));
+}
+
+/** Hex fractions sort lexically. Keep the 32-digit backfill labels intact;
+ * live inserts extend precision in a crowded gap instead of relabeling rooms.
+ * Trim only extra trailing zeroes so a value has exactly one encoding. */
+function between(left: string, right: string): string {
+  let width = Math.max(left.length, right.length);
+  let lo = decodeOrder(left.padEnd(width, '0'));
+  let hi = decodeOrder(right.padEnd(width, '0'));
+  if (hi - lo === 1n) {
+    width++;
+    lo <<= 4n;
+    hi <<= 4n;
+  }
+  const key = ((lo + hi) / 2n).toString(16).padStart(width, '0');
+  return key.slice(0, 32) + key.slice(32).replace(/0+$/, '');
 }
 
 function insertRankAt(tx: Conn, id: string, key: string) {

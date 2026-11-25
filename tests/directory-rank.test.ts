@@ -3,6 +3,7 @@ import { joinedUsers, listedRooms } from '#engine/server/directory.ts';
 import {
   backfillDirectoryRanks,
   rankedDirectoryPage,
+  setRankedVisibility,
 } from '#engine/server/directory-rank.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { Conn, type Database } from '#engine/store/db.ts';
@@ -10,18 +11,159 @@ import { openStore } from '#engine/store/index.ts';
 import { historicalServerSchema } from './fixtures/server-schema-history.ts';
 
 async function assertDirectoryRank(db: Database) {
-  const rooms = await Promise.all((await listedRooms(db)).map(async (id) => ({
-    id,
-    joined: (await joinedUsers(db, id)).length,
-  })));
+  const rooms = [];
+  for (const id of await listedRooms(db)) {
+    rooms.push({ id, joined: (await joinedUsers(db, id)).length });
+  }
   rooms.sort((a, b) => b.joined - a.joined || a.id.localeCompare(b.id));
-  for (const offset of [0, 1, rooms.length, rooms.length + 5]) {
+  for (
+    const offset of [
+      1,
+      ...Array.from(
+        { length: Math.ceil(rooms.length / 100) + 1 },
+        (_, i) => i * 100,
+      ),
+      rooms.length + 5,
+    ]
+  ) {
     assertEquals(await rankedDirectoryPage(db, offset, 100), {
       total: rooms.length,
       rooms: rooms.slice(offset, offset + 100),
     });
   }
 }
+
+Deno.test('CHECKLISTSLOW: publication and membership write work stays bounded as directory grows', async () => {
+  const dir = await Deno.makeTempDir({ prefix: 'rank-write-' });
+  const store = await openStore({
+    dir,
+    library: './.native/libturso_ffi.so',
+    checkpointlogbytes: 65536,
+    maxopenfiles: 8,
+    idleseconds: 300,
+  }, { schemas: { server: historicalServerSchema(60) } });
+  let current: typeof store | undefined;
+  try {
+    const id = (i: number) => `!r${String(i).padStart(4, '0')}:rank.test`;
+    await (await store.server()).tx(async (tx) => {
+      for (let i = 0; i < 128; i++) {
+        await tx.execute("INSERT INTO visibility VALUES(?,'public')", [
+          id(i * 2),
+        ]);
+      }
+    });
+    await store.close();
+    current = await openStore({
+      dir,
+      library: './.native/libturso_ffi.so',
+      checkpointlogbytes: 65536,
+      maxopenfiles: 8,
+      idleseconds: 300,
+    }, { schemas: { server: serverSchema } });
+    const db = await current.server();
+    for await (const _ of backfillDirectoryRanks(db)) {
+      /* resumable batches */
+    }
+    const query = Conn.prototype.query;
+    const execute = Conn.prototype.execute;
+    const measure = async (work: () => Promise<unknown>) => {
+      let statements = 0, rows = 0;
+      Conn.prototype.query = async function (...args) {
+        statements++;
+        const result = await query.apply(this, args);
+        rows += result.length;
+        return result;
+      };
+      Conn.prototype.execute = function (...args) {
+        statements++;
+        return execute.apply(this, args);
+      };
+      try {
+        await work();
+        return { statements, rows };
+      } finally {
+        Conn.prototype.query = query;
+        Conn.prototype.execute = execute;
+      }
+    };
+    const publish = (roomId: string) =>
+      measure(() => db.tx((tx) => setRankedVisibility(tx, roomId, 'public')));
+    const join = (roomId: string) =>
+      measure(() =>
+        db.tx((tx) =>
+          tx.execute(
+            "INSERT INTO memberships VALUES('@a:rank.test',?,'join','$a',1)",
+            [roomId],
+          )
+        )
+      );
+    const large = await publish(id(129));
+    const largeJoin = await join(id(129));
+    await assertDirectoryRank(db);
+    await db.tx(async (tx) => {
+      for (let i = 16; i < 112; i++) {
+        // Retain a sparse directory, including ranks around the next insert.
+        if (i !== 63 && i !== 64 && i !== 65) {
+          await setRankedVisibility(tx, id(i * 2), 'private');
+        }
+      }
+    });
+    const small = await publish(id(127));
+    const smallJoin = await join(id(127));
+    await assertDirectoryRank(db);
+    for (const [op, order] of [['>=', 'ASC'], ['<', 'DESC']]) {
+      const plan = await db.query(
+        `EXPLAIN QUERY PLAN SELECT room_id,order_key FROM directory_rank WHERE order_key${op}? ORDER BY order_key ${order} LIMIT 1`,
+        ['8'.repeat(32)],
+      );
+      const detail = plan.map((row) => String(row.detail)).join('\n');
+      assert(
+        /SEARCH .*directory_rank_order/i.test(detail) && !/TEMP/i.test(detail),
+        detail,
+      );
+    }
+    assertEquals(largeJoin, smallJoin);
+    assertEquals(largeJoin, { statements: 1, rows: 0 });
+    assert(
+      small.rows <= 24 && large.rows <= 24 && large.statements <= 30 &&
+        small.statements <= 30,
+      `publication work at small/large directories: ${
+        JSON.stringify({ small, large })
+      }`,
+    );
+
+    // Adjacent original 32-digit keys used to trigger an all-room relabel.
+    // Compress a neighboring pair to that boundary, preserving its order.
+    const right =
+      (await db.query('SELECT order_key FROM directory_rank WHERE room_id=?', [
+        id(126),
+      ]))[0];
+    const adjacent = (BigInt('0x' + right.order_key) - 1n).toString(16)
+      .padStart(32, '0');
+    await db.execute('UPDATE directory_rank SET order_key=? WHERE room_id=?', [
+      adjacent,
+      id(30),
+    ]);
+    const before = await db.query(
+      'SELECT room_id,order_key FROM directory_rank ORDER BY room_id',
+    );
+    const denseId = '!r0060:rank.test';
+    await publish(denseId);
+    const after = await db.query(
+      'SELECT room_id,order_key FROM directory_rank ORDER BY room_id',
+    );
+    assertEquals(after.filter((row) => row.room_id !== denseId), before);
+    assert(
+      String(after.find((row) => row.room_id === denseId)?.order_key).length >
+        32,
+    );
+    await assertDirectoryRank(db);
+  } finally {
+    await current?.close();
+    await store.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
 
 Deno.test('CHECKLISTSLOW: rank migration resumes and keeps the applied facade directory flag', async () => {
   const dir = await Deno.makeTempDir({ prefix: 'rank-migration-' });
