@@ -391,7 +391,11 @@ export async function installDeviceSnapshot(
         if (!s?.stale || snapshot.user !== cut.user) return false;
         // This view predates some already applied deltas. Only pending deltas
         // are retained for replay, so rebuilding from it would lose that work.
-        if (snapshot.stream !== s.anchor && s.seen.includes(snapshot.stream)) {
+        if (
+          snapshot.stream !== s.anchor &&
+          (s.seen.includes(snapshot.stream) ||
+            s.retired.includes(snapshot.stream))
+        ) {
           return false;
         }
         // Signing EDUs have no causal stream IDs. Reject the old whole snapshot

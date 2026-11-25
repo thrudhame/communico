@@ -327,8 +327,17 @@ Deno.test('a replaced device cut remembers applied deltas without using them as 
     // cut safe to apply or replay over the current snapshot.
     await acceptDeviceDelta(db, delta(25, [20], 'OLD'), limits());
     assertEquals(await cachedDeviceKeys(db, user, [], observer), null);
+    assertEquals(await recover(20, ['OLD']), false);
+    assertEquals(await cachedDeviceKeys(db, user, [], observer), null);
     assertEquals(await recover(40, ['D']), false);
-    assert(await recover(45, ['D']));
+    // An unfamiliar cut can still be authoritative, regardless of its order.
+    assert(await recover(5, ['D']));
+    assertEquals(
+      Object.keys((await cachedDeviceKeys(db, user, [], observer))!),
+      [
+        'D',
+      ],
+    );
   } finally {
     await store.close();
     await Deno.remove(dir, { recursive: true });

@@ -520,7 +520,8 @@ suite.test('single-flight signed snapshot reaches C-S query; malformed and overs
         }
         const response = {
           user_id: user,
-          stream_id: mode === 'covered' ? 50 : 10,
+          // The healthy retry serves a fresh cut, not the old race snapshot.
+          stream_id: mode === 'covered' ? 50 : mode === 'good' ? 80 : 10,
           devices: [{ device_id: 'D', keys: key('D') }],
         };
         if (mode === 'race' || mode === 'covered') {
