@@ -4,6 +4,7 @@ import { config } from '#engine/config.ts';
 import { canonicalJson } from '#engine/canonical.ts';
 import { createHash } from 'node:crypto';
 import { eventIdFor } from '#engine/eventid.ts';
+import { retryReplicaAdmission } from '#engine/facade/readiness.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Pdu } from '#engine/pdu.ts';
 import { ingestInTx } from '#engine/room/ingest.ts';
@@ -58,13 +59,29 @@ async function membershipRoom(
   }
 }
 
-async function template(
+type MembershipAdmissionDeps = InviteDeps & { admissionSignal?: AbortSignal };
+
+function template(
   roomId: string,
   userId: string,
   origin: string,
   versions: string[],
   membership: 'join' | 'leave' | 'knock',
-  deps: InviteDeps,
+  deps: MembershipAdmissionDeps,
+) {
+  return retryReplicaAdmission(
+    deps.admissionSignal,
+    () => templateAttempt(roomId, userId, origin, versions, membership, deps),
+  );
+}
+
+async function templateAttempt(
+  roomId: string,
+  userId: string,
+  origin: string,
+  versions: string[],
+  membership: 'join' | 'leave' | 'knock',
+  deps: MembershipAdmissionDeps,
 ) {
   if (domainOf(userId) !== origin) {
     throw new MatrixError(403, 'M_FORBIDDEN', `${userId} is not on ${origin}`);
@@ -222,7 +239,7 @@ export function makeJoin(
   userId: string,
   origin: string,
   ver: string[],
-  deps: InviteDeps,
+  deps: MembershipAdmissionDeps,
 ) {
   return template(
     roomId,
@@ -239,7 +256,7 @@ export function makeLeave(
   userId: string,
   origin: string,
   ver: string[],
-  deps: InviteDeps,
+  deps: MembershipAdmissionDeps,
 ) {
   return template(roomId, userId, origin, ver, 'leave', deps);
 }
@@ -249,12 +266,12 @@ export function makeKnock(
   userId: string,
   origin: string,
   ver: string[],
-  deps: InviteDeps,
+  deps: MembershipAdmissionDeps,
 ) {
   return template(roomId, userId, origin, ver, 'knock', deps);
 }
 
-export type MembershipSendDeps = InviteDeps & {
+export type MembershipSendDeps = MembershipAdmissionDeps & {
   requireDirectoryScope?: () => Promise<void>;
 };
 
@@ -290,6 +307,34 @@ async function sendMembership(
       `expected an m.room.member ${membership} with state_key === sender`,
     );
   }
+  const finish = await retryReplicaAdmission(
+    deps.admissionSignal,
+    () =>
+      sendMembershipAttempt(
+        roomId,
+        eventId,
+        structuredClone(pdu),
+        origin,
+        membership,
+        apiVersion,
+        deps,
+        omitMembers,
+      ),
+  );
+  // Derived publication is not part of a discardable admission attempt.
+  return await finish();
+}
+
+async function sendMembershipAttempt(
+  roomId: string,
+  eventId: string,
+  pdu: Pdu,
+  origin: string,
+  membership: 'join' | 'leave' | 'knock',
+  apiVersion: 'v1' | 'v2',
+  deps: MembershipSendDeps,
+  omitMembers: boolean,
+) {
   await deps.requireDirectoryScope?.();
   const room = await membershipRoom(deps, roomId);
   const operation = canonicalJson([origin, membership, eventId]);
@@ -355,7 +400,7 @@ async function sendMembership(
   const retained = await room.tx((tx) =>
     tx.membershipReceipts.get(operation, inputHash)
   );
-  if (retained !== null) return await finish(retained);
+  if (retained !== null) return () => finish(retained);
   // If an observed receipt disappeared, its existence is not an admission for
   // a second mutation. The normal retained-material collision check ran above.
   if (admission === undefined) {
@@ -504,7 +549,7 @@ async function sendMembership(
       await recheck();
       return await room.tx(publish);
     });
-  return await finish(answer);
+  return () => finish(answer);
 }
 
 export function sendJoin(

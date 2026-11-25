@@ -36,11 +36,17 @@ import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
 import { startFakeServer } from './federation/fake-server.ts';
 import { serveDeps } from '#engine/federation/context.ts';
 import { serveEvent } from '#engine/federation/serve.ts';
-import { ReplicaReadiness } from '#engine/facade/readiness.ts';
+import {
+  type ObserveCut,
+  ReplicaCutPending,
+  ReplicaReadiness,
+} from '#engine/facade/readiness.ts';
 import { admit } from '#engine/federation/gate.ts';
 import { federationPolicy } from '#engine/federation/policy.ts';
 import { keyStore } from '#engine/federation/keys.ts';
 import { inviteDependencies } from '#engine/federation/dependencies.ts';
+import { makeJoin, sendJoin } from '#engine/federation/joins.ts';
+import { toWire } from '#engine/federation/pdu.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
 import { exportKeyRoster, FacadeKeys } from '#engine/facade/control.ts';
 import { exportAccountAuth } from '#engine/facade/accounts.ts';
@@ -61,7 +67,7 @@ import {
   makeServer,
   seedServer,
 } from './federation/doc-helper.ts';
-import { fedCaller, signTemplate } from './http-federation.ts';
+import { fedCaller, signerFor, signTemplate } from './http-federation.ts';
 import {
   certificatePin,
   enrolledTenant,
@@ -1794,6 +1800,135 @@ Deno.test('PAIR503: signed membership validation precedes pending facade cuts', 
     await tls.close();
     await f.close();
     setConfigForTests({});
+  }
+});
+
+Deno.test('PAIR503: send_join reprepares when a receive supersedes admission', async () => {
+  const f = await fixture();
+  const request = new AbortController();
+  const waiting = Promise.withResolvers<void>();
+  const readiness = new class extends ReplicaReadiness {
+    override wait<T>(
+      read: (observe: ObserveCut) => Promise<T>,
+      signal: AbortSignal,
+    ): Promise<T> {
+      return super.wait<T>(async (observe) => {
+        try {
+          return await read(observe);
+        } catch (error) {
+          if (error instanceof ReplicaCutPending && !error.needsHome) {
+            waiting.resolve();
+          }
+          throw error;
+        }
+      }, signal);
+    }
+  }({
+    canDeliver: () => false,
+    onDeliveryLoss: () => {
+      throw new Error('the newer cut is already durable');
+    },
+  });
+  try {
+    const server = await f.edgeServer();
+    const directory = new DirectoryReplicas(
+      server,
+      await f.edgePairings(),
+      f.signing.name,
+      'f2',
+      readiness,
+    );
+    const journal = new Journal(
+      server,
+      LINK_SUPPORTED,
+      (_peer, stream) => readiness.receiving(stream.incarnation, stream.stream),
+    );
+    const room = await f.exports(), initial = await f.directoryExport();
+    assert(room && initial);
+    await journal.receive('home', [room]);
+    assert(await (await f.replicas()).apply(journal, room));
+    await journal.receive('home', [initial]);
+    assert(await directory.apply(journal, initial));
+    await setVisibility(await f.home.server(), f.source.roomId, 'public');
+    const newer = await f.directoryExport();
+    assert(newer);
+
+    const guest = await makeRemoteServer('guest.test');
+    const user = '@guest:guest.test';
+    const roomId = f.source.roomId;
+    const keys = fakeKeyResolver(f.signing, guest);
+    const deps = {
+      server,
+      store: f.edgeStore(),
+      self: f.signing.name,
+      signer: signerFor(f.signing),
+      keys,
+      wake() {},
+    };
+    const { event } = await makeJoin(roomId, user, guest.name, ['11'], deps);
+    const join = await signTemplate(event, guest);
+    // A content-hash mismatch is accepted after Matrix redaction. The retry
+    // must still bind the receipt to the original request material.
+    const wire = { ...toWire(join, '11'), display_hint: 'redacted on receipt' };
+    const resend = structuredClone(wire);
+    let preparations = 0, verifications = 0;
+    const pending = sendJoin(
+      roomId,
+      String(join.event_id),
+      wire,
+      guest.name,
+      'v2',
+      {
+        ...deps,
+        admissionSignal: request.signal,
+        prepareRoomScope: (roomId) => {
+          preparations++;
+          return directory.prepareRoomScope(
+            roomId,
+            false,
+            undefined,
+            request.signal,
+          );
+        },
+        keys: {
+          async verifyEventSignature(args) {
+            const ok = await keys.verifyEventSignature(args);
+            if (++verifications === 3) await journal.receive('home', [newer]);
+            return ok;
+          },
+        },
+      },
+    );
+    await bounded(
+      Promise.race([
+        waiting.promise,
+        pending.then(() => {
+          throw new Error('join answered without preparing the new cut');
+        }),
+      ]),
+      5000,
+    );
+    assert(await directory.apply(journal, newer));
+    readiness.applied(newer.incarnation, newer.stream);
+    const answer = await bounded(pending, 5000);
+    assert(!Array.isArray(answer) && answer.event);
+    assertEquals((answer.event as Pdu).sender, user);
+    assertEquals(preparations, 2);
+    assertEquals(
+      await sendJoin(
+        roomId,
+        String(join.event_id),
+        resend,
+        guest.name,
+        'v2',
+        deps,
+      ),
+      answer,
+    );
+  } finally {
+    request.abort();
+    readiness.close();
+    await f.close();
   }
 });
 

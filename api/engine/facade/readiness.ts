@@ -1,5 +1,30 @@
 import { MatrixError } from '#engine/matrix-error.ts';
 
+/** An earlier admission proof is no longer usable, not a delivery failure. */
+export class ReplicaAdmissionSuperseded extends MatrixError {
+  constructor() {
+    super(503, 'M_UNAVAILABLE', 'replica unavailable');
+  }
+}
+
+/** The attempt owns its locks and transactions. Re-enter preparation only
+ * after it has unwound; readiness, not this loop, waits on delivery/apply. */
+export async function retryReplicaAdmission<T>(
+  signal: AbortSignal | undefined,
+  attempt: () => Promise<T>,
+): Promise<T> {
+  while (true) {
+    signal?.throwIfAborted();
+    try {
+      return await attempt();
+    } catch (error) {
+      if (!signal || !(error instanceof ReplicaAdmissionSuperseded)) {
+        throw error;
+      }
+    }
+  }
+}
+
 /** A known dependency, not a generic retry on Matrix 503s. */
 export class ReplicaCutPending extends MatrixError {
   constructor(
@@ -123,6 +148,7 @@ export class ReplicaReadiness {
         if (!receiving()) {
           if (outcome.ok) return outcome.value;
           const { error } = outcome;
+          if (error instanceof ReplicaAdmissionSuperseded) continue;
           if (!(error instanceof ReplicaCutPending)) throw error;
           const { pairing, stream, needsHome, after } = error;
           observe(pairing, stream);
