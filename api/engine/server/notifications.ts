@@ -317,17 +317,242 @@ export async function applyPushPublication(
     event,
     now,
   );
-  await applyDecisions(
+  if (!publication.decisions.length) return;
+  const scalar = (decisions: PublicationDecision[]) =>
+    applyDecisions(
+      tx,
+      room,
+      event,
+      eventSeq,
+      pos,
+      { sender: publication.sender, decisions },
+      now,
+      thread,
+      'room',
+    );
+  const routes = await classifyRoomDecisions(
     tx,
     room,
     event,
-    eventSeq,
-    pos,
-    publication,
-    now,
     thread,
-    'room',
+    publication.decisions,
   );
+  let run: FreshDecision[] = [];
+  const flush = async () => {
+    if (!run.length) return;
+    await applyFreshDecisions(tx, room, event, eventSeq, pos, thread, run, now);
+    run = [];
+  };
+  for (let at = 0; at < routes.length; at++) {
+    const route = routes[at];
+    if (route.kind === 'fresh') {
+      run.push(route);
+    } else if (route.kind === 'scalar') {
+      await flush();
+      await scalar([publication.decisions[at]]);
+    }
+  }
+  await flush();
+}
+
+type FreshDecision = {
+  kind: 'fresh';
+  input: PublicationDecision;
+  horizon: number;
+  withdrawn: boolean;
+};
+type DecisionRoute = FreshDecision | { kind: 'scalar' | 'retired' };
+
+/** The current event is already projected, including the sender's implicit
+ * read. Without authority, all remaining variable read effects are scoped to
+ * the recipient. A repeated user may see its own earlier effects, so both
+ * occurrences stay scalar. Flush before any scalar recipient: seeding can
+ * prune shared history, even though it cannot change another user's horizon. */
+async function classifyRoomDecisions(
+  tx: Conn,
+  room: string,
+  event: string,
+  thread: string,
+  inputs: readonly PublicationDecision[],
+): Promise<DecisionRoute[]> {
+  if (
+    inputs.length === 1 || await graphReceiptsEnabled(tx) ||
+    await notificationAuthority(tx)
+  ) return inputs.map(() => ({ kind: 'scalar' }));
+  const keys = inputs.map(({ tenant, user }) => ({ tenant, user }));
+  const witnesses = await tx.query(
+    `WITH recipients AS (
+      SELECT CAST(key AS INTEGER) AS idx,
+        CAST(json_extract(value,'$.tenant') AS TEXT) AS tenant,
+        CAST(json_extract(value,'$.user') AS TEXT) AS user
+      FROM json_each(?)
+    ) SELECT k.idx,
+      prior.event IS NOT NULL AS replay, retired.user IS NOT NULL AS retired,
+      (SELECT MAX(event_seq) FROM notification_horizons WHERE user=k.user AND room=? AND scope IN ('',?)) AS horizon,
+      EXISTS(SELECT 1 FROM redactions WHERE room=? AND target=?) AS withdrawn
+    FROM recipients k
+    LEFT JOIN push_evaluations prior ON prior.tenant=k.tenant AND prior.user=k.user AND prior.event=?
+    LEFT JOIN notification_retired_users retired ON retired.user=k.user
+    ORDER BY k.idx`,
+    [JSON.stringify(keys), room, thread, room, event, event],
+  );
+  const seeded = new Set((await notificationReceiptSeeds(
+    tx,
+    inputs.filter((i) => i.decision?.notify).map(({ user }) => ({
+      room,
+      user,
+    })),
+    false,
+  )).map((s) => s.user));
+  const repeated = new Map<string, number>();
+  for (const { user } of inputs) {
+    repeated.set(user, (repeated.get(user) ?? 0) + 1);
+  }
+  return witnesses.map((row) => {
+    const input = inputs[Number(row.idx)];
+    if (row.retired) return { kind: 'retired' };
+    if (row.replay || seeded.has(input.user) || repeated.get(input.user)! > 1) {
+      return { kind: 'scalar' };
+    }
+    return {
+      kind: 'fresh',
+      input,
+      horizon: Number(row.horizon ?? 0),
+      withdrawn: Boolean(row.withdrawn),
+    };
+  });
+}
+
+async function applyFreshDecisions(
+  tx: Conn,
+  room: string,
+  event: string,
+  eventSeq: number,
+  pos: number,
+  thread: string,
+  run: readonly FreshDecision[],
+  now: number,
+): Promise<void> {
+  const unread = (d: FreshDecision) => d.horizon < eventSeq && !d.withdrawn;
+  const count = run.reduce(
+    (n, d) => n + (d.input.decision?.notify ? 1 + Number(unread(d)) : 0),
+    0,
+  );
+  let next = count
+    ? await reservePublicationCounter(tx, 'notifications', count)
+    : 0;
+  const evaluations: Value[][] = [];
+  const notifications: Value[][] = [];
+  const changes: Value[][] = [];
+  const counts: Value[][] = [];
+  const dispatch: { input: PublicationDecision; seq: number }[] = [];
+  for (const d of run) {
+    const { input, withdrawn } = d;
+    const { tenant, user, decision } = input;
+    evaluations.push([
+      tenant,
+      user,
+      event,
+      room,
+      eventSeq,
+      'room',
+      pos,
+      input.ruleRevision,
+      input.ignoreRevision,
+      1,
+      decision?.ruleId ?? null,
+      decision?.kind ?? null,
+    ]);
+    if (!decision?.notify) continue;
+    const seq = next++;
+    notifications.push([
+      seq,
+      tenant,
+      user,
+      event,
+      room,
+      eventSeq,
+      thread,
+      JSON.stringify(decision.actions),
+      Number(decision.highlight),
+      now,
+      d.horizon >= eventSeq ? now : null,
+      Number(withdrawn),
+    ]);
+    if (!unread(d)) continue;
+    changes.push([next++, user, room, thread]);
+    counts.push([user, room, thread, 1, Number(decision.highlight)]);
+    dispatch.push({ input, seq });
+  }
+  await insertPublicationRows(tx, 'push_evaluations', [
+    'tenant',
+    'user',
+    'event',
+    'room',
+    'event_seq',
+    'source',
+    'source_pos',
+    'rule_revision',
+    'ignore_revision',
+    'version',
+    'rule_id',
+    'rule_kind',
+  ], evaluations);
+  await insertPublicationRows(tx, 'notifications', [
+    'seq',
+    'tenant',
+    'user',
+    'event',
+    'room',
+    'event_seq',
+    'thread',
+    'actions',
+    'highlight',
+    'created_ms',
+    'read_ms',
+    'withdrawn',
+  ], notifications);
+  await insertPublicationRows(
+    tx,
+    'notification_counts',
+    [
+      'user',
+      'room',
+      'thread',
+      'unread',
+      'highlight',
+    ],
+    counts,
+    `ON CONFLICT(user,room,thread) DO UPDATE SET
+    unread=notification_counts.unread+excluded.unread,
+    highlight=notification_counts.highlight+excluded.highlight`,
+  );
+  await insertPublicationRows(tx, 'notification_changes', [
+    'seq',
+    'user',
+    'room',
+    'thread',
+  ], changes);
+  if (notifications.length) {
+    const seqs = JSON.stringify(notifications.map((n) => n[0]));
+    await tx.execute(
+      'DELETE FROM notification_history WHERE seq IN (SELECT value FROM json_each(?))',
+      [seqs],
+    );
+    await tx.execute(
+      `INSERT INTO notification_history(seq,user,room,highlight,read_ms)
+      SELECT seq,user,room,highlight,read_ms FROM notifications WHERE seq IN (SELECT value FROM json_each(?)) AND withdrawn=0 AND (read_ms IS NULL OR read_ms>?)`,
+      [seqs, notificationHistoryCutoff(now)],
+    );
+  }
+  // Keep delivery and badge assignments (including their own timestamps) in
+  // the original recipient order and on their existing owner.
+  for (const { input, seq } of dispatch) {
+    await queueBadge(tx, input.user);
+    for (const incarnation of input.pusherIncarnations ?? []) {
+      await enqueuePush(tx, incarnation, seq, input.user, room, event, now);
+    }
+  }
 }
 
 export type IndependentPush = {

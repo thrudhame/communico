@@ -632,6 +632,11 @@ Deno.test('publication batching: a single ready unit uses set-wise notification 
                 ) {
                   return Promise.resolve([{ '1': 1 }]);
                 }
+                if (ordered && sql.startsWith('WITH recipients AS (')) {
+                  return query(sql, values).then((rows) =>
+                    rows.map((row) => ({ ...row, replay: 1 }))
+                  );
+                }
                 return query(sql, values);
               };
               tx.execute = (sql, values) => {
