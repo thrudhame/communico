@@ -127,11 +127,17 @@ async function insertRank(tx: Conn, roomId: string) {
     left = BigInt(lo) * step;
     right = left + step;
   }
-  await tx.execute(
+  await insertRankAt(tx, roomId, encodeOrder((left + right) / 2n));
+}
+
+function insertRankAt(tx: Conn, id: string, key: string) {
+  return tx.execute(
     `INSERT INTO directory_rank(room_id,order_key,joined_members,listed)
      SELECT ?,?,(SELECT COUNT(*) FROM memberships WHERE room=? AND membership='join'),
-       CASE WHEN EXISTS(SELECT 1 FROM directory WHERE room_id=? AND purgeable_ms IS NOT NULL) THEN 0 ELSE 1 END`,
-    [roomId, encodeOrder((left + right) / 2n), roomId, roomId],
+       CASE WHEN EXISTS(SELECT 1 FROM directory WHERE room_id=? AND purgeable_ms IS NOT NULL) THEN 0 ELSE 1 END
+     WHERE EXISTS(SELECT 1 FROM visibility WHERE room_id=? AND visibility='public')
+     ON CONFLICT(room_id) DO NOTHING`,
+    [id, key, id, id, id],
   );
 }
 
@@ -147,39 +153,124 @@ export async function setRankedVisibility(
      ON CONFLICT(room_id) DO UPDATE SET visibility=excluded.visibility WHERE visibility.visibility!=excluded.visibility`,
     [roomId, visibility],
   );
-  if (visibility === 'public') await insertRank(tx, roomId);
+  if (visibility === 'public') {
+    const [state] = await tx.query(
+      'SELECT complete FROM directory_rank_state WHERE id=1',
+    );
+    if (state.complete === 1) await insertRank(tx, roomId);
+  }
 }
 
-/** One committed upgrade batch; room and cursor move together. */
-export function backfillDirectoryRanks(db: Database): Promise<boolean> {
-  return db.tx(async (tx) => {
-    const [state] = await tx.query(
-      'SELECT version,after_room,complete FROM directory_rank_state WHERE id=1',
-    );
-    let after = state.after_room;
-    if (state.version !== orderVersion) {
-      // Restored data may have come from a runtime with a different collation.
-      await tx.execute('DELETE FROM directory_rank');
-      await tx.execute(
-        'UPDATE directory_rank_state SET version=?,after_room=NULL,complete=0 WHERE id=1',
-        [orderVersion],
+type RankPlan = { id: string; key: string }[];
+
+/** Only one inventory read per uninterrupted backfill. Each durable commit
+ * advances the existing BINARY room cursor with at most 64 indexed writes. */
+export async function* backfillDirectoryRanks(db: Database) {
+  while (true) {
+    const planned = await db.tx(async (tx) => {
+      const [state] = await tx.query(
+        'SELECT version,after_room,complete FROM directory_rank_state WHERE id=1',
       );
-      after = null;
-    } else if (state.complete === 1) return true;
-    const rows = await tx.query(
-      "SELECT room_id FROM visibility WHERE visibility='public' AND room_id>? ORDER BY room_id LIMIT 64",
-      [after ?? ''],
-    );
-    for (const row of rows) await insertRank(tx, String(row.room_id));
-    await tx.execute(
-      'UPDATE directory_rank_state SET after_room=?,complete=? WHERE id=1',
-      [
-        rows.at(-1)?.room_id ?? after,
-        rows.length < 64 ? 1 : 0,
-      ],
-    );
-    return rows.length < 64;
-  });
+      let after = state.after_room as string | null;
+      if (state.version !== orderVersion) {
+        // Restored data may have come from a runtime with a different collation.
+        await tx.execute('DELETE FROM directory_rank');
+        await tx.execute(
+          'UPDATE directory_rank_state SET version=?,after_room=NULL,complete=0 WHERE id=1',
+          [orderVersion],
+        );
+        after = null;
+      } else if (state.complete === 1) return null;
+      const rows = (await tx.query(
+        "SELECT v.room_id,r.order_key,v.room_id>? AS remaining FROM visibility v LEFT JOIN directory_rank r ON r.room_id=v.room_id WHERE v.visibility='public' ORDER BY v.room_id",
+        [after ?? ''],
+      )).map((row) => ({
+        id: String(row.room_id),
+        key: row.order_key as string | null,
+        remaining: row.remaining === 1,
+      }));
+      const restart = after !== null &&
+        rows.some((row) => !row.remaining && row.key === null);
+      const ordered = rows.slice().sort((a, b) => compareRoomIds(a.id, b.id));
+      let first = 0, left = 0n;
+      for (let i = 0; i <= ordered.length; i++) {
+        const anchor = ordered[i]?.key;
+        if (anchor === null) continue;
+        const right = anchor === undefined ? maxKey : decodeOrder(anchor);
+        const step = (right - left) / BigInt(i - first + 1);
+        if (step === 0n) {
+          // A previous runtime or insertion history may leave a tight gap.
+          // Re-space existing labels once, not once per inserted room.
+          const spacing = maxKey / BigInt(ordered.length + 1);
+          for (const [j, row] of ordered.entries()) {
+            const key = encodeOrder(BigInt(j + 1) * spacing);
+            if (row.key !== null) {
+              await tx.execute(
+                'UPDATE directory_rank SET order_key=? WHERE room_id=?',
+                [key, row.id],
+              );
+            }
+            row.key = key;
+          }
+          break;
+        }
+        for (let j = first; j < i; j++) {
+          ordered[j].key = encodeOrder(left + BigInt(j - first + 1) * step);
+        }
+        left = right;
+        first = i + 1;
+      }
+      // A visibility write during startup may add a room behind the cursor.
+      // Revisit it with a fresh plan, keeping the same durable cursor format.
+      if (restart) {
+        await tx.execute(
+          'UPDATE directory_rank_state SET after_room=NULL WHERE id=1',
+        );
+        after = null;
+      }
+      const plan: RankPlan = rows.filter((row) =>
+        after === null || row.remaining
+      ).map((row) => ({ id: row.id, key: row.key! }));
+      return { after, plan };
+    });
+    if (planned === null) return;
+    let after = planned.after;
+    for (let i = 0;; i += 64) {
+      const batch = planned.plan.slice(i, i + 64);
+      const next = await db.tx(async (tx) => {
+        const [state] = await tx.query(
+          'SELECT after_room,complete,version FROM directory_rank_state WHERE id=1',
+        );
+        if (state.complete === 1) return 'done';
+        if (state.after_room !== after || state.version !== orderVersion) {
+          return 'replan';
+        }
+        for (const row of batch) await insertRankAt(tx, row.id, row.key);
+        if (i + 64 >= planned.plan.length) {
+          const missing = (await tx.query(
+            "SELECT 1 FROM visibility v LEFT JOIN directory_rank r ON r.room_id=v.room_id WHERE v.visibility='public' AND r.room_id IS NULL LIMIT 1",
+          )).length !== 0;
+          await tx.execute(
+            'UPDATE directory_rank_state SET after_room=?,complete=? WHERE id=1',
+            [
+              missing ? null : batch.at(-1)?.id ?? after,
+              missing ? 0 : 1,
+            ],
+          );
+          return missing ? 'replan' : 'done';
+        }
+        await tx.execute(
+          'UPDATE directory_rank_state SET after_room=? WHERE id=1',
+          [batch.at(-1)!.id],
+        );
+        return 'more';
+      });
+      if (next === 'done') return;
+      if (next === 'replan') break;
+      after = batch.at(-1)!.id;
+      yield;
+    }
+  }
 }
 
 export function rankedDirectoryPage(

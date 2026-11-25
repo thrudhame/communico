@@ -5,7 +5,7 @@ import {
   rankedDirectoryPage,
 } from '#engine/server/directory-rank.ts';
 import { serverSchema } from '#engine/server/schema.ts';
-import type { Conn, Database } from '#engine/store/db.ts';
+import { Conn, type Database } from '#engine/store/db.ts';
 import { openStore } from '#engine/store/index.ts';
 import { historicalServerSchema } from './fixtures/server-schema-history.ts';
 
@@ -42,8 +42,8 @@ Deno.test('CHECKLISTSLOW: rank migration resumes and keeps the applied facade di
       '!é:rank.test',
       '!e\u0301:rank.test',
       ...Array.from(
-        { length: 70 },
-        (_, i) => `!x${i.toString().padStart(2, '0')}:rank.test`,
+        { length: 250 },
+        (_, i) => `!x${i.toString().padStart(3, '0')}:rank.test`,
       ),
     ];
     for (const [i, id] of ids.entries()) {
@@ -77,7 +77,27 @@ Deno.test('CHECKLISTSLOW: rank migration resumes and keeps the applied facade di
       source_cut: 17,
       public_rooms: 1,
     }]);
-    assertEquals(await backfillDirectoryRanks(db), false);
+    // A 64-room batch must not transfer the existing rank list once per room.
+    const query = Conn.prototype.query;
+    let rankRows = 0;
+    Conn.prototype.query = async function (...args) {
+      const rows = await query.apply(this, args);
+      if (/\b(?:FROM|JOIN) directory_rank\b/i.test(args[0])) {
+        rankRows += rows.length;
+      }
+      return rows;
+    };
+    const first = backfillDirectoryRanks(db);
+    try {
+      assertEquals((await first.next()).done, false);
+      await first.return();
+    } finally {
+      Conn.prototype.query = query;
+    }
+    assert(
+      rankRows <= 64 * 8,
+      `rank rows transferred in one batch: ${rankRows}`,
+    );
     assertEquals(await db.query('SELECT COUNT(*) AS n FROM directory_rank'), [{
       n: 64,
     }]);
@@ -93,14 +113,29 @@ Deno.test('CHECKLISTSLOW: rank migration resumes and keeps the applied facade di
       await reopened.query(
         'SELECT after_room,complete FROM directory_rank_state',
       ),
-      [{ after_room: '!x58:rank.test', complete: 0 }],
+      [{ after_room: '!x058:rank.test', complete: 0 }],
     );
-    assertEquals(await backfillDirectoryRanks(reopened), true);
+    rankRows = 0;
+    Conn.prototype.query = async function (...args) {
+      const rows = await query.apply(this, args);
+      if (/\b(?:FROM|JOIN) directory_rank\b/i.test(args[0])) {
+        rankRows += rows.length;
+      }
+      return rows;
+    };
+    try {
+      for await (const _ of backfillDirectoryRanks(reopened)) {
+        // Continue from the durable cursor through multiple batches.
+      }
+    } finally {
+      Conn.prototype.query = query;
+    }
+    assertEquals(rankRows, 256, 'resume should read the rank inventory once');
     await assertDirectoryRank(reopened);
     const before = await reopened.query(
       'SELECT * FROM directory_rank ORDER BY room_id',
     );
-    assertEquals(await backfillDirectoryRanks(reopened), true);
+    assertEquals((await backfillDirectoryRanks(reopened).next()).done, true);
     assertEquals(
       await reopened.query('SELECT * FROM directory_rank ORDER BY room_id'),
       before,

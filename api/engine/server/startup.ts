@@ -80,8 +80,8 @@ export async function recoverServer(store: StartupStore): Promise<void> {
     )).map((r) => String(r.subject));
     await reconcileDeviceSubscriptions(tx, subjects, localServers);
   });
-  while (
-    !await backfillDirectoryRanks(server)
-  ) { /* one durable page per transaction */ }
+  for await (const _ of backfillDirectoryRanks(server)) {
+    // One durable page per transaction.
+  }
   await completionService(concrete).discover(localServers[0] ?? '');
 }
