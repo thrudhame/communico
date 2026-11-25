@@ -14,6 +14,7 @@ import { projectTenant } from '#engine/server/project-tenant.ts';
 import { bobJoins, genesis } from '#tests/fixtures/genesis.ts';
 import { setTyping, typingIn } from '#engine/typing.ts';
 import { observePublication } from '#tests/support/hold-publication.ts';
+import { onEventStream } from '#engine/server/stream.ts';
 
 async function withStore(fn: (store: Store) => Promise<void>) {
   const dir = await Deno.makeTempDir();
@@ -149,31 +150,71 @@ Deno.test('projection work: queued same-room callers owe separate finite cuts in
     const hold = holdEvent(store, g.roomId, first.eventId, true);
     const pending = project(store, g.roomId);
     const jobs = [pending];
-    const observed: unknown[][] = [];
+    const observed = new Map<number, unknown[]>();
+    const entered = Promise.withResolvers<void>();
+    const allowRead = Promise.withResolvers<void>();
     let removeListener = () => {};
+    let removeCommitListener = () => {};
+    let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await hold.entered;
       const second = await write('later cut');
       const db = await store.server();
-      removeListener = onProjected(async (owner, id) => {
+      const firstCut = first.completion!.through;
+      const secondCut = second.completion!.through;
+      let commits = 0;
+      removeCommitListener = onEventStream((path) => {
+        if (path === db.path) commits++;
+      });
+      const callbacks: number[] = [];
+      removeListener = onProjected(async (owner, id, through) => {
         if (owner === store && id === g.roomId) {
-          observed.push((await db.query(
-            'SELECT event FROM feed WHERE event IN (?,?) ORDER BY seq',
-            [first.eventId, second.eventId],
-          )).map((r) => r.event));
+          callbacks.push(through);
+          if (through === firstCut) {
+            entered.resolve();
+            await allowRead.promise;
+          }
+          // The callback carries a room cut, not a snapshot of the live feed.
+          observed.set(
+            through,
+            (await db.query(
+              'SELECT event FROM feed WHERE room=? AND pos<=? AND event IN (?,?) ORDER BY seq',
+              [id, through, first.eventId, second.eventId],
+            )).map((r) => r.event),
+          );
         }
       });
       jobs.push(project(store, g.roomId));
       hold.release();
+      await Promise.race([
+        (async () => {
+          await Promise.race([entered.promise, pending]);
+          // Force the first callback to read after the second publication.
+          await jobs[1];
+        })(),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(
+            () => reject(new Error('later projection retained by callback')),
+            5000,
+          );
+        }),
+      ]);
+      allowRead.resolve();
       await Promise.all(jobs);
-      assertEquals(observed, [[first.eventId], [
-        first.eventId,
-        second.eventId,
-      ]]);
+      assertEquals(commits, 2, 'each admitted cut gets its own writer turn');
+      assertEquals(callbacks.toSorted((a, b) => a - b), [
+        firstCut,
+        secondCut,
+      ]);
+      assertEquals(observed.get(firstCut), [first.eventId]);
+      assertEquals(observed.get(secondCut), [first.eventId, second.eventId]);
     } finally {
+      clearTimeout(timer);
       hold.release();
-      await Promise.all(jobs);
+      allowRead.resolve();
+      await Promise.allSettled(jobs);
       removeListener();
+      removeCommitListener();
       hold.restore();
     }
   });
