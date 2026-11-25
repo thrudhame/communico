@@ -31,6 +31,7 @@ import type { Pairings } from './pairing.ts';
 import { membershipExportPrefix } from './membership.ts';
 import {
   type ObserveCut,
+  ReplicaAdmissionSuperseded,
   ReplicaCutPending,
   type ReplicaReadiness,
 } from './readiness.ts';
@@ -638,7 +639,7 @@ export class DirectoryReplicas {
       for (const stream of streams) {
         if (
           !received('home', { source: 'home', incarnation: pairing, stream })
-        ) unavailable();
+        ) throw new ReplicaAdmissionSuperseded();
       }
     }, authority);
     const verify = async (conn: Conn, observe?: ObserveCut) => {
@@ -694,7 +695,22 @@ export class DirectoryReplicas {
       conn.admit(checkCurrent);
     };
     await this.db.tx((conn) => verify(conn, observe));
-    return { check: (conn) => verify(conn), checkCurrent };
+    return {
+      async check(conn) {
+        try {
+          await verify(conn);
+        } catch (error) {
+          // A pending dependency during locked revalidation means this
+          // prepared proof must be rebuilt outside the lock. Let the next
+          // preparation decide whether the cut can actually be delivered.
+          if (error instanceof ReplicaCutPending) {
+            throw new ReplicaAdmissionSuperseded();
+          }
+          throw error;
+        }
+      },
+      checkCurrent,
+    };
   }
 
   /** Selection comes from the authenticated account stream, initiation from
