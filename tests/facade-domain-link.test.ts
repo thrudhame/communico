@@ -3,6 +3,8 @@ import { createHash } from 'node:crypto';
 import { canonicalJson } from '#engine/canonical.ts';
 import { setConfigForTests } from '#engine/config.ts';
 import { ActivityExchange } from '#engine/facade/activity.ts';
+import { acceptIngressEdu } from '#engine/facade/ingress-edus.ts';
+import { eduState } from '#engine/federation/edus.ts';
 import { DeviceOperations } from '#engine/facade/devices.ts';
 import { deleteDevices, upsertDevice } from '#engine/tenant/devices.ts';
 import { deviceIdentity } from '#engine/tenant/txns.ts';
@@ -326,6 +328,82 @@ async function activityFixture() {
   const edge = new ActivityExchange(f.edge, f.et, f.fp, f.node);
   return { ...f, device, homeActivity: home, edgeActivity: edge };
 }
+
+Deno.test('PAIR503: live remote presence follows the home room audience and original timestamp', async (t) => {
+  for (const presence of ['online', 'unavailable']) {
+    await t.step(presence, async () => {
+      const f = await activityFixture();
+      const user = '@remote:remote.test';
+      const outsider = '@outsider:remote.test';
+      const self = 'logical.test';
+      try {
+        const home = await f.home.server(), edge = await f.edge.server();
+        const edus = eduState(edge, self, f.edge);
+        const receivedMs = Date.now() - (presence === 'online' ? 0 : 75_000);
+        const lastActiveAgo = 120_000;
+        const status = presence === 'online'
+          ? 'Update for room members'
+          : undefined;
+        const push = (user_id: string) => ({
+          user_id,
+          presence,
+          last_active_ago: lastActiveAgo,
+          currently_active: false,
+          ...(status === undefined ? {} : { status_msg: status }),
+        });
+        const join = async (db: typeof home, member: string) => {
+          await db.execute('INSERT INTO memberships VALUES(?,?,?,?,?)', [
+            member,
+            '!shared:logical.test',
+            'join',
+            '$join',
+            1,
+          ]);
+        };
+        for (const member of ['@alice:logical.test', user]) {
+          await join(home, member);
+          if (presence === 'unavailable') await join(edge, member);
+        }
+        await acceptIngressEdu(
+          'remote.test',
+          self,
+          {
+            edu_type: 'm.presence',
+            content: { push: [push(user), push(outsider)] },
+          },
+          edus,
+          'f2',
+          undefined,
+          receivedMs,
+        );
+        if (presence === 'online') {
+          assertEquals((await getPresence(edge, user)).presence, 'offline');
+        }
+        const wire = await f.edgeActivity.capture(f.bundle.id);
+        assertEquals(
+          object(await f.edgeActivity.capture(f.bundle.id, false))
+            .remotePresence,
+          undefined,
+        );
+        await f.homeActivity.apply(f.bundle.id, wire, () => 0);
+        const reported = await getPresence(home, user);
+        assertEquals(reported.presence, presence);
+        assertEquals(reported.statusMsg, status ?? null);
+        assertEquals(reported.lastActiveMs, receivedMs - lastActiveAgo);
+        await f.homeActivity.apply(f.bundle.id, wire, () => 0);
+        assertEquals((await getPresence(home, user)).seq, reported.seq);
+        assertEquals(
+          await home.query('SELECT 1 FROM presence WHERE user_id=?', [
+            outsider,
+          ]),
+          [],
+        );
+      } finally {
+        await f.close();
+      }
+    });
+  }
+});
 
 Deno.test('live activity wire binds local generation to retained device creation', async () => {
   const f = await activityFixture();

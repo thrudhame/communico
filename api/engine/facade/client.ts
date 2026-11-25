@@ -278,7 +278,7 @@ export class JournalClient {
     try {
       const value = await this.call(
         'activity',
-        { required, challenge },
+        { required, challenge, relayPresence: true },
         signal,
       );
       await this.authorized();

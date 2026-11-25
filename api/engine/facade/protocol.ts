@@ -82,7 +82,7 @@ export const LIVE_ACTIVITY_CAPABILITY: Capability = {
 // The domain owners validate snapshots and admit their original source. Elapsed
 // time is receiver-local and includes any wait for their own transaction gates.
 export type LiveActivity = {
-  capture(pairing: string): Promise<unknown>;
+  capture(pairing: string, relayPresence?: boolean): Promise<unknown>;
   apply(
     pairing: string,
     snapshot: unknown,
