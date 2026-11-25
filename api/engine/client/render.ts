@@ -10,7 +10,8 @@ import { redactionsOf } from '#engine/server/read.ts';
 import { relationBundlesFor } from './relation-view.ts';
 import { ignoredSenders } from './ignored.ts';
 import { roomVersionOf } from '#engine/room/build.ts';
-import { canSeeEventAt } from './visibility.ts';
+import { visibleEventsAt } from './visibility.ts';
+import type { GroupKey } from '#engine/room/state.ts';
 import { erasedViews } from '#engine/erasure.ts';
 import { admitState, type StateAdmission } from './state-admission.ts';
 import {
@@ -191,52 +192,79 @@ async function captureAndRender(
   const captured = await room.tx(async (tx) => {
     const stay = await tx.segments.latestStay();
     if (stay === null) return null;
-    const version = await roomVersionOf(tx, stay.id);
+    const version = await roomVersionOf(
+      tx,
+      stay.id,
+      async (...key) => (await tx.state.groupKeys([key]))[0],
+    );
     const rows = await tx.events.list(ids);
-    const events = new Map<string, LoadedEvent>();
+    const statuses = await tx.events.statuses(ids);
+    const refs = await tx.state.eventStateRefs(ids);
+    const visible = admission === undefined
+      ? await visibleEventsAt(viewer!.userId, tx, rows, statuses, refs)
+      : null;
+    const selected = [];
     for (const id of ids) {
-      if (take !== undefined && events.size >= take) break;
+      if (take !== undefined && selected.length >= take) break;
       const row = rows.get(id);
       if (row === undefined) continue;
-      if (admission === undefined) {
-        if (!await canSeeEventAt(viewer!.userId, tx, id)) continue;
-        if (row.state_key === null && ignored.has(row.sender)) continue;
-      } else if ((await tx.events.getStatus(id))?.standing !== 'accepted') {
-        continue;
-      }
-      let prev: Pdu | null = null;
-      let prevId: string | null = null;
-      if (row.state_key !== null) {
-        const before = await tx.state.eventStateBefore(id);
-        prevId = before === null
-          ? null
-          : await tx.state.groupKey(before.group, row.type, row.state_key);
-        const old = prevId === null ? null : await tx.events.get(prevId);
-        if (old !== null) prev = JSON.parse(old.pdu) as Pdu;
-      }
+      if (visible !== null) {
+        if (
+          !visible.has(id) ||
+          (row.state_key === null && ignored.has(row.sender))
+        ) continue;
+      } else if (statuses.get(id)?.standing !== 'accepted') continue;
+      selected.push(row);
+    }
+    const cuts = selected.flatMap((row, index) => {
+      const at = publications?.get(row.id);
+      return at === undefined || viewer === undefined ? [] : [{ index, at }];
+    });
+    const published = await tx.state.publishedAtMany(
+      cuts.map(({ at }) => [at.stay, at.pos]),
+    );
+    const keys: GroupKey[] = [];
+    const previous = selected.map((row) => {
+      const before = refs.get(row.id)?.before;
+      return before == null || row.state_key === null
+        ? -1
+        : keys.push([before.group, row.type, row.state_key]) - 1;
+    });
+    const memberships = new Map(
+      cuts.map(({ index }, n) => [
+        index,
+        published[n] === null
+          ? -1
+          : keys.push([published[n]!, 'm.room.member', viewer!.userId]) - 1,
+      ]),
+    );
+    const stateIds = await tx.state.groupKeys(keys);
+    const stateRows = await tx.events.list([
+      ...new Set(stateIds.flatMap((id) => id === null ? [] : [id])),
+    ]);
+    const events = new Map<string, LoadedEvent>();
+    for (const [index, row] of selected.entries()) {
+      const id = row.id;
+      const prevId = stateIds[previous[index]] ?? null;
+      const old = prevId === null ? undefined : stateRows.get(prevId);
+      const prev = old === undefined ? null : JSON.parse(old.pdu) as Pdu;
       const pdu = JSON.parse(row.pdu) as Pdu;
       const membership = pdu.type === 'm.room.member'
         ? pdu.content?.membership
         : null;
       const prejoinGroup = membership === 'invite' || membership === 'knock'
-        ? await tx.state.eventStateAfter(id)
+        ? refs.get(id)?.after ?? null
         : null;
       const prejoinIds = prejoinGroup === null
         ? null
         : [...(await tx.state.groupMap(prejoinGroup.group)).values()];
       let viewerMembership = viewer?.membership;
-      const publication = publications?.get(id);
-      if (publication !== undefined && viewer !== undefined) {
-        const group = await tx.state.publishedAt(
-          publication.stay,
-          publication.pos,
-        );
-        const memberId = group === null
-          ? null
-          : await tx.state.groupKey(group, 'm.room.member', viewer.userId);
-        const member = memberId === null ? null : await tx.events.get(memberId);
+      const membershipKey = memberships.get(index);
+      if (membershipKey !== undefined) {
+        const memberId = stateIds[membershipKey];
+        const member = memberId == null ? undefined : stateRows.get(memberId);
         viewerMembership = String(
-          member === null
+          member === undefined
             ? 'leave'
             : JSON.parse(member.pdu).content?.membership ?? 'leave',
         );

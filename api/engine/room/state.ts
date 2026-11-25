@@ -3,6 +3,7 @@
 // state_entries, event_state, publications and the current pointer belong
 // to materialize.ts alone.
 import type { Conn } from '#engine/store/db.ts';
+import type { Row } from '#engine/store/ffi.ts';
 import { childrenOf } from './events.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 export type ErasureCut = { changePos: number; segment: number; group: number };
@@ -293,6 +294,116 @@ export type EventStateRef = {
   provenance: 'dag' | 'imported';
 };
 
+export async function eventStateRefs(conn: Conn, ids: readonly string[]) {
+  const out = new Map<
+    string,
+    { before: EventStateRef | null; after: EventStateRef | null }
+  >();
+  if (!ids.length) return out;
+  for (
+    const row of await conn.query(
+      `SELECT s.event, s.before_group, s.after_group, s.provenance
+     FROM json_each(?) AS i JOIN event_state s ON s.event = i.value`,
+      [JSON.stringify(ids)],
+    )
+  ) {
+    const ref = (group: Row[string]): EventStateRef | null =>
+      group === null ? null : {
+        group: Number(group),
+        provenance: row.provenance as EventStateRef['provenance'],
+      };
+    out.set(String(row.event), {
+      before: ref(row.before_group),
+      after: ref(row.after_group),
+    });
+  }
+  return out;
+}
+
+export type GroupKey = readonly [group: number, type: string, stateKey: string];
+
+// Resolve only requested keys. Keep a nearest NULL entry: it is a deletion,
+// not permission to look through to an older value in an ancestor.
+export async function groupKeys(
+  conn: Conn,
+  keys: readonly GroupKey[],
+): Promise<(string | null)[]> {
+  const result = keys.map((): string | null => null);
+  if (!keys.length) return result;
+  const paths = new Map<number, number[]>();
+  const roots = [...new Set(keys.map(([group]) => group))];
+  const links = await conn.query(
+    `WITH RECURSIVE links(root, grp, depth) AS (
+       SELECT value, value, 0 FROM json_each(?)
+       UNION ALL
+       SELECT l.root, g.parent, l.depth + 1 FROM links l
+       JOIN state_groups g ON g.id = l.grp
+       WHERE g.parent IS NOT NULL
+     )
+     SELECT l.root, l.grp, l.depth, g.id AS found FROM links l
+       LEFT JOIN state_groups g ON g.id = l.grp`,
+    [JSON.stringify(roots)],
+  );
+  for (const row of links) {
+    const root = Number(row.root);
+    if (row.found === null) throw new Error(`unknown state group ${root}`);
+    const path = paths.get(root) ?? [];
+    path[Number(row.depth)] = Number(row.grp);
+    paths.set(root, path);
+  }
+  const wanted = new Map<string, number>();
+  const input: GroupKey[] = [];
+  const indices = keys.map(([root, type, key]) =>
+    paths.get(root)!.map((group) => {
+      const selector: GroupKey = [group, type, key];
+      const encoded = JSON.stringify(selector);
+      const index = wanted.get(encoded);
+      if (index !== undefined) return index;
+      const next = input.push(selector) - 1;
+      wanted.set(encoded, next);
+      return next;
+    })
+  );
+  const loaded = new Map<number, string | null>();
+  for (
+    const row of await conn.query(
+      `SELECT i.key AS idx, e.event FROM json_each(?) i JOIN state_entries e
+       ON e.grp = json_extract(i.value,'$[0]') AND e.type = json_extract(i.value,'$[1]')
+       AND e.state_key = json_extract(i.value,'$[2]')`,
+      [JSON.stringify(input)],
+    )
+  ) loaded.set(Number(row.idx), row.event === null ? null : String(row.event));
+  for (const [n, candidates] of indices.entries()) {
+    for (const idx of candidates) {
+      if (!loaded.has(idx)) continue;
+      result[n] = loaded.get(idx)!;
+      break;
+    }
+  }
+  return result;
+}
+
+export async function publishedAtMany(
+  conn: Conn,
+  points: readonly (readonly [stay: number, pos: number])[],
+) {
+  const result = points.map((): number | null => null);
+  if (!points.length) return result;
+  for (
+    const row of await conn.query(
+      `WITH cuts AS (
+       SELECT CAST(key AS INTEGER) AS idx, json_extract(value,'$[0]') AS stay,
+              json_extract(value,'$[1]') AS pos FROM json_each(?)
+     )
+     SELECT c.idx, COALESCE((SELECT grp FROM publications p
+       WHERE p.stay = c.stay AND p.change_pos <= c.pos ORDER BY p.change_pos DESC LIMIT 1),
+       (SELECT opening_group FROM segments WHERE id = c.stay)) AS grp FROM cuts c`,
+      [JSON.stringify(points)],
+    )
+  ) result[Number(row.idx)] = row.grp === null ? null : Number(row.grp);
+  return result;
+}
+
 async function eventStateRef(
   conn: Conn,
   event: string,
@@ -457,4 +568,44 @@ export async function publishedGroupsAfter(
     ],
   );
   return rows.map((row) => Number(row.grp));
+}
+
+// Non-isolated positions use the same stay/offset comparisons as the scalar
+// reader. Preserve its bounded causal proof for isolated history anchors.
+export async function publishedGroupsAfterMany(
+  conn: Conn,
+  ids: readonly string[],
+) {
+  const groups = new Map<string, number[]>();
+  if (!ids.length) return groups;
+  const rows = await conn.query(
+    `WITH anchors AS (
+       SELECT p.event, CASE WHEN s.kind = 'history' THEN s.prev ELSE s.id END AS stay,
+              s.kind, p.offset
+       FROM json_each(?) i JOIN positions p ON p.event = i.value
+       JOIN segments s ON s.id = p.segment
+     )
+     SELECT a.event, pub.grp, 0 AS isolated FROM anchors a
+       JOIN publications pub ON pub.stay >= a.stay
+       JOIN changes c ON c.pos = pub.change_pos JOIN positions p ON p.event = c.event
+     WHERE a.kind != 'anchor' AND (pub.stay > a.stay OR a.kind = 'history' OR p.offset >= a.offset)
+     UNION
+     SELECT a.event, s.opening_group AS grp, 0 FROM anchors a JOIN segments s
+       ON s.kind = 'stay' AND (s.id > a.stay OR (s.id = a.stay AND a.kind = 'history'))
+     WHERE a.kind != 'anchor' AND s.opening_group IS NOT NULL
+     UNION
+     SELECT event, NULL, 1 FROM anchors WHERE kind = 'anchor'`,
+    [JSON.stringify(ids)],
+  );
+  for (const row of rows) {
+    const id = String(row.event);
+    if (Number(row.isolated)) {
+      groups.set(id, await publishedGroupsAfter(conn, id));
+    } else {
+      const values = groups.get(id) ?? [];
+      values.push(Number(row.grp));
+      groups.set(id, values);
+    }
+  }
+  return groups;
 }
