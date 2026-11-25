@@ -313,7 +313,7 @@ async function sendMembership(
       sendMembershipAttempt(
         roomId,
         eventId,
-        pdu,
+        structuredClone(pdu),
         origin,
         membership,
         apiVersion,

@@ -1852,11 +1852,15 @@ Deno.test('PAIR503: send_join reprepares when a receive supersedes admission', a
     };
     const { event } = await makeJoin(roomId, user, guest.name, ['11'], deps);
     const join = await signTemplate(event, guest);
+    // A content-hash mismatch is accepted after Matrix redaction. The retry
+    // must still bind the receipt to the original request material.
+    const wire = { ...toWire(join, '11'), display_hint: 'redacted on receipt' };
+    const resend = structuredClone(wire);
     let preparations = 0, verifications = 0;
     const pending = sendJoin(
       roomId,
       String(join.event_id),
-      toWire(join, '11'),
+      wire,
       guest.name,
       'v2',
       {
@@ -1895,6 +1899,17 @@ Deno.test('PAIR503: send_join reprepares when a receive supersedes admission', a
     assert(!Array.isArray(answer) && answer.event);
     assertEquals((answer.event as Pdu).sender, user);
     assertEquals(preparations, 2);
+    assertEquals(
+      await sendJoin(
+        roomId,
+        String(join.event_id),
+        resend,
+        guest.name,
+        'v2',
+        deps,
+      ),
+      answer,
+    );
   } finally {
     request.abort();
     readiness.close();
