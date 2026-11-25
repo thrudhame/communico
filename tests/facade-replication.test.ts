@@ -5,7 +5,7 @@ import {
   startFederationServices,
   theApp,
 } from '#engine/app.ts';
-import { setConfigForTests } from '#engine/config.ts';
+import { config, setConfigForTests } from '#engine/config.ts';
 import { claimKeys, queryKeys } from '#engine/client/e2ee.ts';
 import { canSeeEvent } from '#engine/client/visibility.ts';
 import { join as clientJoin, joinedRooms } from '#engine/client/membership.ts';
@@ -155,6 +155,8 @@ import {
   facadeProcess,
 } from './helpers/facade-process.ts';
 import { facadeTls } from './support/facade-tls.ts';
+import { startFacade } from '#root/api/facade.ts';
+import { ServerLifetime } from '#root/api/server-lifetime.ts';
 import { object, recordHash } from '#engine/facade/protocol.ts';
 import { registerUser } from '#engine/tenant/users.ts';
 import { getPresence } from '#engine/client/presence.ts';
@@ -5877,6 +5879,73 @@ Deno.test('CHECKLISTSLOW: only a returned unapplied directory room waits', async
     await result?.catch(() => {});
     readiness.close();
     await f.close();
+  }
+});
+
+Deno.test('CHECKLISTSLOW: production facade serves the applied ranked page', async () => {
+  const tls = await facadeTls();
+  const f = await fixture(serverSchema, '11', tls.facadePin, tls.homePin);
+  const lifetime = new ServerLifetime();
+  const listener = Deno.listen({ hostname: '127.0.0.1', port: 0 });
+  const port = listener.addr.port;
+  listener.close();
+  let facade: Awaited<ReturnType<typeof startFacade>> | undefined;
+  let fatal: unknown;
+  const ranked = DirectoryReplicas.prototype.rankedDirectoryPage;
+  let pages = 0;
+  try {
+    const initial = await f.exports(), inventory = await f.directoryExport();
+    assert(initial && inventory);
+    const journal = await f.journal();
+    await journal.receive('home', [initial]);
+    await journal.receive('home', [inventory]);
+    assert(await (await f.replicas()).apply(journal, initial));
+    assert(await (await f.directoryOwner()).apply(journal, inventory));
+    await f.edgeStore().close();
+    setConfigForTests({
+      server: { name: 'logical.test', role: 'facade', port },
+      admin: { socket: f.dir + '/admin.sock' },
+      directory: { allowanonymous: true },
+      federation: { enabled: false },
+      facade: {
+        nodeid: 'edge_a',
+        phase: 'f2',
+        url: 'https://facade.test',
+        linkport: 0,
+        linkcert: tls.dir + '/facade.crt',
+        linkkey: tls.dir + '/facade.key',
+        linkcacerts: [tls.dir + '/ca.crt'],
+      },
+    });
+    Object.assign(config().store, {
+      dir: f.dir + '/edge',
+      library: './.native/libturso_ffi.so',
+    });
+    DirectoryReplicas.prototype.rankedDirectoryPage = function (...args) {
+      pages++;
+      return ranked.apply(this, args);
+    };
+    facade = await startFacade(lifetime, (error) => {
+      fatal = error;
+    });
+    const response = await fetch(
+      `http://127.0.0.1:${port}/_matrix/client/v3/publicRooms?limit=1`,
+    );
+    const body = await response.json();
+    assertEquals(fatal, undefined);
+    assertEquals(response.status, 200, JSON.stringify(body));
+    assertEquals(body, { chunk: [], total_room_count_estimate: 0 });
+    assertEquals(
+      pages,
+      1,
+      'production publicRooms did not call the applied ranked owner',
+    );
+  } finally {
+    DirectoryReplicas.prototype.rankedDirectoryPage = ranked;
+    await facade?.close();
+    setConfigForTests({});
+    await f.close();
+    await tls.close();
   }
 });
 
