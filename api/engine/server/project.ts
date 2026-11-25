@@ -373,6 +373,8 @@ type ProjectionRequest = {
 // like the room hooks, fired after each completed projection. Each emission
 // owns its audience and completion, but never retains the publication lock
 // while awaiting observers. One listener cannot suppress another's wake.
+// `through` is a room change position, not a snapshot: a listener reading the
+// live server file may see later commits and must bound any per-cut work.
 const projectedListeners:
   ((store: Store, roomId: string, through: number) => void | Promise<void>)[] =
     [];

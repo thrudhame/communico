@@ -38,17 +38,8 @@ export async function eventStreamTx<T>(
   }
 }
 
-export async function nextEventSeq(tx: Conn): Promise<number> {
-  await tx.execute(
-    "INSERT INTO counters(name, value) VALUES('events', 0) ON CONFLICT(name) DO NOTHING",
-  );
-  await tx.execute(
-    "UPDATE counters SET value = value + 1 WHERE name = 'events'",
-  );
-  const rows = await tx.query(
-    "SELECT value FROM counters WHERE name = 'events'",
-  );
-  return Number(rows[0].value);
+export function nextEventSeq(tx: Conn): Promise<number> {
+  return reserveEventSeqs(tx, 1);
 }
 
 /** One rollback-scoped range, mapped in the writer's original FIFO order. */
