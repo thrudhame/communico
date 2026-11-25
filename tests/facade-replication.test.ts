@@ -5,7 +5,7 @@ import {
   startFederationServices,
   theApp,
 } from '#engine/app.ts';
-import { setConfigForTests } from '#engine/config.ts';
+import { config, setConfigForTests } from '#engine/config.ts';
 import { claimKeys, queryKeys } from '#engine/client/e2ee.ts';
 import { canSeeEvent } from '#engine/client/visibility.ts';
 import { join as clientJoin, joinedRooms } from '#engine/client/membership.ts';
@@ -36,11 +36,17 @@ import { reconcileDeviceRoom } from '#engine/server/e2ee.ts';
 import { startFakeServer } from './federation/fake-server.ts';
 import { serveDeps } from '#engine/federation/context.ts';
 import { serveEvent } from '#engine/federation/serve.ts';
-import { ReplicaReadiness } from '#engine/facade/readiness.ts';
+import {
+  type ObserveCut,
+  ReplicaCutPending,
+  ReplicaReadiness,
+} from '#engine/facade/readiness.ts';
 import { admit } from '#engine/federation/gate.ts';
 import { federationPolicy } from '#engine/federation/policy.ts';
 import { keyStore } from '#engine/federation/keys.ts';
 import { inviteDependencies } from '#engine/federation/dependencies.ts';
+import { makeJoin, sendJoin } from '#engine/federation/joins.ts';
+import { toWire } from '#engine/federation/pdu.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
 import { exportKeyRoster, FacadeKeys } from '#engine/facade/control.ts';
 import { exportAccountAuth } from '#engine/facade/accounts.ts';
@@ -61,7 +67,7 @@ import {
   makeServer,
   seedServer,
 } from './federation/doc-helper.ts';
-import { fedCaller, signTemplate } from './http-federation.ts';
+import { fedCaller, signerFor, signTemplate } from './http-federation.ts';
 import {
   certificatePin,
   enrolledTenant,
@@ -90,7 +96,11 @@ import {
   registerAlias,
   removeAlias,
 } from '#engine/server/aliases.ts';
-import { listedRooms, setVisibility } from '#engine/server/directory.ts';
+import {
+  joinedUsers,
+  listedRooms,
+  setVisibility,
+} from '#engine/server/directory.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { setReceipt as writeClientReceipt } from '#engine/receipts.ts';
 import { appendRecord, Journal } from '#engine/facade/journal.ts';
@@ -151,6 +161,8 @@ import {
   facadeProcess,
 } from './helpers/facade-process.ts';
 import { facadeTls } from './support/facade-tls.ts';
+import { startFacade } from '#root/api/facade.ts';
+import { ServerLifetime } from '#root/api/server-lifetime.ts';
 import { object, recordHash } from '#engine/facade/protocol.ts';
 import { registerUser } from '#engine/tenant/users.ts';
 import { getPresence } from '#engine/client/presence.ts';
@@ -1794,6 +1806,135 @@ Deno.test('PAIR503: signed membership validation precedes pending facade cuts', 
     await tls.close();
     await f.close();
     setConfigForTests({});
+  }
+});
+
+Deno.test('PAIR503: send_join reprepares when a receive supersedes admission', async () => {
+  const f = await fixture();
+  const request = new AbortController();
+  const waiting = Promise.withResolvers<void>();
+  const readiness = new class extends ReplicaReadiness {
+    override wait<T>(
+      read: (observe: ObserveCut) => Promise<T>,
+      signal: AbortSignal,
+    ): Promise<T> {
+      return super.wait<T>(async (observe) => {
+        try {
+          return await read(observe);
+        } catch (error) {
+          if (error instanceof ReplicaCutPending && !error.needsHome) {
+            waiting.resolve();
+          }
+          throw error;
+        }
+      }, signal);
+    }
+  }({
+    canDeliver: () => false,
+    onDeliveryLoss: () => {
+      throw new Error('the newer cut is already durable');
+    },
+  });
+  try {
+    const server = await f.edgeServer();
+    const directory = new DirectoryReplicas(
+      server,
+      await f.edgePairings(),
+      f.signing.name,
+      'f2',
+      readiness,
+    );
+    const journal = new Journal(
+      server,
+      LINK_SUPPORTED,
+      (_peer, stream) => readiness.receiving(stream.incarnation, stream.stream),
+    );
+    const room = await f.exports(), initial = await f.directoryExport();
+    assert(room && initial);
+    await journal.receive('home', [room]);
+    assert(await (await f.replicas()).apply(journal, room));
+    await journal.receive('home', [initial]);
+    assert(await directory.apply(journal, initial));
+    await setVisibility(await f.home.server(), f.source.roomId, 'public');
+    const newer = await f.directoryExport();
+    assert(newer);
+
+    const guest = await makeRemoteServer('guest.test');
+    const user = '@guest:guest.test';
+    const roomId = f.source.roomId;
+    const keys = fakeKeyResolver(f.signing, guest);
+    const deps = {
+      server,
+      store: f.edgeStore(),
+      self: f.signing.name,
+      signer: signerFor(f.signing),
+      keys,
+      wake() {},
+    };
+    const { event } = await makeJoin(roomId, user, guest.name, ['11'], deps);
+    const join = await signTemplate(event, guest);
+    // A content-hash mismatch is accepted after Matrix redaction. The retry
+    // must still bind the receipt to the original request material.
+    const wire = { ...toWire(join, '11'), display_hint: 'redacted on receipt' };
+    const resend = structuredClone(wire);
+    let preparations = 0, verifications = 0;
+    const pending = sendJoin(
+      roomId,
+      String(join.event_id),
+      wire,
+      guest.name,
+      'v2',
+      {
+        ...deps,
+        admissionSignal: request.signal,
+        prepareRoomScope: (roomId) => {
+          preparations++;
+          return directory.prepareRoomScope(
+            roomId,
+            false,
+            undefined,
+            request.signal,
+          );
+        },
+        keys: {
+          async verifyEventSignature(args) {
+            const ok = await keys.verifyEventSignature(args);
+            if (++verifications === 3) await journal.receive('home', [newer]);
+            return ok;
+          },
+        },
+      },
+    );
+    await bounded(
+      Promise.race([
+        waiting.promise,
+        pending.then(() => {
+          throw new Error('join answered without preparing the new cut');
+        }),
+      ]),
+      5000,
+    );
+    assert(await directory.apply(journal, newer));
+    readiness.applied(newer.incarnation, newer.stream);
+    const answer = await bounded(pending, 5000);
+    assert(!Array.isArray(answer) && answer.event);
+    assertEquals((answer.event as Pdu).sender, user);
+    assertEquals(preparations, 2);
+    assertEquals(
+      await sendJoin(
+        roomId,
+        String(join.event_id),
+        resend,
+        guest.name,
+        'v2',
+        deps,
+      ),
+      answer,
+    );
+  } finally {
+    request.abort();
+    readiness.close();
+    await f.close();
   }
 });
 
@@ -5786,6 +5927,160 @@ Deno.test('PAIR503: public federation reads serve the applied publication', asyn
     await closeApp();
     setConfigForTests({});
     await f.close();
+  }
+});
+
+Deno.test('CHECKLISTSLOW: only a returned unapplied directory room waits', async () => {
+  const f = await fixture();
+  const observed = Promise.withResolvers<void>();
+  const readiness = new ReplicaReadiness({
+    canDeliver: () => {
+      observed.resolve();
+      return true;
+    },
+    onDeliveryLoss: () => () => {},
+  });
+  const abort = new AbortController();
+  let result: Promise<unknown> | undefined;
+  try {
+    const server = await f.edgeServer();
+    const directory = new DirectoryReplicas(
+      server,
+      await f.edgePairings(),
+      f.tenant.serverName,
+      'f1',
+      readiness,
+    );
+    const journal = new Journal(
+      server,
+      LINK_CAPABILITIES,
+      (_, stream) => readiness.receiving(stream.incarnation, stream.stream),
+    );
+    const rooms = await f.replicas();
+    const pending = await makeFakeRoom({
+      roomId: '!z-pending:logical.test',
+      server: f.signing,
+      version: f.source.version,
+    });
+    const [create, join] = pending.events.values();
+    const keys = fakeKeyResolver(f.signing);
+    await importReplicaGenesis(f.home, {
+      roomId: pending.roomId,
+      roomVersion: pending.version,
+      self: f.signing.name,
+      keys,
+      create,
+      join,
+    });
+    const home = await f.home.server();
+    await setVisibility(home, f.source.roomId, 'public');
+    await setVisibility(home, pending.roomId, 'public');
+    const initial = await f.exports(), inventory = await f.directoryExport();
+    const delayed = await exportRoomReplica(
+      f.home,
+      await openRoom(f.home, pending.roomId),
+      f.signing.name,
+      f.node.node,
+      f.bundle.id,
+    );
+    assert(initial && inventory && delayed);
+    await journal.receive('home', [initial]);
+    await journal.receive('home', [inventory]);
+    assert(await rooms.apply(journal, initial));
+    assert(await directory.apply(journal, inventory));
+    const signal = AbortSignal.any([abort.signal, AbortSignal.timeout(8000)]);
+    const first = await directory.rankedDirectoryPage(0, 1, signal);
+    assertEquals(first.total, 2);
+    assertEquals(first.rooms.map(({ id }) => id), [f.source.roomId]);
+    let completed = false;
+    const page = directory.rankedDirectoryPage(1, 1, signal).finally(() => {
+      completed = true;
+    });
+    result = page;
+    await Promise.race([observed.promise, page]);
+    assert(!completed, 'the selected unapplied room should wait');
+    await journal.receive('home', [delayed]);
+    assert(await rooms.apply(journal, delayed));
+    readiness.applied(delayed.incarnation, delayed.stream);
+    assertEquals(await page, {
+      total: 2,
+      rooms: [{
+        id: pending.roomId,
+        joined: (await joinedUsers(server, pending.roomId)).length,
+      }],
+    });
+  } finally {
+    abort.abort();
+    await result?.catch(() => {});
+    readiness.close();
+    await f.close();
+  }
+});
+
+Deno.test('CHECKLISTSLOW: production facade serves the applied ranked page', async () => {
+  const tls = await facadeTls();
+  const f = await fixture(serverSchema, '11', tls.facadePin, tls.homePin);
+  const lifetime = new ServerLifetime();
+  const listener = Deno.listen({ hostname: '127.0.0.1', port: 0 });
+  const port = listener.addr.port;
+  listener.close();
+  let facade: Awaited<ReturnType<typeof startFacade>> | undefined;
+  let fatal: unknown;
+  const ranked = DirectoryReplicas.prototype.rankedDirectoryPage;
+  let pages = 0;
+  try {
+    const initial = await f.exports(), inventory = await f.directoryExport();
+    assert(initial && inventory);
+    const journal = await f.journal();
+    await journal.receive('home', [initial]);
+    await journal.receive('home', [inventory]);
+    assert(await (await f.replicas()).apply(journal, initial));
+    assert(await (await f.directoryOwner()).apply(journal, inventory));
+    await f.edgeStore().close();
+    setConfigForTests({
+      server: { name: 'logical.test', role: 'facade', port },
+      admin: { socket: f.dir + '/admin.sock' },
+      directory: { allowanonymous: true },
+      federation: { enabled: false },
+      facade: {
+        nodeid: 'edge_a',
+        phase: 'f2',
+        url: 'https://facade.test',
+        linkport: 0,
+        linkcert: tls.dir + '/facade.crt',
+        linkkey: tls.dir + '/facade.key',
+        linkcacerts: [tls.dir + '/ca.crt'],
+      },
+    });
+    Object.assign(config().store, {
+      dir: f.dir + '/edge',
+      library: './.native/libturso_ffi.so',
+    });
+    DirectoryReplicas.prototype.rankedDirectoryPage = function (...args) {
+      pages++;
+      return ranked.apply(this, args);
+    };
+    facade = await startFacade(lifetime, (error) => {
+      fatal = error;
+    });
+    const response = await fetch(
+      `http://127.0.0.1:${port}/_matrix/client/v3/publicRooms?limit=1`,
+    );
+    const body = await response.json();
+    assertEquals(fatal, undefined);
+    assertEquals(response.status, 200, JSON.stringify(body));
+    assertEquals(body, { chunk: [], total_room_count_estimate: 0 });
+    assertEquals(
+      pages,
+      1,
+      'production publicRooms did not call the applied ranked owner',
+    );
+  } finally {
+    DirectoryReplicas.prototype.rankedDirectoryPage = ranked;
+    await facade?.close();
+    setConfigForTests({});
+    await f.close();
+    await tls.close();
   }
 });
 

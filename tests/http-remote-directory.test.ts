@@ -1,10 +1,11 @@
-import { assertEquals, assertThrows } from '@std/assert';
+import { assert, assertEquals, assertThrows } from '@std/assert';
 import { parsePosition } from '#engine/client/tokens.ts';
 import { theApp } from '#engine/app.ts';
 import { setConfigForTests } from '#engine/config.ts';
 import { lookupRoom } from '#engine/client/room.ts';
 import { resetCaCertsForTests } from '#engine/federation/client.ts';
 import { lookupPeer } from '#engine/federation/peers.ts';
+import { Turso } from '#engine/store/ffi.ts';
 import { startFakeServer } from '#tests/federation/fake-server.ts';
 import { httpSuite } from '#tests/http-app.ts';
 import { fedCaller, remoteServer } from '#tests/http-federation.ts';
@@ -430,18 +431,117 @@ Deno.test('federation GET normalizes no caller limit separately from client and 
   );
 });
 
+async function directoryPageWork<T>(read: () => Promise<T>) {
+  const { query, execute, exec, open } = Turso.prototype;
+  let statements = 0, roomOpens = 0;
+  Turso.prototype.query = function (...args) {
+    statements++;
+    return query.apply(this, args);
+  };
+  Turso.prototype.execute = function (...args) {
+    statements++;
+    return execute.apply(this, args);
+  };
+  Turso.prototype.exec = function (...args) {
+    statements++;
+    return exec.apply(this, args);
+  };
+  Turso.prototype.open = function (...args) {
+    if (args[0].includes('/rooms/')) roomOpens++;
+    return open.apply(this, args);
+  };
+  try {
+    const value = await read();
+    return { value, statements, roomOpens };
+  } finally {
+    Object.assign(Turso.prototype, { query, execute, exec, open });
+  }
+}
+
 suite.test('105 published rooms retain the shared Synapse cap and reachable tail on every directory route', async () => {
   const user = await suite.registerTestUser('directory-pagination', 'pw');
+  const joiner = await suite.registerTestUser('directory-rank', 'pw');
+  const ids: string[] = [];
+  const work: {
+    published: number;
+    offset: number;
+    statements: number;
+    roomOpens: number;
+  }[] = [];
+  const size = 3;
+  const checkSmallPages = async () => {
+    const [largest, ...rest] = ids;
+    const expected = [largest, ...rest.sort((a, b) => a.localeCompare(b))];
+    let since: string | undefined;
+    for (const offset of [0, size]) {
+      const measured = await directoryPageWork(() =>
+        call(
+          '',
+          user.access_token,
+          undefined,
+          `&limit=${size}` +
+            (since === undefined ? '' : '&since=' + encodeURIComponent(since)),
+        )
+      );
+      const { status, body } = measured.value;
+      assertEquals(status, 200);
+      assertEquals(body.total_room_count_estimate, ids.length);
+      assertEquals(
+        (body.chunk as Json[]).map(({ room_id, num_joined_members }) => [
+          room_id,
+          num_joined_members,
+        ]),
+        expected.slice(offset, offset + size).map((id) => [
+          id,
+          id === largest ? 2 : 1,
+        ]),
+      );
+      assertEquals(
+        parsePosition(String(body.next_batch))?.payload,
+        String(offset + size),
+      );
+      if (offset === 0) assertEquals(body.prev_batch, undefined);
+      else assertEquals(parsePosition(String(body.prev_batch))?.payload, '0');
+      since = String(body.next_batch);
+      work.push({
+        published: ids.length,
+        offset,
+        statements: measured.statements,
+        roomOpens: measured.roomOpens,
+      });
+    }
+  };
   for (let i = 0; i < 105; i++) {
     const response = await suite.matrix(
       new Request('http://x/_matrix/client/v3/createRoom', {
         method: 'POST',
         headers: { Authorization: 'Bearer ' + user.access_token },
-        body: JSON.stringify({ visibility: 'public', name: 'Published ' + i }),
+        body: JSON.stringify({
+          visibility: 'public',
+          preset: 'public_chat',
+          name: 'Published ' + i,
+        }),
       }),
     );
-    await response.arrayBuffer();
     assertEquals(response.status, 200);
+    const { room_id } = await response.json();
+    assert(typeof room_id === 'string');
+    ids.push(room_id);
+    if (i === 0) {
+      const joined = await suite.matrix(
+        new Request(
+          'http://x/_matrix/client/v3/join/' + encodeURIComponent(room_id),
+          {
+            method: 'POST',
+            headers: { Authorization: 'Bearer ' + joiner.access_token },
+            body: '{}',
+          },
+        ),
+      );
+      await joined.arrayBuffer();
+      assertEquals(joined.status, 200);
+    }
+    if (ids.length === 35 || ids.length === 105) await checkSmallPages();
   }
   const fed = await federationCaller();
   setConfigForTests({ federation: { publicrooms: true } });
@@ -501,4 +601,12 @@ suite.test('105 published rooms retain the shared Synapse cap and reachable tail
   } finally {
     setConfigForTests({});
   }
+  // Leave room for the existing per-result serializer plus fixed request work.
+  // Neither budget grows when there are more published rooms off the page.
+  assert(
+    work.every(({ statements, roomOpens }) =>
+      statements <= 50 + 100 * size && roomOpens <= size
+    ),
+    'Directory page work must be bounded by its limit: ' + JSON.stringify(work),
+  );
 });

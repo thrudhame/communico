@@ -40,6 +40,7 @@ export async function startFacade(
       if (!tenant) return;
       if (!appBound) {
         await openReplicaApp(runtime.store, tenant, {
+          rankedDirectoryPage: runtime.rankedDirectoryPage,
           requireReadScope: runtime.requireReadScope,
           prepareReadRoomScope: runtime.prepareReadRoomScope,
           requireScope: runtime.requireScope,

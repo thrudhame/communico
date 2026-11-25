@@ -7,6 +7,8 @@ import { genesis } from '#tests/fixtures/genesis.ts';
 // Independent of removal.ts: a new room-keyed server table must choose its
 // lifecycle here, then prove it with a populated row through the real owner.
 const cleared = [
+  // The visibility deletion retires the rank row in the same transaction.
+  'directory_rank',
   'aliases',
   'directory',
   'e2ee_room_members',

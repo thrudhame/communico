@@ -1,6 +1,6 @@
 // Composition for thin endpoint adapters; all state belongs to the app.
 import { theApp } from '#engine/app.ts';
-import type { InviteDeps } from './invites.ts';
+import type { MembershipSendDeps } from './joins.ts';
 import { inviteDependencies, transactionDependencies } from './dependencies.ts';
 import type { TransactionDeps } from './transactions.ts';
 import type { ServeDeps } from './serve.ts';
@@ -20,7 +20,7 @@ export function serveDeps(signal?: AbortSignal): ServeDeps {
   };
 }
 
-export function inviteDeps(signal?: AbortSignal): InviteDeps {
+export function inviteDeps(signal?: AbortSignal): MembershipSendDeps {
   return inviteDependencies(theApp(), signal);
 }
 
