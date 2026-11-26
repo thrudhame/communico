@@ -1,3 +1,4 @@
+import { DiagnosticCommand } from '#tests/helpers/child-diagnostics.ts';
 import { assert } from '@std/assert';
 import { join } from '@std/path';
 
@@ -15,7 +16,7 @@ for (const kind of ['early', 'main', 'peak']) {
     const decoder = new TextDecoder();
     try {
       if (kind !== 'peak') {
-        const compiler = await new Deno.Command('cc', {
+        const compiler = await new DiagnosticCommand('cc', {
           args: [
             '-shared',
             '-fPIC',
@@ -33,7 +34,7 @@ for (const kind of ['early', 'main', 'peak']) {
           CHECKPOINT_FAULT_ARM: arm,
         });
       }
-      const run = await new Deno.Command(Deno.execPath(), {
+      const run = await new DiagnosticCommand(Deno.execPath(), {
         args: [
           'run',
           '--allow-read',
