@@ -10,6 +10,7 @@ import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { openStore, type StoreConfig } from '#engine/store/index.ts';
+import { Capacity } from '#engine/store/capacity.ts';
 import { type Tenant, tenantSchema } from '#engine/tenant/index.ts';
 import { capabilities } from './capabilities.ts';
 import { FacadeKeys } from './control.ts';
@@ -100,6 +101,7 @@ export async function openFacadeRuntime(
     schemas: { server: serverSchema, tenant: tenantSchema, room: roomSchema },
     beforeStartup: (store) => bindRole(store, identity),
   });
+  const capacity = new Capacity([store.directory, config().media.root]);
   const server = await store.server();
   const journal = new Journal(
     server,
@@ -865,6 +867,7 @@ export async function openFacadeRuntime(
         incarnation: node?.incarnation ?? null,
         keyId: node?.keyId ?? null,
         matrix: false,
+        capacity: await capacity.status(),
         scopes: active ? await (await roomOwner()).scopes(active.id) : [],
         streams: active ? await journal.streams('home', 'in') : [],
         keyRoster: active
