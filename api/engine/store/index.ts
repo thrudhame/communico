@@ -82,6 +82,7 @@ export class Store implements StartupStore {
     private readonly pool: Pool,
     private readonly ownership: number,
     private readonly admission: Admission,
+    readonly capacity?: import('./capacity.ts').Capacity,
   ) {
     this.serverOperations = operations(
       (fn, options) => this.run(() => this.serverDb.tx(fn, options)),
@@ -496,7 +497,14 @@ export async function openStore(
       admission,
       options.capacityOwner,
     );
-    const store = new Store(ffi, serverDb, pool, ownership, admission);
+    const store = new Store(
+      ffi,
+      serverDb,
+      pool,
+      ownership,
+      admission,
+      options.capacityOwner,
+    );
     // The composition root binds runtime authority before a recovery hook may
     // project data or schedule owner-specific intents. Failure unwinds the pool.
     await options.beforeStartup?.(store);

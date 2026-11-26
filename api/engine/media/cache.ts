@@ -1,6 +1,7 @@
 // One owner for disk publication, deduplication, cleanup and serving leases.
 // Network/disk work is never repeated by a retrying database transaction.
 import type { Database as Db } from '#engine/store/db.ts';
+import type { Capacity, Reservation } from '#engine/store/capacity.ts';
 import {
   type CachedMedia,
   cachedMedia,
@@ -62,7 +63,12 @@ export class MediaCache {
   private active = 0;
   private waiters: (() => void)[] = [];
   readonly directory: string;
-  constructor(private db: Db, root: string, private maxVariants = 32) {
+  constructor(
+    private db: Db,
+    root: string,
+    private maxVariants = 32,
+    private capacity?: Capacity,
+  ) {
     this.directory = root + '/cache';
   }
   private locked<T>(fn: () => Promise<T>): Promise<T> {
@@ -71,7 +77,8 @@ export class MediaCache {
     return next;
   }
   async start(): Promise<void> {
-    await Deno.mkdir(this.directory, { recursive: true });
+    if (this.capacity) await this.capacity.ensureDirectory(this.directory);
+    else await Deno.mkdir(this.directory, { recursive: true });
     const rows = await listCachedMedia(this.db);
     const known = new Set<string>();
     for (const row of rows) {
@@ -118,6 +125,7 @@ export class MediaCache {
       signal: AbortSignal,
     ) => Promise<ByteMetadata>,
     signal?: AbortSignal,
+    maxBytes?: number,
   ): Promise<CachedMedia> {
     if (!Number.isSafeInteger(maxConcurrent) || maxConcurrent <= 0) {
       throw new Error('invalid media concurrency');
@@ -128,7 +136,7 @@ export class MediaCache {
     if (prior) {
       if (prior.controller.signal.aborted) {
         await abortable(signal, () => prior.run.catch(() => {}));
-        return await this.fetch(id, maxConcurrent, producer, signal);
+        return await this.fetch(id, maxConcurrent, producer, signal, maxBytes);
       }
       return await this.subscribe(prior, signal);
     }
@@ -142,6 +150,7 @@ export class MediaCache {
       maxConcurrent,
       producer,
       AbortSignal.any([this.controller.signal, controller.signal]),
+      maxBytes,
     );
     const entry: Pending = { run, controller, users: 0, settled: false };
     this.pending.set(key, entry);
@@ -177,6 +186,7 @@ export class MediaCache {
       signal: AbortSignal,
     ) => Promise<ByteMetadata>,
     signal: AbortSignal,
+    maxBytes?: number,
   ): Promise<CachedMedia> {
     while (this.active >= maxConcurrent) {
       let wake: (() => void) | undefined;
@@ -200,6 +210,7 @@ export class MediaCache {
     const part = this.directory + '/' + stem + '.part';
     const blob = stem + '.blob';
     let file: Deno.FsFile | null = null;
+    let space: Reservation | undefined;
     let renamed = false;
     const media = JSON.stringify([id.origin, id.mediaId]);
     let reservation: Set<string> | undefined;
@@ -224,6 +235,13 @@ export class MediaCache {
         return null;
       });
       if (hit) return hit;
+      if (this.capacity) {
+        if (maxBytes === undefined) {
+          throw new Error('media size bound required');
+        }
+        space = await this.capacity.reserveStaging(part, maxBytes);
+      }
+      signal.throwIfAborted();
       file = await Deno.open(part, {
         createNew: true,
         write: true,
@@ -234,6 +252,13 @@ export class MediaCache {
       // validation and fsync are complete; writable.close alone cannot publish.
       const output = new WritableStream<Uint8Array>({
         async write(chunk) {
+          if (maxBytes !== undefined && chunk.length > maxBytes - size) {
+            throw new MatrixError(
+              413,
+              'M_TOO_LARGE',
+              'Media exceeds its size limit',
+            );
+          }
           let offset = 0;
           while (offset < chunk.length) {
             const n = await file!.write(chunk.subarray(offset));
@@ -254,6 +279,9 @@ export class MediaCache {
       file = null;
       await Deno.rename(part, this.directory + '/' + blob);
       renamed = true;
+      // Published bytes now belong to the inventory. Do not hold a staging
+      // claim while acquiring another claim to commit the cache index row.
+      space?.release();
       signal.throwIfAborted();
       const now = Date.now();
       const row: CachedMedia = {
@@ -283,6 +311,7 @@ export class MediaCache {
       );
       throw storageFailure(error);
     } finally {
+      space?.release();
       reservation?.delete(key);
       if (this.variants.get(media)?.size === 0) this.variants.delete(media);
       this.active--;

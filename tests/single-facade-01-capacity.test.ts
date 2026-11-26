@@ -14,7 +14,9 @@ import { LinkClient, startLinkTransport } from '#engine/facade/transport.ts';
 import { MediaCache } from '#engine/media/cache.ts';
 import { roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
+import { Capacity, type CapacityProbe } from '#engine/store/capacity.ts';
 import { StoreError, Turso } from '#engine/store/ffi.ts';
+import { StoragePressureError } from '#engine/store/pressure.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { assert, assertEquals, assertRejects } from '@std/assert';
@@ -337,11 +339,63 @@ const schemas = {
   room: roomSchema,
 };
 
+Deno.test('facade capacity: outstanding claims fence concurrent staging and checkpoints', async () => {
+  const root = await Deno.makeTempDir({ prefix: 'capacity-claims-' });
+  const store = root + '/store';
+  const media = root + '/media';
+  try {
+    await Deno.mkdir(store);
+    await Deno.mkdir(media);
+    const path = store + '/data.db';
+    await Deno.writeFile(path, Uint8Array.of(1));
+    const capacity = new Capacity([store, media], 3 * MiB, (path) => ({
+      totalBytes: 32 * MiB,
+      freeBytes: 32 * MiB,
+      freeInodes: 1000,
+      blockSize: 4096,
+      device: path.startsWith(store) ? 1 : 2,
+    }));
+    const [first, second] = await Promise.allSettled([
+      capacity.reserveStaging(media + '/first.part', 2 * MiB),
+      capacity.reserveStaging(store + '/second.part', 2 * MiB),
+    ]);
+    assert(first.status === 'fulfilled');
+    try {
+      assert(
+        second.status === 'rejected' &&
+          second.reason instanceof StoragePressureError,
+      );
+      assertEquals(await capacity.tryCheckpoint(path), undefined);
+      assertEquals(
+        (await capacity.status()).filesystems[1].reservedBytes,
+        2 * MiB + 32768,
+      );
+    } finally {
+      first.value.release();
+    }
+    const checkpoint = await capacity.tryCheckpoint(path);
+    assert(checkpoint);
+    try {
+      await assertRejects(
+        () => capacity.reserveStaging(media + '/third.part', 2 * MiB),
+        StoragePressureError,
+      );
+    } finally {
+      checkpoint.finish();
+    }
+    const retry = await capacity.reserveStaging(media + '/third.part', 2 * MiB);
+    retry.release();
+    assertEquals((await capacity.status()).filesystems[1].reservedBytes, 0);
+  } finally {
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
 // Deterministic physical-space snapshots exercise the same admission as the
 // real filesystem probe, without filling the shared guest or simulating an
 // ENOSPC by changing the OS beneath the other tests.
 async function mediaFixture(
-  options: Record<string, unknown>,
+  options: { budgetBytes?: number | null; probe?: CapacityProbe },
   run: (cache: MediaCache, root: string) => Promise<void>,
 ) {
   const root = await Deno.makeTempDir({ prefix: 'capacity-' });
@@ -349,11 +403,22 @@ async function mediaFixture(
   let store: Store | undefined;
   let cache: MediaCache | undefined;
   try {
-    store = await openStore(settingsFor(root + '/store'), {
+    const storeRoot = root + '/store';
+    const capacity = new Capacity(
+      [storeRoot, mediaRoot],
+      options.budgetBytes,
+      options.probe,
+    );
+    store = await openStore(settingsFor(storeRoot), {
       schemas,
-      ...{ capacity: { roots: [mediaRoot], ...options } },
+      capacityOwner: capacity,
     });
-    cache = new MediaCache(await store.server(), mediaRoot);
+    cache = new MediaCache(
+      await store.server(),
+      mediaRoot,
+      undefined,
+      capacity,
+    );
     await cache.start();
     await run(cache, mediaRoot);
   } finally {
@@ -374,16 +439,22 @@ const publish = (
   identity: ReturnType<typeof cacheId>,
   size: number,
 ) =>
-  cache.fetch(identity, 1, async (out) => {
-    const writer = out.getWriter();
-    try {
-      await writer.write(new Uint8Array(size).fill(73));
-      await writer.close();
-    } finally {
-      writer.releaseLock();
-    }
-    return { contentType: 'application/octet-stream', filename: null, size };
-  });
+  cache.fetch(
+    identity,
+    1,
+    async (out) => {
+      const writer = out.getWriter();
+      try {
+        await writer.write(new Uint8Array(size).fill(73));
+        await writer.close();
+      } finally {
+        writer.releaseLock();
+      }
+      return { contentType: 'application/octet-stream', filename: null, size };
+    },
+    undefined,
+    size,
+  );
 
 Deno.test('facade capacity: each filesystem enforces its own default share', async () => {
   const totalBytes = 8 * MiB;

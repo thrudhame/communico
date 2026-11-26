@@ -17,10 +17,14 @@ import type { Scope } from '#engine/facade/capabilities.ts';
 import { federationPolicy } from '#engine/federation/policy.ts';
 import { requestFailure } from '#engine/request-diagnostics.ts';
 import { join } from '@std/path';
+import type { Capacity } from '#engine/store/capacity.ts';
 
-async function routeProcessScratch(dataRoot: string): Promise<void> {
+async function routeProcessScratch(
+  dataRoot: string,
+  capacity: Capacity,
+): Promise<void> {
   const scratch = join(dataRoot, '.scratch');
-  await Deno.mkdir(scratch, { recursive: true, mode: 0o700 });
+  await capacity.ensureDirectory(scratch, 0o700);
   if (!(await Deno.lstat(scratch)).isDirectory) {
     throw new Error('facade scratch root is not a directory');
   }

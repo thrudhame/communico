@@ -180,7 +180,7 @@ export async function openApp(storeConfig?: StoreConfig): Promise<App> {
     const server = await store.server();
     const federationContacts = new PendingContacts(server);
     services.push(() => federationContacts.close());
-    const media = new MediaService(server, tenant);
+    const media = new MediaService(server, tenant, store.capacity);
     services.push(() => media.close());
     const stopRuleMigration = await installRuleMigration(store, tenant);
     services.push(stopRuleMigration);

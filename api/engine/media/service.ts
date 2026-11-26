@@ -10,6 +10,7 @@ import {
 import { MatrixError } from '#engine/matrix-error.ts';
 import { serverAllowed } from '#engine/room/acl.ts';
 import type { Database as Db } from '#engine/store/db.ts';
+import type { Capacity } from '#engine/store/capacity.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { contentDisposition, serveMedia } from '#engine/media.ts';
 import { type ByteMetadata, type CacheIdentity, MediaCache } from './cache.ts';
@@ -99,7 +100,11 @@ export class MediaService {
   private cache: Promise<MediaCache> | null = null;
   private timer: ReturnType<typeof setInterval> | null = null;
   private thumbnails = new ThumbnailWorkers();
-  constructor(private db: Db, private tenant: Tenant) {}
+  constructor(
+    private db: Db,
+    private tenant: Tenant,
+    private capacity?: Capacity,
+  ) {}
   private cacheOwner(): Promise<MediaCache> {
     if (this.cache === null) {
       const owner = (async () => {
@@ -107,6 +112,7 @@ export class MediaService {
           this.db,
           config().media.root,
           config().media.maxvariants,
+          this.capacity,
         );
         try {
           await cache.start();
@@ -188,6 +194,7 @@ export class MediaService {
         config().media.maxfetches,
         (output, signal) => this.remote(origin, mediaId, output, signal),
         signal,
+        config().media.maxbytes,
       );
     }
     // Network work may yield while the origin is blocked by the operator.
@@ -308,6 +315,7 @@ export class MediaService {
           };
         },
         signal,
+        config().media.maxbytes,
       );
     }
     if (origin !== serverName()) {
