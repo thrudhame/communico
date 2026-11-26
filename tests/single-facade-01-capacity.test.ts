@@ -760,6 +760,29 @@ const publish = (
     size,
   );
 
+Deno.test('facade capacity: quota detection reports only the matching filesystem', async () => {
+  const probe = (path: string) => ({
+    device: path.endsWith('/media') ? 2 : 1,
+    totalBytes: 128 * MiB,
+    freeBytes: 64 * MiB,
+    freeInodes: 1000,
+    blockSize: 4096,
+  });
+  await mediaFixture({ probe }, async (cache, media, capacity) => {
+    const { filesystems } = await capacity.status((path) =>
+      Promise.resolve(path === media)
+    );
+    assertEquals(
+      filesystems.map((disk) => [disk.device, disk.quotaBackstop]),
+      [['1', false], ['2', true]],
+    );
+    assertEquals(
+      (await publish(cache, cacheId('quota-diagnostic'), 16)).size,
+      16,
+    );
+  });
+});
+
 Deno.test('facade capacity: each filesystem enforces its own default share', async () => {
   const totalBytes = 8 * MiB;
   const probe = (path: string) => {

@@ -94,6 +94,12 @@ export class Store implements StartupStore {
     return Promise.resolve(this.serverOperations);
   }
 
+  capacityStatus() {
+    return this.run(async () =>
+      await this.capacity?.status((path) => this.ffi.quotaEnforced(path))
+    );
+  }
+
   serverRevision(): string | undefined {
     return this.serverDb.stableRevision;
   }

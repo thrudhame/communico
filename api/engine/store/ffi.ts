@@ -47,6 +47,11 @@ type OwnedCheckpoint =
 
 const definitions = {
   ffi_open: { parameters: ['buffer'], result: 'pointer', nonblocking: true },
+  ffi_quota_enforced: {
+    parameters: ['buffer'],
+    result: 'pointer',
+    nonblocking: true,
+  },
   ffi_open_bounded: {
     parameters: ['buffer', 'u64', 'u64', 'u32'],
     result: 'pointer',
@@ -368,5 +373,11 @@ export class Turso {
 
   buildInfo(): Promise<BuildInfo> {
     return this.value(() => this.library.symbols.ffi_build_info());
+  }
+
+  quotaEnforced(path: string): Promise<boolean> {
+    return this.value(() =>
+      this.library.symbols.ffi_quota_enforced(bytes(path))
+    );
   }
 }

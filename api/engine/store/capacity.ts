@@ -17,6 +17,7 @@ type Space = {
 };
 
 export type CapacityProbe = (path: string) => Space | Promise<Space>;
+type QuotaProbe = (path: string) => Promise<boolean>;
 
 type Claim = { device: string; bytes: number; inodes: number };
 type CacheBlob = {
@@ -485,11 +486,11 @@ export class Capacity {
     }
   }
 
-  private async inventory() {
+  private async inventory(quotaPaths?: Map<FilesystemCapacity, string>) {
     const filesystems = new Map<string, FilesystemCapacity>();
     const reclaimable: Reclaimable[] = [];
     const seen = new Set<string>();
-    const filesystem = (space: Space) => {
+    const filesystem = (space: Space, path: string) => {
       const device = String(space.device);
       const known = filesystems.get(device);
       if (known) return known;
@@ -517,6 +518,7 @@ export class Capacity {
         },
       };
       filesystems.set(device, disk);
+      quotaPaths?.set(disk, path);
       return disk;
     };
     const visit = async (
@@ -536,6 +538,7 @@ export class Capacity {
           ? parent
           : filesystem(
             await this.space({ path, device, original: path, target: path }),
+            path,
           );
         const bytes = Number(entry.blocks * 512n);
         disk.usedBytes += bytes;
@@ -567,7 +570,7 @@ export class Capacity {
     };
     for (const root of this.roots) {
       const at = await ancestor(root);
-      const disk = filesystem(await this.space(at));
+      const disk = filesystem(await this.space(at), at.path);
       // A missing root may allocate on its ancestor's filesystem, but does
       // not include the ancestor's existing data in the facade inventory.
       if (at.original === resolve(root)) await visit(at.path, disk, at.device);
@@ -599,8 +602,14 @@ export class Capacity {
     return { filesystems: disks, reclaimable };
   }
 
-  async status() {
-    const { filesystems } = await this.inventory();
+  async status(probeQuota?: QuotaProbe) {
+    const paths = probeQuota && new Map<FilesystemCapacity, string>();
+    const { filesystems } = await this.inventory(paths);
+    if (probeQuota && paths) {
+      await Promise.all([...paths].map(async ([disk, path]) => {
+        disk.quotaBackstop = await probeQuota(path);
+      }));
+    }
     const currentBytes = await this.observeScratch() ?? 0;
     return {
       filesystems,

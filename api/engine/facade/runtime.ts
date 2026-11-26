@@ -883,7 +883,7 @@ export async function openFacadeRuntime(
         incarnation: node?.incarnation ?? null,
         keyId: node?.keyId ?? null,
         matrix: false,
-        capacity: await capacity.status(),
+        capacity: await store.capacityStatus(),
         scopes: active ? await (await roomOwner()).scopes(active.id) : [],
         streams: active ? await journal.streams('home', 'in') : [],
         keyRoster: active

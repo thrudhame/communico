@@ -16,6 +16,9 @@ turso_core = { version = "=0.8.3", default-features = false }
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time"] }
 serde_json = "1"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [profile.release]
 debug = false
 incremental = false

@@ -310,6 +310,50 @@ pub unsafe extern "C" fn ffi_open(path: *const c_char) -> *mut c_char {
     reply(|| open_file(canonical_file(&text(path)?)?, initialize_database).map(|id| json!(id)))
 }
 
+/// Query enforcement on this filesystem, not the limit assigned to an identity.
+/// Unsupported kernels/filesystems and denied probes report no detected quota.
+#[no_mangle]
+pub unsafe extern "C" fn ffi_quota_enforced(path: *const c_char) -> *mut c_char {
+    reply(|| Ok(json!(quota_enforced(Path::new(&text(path)?)))))
+}
+
+fn quota_enforced(_path: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // O_PATH selects the actual filesystem without opening file contents
+        // or needing access to its block device (e.g. inside a container).
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+            .open(_path)
+        else {
+            return false;
+        };
+        // Linux uapi dqblk_xfs.h: fs_quota_statv v1 is a fixed 160 bytes;
+        // qs_flags is a native-endian u16 at offset 2. Querying any supported
+        // quota type returns flags for all three types.
+        const Q_XGETQSTATV: libc::c_uint = (b'X' as libc::c_uint) << 8 | 8;
+        const ENFORCED: u16 = (1 << 1) | (1 << 3) | (1 << 5);
+        for kind in 0..3 {
+            let mut status = [0u8; 160];
+            status[0] = 1;
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_quotactl_fd,
+                    file.as_raw_fd(),
+                    (Q_XGETQSTATV << 8) | kind,
+                    0 as libc::c_uint,
+                    status.as_mut_ptr(),
+                )
+            };
+            if rc == 0 {
+                return u16::from_ne_bytes([status[2], status[3]]) & ENFORCED != 0;
+            }
+        }
+    }
+    false
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn ffi_open_bounded(
     path: *const c_char,
