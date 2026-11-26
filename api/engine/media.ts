@@ -9,6 +9,7 @@ import {
 } from '#engine/tenant/media.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import type { Capacity } from '#engine/store/capacity.ts';
 import { isStoragePressure, storageFailure } from '#engine/store/pressure.ts';
 import { b64encode } from '#engine/signing-primitives.js';
 
@@ -17,6 +18,12 @@ export function mediaRoot(): string {
 }
 export function mediaMaxBytes(): number {
   return config().media.maxbytes;
+}
+export function declaredUploadBytes(headers: Headers): number | undefined {
+  const length = headers.get('content-length');
+  if (length === null || !/^\d+$/.test(length)) return;
+  const bytes = Number(length);
+  return Number.isSafeInteger(bytes) ? bytes : undefined;
 }
 export function newMediaId(): string {
   return b64encode(crypto.getRandomValues(new Uint8Array(18)));
@@ -97,8 +104,10 @@ export async function uploadMedia(
   localpart: string,
   stream: ReadableStream<Uint8Array> | null,
   meta: Omit<MediaMeta, 'size_bytes'>,
-  reservation?: string,
+  options: { reservation?: string; capacity?: Capacity; maxBytes?: number } =
+    {},
 ): Promise<{ mediaId: string; sizeBytes: number }> {
+  const { reservation } = options;
   const mediaId = reservation ?? newMediaId();
   if (!MXC_MEDIA_ID.test(mediaId)) {
     throw new MatrixError(404, 'M_NOT_FOUND', 'Unknown media ID');
@@ -132,7 +141,14 @@ export async function uploadMedia(
         'Media already uploaded',
       );
     }
-    const sizeBytes = await storeUploadBody(stream, root, mediaId);
+    const limit = Math.min(mediaMaxBytes(), options.maxBytes ?? Infinity);
+    const sizeBytes = await storeUploadBody(
+      stream,
+      root,
+      mediaId,
+      stream === null ? 0 : limit,
+      options.capacity,
+    );
     const uploaded = { ...meta, size_bytes: sizeBytes };
     try {
       if (reservation === undefined) {
@@ -161,10 +177,28 @@ async function storeUploadBody(
   stream: ReadableStream<Uint8Array> | null,
   root: string,
   mediaId: string,
+  limit: number,
+  capacity?: Capacity,
+): Promise<number> {
+  await capacity?.ensureDirectory(root, 0o700);
+  const lease = await capacity?.reserveStaging(`${root}/${mediaId}`, limit);
+  try {
+    return await writeUploadBody(stream, root, mediaId, limit);
+  } finally {
+    // On successful publication inventory accounts for the final file. Release
+    // before the metadata transaction so it can independently claim its WAL.
+    lease?.release();
+  }
+}
+
+async function writeUploadBody(
+  stream: ReadableStream<Uint8Array> | null,
+  root: string,
+  mediaId: string,
+  limit: number,
 ): Promise<number> {
   const partPath = `${root}/${mediaId}.${crypto.randomUUID()}.part`;
   const finalPath = `${root}/${mediaId}`;
-  const limit = mediaMaxBytes();
   let file: Deno.FsFile | null = await Deno.open(partPath, {
     createNew: true,
     write: true,

@@ -106,14 +106,16 @@ export async function previewUrl(
   });
   const filename = filenameOf(absolute);
   const contentType = img.contentType.split(';')[0].trim();
+  const { tenant, store } = theApp();
   const { mediaId, sizeBytes } = await uploadMedia(
-    theApp().tenant,
+    tenant,
     localpartOf(userId),
     stream,
     {
       content_type: contentType,
       filename: filename.length > 0 ? filename : undefined,
     },
+    { capacity: store.capacity, maxBytes: img.body.byteLength },
   );
   og['og:image'] = 'mxc://' + serverName() + '/' + mediaId;
   og['og:image:type'] = contentType;

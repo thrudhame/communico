@@ -12,6 +12,7 @@ import {
 } from '#engine/facade/protocol.ts';
 import { LinkClient, startLinkTransport } from '#engine/facade/transport.ts';
 import { MediaCache } from '#engine/media/cache.ts';
+import { uploadMedia } from '#engine/media.ts';
 import { roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { Capacity, type CapacityProbe } from '#engine/store/capacity.ts';
@@ -653,6 +654,65 @@ Deno.test('facade capacity: authenticated client upload maps storage pressure, n
     assertEquals((await upload(4)).status, 200);
   } finally {
     setConfigForTests({ server: previousServer, media: previous });
+    await app.close();
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test('facade capacity: authenticated client upload claims its full staging bound before opening a file', async () => {
+  const root = await Deno.makeTempDir({ prefix: 'capacity-upload-lease-' });
+  const previous = config().media;
+  const app = await startHttp();
+  const KiB = 1024;
+  const capacity = new Capacity([root], 160 * KiB);
+  const upload = (bytes: number, maxBytes?: number) =>
+    uploadMedia(
+      app.app.tenant,
+      'capacity-staging',
+      new Blob([new Uint8Array(bytes)]).stream(),
+      { content_type: 'application/octet-stream' },
+      { capacity, maxBytes },
+    );
+  const open = Deno.open;
+  let parts = 0;
+  try {
+    await app.registerTestUser('capacity-staging', 'pw');
+    setConfigForTests({ media: { root, maxbytes: 256 * KiB } });
+    Deno.open = function (path, options) {
+      if (
+        typeof path === 'string' && path.startsWith(root + '/') &&
+        path.endsWith('.part')
+      ) {
+        parts++;
+      }
+      return open(path, options);
+    };
+    await assertRejects(() => upload(1), StoragePressureError);
+    const competing = await capacity.reserveStaging(
+      root + '/cache.part',
+      96 * KiB,
+    );
+    try {
+      await assertRejects(() => upload(1, 1), StoragePressureError);
+      assertEquals(parts, 0);
+    } finally {
+      competing.release();
+    }
+    await assertRejects(
+      () => upload(2, 1),
+      Error,
+      'Upload exceeds the server limit',
+    );
+    assertEquals(Array.from(Deno.readDirSync(root)), []);
+    const published = await upload(1, 1);
+    assertEquals(
+      await Deno.readFile(`${root}/${published.mediaId}`),
+      new Uint8Array(1),
+    );
+    assertEquals((await capacity.status()).filesystems[0].reservedBytes, 0);
+  } finally {
+    Deno.open = open;
+    setConfigForTests({ media: previous });
     await app.close();
     await Deno.remove(root, { recursive: true });
   }
