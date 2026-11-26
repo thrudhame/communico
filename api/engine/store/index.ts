@@ -429,6 +429,7 @@ export async function openStore(
   options: {
     schemas?: StoreSchemas;
     capacityOwner?: import('./capacity.ts').Capacity;
+    beforeOpen?(dataRoot: string): Promise<void>;
     beforeStartup?(store: Store): Promise<unknown>;
   } = {},
 ): Promise<Store> {
@@ -444,6 +445,8 @@ export async function openStore(
     ownership = await ffi.lockStore(await ownershipPath(config.dir));
     await assertNoPromotion(config.dir);
     await Deno.mkdir(config.dir, { recursive: true, mode: 0o700 });
+    // The data root is canonical and locked; no database has opened yet.
+    await options.beforeOpen?.(config.dir);
     await sweep(config.dir);
     await sweep(join(config.dir, 'rooms'));
     await sweep(join(config.dir, 'tenants'));

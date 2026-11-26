@@ -46,6 +46,8 @@ Deno.test('facade capacity: local status exposes the default budget before pairi
     const edge = await facadeProcess(
       settings,
       'facade: link/local admin ready',
+      [],
+      { probeScratch: `${tls.dir}/store/.scratch` },
     );
     try {
       const response = await adminCall(socket, 'facade/status');

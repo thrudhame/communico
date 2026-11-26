@@ -488,7 +488,7 @@ export async function facadeProcess(
   config: string,
   ready: string,
   heldPublications: string[] = [],
-  options: { failIngressCommit?: string } = {},
+  options: { failIngressCommit?: string; probeScratch?: string } = {},
 ) {
   const observations = new FacadeObservations();
   const initialHolds = new Set(heldPublications);
@@ -504,6 +504,10 @@ export async function facadeProcess(
       DENO_NO_PROMPT: '1',
       FACADE_TEST_HOLDS: JSON.stringify(heldPublications),
       FACADE_TEST_FAIL_INGRESS_COMMIT: options.failIngressCommit ?? '',
+      FACADE_TEST_PROBE_SCRATCH: options.probeScratch ?? '',
+      ...(options.probeScratch
+        ? { TURSO_TMPDIR: Deno.env.get('TMPDIR') ?? '.' }
+        : {}),
       ...listeners.env,
     },
     stdin: 'piped',

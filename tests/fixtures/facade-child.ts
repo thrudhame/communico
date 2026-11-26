@@ -42,6 +42,44 @@ import {
 
 const encoder = new TextEncoder();
 observeFixtureListeners();
+const probeScratch = Deno.env.get('FACADE_TEST_PROBE_SCRATCH');
+if (probeScratch) {
+  const open = Turso.prototype.open;
+  Turso.prototype.open = async function (path) {
+    Turso.prototype.open = open;
+    if (
+      Deno.env.get('TURSO_TMPDIR') !== probeScratch ||
+      Deno.env.get('TMPDIR') !== probeScratch
+    ) {
+      throw new Error('scratch was not routed before the first native open');
+    }
+    const file = await open.call(this, path);
+    try {
+      const connection = await this.connect(file);
+      try {
+        await this.exec(connection, 'PRAGMA temp_store = FILE');
+        await this.exec(connection, 'CREATE TEMP TABLE scratch_probe (id)');
+        let found = false;
+        for await (const entry of Deno.readDir(probeScratch)) {
+          if (!entry.isDirectory) continue;
+          for await (
+            const file of Deno.readDir(`${probeScratch}/${entry.name}`)
+          ) {
+            if (file.isFile && file.name === 'tursodb-temp.db') found = true;
+          }
+        }
+        if (!found) throw new Error('native TEMP database escaped scratch');
+      } finally {
+        await this.closeConnection(connection);
+      }
+      return file;
+    } catch (error) {
+      await this.closeFile(file);
+      throw error;
+    }
+  };
+}
+
 function emit(event: FacadeObservation) {
   const bytes = encoder.encode(
     observationPrefix + JSON.stringify(event) + '\n',

@@ -78,6 +78,7 @@ export async function openFacadeRuntime(
   storeConfig: StoreConfig = config().store,
   apply: (journal: Journal, stream: Stream) => Promise<boolean> = () =>
     Promise.resolve(false),
+  beforeOpen?: (dataRoot: string) => Promise<void>,
 ) {
   const settings = config().facade;
   const caps = capabilities(config().server.role, settings.phase);
@@ -100,6 +101,7 @@ export async function openFacadeRuntime(
   const capacity = new Capacity([storeConfig.dir, config().media.root]);
   const store = await openStore(storeConfig, {
     schemas: { server: serverSchema, tenant: tenantSchema, room: roomSchema },
+    beforeOpen,
     beforeStartup: (store) => bindRole(store, identity),
     capacityOwner: capacity,
   });
