@@ -1,5 +1,10 @@
-import { assertEquals, assertThrows } from '@std/assert';
+import { assertEquals, assertRejects, assertThrows } from '@std/assert';
 import { ContactObservations } from '#engine/federation/pending-contacts.ts';
+import { Capacity } from '#engine/store/capacity.ts';
+import {
+  StorageBusyError,
+  StoragePressureError,
+} from '#engine/store/pressure.ts';
 
 Deno.test('contact observations merge exact maxima across overlapping drain and independent keys', async () => {
   const entered = Promise.withResolvers<void>();
@@ -45,5 +50,59 @@ Deno.test('contact observations merge exact maxima across overlapping drain and 
     release.resolve();
     releaseFollowing.resolve();
     await contacts.close();
+  }
+});
+
+Deno.test('contact observations resume after a capacity grant releases and close cleanly when full', async () => {
+  const dir = await Deno.makeTempDir();
+  const budget = 256 * 1024;
+  const capacity = new Capacity([dir], budget);
+  const held = await capacity.reserveNative(dir, 2);
+  const blocked = Promise.withResolvers<void>();
+  const persisted: number[] = [];
+  const reported: unknown[] = [];
+  const contacts = new ContactObservations<number>(
+    async (_key, value) => {
+      const grant = await capacity.reserveNative(dir, 2).catch((cause) => {
+        if (cause instanceof StorageBusyError) blocked.resolve();
+        else blocked.reject(cause);
+        throw cause;
+      });
+      persisted.push(value);
+      grant.release();
+    },
+    Math.max,
+    (error) => reported.push(error),
+  );
+  try {
+    contacts.observe('edge', 1);
+    await blocked.promise;
+    assertEquals(persisted, []);
+    held.release();
+    await contacts.drain();
+    assertEquals(persisted, [1]);
+    assertEquals(reported, []);
+    const filler = `${dir}/filler`;
+    await Deno.writeFile(filler, new Uint8Array(budget).fill(1));
+    contacts.observe('edge', 2);
+    const error = await assertRejects(
+      () => contacts.drain(),
+      StoragePressureError,
+    );
+    assertEquals(error instanceof StorageBusyError, false);
+    assertEquals(reported, [error]);
+    await Deno.remove(filler);
+    contacts.observe('edge', 3);
+    await contacts.drain();
+    assertEquals(persisted, [1, 3]);
+    await Deno.writeFile(filler, new Uint8Array(budget).fill(1));
+    contacts.observe('edge', 4);
+    await contacts.close();
+    assertEquals(persisted, [1, 3]);
+    assertEquals(reported.length, 2);
+  } finally {
+    held.release();
+    await contacts.close();
+    await Deno.remove(dir, { recursive: true });
   }
 });

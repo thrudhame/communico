@@ -1,7 +1,11 @@
 import { lstat, realpath, stat, statfs } from 'node:fs/promises';
 import { dirname, join, relative, resolve, SEPARATOR } from '@std/path';
 import { databaseFiles } from '#engine/store/layout.ts';
-import { storageFailure, StoragePressureError } from './pressure.ts';
+import {
+  StorageBusyError,
+  storageFailure,
+  StoragePressureError,
+} from './pressure.ts';
 
 type Space = {
   device: string | number;
@@ -60,15 +64,67 @@ function missing(error: unknown): boolean {
 export class Capacity {
   private lane: Promise<unknown> = Promise.resolve();
   private readonly claims = new Set<Claim>();
+  private released = Promise.withResolvers<void>();
   private checkpointActive?: { device?: string; peakOvershootBytes: number };
   private readonly checkpointPeaks = new Map<string, number>();
   private readonly checkpointFailures = new Map<string, string>();
+  private scratchRoot?: string;
+  private scratchObservedPeakBytes = 0;
 
   constructor(
     private readonly roots: readonly string[],
     private readonly budget?: number | null,
     private readonly probe?: CapacityProbe,
   ) {}
+
+  private notifyRelease(): void {
+    this.released.resolve();
+    this.released = Promise.withResolvers<void>();
+  }
+
+  setScratchRoot(path: string): void {
+    this.scratchRoot = path;
+  }
+
+  // At statement/checkpoint boundaries, sample just scratch rather than
+  // the whole store. Telemetry must not change the outcome of native work.
+  observeScratch(): Promise<number> | undefined {
+    if (this.scratchRoot === undefined) return;
+    return this.measureScratch(this.scratchRoot).then((bytes) => {
+      this.scratchObservedPeakBytes = Math.max(
+        this.scratchObservedPeakBytes,
+        bytes,
+      );
+      return bytes;
+    });
+  }
+
+  private async measureScratch(root: string): Promise<number> {
+    const seen = new Set<string>();
+    const visit = async (path: string): Promise<number> => {
+      let bytes = 0;
+      try {
+        const entry = await lstat(path, { bigint: true });
+        const identity = `${entry.dev}:${entry.ino}`;
+        if (seen.has(identity)) return 0;
+        seen.add(identity);
+        // The permanent scratch directory belongs to ordinary inventory;
+        // report only its temporary contents in the scratch counter.
+        if (path !== root) bytes = Number(entry.blocks * 512n);
+        if (entry.isDirectory()) {
+          for await (const child of Deno.readDir(path)) {
+            bytes += await visit(join(path, child.name));
+          }
+        }
+      } catch (error) {
+        if (!missing(error) && !(error instanceof Deno.errors.NotFound)) {
+          throw error;
+        }
+      }
+      return bytes;
+    };
+    return await visit(root);
+  }
 
   private async space(
     at: Awaited<ReturnType<typeof ancestor>>,
@@ -103,7 +159,8 @@ export class Capacity {
     publication = false,
   ): Promise<NativeReservation> {
     const result = this.lane.then(async () => {
-      if (this.checkpointActive) throw new StoragePressureError();
+      const { promise: released } = this.released;
+      if (this.checkpointActive) throw new StorageBusyError(released);
       if (
         [
           footprint.bytes ?? 0,
@@ -144,28 +201,44 @@ export class Capacity {
         : this.budget === null
         ? null
         : this.budget ?? Math.floor(space.totalBytes * 0.99);
-      const available = Math.min(
-        space.freeBytes - claimedBytes(local),
-        (budget ?? Infinity) - used -
-          claimedBytes(explicit ? outstanding : local),
-      );
-      const data = footprint.bytes === undefined
-        ? Math.floor((available - metadata) / blockSize) * blockSize
+      const budgetLeft = (budget ?? Infinity) - used;
+      const minimum = footprint.bytes === undefined
+        ? 0
         : [footprint.bytes, ...(footprint.files ?? [])].reduce(
           (sum, size) => sum + Math.ceil(size / blockSize) * blockSize,
           0,
         );
-      const bytes = data + metadata;
+      const inodesLeft = space.freeInodes ?? Infinity;
+      const needs = minimum + metadata;
+      // Actual exhaustion is independent of claims. A data-dependent native
+      // operation needs its metadata up front; it can only use a checked
+      // ceiling on payload, not a guessed SQL byte cost.
       if (
-        this.checkpointActive ||
-        data < 0 || bytes > available ||
-        footprint.inodes > (space.freeInodes ?? Infinity) -
-            local.reduce((sum, claim) => sum + claim.inodes, 0)
+        needs > Math.min(space.freeBytes, budgetLeft) ||
+        footprint.inodes > inodesLeft
       ) throw new StoragePressureError();
-      const claim = { device, bytes, inodes: footprint.inodes };
+      const available = Math.min(
+        space.freeBytes - claimedBytes(local),
+        budgetLeft - claimedBytes(explicit ? outstanding : local),
+      );
+      if (
+        this.checkpointActive || needs > available ||
+        footprint.inodes > inodesLeft -
+            local.reduce((sum, claim) => sum + claim.inodes, 0)
+      ) throw new StorageBusyError(released);
+      const data = footprint.bytes === undefined
+        ? Math.floor((available - metadata) / blockSize) * blockSize
+        : minimum;
+      const claim = {
+        device,
+        bytes: data + metadata,
+        inodes: footprint.inodes,
+      };
       this.claims.add(claim);
       return {
-        release: () => void this.claims.delete(claim),
+        release: () => {
+          if (this.claims.delete(claim)) this.notifyRelease();
+        },
         blockSize,
         bytes: data,
         creates: footprint.inodes,
@@ -283,15 +356,20 @@ export class Capacity {
           }
           this.checkpointPeaks.set(device, active.peakOvershootBytes);
           this.checkpointActive = undefined;
+          this.notifyRelease();
         },
       };
     } catch (error) {
       this.checkpointActive = undefined;
+      this.notifyRelease();
       throw error;
     }
   }
 
-  async status(): Promise<{ filesystems: FilesystemCapacity[] }> {
+  async status(): Promise<{
+    filesystems: FilesystemCapacity[];
+    scratch: { currentBytes: number; observedPeakBytes: number };
+  }> {
     const filesystems = new Map<string, FilesystemCapacity>();
     const seen = new Set<string>();
     const filesystem = (space: Space) => {
@@ -388,7 +466,14 @@ export class Capacity {
         overshoot,
       );
     }
-    return { filesystems: disks };
+    const currentBytes = await this.observeScratch() ?? 0;
+    return {
+      filesystems: disks,
+      scratch: {
+        currentBytes,
+        observedPeakBytes: this.scratchObservedPeakBytes,
+      },
+    };
   }
 }
 

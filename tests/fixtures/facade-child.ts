@@ -1,9 +1,7 @@
 // Test-only entrypoint: production never imports it. Observe existing owner
 // completions after their transactions, without changing product scheduling.
-import { AsyncLocalStorage } from 'node:async_hooks';
 import { Journal } from '#engine/facade/journal.ts';
-import { Mailbox } from '#engine/facade/mailbox.ts';
-import { StoreError, Turso } from '#engine/store/ffi.ts';
+import { Turso } from '#engine/store/ffi.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
 import { AuthLinkHealth } from '#engine/facade/auth.ts';
 import { FacadeKeys } from '#engine/facade/control.ts';
@@ -95,27 +93,6 @@ function failure(
   scope?: ObservationScope,
 ) {
   emit(facadeFailure(operation, error, scope));
-}
-
-const failIngressCommit = Deno.env.get('FACADE_TEST_FAIL_INGRESS_COMMIT');
-if (failIngressCommit) {
-  const ingress = new AsyncLocalStorage<string>();
-  const stage = Mailbox.prototype.stage;
-  const commit = Turso.prototype.commit;
-  let armed = true;
-  Mailbox.prototype.stage = function (txnId, raw) {
-    return ingress.run(txnId, () => stage.call(this, txnId, raw));
-  };
-  Turso.prototype.commit = function (connection) {
-    if (!armed || ingress.getStore() !== failIngressCommit) {
-      return commit.call(this, connection);
-    }
-    armed = false;
-    emit({ kind: 'ingress-commit-fault', txnId: failIngressCommit });
-    return Promise.reject(
-      new StoreError(13, 'database or disk is full', 'DatabaseFull'),
-    );
-  };
 }
 
 // Domain validation can refuse before entering Journal.apply/complete. Observe

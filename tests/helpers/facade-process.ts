@@ -31,7 +31,6 @@ export type FacadeObservation =
   | { kind: 'pairing'; id: string; state: 'paired' | 'revoked' }
   | { kind: 'listener'; port: number }
   | { kind: 'fence'; id: string }
-  | { kind: 'ingress-commit-fault'; txnId: string }
   | { kind: 'egress'; destination: string; txnId: string; body: string }
   | {
     kind: 'health';
@@ -488,7 +487,7 @@ export async function facadeProcess(
   config: string,
   ready: string,
   heldPublications: string[] = [],
-  options: { failIngressCommit?: string; probeScratch?: string } = {},
+  options: { probeScratch?: string } = {},
 ) {
   const observations = new FacadeObservations();
   const initialHolds = new Set(heldPublications);
@@ -503,7 +502,6 @@ export async function facadeProcess(
       COMMUNICO_CONFIG: config,
       DENO_NO_PROMPT: '1',
       FACADE_TEST_HOLDS: JSON.stringify(heldPublications),
-      FACADE_TEST_FAIL_INGRESS_COMMIT: options.failIngressCommit ?? '',
       FACADE_TEST_PROBE_SCRATCH: options.probeScratch ?? '',
       ...(options.probeScratch
         ? { TURSO_TMPDIR: Deno.env.get('TMPDIR') ?? '.' }

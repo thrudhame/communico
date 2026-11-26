@@ -37,6 +37,7 @@ export const SCHEMA = {
     reconnectmaxseconds: 'int',
     outbound: 'string',
     replicaterooms: 'string',
+    storagebudgetbytes: 'int',
     mailboxmaxbytes: 'int',
     mailboxmaxagedays: 'int',
     maxofflinedays: 'int',

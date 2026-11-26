@@ -21,6 +21,7 @@ export const INTEGER_DOMAINS = {
   'facade.linkport': { min: 0, max: 65535 },
   'facade.pollseconds': { ...seconds, timer: true },
   'facade.reconnectmaxseconds': { ...seconds, timer: true },
+  'facade.storagebudgetbytes': { min: -1 },
   'facade.mailboxmaxbytes': nonnegative,
   'facade.mailboxmaxagedays': days,
   'facade.maxofflinedays': days,

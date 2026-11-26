@@ -32,6 +32,7 @@ async function routeProcessScratch(
   // the process temp directory instead. Both must stay in the inventory.
   Deno.env.set('TURSO_TMPDIR', scratch);
   Deno.env.set('TMPDIR', scratch);
+  capacity.setScratchRoot(scratch);
 }
 
 export async function startFacade(

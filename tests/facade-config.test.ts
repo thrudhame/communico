@@ -9,6 +9,16 @@ function load(env: Record<string, string> = {}) {
   }).config;
 }
 
+Deno.test('facade storage budget accepts default, uncapped and aggregate bytes', () => {
+  assertEquals(load().facade.storagebudgetbytes, -1);
+  const withBudget = (bytes: string) =>
+    load({ COMMUNICO_FACADE_STORAGEBUDGETBYTES: bytes }).facade
+      .storagebudgetbytes;
+  assertEquals(withBudget('0'), 0);
+  assertEquals(withBudget('16777216'), 16 * 1024 * 1024);
+  assertThrows(() => withBudget('-2'), ConfigError, 'storagebudgetbytes');
+});
+
 Deno.test('facade configuration preserves standalone home and exposes typed layered settings', () => {
   assertEquals(load().server.role, 'home');
   assertEquals(load().facade.nodes, []);

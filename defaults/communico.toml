@@ -69,6 +69,9 @@ reconnectmaxseconds = 10
 # COMMUNICO_FACADE_OUTBOUND / REPLICATEROOMS
 outbound = "direct"
 replicaterooms = "local"
+# COMMUNICO_FACADE_STORAGEBUDGETBYTES: -1 = 99% per filesystem,
+# 0 = no software cap, positive = aggregate cap in bytes.
+storagebudgetbytes = -1
 # Zero is unlimited. Age flags work, never evicts acknowledged undrained work.
 # COMMUNICO_FACADE_MAILBOXMAXBYTES / MAILBOXMAXAGEDAYS / MAXOFFLINEDAYS
 mailboxmaxbytes = 0

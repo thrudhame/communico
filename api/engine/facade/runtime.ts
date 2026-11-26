@@ -98,7 +98,11 @@ export async function openFacadeRuntime(
     server: serverName(),
     node: settings.nodeid,
   };
-  const capacity = new Capacity([storeConfig.dir, config().media.root]);
+  const cap = settings.storagebudgetbytes;
+  const capacity = new Capacity(
+    [storeConfig.dir, config().media.root],
+    cap === -1 ? undefined : cap === 0 ? null : cap,
+  );
   const store = await openStore(storeConfig, {
     schemas: { server: serverSchema, tenant: tenantSchema, room: roomSchema },
     beforeOpen: beforeOpen && ((dataRoot) => beforeOpen(dataRoot, capacity)),

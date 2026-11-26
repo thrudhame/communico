@@ -8,6 +8,15 @@ export class StoragePressureError extends Error {
   }
 }
 
+/** Retry only after releasing any transaction or resources held by the caller. */
+export class StorageBusyError extends StoragePressureError {
+  constructor(readonly released: Promise<void>) {
+    super();
+    this.name = 'StorageBusyError';
+    this.message = 'Storage capacity is reserved by other work';
+  }
+}
+
 export function isStoragePressure(error: unknown): boolean {
   if (error instanceof StoragePressureError) return true;
   if (error instanceof StoreError) return error.storageFull;

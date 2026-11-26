@@ -23,6 +23,7 @@ import { StoragePressureError } from '#engine/store/pressure.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { assert, assertEquals, assertRejects } from '@std/assert';
+import { lstat } from 'node:fs/promises';
 import { adminCall } from './admin-client.ts';
 import { makeServer, seedServer } from './federation/doc-helper.ts';
 import { facadeProcess } from './helpers/facade-process.ts';
@@ -73,11 +74,55 @@ Deno.test('facade capacity: local status exposes the default budget before pairi
         peakOvershootBytes: 0,
         retainedWalBytes: 0,
       });
+      const scratch = async () =>
+        (await adminCall(socket, 'facade/status')).body.result.capacity.scratch;
+      const baseline = await scratch();
+      const spill = `${tls.dir}/store/.scratch/live-spill`;
+      await Deno.writeFile(spill, new Uint8Array(8192).fill(1));
+      const bytes = Number(
+        (await lstat(spill, { bigint: true })).blocks * 512n,
+      );
+      assert(bytes > 0);
+      const current = await scratch();
+      assertEquals(current.currentBytes, baseline.currentBytes + bytes);
+      assert(current.observedPeakBytes >= current.currentBytes);
+      await Deno.remove(spill);
+      assertEquals(await scratch(), {
+        currentBytes: baseline.currentBytes,
+        observedPeakBytes: current.observedPeakBytes,
+      });
     } finally {
       await edge.stop();
     }
   } finally {
     await tls.close();
+  }
+});
+
+Deno.test('facade capacity: a completed statement samples scratch before the next status read', async () => {
+  const root = await Deno.makeTempDir({ prefix: 'facade-observed-scratch-' });
+  const ffi = new Turso('./.native/libturso_ffi.so');
+  const capacity = new Capacity([root]);
+  let db: Db | undefined;
+  try {
+    const scratch = `${root}/.scratch`;
+    await Deno.mkdir(scratch);
+    capacity.setScratchRoot(scratch);
+    db = await Db.open(ffi, root + '/data.db', MiB, undefined, capacity);
+    const spill = `${scratch}/live-spill`;
+    await Deno.writeFile(spill, new Uint8Array(8192).fill(1));
+    const bytes = Number((await lstat(spill, { bigint: true })).blocks * 512n);
+    assert(bytes > 0);
+    assertEquals(await db.query('SELECT 1 AS id'), [{ id: 1 }]);
+    await Deno.remove(spill);
+    assertEquals((await capacity.status()).scratch, {
+      currentBytes: 0,
+      observedPeakBytes: bytes,
+    });
+  } finally {
+    await db?.close();
+    ffi.close();
+    await Deno.remove(root, { recursive: true });
   }
 });
 
@@ -330,8 +375,10 @@ Deno.test('facade capacity: staged media and native journal writers cannot overs
       'fulfilled',
       'already reserved staging can finish',
     );
-    assert(native.status === 'rejected' && native.reason instanceof Error);
-    assertEquals(native.reason.name, 'StoragePressureError');
+    assert(
+      native.status === 'rejected' &&
+        native.reason instanceof StoragePressureError,
+    );
     assertEquals(
       (await journal.heads('home', 'out', source)).applied,
       EMPTY_CUT,
@@ -1126,7 +1173,9 @@ Deno.test('facade capacity: signed federation refuses on storage exhaustion and 
           home ? 'home' : 'facade'
         }.crt"\nlinkkey="${tls.dir}/${home ? 'home' : 'facade'}.key"\n` +
         `linkcacerts=["${tls.dir}/ca.crt"]\npollseconds=1\nreconnectmaxseconds=1\n` +
-        (home ? `nodes=["edge_a"]\npairfile="${bundlefile}"\n` : ''),
+        (home
+          ? `nodes=["edge_a"]\npairfile="${bundlefile}"\n`
+          : `storagebudgetbytes=${budget}\n`),
     );
   };
   let edge: Awaited<ReturnType<typeof facadeProcess>> | undefined;
@@ -1171,6 +1220,8 @@ Deno.test('facade capacity: signed federation refuses on storage exhaustion and 
       (scope: { scope: string; ready: boolean }) =>
         scope.scope === 'directory' && scope.ready,
     ));
+    await home.stop();
+    home = undefined;
     let port = await edge.port('client');
     const call = fedCaller((request) => {
       const url = new URL(request.url);
@@ -1219,22 +1270,22 @@ Deno.test('facade capacity: signed federation refuses on storage exhaustion and 
         await store.close();
       }
     };
-    await home.stop();
-    home = undefined;
     await edge.stop();
     edge = undefined;
     const saved = await readCuts();
     assertEquals(saved.received.sequence, 1, 'signed ingress owns this cut');
-    await Deno.writeFile(filler, new Uint8Array(budget));
     await writeConfig('edge', linkPort);
-    edge = await facadeProcess(
-      facadeConfig,
-      'facade: link/local admin ready',
-      [],
-      { failIngressCommit: 'retry' },
+    edge = await facadeProcess(facadeConfig, 'facade: link/local admin ready');
+    port = await edge.port('client');
+    await Deno.writeFile(filler, new Uint8Array(budget).fill(1));
+    const rejected = await call('PUT', path + 'retry', body);
+    assertEquals(
+      rejected.status,
+      503,
+      'signed federation pressure must be retryable',
     );
     await t.step(
-      'local status accounts for occupied bytes on restart',
+      'local status shows software budget exhaustion with physical space free',
       async () => {
         const response = await local();
         assertEquals(response.status, 200);
@@ -1243,13 +1294,10 @@ Deno.test('facade capacity: signed federation refuses on storage exhaustion and 
           disks?.[0],
           'local status must report capacity on restart',
         );
-        assert(disks[0].usedBytes >= budget);
+        assertEquals(disks[0].budgetBytes, budget);
+        assert(disks[0].usedBytes >= budget && disks[0].freeBytes > budget);
+        assertEquals(disks[0].filesystemFull, false);
       },
-    );
-    port = await edge.port('client');
-    const rejected = await call('PUT', path + 'retry', body);
-    await edge.observations.wait((event) =>
-      event.kind === 'ingress-commit-fault' && event.txnId === 'retry'
     );
     await edge.stop();
     edge = undefined;
@@ -1258,11 +1306,6 @@ Deno.test('facade capacity: signed federation refuses on storage exhaustion and 
       'signed ingress refuses retryably without advancing its cut',
       () => {
         assertEquals(afterRefusal, saved);
-        assertEquals(
-          rejected.status,
-          503,
-          'signed federation pressure must be retryable',
-        );
       },
     );
     await Deno.remove(filler);

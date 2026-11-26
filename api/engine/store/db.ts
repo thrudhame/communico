@@ -11,6 +11,7 @@ import {
 import { Gate } from '#engine/store/gate.ts';
 import {
   isStoragePressure,
+  StorageBusyError,
   storageFailure,
   StoragePressureError,
 } from '#engine/store/pressure.ts';
@@ -60,6 +61,7 @@ export class Conn {
     private readonly handle: number,
     private readonly checks = new Set<CommitCheck>(),
     private readonly beginWrite: () => void | Promise<void> = () => {},
+    private readonly observeScratch?: () => Promise<unknown> | undefined,
   ) {}
 
   /** Retain a dependency for this attempt's actual native commit. */
@@ -83,7 +85,7 @@ export class Conn {
     const readOnly = /^\s*(SELECT|WITH)\b[^;]*;?\s*$/is.test(sql) &&
       !/\b(INSERT|UPDATE|DELETE|REPLACE)\b/i.test(sql);
     const query = () => this.ffi.query(this.handle, sql, values);
-    return readOnly ? query() : this.write(query);
+    return readOnly ? this.statement(query) : this.write(query);
   }
 
   /** Successful affected-row writes in this attempt, not global database work.
@@ -110,7 +112,15 @@ export class Conn {
 
   private write<T>(run: () => Promise<T>): Promise<T> {
     const admitted = this.beginWrite();
-    return admitted ? admitted.then(run) : run();
+    return admitted
+      ? admitted.then(() => this.statement(run))
+      : this.statement(run);
+  }
+
+  private statement<T>(run: () => Promise<T>): Promise<T> {
+    const result = run();
+    const observe = this.observeScratch;
+    return observe ? result.finally(() => observe()?.catch(() => {})) : result;
   }
 
   release(): void {
@@ -237,6 +247,7 @@ export class Db {
           }
         } finally {
           lease?.finish(outcome);
+          await this.capacity?.observeScratch()?.catch(() => {});
           this.notify();
         }
       }
@@ -365,7 +376,7 @@ export class Db {
   // A body may run more than once. Use only its Conn and attempt-local
   // values; never perform network I/O, notify listeners, or mutate captured
   // state. Return effects as values and publish them only after tx resolves.
-  // Only native write-write/busy conflicts retry, after a successful rollback.
+  // Native conflicts and temporarily held capacity retry after rollback.
   async tx<T>(
     fn: (connection: Conn) => Promise<T>,
     options: { mode?: BeginMode; admit?: CommitCheck } = {},
@@ -378,19 +389,23 @@ export class Db {
       for (let attempt = 1;; attempt++) {
         const result = await this.attempt(fn, options);
         if (result.committed) return result.value;
-        this.conflictCounters.conflicts++;
+        const error = result.error;
+        if (error instanceof StoreError) this.conflictCounters.conflicts++;
         if (attempt === TRANSACTION_ATTEMPTS) {
+          if (error instanceof StorageBusyError) throw error;
           this.conflictCounters.exhausted++;
-          throw new StoreConflictError(this.path, attempt, result.error);
+          throw new StoreConflictError(this.path, attempt, error);
         }
-        this.conflictCounters.retries++;
+        if (error instanceof StoreError) this.conflictCounters.retries++;
         // Equal jitter avoids synchronized writers and caps every wait at 50ms.
         const cap = Math.min(50, 2 ** (attempt - 1));
         const started = performance.now();
         await new Promise((wake) =>
           setTimeout(wake, cap / 2 + Math.random() * cap / 2)
         );
-        this.conflictCounters.backoffMs += performance.now() - started;
+        if (error instanceof StoreError) {
+          this.conflictCounters.backoffMs += performance.now() - started;
+        }
       }
     } finally {
       this.users--;
@@ -402,7 +417,8 @@ export class Db {
     fn: (connection: Conn) => Promise<T>,
     options: { mode?: BeginMode; admit?: CommitCheck },
   ): Promise<
-    { committed: true; value: T } | { committed: false; error: StoreError }
+    | { committed: true; value: T }
+    | { committed: false; error: StoreError | StorageBusyError }
   > {
     await this.gate.enter();
     let handle: number | undefined;
@@ -433,7 +449,7 @@ export class Db {
             await this.ffi.setLimit(handle!, grant, undo);
           })();
         }
-      });
+      }, this.capacity && (() => this.capacity!.observeScratch()));
       try {
         await this.ffi.begin(handle, options.mode ?? 'concurrent');
         if (options.admit) connection.admit(options.admit);
@@ -461,7 +477,10 @@ export class Db {
             ? new StoragePressureError(failure)
             : failure;
         }
-        if (error instanceof StoreError && error.conflict) {
+        if (
+          error instanceof StorageBusyError ||
+          (error instanceof StoreError && error.conflict)
+        ) {
           return { committed: false, error };
         }
         throw storageFailure(error);

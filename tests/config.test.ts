@@ -58,6 +58,7 @@ role = "home"
 port = 8008
 shutdowngraceseconds = 10
 maxrequestbytes = 13107200
+admincontact = ""
 
 [push]
 readretentiondays = 30
@@ -85,6 +86,7 @@ pollseconds = 5
 reconnectmaxseconds = 10
 outbound = "direct"
 replicaterooms = "local"
+storagebudgetbytes = -1
 mailboxmaxbytes = 0
 mailboxmaxagedays = 0
 maxofflinedays = 0
@@ -966,7 +968,7 @@ Deno.test('public directory settings use complete defaults and strict leaf-wise 
   }
 });
 
-Deno.test('146 leaves total across the sections (the surface tripwire)', async () => {
+Deno.test('148 leaves total across the sections (the surface tripwire)', async () => {
   const dir = await writeTree({ 'defaults/communico.toml': FULL });
   const loaded = loadConfig({
     defaultsPath: `${dir}/defaults/communico.toml`,
@@ -985,10 +987,10 @@ Deno.test('146 leaves total across the sections (the surface tripwire)', async (
     [name, leaves],
   ): [string, number] => [name, countLeaves(leaves)]);
   assertEquals(counts, [
-    ['server', 5],
+    ['server', 6],
     ['admin', 2],
     ['backup', 2],
-    ['facade', 22],
+    ['facade', 23],
     ['wellknown', 7],
     ['turn', 5],
     ['matrixrtc', 1],
@@ -1009,7 +1011,7 @@ Deno.test('146 leaves total across the sections (the surface tripwire)', async (
   ]);
   assertEquals(
     counts.reduce((total, [, n]) => total + n, 0),
-    146,
+    148,
     'the whole config surface includes discovery, TURN, HTTP administrators, backup and facade role',
   );
 });
