@@ -21,18 +21,23 @@ try {
   await db.exec(
     'CREATE TABLE t (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)',
   );
-  await db.tx(async (conn) => {
-    for (let i = 0; i < 1024 * 128; i += 512) {
-      const values = Array.from(
-        { length: 512 },
-        (_, j) => `(${i + j}, 'a${String(i + j).padStart(64, '0')}')`,
-      );
-      await conn.exec('INSERT INTO t VALUES ' + values.join(','));
-    }
-  }, { mode: 'immediate' });
+  // Build a nearly full store using bounded commits. One initial 128K-row
+  // commit would need room for its entire journal and cleanup before it fits.
+  for (let base = 0; base < 1024 * 128; base += 2048) {
+    await db.tx(async (conn) => {
+      for (let i = base; i < base + 2048; i += 512) {
+        const values = Array.from(
+          { length: 512 },
+          (_, j) => `(${i + j}, 'a${String(i + j).padStart(64, '0')}')`,
+        );
+        await conn.exec('INSERT INTO t VALUES ' + values.join(','));
+      }
+    }, { mode: 'immediate' });
+  }
   assert((await disk()).usedBytes < budget);
   assertEquals(await blocks(files.wal), 0);
-  assertEquals(db.gate.stats().completed, 1);
+  const seedCheckpoints = db.gate.stats().completed;
+  assert(seedCheckpoints > 0);
 
   const arm = Deno.env.get('CHECKPOINT_FAULT_ARM');
   if (arm) await Deno.writeTextFile(arm, '');
@@ -58,7 +63,7 @@ try {
     assertEquals(after.filesystemFull, true);
     assert(after.protectedBytes >= retained + await blocks(files.database));
     assertEquals(after.usedBytes, after.protectedBytes);
-    assertEquals(db.gate.stats().completed, 1);
+    assertEquals(db.gate.stats().completed, seedCheckpoints);
     await Deno.remove(arm!);
     // An ordinary commit triggers the existing threshold schedule; do not
     // call the checkpoint binding directly to make recovery pass.
@@ -66,7 +71,7 @@ try {
     assertEquals(attempts, 2);
   }
   const released = await disk();
-  assertEquals(db.gate.stats().completed, 2);
+  assertEquals(db.gate.stats().completed, seedCheckpoints + 1);
   assertEquals(released.checkpoint.overshootBytes, 0);
   assertEquals(released.checkpoint.retainedWalBytes, 0);
   assertEquals(released.filesystemFull, false);

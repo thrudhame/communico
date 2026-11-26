@@ -53,6 +53,16 @@ const definitions = {
     nonblocking: true,
   },
   ffi_connect: { parameters: ['u32'], result: 'pointer', nonblocking: true },
+  ffi_connect_bounded: {
+    parameters: ['u32'],
+    result: 'pointer',
+    nonblocking: true,
+  },
+  ffi_set_limit: {
+    parameters: ['u32', 'u64', 'u64', 'u64'],
+    result: 'pointer',
+    nonblocking: true,
+  },
   ffi_exec: {
     parameters: ['u32', 'buffer'],
     result: 'pointer',
@@ -186,8 +196,27 @@ export class Turso {
     return handle;
   }
 
-  connect(file: number): Promise<number> {
-    return this.value(() => this.library.symbols.ffi_connect(file));
+  connect(file: number, bounded = false): Promise<number> {
+    return this.value(() =>
+      bounded
+        ? this.library.symbols.ffi_connect_bounded(file)
+        : this.library.symbols.ffi_connect(file)
+    );
+  }
+
+  setLimit(
+    connection: number,
+    { blockSize, bytes }: { blockSize: number; bytes: number },
+    undoBytes: number,
+  ): Promise<void> {
+    return this.value(() =>
+      this.library.symbols.ffi_set_limit(
+        connection,
+        BigInt(blockSize),
+        BigInt(bytes),
+        BigInt(undoBytes),
+      )
+    );
   }
 
   exec(connection: number, sql: string): Promise<void> {

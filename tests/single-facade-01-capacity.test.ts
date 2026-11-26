@@ -257,16 +257,22 @@ Deno.test('facade capacity: staged media and native journal writers cannot overs
   let store: Store | undefined;
   let cache: MediaCache | undefined;
   try {
-    const capacity = { budgetBytes, roots: [mediaRoot] };
-    store = await openStore({
+    const capacityOwner = new Capacity(
+      [root + '/store', mediaRoot],
+      budgetBytes,
+    );
+    const settings = {
       dir: root + '/store',
       library: './.native/libturso_ffi.so',
       checkpointlogbytes: 8 * MiB,
       maxopenfiles: 8,
       idleseconds: 300,
-    }, { schemas: { server: serverSchema }, ...{ capacity } });
+    };
+    const open = () =>
+      openStore(settings, { schemas: { server: serverSchema }, capacityOwner });
+    store = await open();
     const db = await store.server();
-    cache = new MediaCache(db, mediaRoot);
+    cache = new MediaCache(db, mediaRoot, 32, capacityOwner);
     await cache.start();
     const caps = [{ type: 'control', version: 1 }];
     const journal = new Journal(db, caps);
@@ -277,14 +283,24 @@ Deno.test('facade capacity: staged media and native journal writers cannot overs
       variant: 'original',
       scope: 'remote' as const,
     };
-    const mediaWork = cache.fetch(identity, 1, async (output) => {
-      const writer = output.getWriter();
-      await writer.write(new Uint8Array(size).fill(37));
-      await writer.close();
-      staged.resolve();
-      await release.promise;
-      return { contentType: 'application/octet-stream', filename: null, size };
-    });
+    const mediaWork = cache.fetch(
+      identity,
+      1,
+      async (output) => {
+        const writer = output.getWriter();
+        await writer.write(new Uint8Array(size).fill(37));
+        await writer.close();
+        staged.resolve();
+        await release.promise;
+        return {
+          contentType: 'application/octet-stream',
+          filename: null,
+          size,
+        };
+      },
+      undefined,
+      size,
+    );
     let native!: PromiseSettledResult<LinkRecord>;
     let media!: PromiseSettledResult<Awaited<typeof mediaWork>>;
     try {
@@ -319,6 +335,29 @@ Deno.test('facade capacity: staged media and native journal writers cannot overs
       (await journal.heads('home', 'out', source)).applied,
       EMPTY_CUT,
     );
+    assertEquals((await cache.get(identity))?.size, size);
+    await cache.close();
+    cache = undefined;
+    await store.close();
+    store = await open();
+    const reopened = await store.server();
+    const recovered = new Journal(reopened, caps);
+    assertEquals(
+      (await recovered.heads('home', 'out', source)).applied,
+      EMPTY_CUT,
+    );
+    await recovered.append('home', {
+      ...source,
+      type: 'control',
+      version: 1,
+      operationId: 'over-budget-together',
+      payload: { data: 'fits after rollback' },
+    });
+    assertEquals(
+      (await recovered.heads('home', 'out', source)).received.sequence,
+      1,
+    );
+    cache = new MediaCache(reopened, mediaRoot, 32, capacityOwner);
     assertEquals((await cache.get(identity))?.size, size);
   } finally {
     await cache?.close();

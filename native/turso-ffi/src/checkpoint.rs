@@ -16,6 +16,42 @@ pub struct Observer {
     open_limit: Mutex<Option<(u64, u64)>>,
 }
 
+pub struct Grant {
+    block: u64,
+    undo: u64,
+    remaining: Mutex<u64>,
+}
+
+tokio::task_local! {
+    pub static LIMIT: Option<(Arc<Grant>, bool)>;
+}
+
+impl Grant {
+    pub fn new(block: u64, bytes: u64, undo: u64) -> Self {
+        Self {
+            block,
+            undo,
+            remaining: Mutex::new(bytes),
+        }
+    }
+
+    fn charge(&self, pos: u64, len: u64, cleanup: bool) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        let mut remaining = self.remaining.lock().unwrap();
+        let cost = (pos % self.block)
+            .checked_add(len)
+            .and_then(|span| span.div_ceil(self.block).checked_mul(self.block));
+        let floor = if cleanup { 0 } else { self.undo };
+        *remaining = cost
+            .and_then(|n| remaining.checked_sub(n))
+            .filter(|left| *left >= floor)
+            .ok_or(turso_core::LimboError::DatabaseFull)?;
+        Ok(())
+    }
+}
+
 impl Observer {
     pub fn new(path: &str) -> Self {
         Self {
@@ -57,6 +93,14 @@ impl Observer {
     }
 
     fn check_write(&self, pos: u64, len: u64) -> Result<()> {
+        LIMIT
+            .try_with(|limit| -> Result<()> {
+                if let Some((grant, cleanup)) = limit {
+                    grant.charge(pos, len, *cleanup)?;
+                }
+                Ok(())
+            })
+            .unwrap_or(Ok(()))?;
         if let Some((block, remaining)) = self.open_limit.lock().unwrap().as_mut() {
             // Charge every block the call can touch, including an unaligned
             // tail, even when a filesystem can reuse an existing allocation.
@@ -160,7 +204,9 @@ impl File for ObservedFile {
     }
 
     fn truncate(&self, len: u64, completion: Completion) -> Result<Completion> {
-        if self.1.open_limit.lock().unwrap().is_some() {
+        if LIMIT.try_with(Option::is_some).unwrap_or(false)
+            || self.1.open_limit.lock().unwrap().is_some()
+        {
             let old_size = self.0.size()?;
             self.1.check_write(old_size, len.saturating_sub(old_size))?;
         }

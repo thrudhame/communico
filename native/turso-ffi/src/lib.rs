@@ -99,6 +99,7 @@ impl Drop for Connecting {
 }
 
 type SharedConnection = Arc<tokio::sync::Mutex<Connection>>;
+type ConnectionLimit = Option<Arc<checkpoint::Grant>>;
 
 #[derive(Default)]
 struct Handles {
@@ -106,7 +107,7 @@ struct Handles {
     files: HashMap<u32, File>,
     paths: HashMap<PathBuf, u32>,
     opening: HashMap<PathBuf, Arc<Opening>>,
-    connections: HashMap<u32, (u32, SharedConnection)>,
+    connections: HashMap<u32, (u32, SharedConnection, ConnectionLimit)>,
     locks: HashMap<u32, std::fs::File>,
 }
 
@@ -244,12 +245,36 @@ async fn query(connection: &Connection, sql: &str, parameters: Vec<Value>) -> Re
     Ok(json!(output))
 }
 
-fn connection(handle: u32) -> Result<SharedConnection> {
+fn connection(handle: u32) -> Result<(SharedConnection, ConnectionLimit)> {
     handles()?
         .connections
         .get(&handle)
-        .map(|(_, value)| value.clone())
+        .map(|(_, value, limit)| (value.clone(), limit.clone()))
         .ok_or_else(|| Failure::binding("invalid connection"))
+}
+
+#[no_mangle]
+pub extern "C" fn ffi_set_limit(handle: u32, block: u64, bytes: u64, undo: u64) -> *mut c_char {
+    reply(|| {
+        if block == 0 || undo > bytes {
+            return Err(Failure::binding("invalid native grant"));
+        }
+        let mut handles = handles()?;
+        let (_, _, limit) = handles
+            .connections
+            .get_mut(&handle)
+            .ok_or_else(|| Failure::binding("invalid connection"))?;
+        *limit = Some(Arc::new(checkpoint::Grant::new(block, bytes, undo)));
+        Ok(Json::Null)
+    })
+}
+
+fn run_limited<T: Send + 'static>(
+    limit: ConnectionLimit,
+    cleanup: bool,
+    work: impl std::future::Future<Output = Result<T>> + Send + 'static,
+) -> Result<T> {
+    run(checkpoint::LIMIT.scope(limit.map(|grant| (grant, cleanup)), work))
 }
 
 fn canonical_file(path: &str) -> Result<PathBuf> {
@@ -445,7 +470,7 @@ mod registry_tests {
         let (entered, ready) = mpsc::channel();
         let (release, held) = mpsc::channel();
         let connecting = std::thread::spawn(move || {
-            connect_file(handle, |connection| {
+            connect_file(handle, None, |connection| {
                 entered.send(()).unwrap();
                 held.recv().unwrap();
                 Ok(connection)
@@ -474,9 +499,19 @@ mod registry_tests {
 
 #[no_mangle]
 pub extern "C" fn ffi_connect(handle: u32) -> *mut c_char {
+    connect(handle, None)
+}
+
+#[no_mangle]
+pub extern "C" fn ffi_connect_bounded(handle: u32) -> *mut c_char {
+    connect(handle, Some(Arc::new(checkpoint::Grant::new(1, 0, 0))))
+}
+
+fn connect(handle: u32, limit: ConnectionLimit) -> *mut c_char {
     reply(|| {
-        connect_file(handle, |connection| {
-            run(async move {
+        let startup_limit = limit.clone();
+        connect_file(handle, limit, |connection| {
+            run_limited(startup_limit, false, async move {
                 query(&connection, "PRAGMA synchronous=FULL", vec![]).await?;
                 Ok(connection)
             })
@@ -487,6 +522,7 @@ pub extern "C" fn ffi_connect(handle: u32) -> *mut c_char {
 
 fn connect_file(
     handle: u32,
+    limit: ConnectionLimit,
     initialize: impl FnOnce(Connection) -> Result<Connection>,
 ) -> Result<u32> {
     let (database, connecting) = {
@@ -498,13 +534,17 @@ fn connect_file(
         file.connecting += 1;
         (file.database.clone(), Connecting(handle))
     };
-    let connection = initialize(database.connect()?)?;
+    let connection = checkpoint::LIMIT
+        .sync_scope(limit.clone().map(|grant| (grant, false)), || {
+            initialize(database.connect()?)
+        })?;
     let id = {
         let mut handles = handles()?;
         let id = handles.id()?;
-        handles
-            .connections
-            .insert(id, (handle, Arc::new(tokio::sync::Mutex::new(connection))));
+        handles.connections.insert(
+            id,
+            (handle, Arc::new(tokio::sync::Mutex::new(connection)), limit),
+        );
         id
     };
     drop(connecting);
@@ -514,9 +554,9 @@ fn connect_file(
 #[no_mangle]
 pub unsafe extern "C" fn ffi_exec(handle: u32, sql: *const c_char) -> *mut c_char {
     reply(|| {
-        let connection = connection(handle)?;
+        let (connection, limit) = connection(handle)?;
         let sql = text(sql)?;
-        run(async move {
+        run_limited(limit, false, async move {
             connection.lock().await.execute_batch(sql).await?;
             Ok(Json::Null)
         })
@@ -541,8 +581,8 @@ pub unsafe extern "C" fn ffi_vacuum_into(handle: u32, staging: *const c_char) ->
             "VACUUM INTO '/proc/self/fd/{}/data.db'",
             directory.as_raw_fd()
         );
-        let connection = connection(handle)?;
-        run(async move {
+        let (connection, limit) = connection(handle)?;
+        run_limited(limit, false, async move {
             let connection = connection.lock().await;
             if !connection.is_autocommit()? {
                 return Err(Failure::binding("backup snapshot requires autocommit"));
@@ -632,10 +672,10 @@ pub unsafe extern "C" fn ffi_execute(
     params: *const c_char,
 ) -> *mut c_char {
     reply(|| {
-        let connection = connection(handle)?;
+        let (connection, limit) = connection(handle)?;
         let sql = text(sql)?;
         let params = parameters(text(params)?)?;
-        run(async move {
+        run_limited(limit, false, async move {
             let count = connection
                 .lock()
                 .await
@@ -653,16 +693,20 @@ pub unsafe extern "C" fn ffi_query(
     params: *const c_char,
 ) -> *mut c_char {
     reply(|| {
-        let connection = connection(handle)?;
+        let (connection, limit) = connection(handle)?;
         let sql = text(sql)?;
         let params = parameters(text(params)?)?;
-        run(async move { query(&*connection.lock().await, &sql, params).await })
+        run_limited(limit, false, async move {
+            query(&*connection.lock().await, &sql, params).await
+        })
     })
 }
 
 fn control(handle: u32, sql: &'static str) -> Result<Json> {
-    let connection = connection(handle)?;
-    run(async move { query(&*connection.lock().await, sql, vec![]).await })
+    let (connection, limit) = connection(handle)?;
+    run_limited(limit, false, async move {
+        query(&*connection.lock().await, sql, vec![]).await
+    })
 }
 
 #[no_mangle]
@@ -688,8 +732,8 @@ pub extern "C" fn ffi_commit(handle: u32) -> *mut c_char {
 #[no_mangle]
 pub extern "C" fn ffi_rollback(handle: u32) -> *mut c_char {
     reply(|| {
-        let connection = connection(handle)?;
-        run(async move {
+        let (connection, limit) = connection(handle)?;
+        run_limited(limit, true, async move {
             let connection = connection.lock().await;
             if !connection.is_autocommit()? {
                 query(&connection, "ROLLBACK", vec![]).await?;
@@ -720,7 +764,7 @@ pub extern "C" fn ffi_owned_checkpoint(handle: u32) -> *mut c_char {
     reply(|| {
         let (connection, observer) = {
             let handles = handles()?;
-            let (file, connection) = handles
+            let (file, connection, _) = handles
                 .connections
                 .get(&handle)
                 .ok_or_else(|| Failure::binding("invalid connection"))?;
@@ -761,10 +805,15 @@ pub extern "C" fn ffi_close(handle: u32, kind: u32) -> *mut c_char {
                     .ok_or_else(|| Failure::binding("invalid store lock"))?;
             }
             1 => {
-                handles
+                let (_, connection, limit) = handles
                     .connections
                     .remove(&handle)
                     .ok_or_else(|| Failure::binding("invalid connection"))?;
+                drop(handles);
+                return run_limited(limit, true, async move {
+                    drop(connection);
+                    Ok(Json::Null)
+                });
             }
             0 => {
                 let file = handles
@@ -773,7 +822,7 @@ pub extern "C" fn ffi_close(handle: u32, kind: u32) -> *mut c_char {
                     .ok_or_else(|| Failure::binding("invalid database"))?;
                 if file.references == 1
                     && (file.connecting > 0
-                        || handles.connections.values().any(|(id, _)| *id == handle))
+                        || handles.connections.values().any(|(id, _, _)| *id == handle))
                 {
                     return Err(Failure::binding("database has live connections"));
                 }

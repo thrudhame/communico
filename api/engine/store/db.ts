@@ -16,6 +16,7 @@ import {
 } from '#engine/store/pressure.ts';
 import { commitAdmitted, type CommitCheck } from '#engine/store/commit.ts';
 import type { Admission } from '#engine/store/admission.ts';
+import type { Capacity, Reservation } from '#engine/store/capacity.ts';
 import { databaseFiles } from '#engine/store/layout.ts';
 import { publish } from '#engine/store/files.ts';
 import {
@@ -48,6 +49,7 @@ export type ConflictStats = {
 };
 
 const TRANSACTION_ATTEMPTS = 20;
+const NO_GROWTH = { blockSize: 1, bytes: 0 };
 
 export class Conn {
   private active = true;
@@ -57,7 +59,7 @@ export class Conn {
     private readonly ffi: Turso,
     private readonly handle: number,
     private readonly checks = new Set<CommitCheck>(),
-    private readonly beginWrite = () => {},
+    private readonly beginWrite: () => void | Promise<void> = () => {},
   ) {}
 
   /** Retain a dependency for this attempt's actual native commit. */
@@ -80,8 +82,8 @@ export class Conn {
     // statement (including keywords inside strings/comments).
     const readOnly = /^\s*(SELECT|WITH)\b[^;]*;?\s*$/is.test(sql) &&
       !/\b(INSERT|UPDATE|DELETE|REPLACE)\b/i.test(sql);
-    if (!readOnly) this.beginWrite();
-    return this.ffi.query(this.handle, sql, values);
+    const query = () => this.ffi.query(this.handle, sql, values);
+    return readOnly ? query() : this.write(query);
   }
 
   /** Successful affected-row writes in this attempt, not global database work.
@@ -93,17 +95,22 @@ export class Conn {
 
   execute(sql: string, values: readonly Value[] = []): Promise<number> {
     this.check();
-    this.beginWrite();
-    return this.ffi.execute(this.handle, sql, values).then((affected) => {
-      if (affected > 0) this.writeVersion++;
-      return affected;
-    });
+    return this.write(() => this.ffi.execute(this.handle, sql, values)).then(
+      (affected) => {
+        if (affected > 0) this.writeVersion++;
+        return affected;
+      },
+    );
   }
 
   exec(sql: string): Promise<void> {
     this.check();
-    this.beginWrite();
-    return this.ffi.exec(this.handle, sql);
+    return this.write(() => this.ffi.exec(this.handle, sql));
+  }
+
+  private write<T>(run: () => Promise<T>): Promise<T> {
+    const admitted = this.beginWrite();
+    return admitted ? admitted.then(run) : run();
   }
 
   release(): void {
@@ -167,7 +174,7 @@ export class Db {
     private readonly handle: number,
     checkpointlogbytes: number,
     private readonly admission?: Admission,
-    private readonly capacity?: import('./capacity.ts').Capacity,
+    private readonly capacity?: Capacity,
   ) {
     this.gate = new Gate(path, checkpointlogbytes, async (started) => {
       const lease = await this.capacity?.tryCheckpoint(path);
@@ -333,7 +340,7 @@ export class Db {
       if (this.connections < 8) {
         this.connections++;
         try {
-          return await this.ffi.connect(this.handle);
+          return await this.ffi.connect(this.handle, !!this.capacity);
         } catch (error) {
           this.connections--;
           this.notify();
@@ -396,13 +403,32 @@ export class Db {
     let reusable = true;
     let committed = false;
     let writing = false;
+    let lease: Reservation | undefined;
+    let admission: Promise<void> | undefined;
     try {
       handle = await this.acquire();
       const checks = new Set<CommitCheck>();
       connection = new Conn(this.ffi, handle, checks, () => {
-        if (writing) return;
-        writing = true;
-        this.writers++;
+        if (!writing) {
+          writing = true;
+          this.writers++;
+        }
+        // A read-only attempt starts (and ends) under a zero-growth guard.
+        // Only a write-capable statement can take the rest of the envelope.
+        if (this.capacity) {
+          return admission ??= (async () => {
+            const grant = await this.capacity!.reserveNative(this.path, {
+              inodes: 0,
+              metadataBlocks: 0,
+            });
+            lease = grant;
+            // Keep a separate pool for rollback/destruction. In particular,
+            // a failed commit cannot consume the last of its own grant.
+            const undo = Math.ceil(grant.bytes / grant.blockSize / 2) *
+              grant.blockSize;
+            await this.ffi.setLimit(handle!, grant, undo);
+          })();
+        }
       });
       try {
         await this.ffi.begin(handle, options.mode ?? 'concurrent');
@@ -441,8 +467,18 @@ export class Db {
       connection?.release();
       try {
         if (handle !== undefined) {
-          if (reusable) this.idle.push(handle);
-          else {
+          if (reusable) {
+            try {
+              if (lease) await this.ffi.setLimit(handle, NO_GROWTH, 0);
+              this.idle.push(handle);
+              handle = undefined;
+            } finally {
+              if (handle !== undefined) {
+                this.connections--;
+                await this.ffi.closeConnection(handle);
+              }
+            }
+          } else {
             try {
               await this.ffi.closeConnection(handle);
             } finally {
@@ -451,6 +487,7 @@ export class Db {
           }
         }
       } finally {
+        lease?.release();
         this.notify();
         // Maintenance errors after COMMIT must never replay a committed body.
         await this.gate.leave(committed);
