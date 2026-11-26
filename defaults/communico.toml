@@ -17,6 +17,8 @@ shutdowngraceseconds = 10
 # Synapse MAX_REQUEST_SIZE: 200 x 64 KiB = 12.5 MiB. Must be positive.
 # Media uploads retain media.maxbytes. COMMUNICO_SERVER_MAXREQUESTBYTES
 maxrequestbytes = 13107200
+# Optional Matrix admin_contact URI for client resource-limit responses.
+admincontact = ""
 
 [admin]
 # Local operator API. Empty means admin.sock beside the resolved store root.

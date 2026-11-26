@@ -14,6 +14,15 @@ import { certificatePin, readProtectedFile } from './identity.ts';
 import { LinkError } from './protocol.ts';
 import { lines } from './notices.ts';
 import { requestFailure } from '#engine/request-diagnostics.ts';
+import { isStoragePressure } from '#engine/store/pressure.ts';
+
+function failureStatus(error: unknown): number {
+  return error instanceof LinkError
+    ? error.status
+    : isStoragePressure(error)
+    ? 503
+    : 500;
+}
 
 export type LinkTls = { cert: string; key: string; ca: string[] };
 export const LINK_PREFIX = '/_communico/link/v1/';
@@ -179,7 +188,7 @@ export async function startLinkTransport(options: {
           report(error);
         }
         if (!ws && !socket.destroyed) {
-          const status = error instanceof LinkError ? error.status : 500;
+          const status = failureStatus(error);
           socket.end(
             `HTTP/1.1 ${status} Refused\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`,
           );
@@ -245,13 +254,15 @@ export async function startLinkTransport(options: {
         }
         if (outgoing.headersSent) outgoing.destroy();
         else {
-          outgoing.writeHead(error instanceof LinkError ? error.status : 500, {
+          outgoing.writeHead(failureStatus(error), {
             'content-type': 'application/json',
             connection: 'close',
           }).end(
             JSON.stringify({
               code: error instanceof LinkError
                 ? error.code
+                : isStoragePressure(error)
+                ? 'LINK_UNAVAILABLE'
                 : 'LINK_INTERNAL_ERROR',
             }),
           );

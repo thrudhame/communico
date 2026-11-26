@@ -11,6 +11,7 @@ import {
   touchCachedMedia,
 } from '#engine/server/media.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { storageFailure } from '#engine/store/pressure.ts';
 import { abortable } from '#engine/net/abort.ts';
 
 export type Retention = {
@@ -280,7 +281,7 @@ export class MediaCache {
           if (!(e instanceof Deno.errors.NotFound)) throw e;
         },
       );
-      throw error;
+      throw storageFailure(error);
     } finally {
       reservation?.delete(key);
       if (this.variants.get(media)?.size === 0) this.variants.delete(media);

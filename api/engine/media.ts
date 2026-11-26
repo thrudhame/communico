@@ -9,6 +9,7 @@ import {
 } from '#engine/tenant/media.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { isStoragePressure, storageFailure } from '#engine/store/pressure.ts';
 import { b64encode } from '#engine/signing-primitives.js';
 
 export function mediaRoot(): string {
@@ -133,12 +134,21 @@ export async function uploadMedia(
     }
     const sizeBytes = await storeUploadBody(stream, root, mediaId);
     const uploaded = { ...meta, size_bytes: sizeBytes };
-    if (reservation === undefined) {
-      await createMedia(tenant, localpart, mediaId, 'uploaded', uploaded);
-    } else {
-      await markUploaded(tenant, mediaId, uploaded);
+    try {
+      if (reservation === undefined) {
+        await createMedia(tenant, localpart, mediaId, 'uploaded', uploaded);
+      } else {
+        await markUploaded(tenant, mediaId, uploaded);
+      }
+    } catch (error) {
+      // A refused metadata write keeps the old pending row (if any). Remove
+      // this attempt's unpublished bytes before unlocking that upload ID.
+      if (isStoragePressure(error)) await Deno.remove(key);
+      throw error;
     }
     return { mediaId, sizeBytes };
+  } catch (error) {
+    throw storageFailure(error);
   } finally {
     release();
     if (uploads.get(key) === tail) uploads.delete(key);

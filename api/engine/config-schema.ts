@@ -15,6 +15,7 @@ export const SCHEMA = {
     port: 'int',
     shutdowngraceseconds: 'int',
     maxrequestbytes: 'int',
+    admincontact: 'string',
   },
   admin: {
     socket: 'string',

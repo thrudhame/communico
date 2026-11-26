@@ -577,6 +577,7 @@ export type ConfigPatch = {
     port?: number;
     shutdowngraceseconds?: number;
     maxrequestbytes?: number;
+    admincontact?: string;
   };
   admin?: Partial<Config['admin']>;
   media?: Partial<Omit<Config['media'], 'cache'>> & {

@@ -9,6 +9,11 @@ import {
   type Value,
 } from '#engine/store/ffi.ts';
 import { Gate } from '#engine/store/gate.ts';
+import {
+  isStoragePressure,
+  storageFailure,
+  StoragePressureError,
+} from '#engine/store/pressure.ts';
 import { commitAdmitted, type CommitCheck } from '#engine/store/commit.ts';
 import type { Admission } from '#engine/store/admission.ts';
 import { databaseFiles } from '#engine/store/layout.ts';
@@ -404,15 +409,18 @@ export class Db {
           await this.ffi.rollback(handle);
         } catch (rollback) {
           reusable = false;
-          throw new AggregateError(
+          const failure = new AggregateError(
             [error, rollback],
             'transaction and rollback failed',
           );
+          throw isStoragePressure(error)
+            ? new StoragePressureError(failure)
+            : failure;
         }
         if (error instanceof StoreError && error.conflict) {
           return { committed: false, error };
         }
-        throw error;
+        throw storageFailure(error);
       }
     } finally {
       if (writing) this.writers--;
