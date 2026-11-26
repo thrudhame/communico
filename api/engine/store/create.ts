@@ -7,6 +7,7 @@ import { type Conn, type Database, Db } from '#engine/store/db.ts';
 import { type Row, Turso } from '#engine/store/ffi.ts';
 import { databaseFiles } from '#engine/store/layout.ts';
 import type { Admission } from '#engine/store/admission.ts';
+import type { Capacity } from '#engine/store/capacity.ts';
 
 export type CreateOptions = {
   checkpointlogbytes: number;
@@ -15,6 +16,7 @@ export type CreateOptions = {
   beforeRename?: (temporary: string, final: string) => Promise<void>;
   discardOnFailure?: boolean;
   publication?: Admission;
+  capacity?: Capacity;
 };
 
 // A schema provider owns one database kind's domain tables. Safe create
@@ -174,18 +176,30 @@ export async function createDatabase(
   } catch (error) {
     if (!(error instanceof Deno.errors.NotFound)) throw error;
   }
-  await Deno.mkdir(temporary, { mode: 0o700 });
+  const create = () => Deno.mkdir(temporary, { mode: 0o700 });
+  if (options.capacity) {
+    await options.capacity.withMetadata(temporary, 1, create);
+  } else await create();
   // Only this invocation's successfully reserved staging directory is ours
   // to discard. Never remove an existing final or another creator's stage.
   try {
     const path = databaseFiles(temporary).database;
-    let db = await Db.open(ffi, path, options.checkpointlogbytes);
+    const open = () =>
+      Db.open(
+        ffi,
+        path,
+        options.checkpointlogbytes,
+        undefined,
+        options.capacity,
+        true,
+      );
+    let db = await open();
     try {
       await options.schema(db);
     } finally {
       await db.close();
     }
-    db = await Db.open(ffi, path, options.checkpointlogbytes);
+    db = await open();
     try {
       await integrityCheck(db);
       await options.verify(db);
@@ -194,15 +208,19 @@ export async function createDatabase(
     }
     await syncTree(temporary);
     await options.beforeRename?.(temporary, final);
-    const publish = async () => {
+    const rename = async () => {
       await Deno.rename(temporary, final);
       await sync(parent);
     };
+    const publish = () =>
+      options.capacity
+        ? options.capacity.withMetadata(final, 0, rename)
+        : rename();
     if (options.publication) await options.publication.run(publish);
     else await publish();
     return final;
   } catch (error) {
-    if (options.discardOnFailure) {
+    if (options.discardOnFailure || options.capacity) {
       try {
         await Deno.remove(temporary, { recursive: true });
         await sync(parent);

@@ -445,7 +445,9 @@ export async function openStore(
     await Deno.mkdir(dirname(config.dir), { recursive: true, mode: 0o700 });
     ownership = await ffi.lockStore(await ownershipPath(config.dir));
     await assertNoPromotion(config.dir);
-    await Deno.mkdir(config.dir, { recursive: true, mode: 0o700 });
+    if (options.capacityOwner) {
+      await options.capacityOwner.ensureDirectory(config.dir, 0o700);
+    } else await Deno.mkdir(config.dir, { recursive: true, mode: 0o700 });
     // The data root is canonical and locked; no database has opened yet.
     await options.beforeOpen?.(config.dir);
     await sweep(config.dir);
@@ -467,9 +469,9 @@ export async function openStore(
       if (!(error instanceof Deno.errors.NotFound)) throw error;
     }
     if (!present) {
-      await Deno.mkdir(config.dir, { recursive: true });
       await createDatabase(ffi, config.dir, 'server', {
         checkpointlogbytes: config.checkpointlogbytes,
+        capacity: options.capacityOwner,
         schema: (db) => applySchema(db, serverProvider),
         verify: (db) => checkSchema(db, serverProvider),
       });

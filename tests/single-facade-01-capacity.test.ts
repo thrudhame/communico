@@ -16,7 +16,8 @@ import { uploadMedia } from '#engine/media.ts';
 import { roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { Capacity, type CapacityProbe } from '#engine/store/capacity.ts';
-import { Db } from '#engine/store/db.ts';
+import { createDatabase } from '#engine/store/create.ts';
+import { type Database, Db } from '#engine/store/db.ts';
 import { StoreError, Turso } from '#engine/store/ffi.ts';
 import { StoragePressureError } from '#engine/store/pressure.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
@@ -367,6 +368,50 @@ Deno.test('facade capacity: staged media and native journal writers cannot overs
 });
 
 const MiB = 1024 * 1024;
+
+Deno.test('facade capacity: private database creation is bounded before publication', async () => {
+  const root = await Deno.makeTempDir();
+  const ffi = new Turso('./.native/libturso_ffi.so');
+  try {
+    const options = {
+      checkpointlogbytes: 65536,
+      capacity: new Capacity([root], 256 * 1024),
+      schema: async (db: Database) => {
+        await db.exec('CREATE TABLE payload(value BLOB)');
+        await db.exec('INSERT INTO payload VALUES(zeroblob(524288))');
+      },
+      verify: () => Promise.resolve(),
+    };
+    await assertRejects(
+      () => createDatabase(ffi, root, 'server', options),
+      StoragePressureError,
+    );
+    assertEquals(await Array.fromAsync(Deno.readDir(root)), []);
+    const [disk] = (await options.capacity.status()).filesystems;
+    assertEquals(disk.reservedBytes, 0);
+    const path = await createDatabase(ffi, root, 'server', {
+      ...options,
+      schema: (db) => db.exec('CREATE TABLE payload(value BLOB)'),
+    });
+    const db = await Db.open(
+      ffi,
+      path + '/data.db',
+      65536,
+      undefined,
+      options.capacity,
+    );
+    try {
+      assertEquals(await db.query('SELECT count(*) AS count FROM payload'), [{
+        count: 0,
+      }]);
+    } finally {
+      await db.close();
+    }
+  } finally {
+    ffi.close();
+    await Deno.remove(root, { recursive: true });
+  }
+});
 
 Deno.test('facade capacity: native bootstrap obeys its grant before writing', async () => {
   const root = await Deno.makeTempDir({ prefix: 'facade-native-open-' });

@@ -155,6 +155,27 @@ export class Capacity {
     });
   }
 
+  async withMetadata<T>(
+    path: string,
+    inodes: number,
+    write: () => Promise<T>,
+  ): Promise<T> {
+    // Reserve the inode and worst-case directory entry/index updates. Rename
+    // also needs destination metadata even when it moves no file payload.
+    const lease = await this.reserve(path, {
+      bytes: 0,
+      inodes,
+      metadataBlocks: 8,
+    });
+    try {
+      return await write();
+    } catch (error) {
+      throw storageFailure(error);
+    } finally {
+      lease.release();
+    }
+  }
+
   async ensureDirectory(path: string, mode?: number): Promise<void> {
     const target = resolve(path);
     const at = await ancestor(target);

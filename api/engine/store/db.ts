@@ -175,8 +175,14 @@ export class Db {
     checkpointlogbytes: number,
     private readonly admission?: Admission,
     private readonly capacity?: Capacity,
+    private readonly privateDatabase = false,
   ) {
     this.gate = new Gate(path, checkpointlogbytes, async (started) => {
+      if (this.capacity && this.privateDatabase) {
+        // A staging database has no owned-checkpoint exception. Its journal
+        // is part of the private tree and can survive until publication.
+        return;
+      }
       const lease = await this.capacity?.tryCheckpoint(path);
       if (this.capacity && !lease) return;
       let outcome: 'full' | 'completed' | undefined;
@@ -242,7 +248,8 @@ export class Db {
     path: string,
     checkpointlogbytes: number,
     admission?: Admission,
-    capacity?: import('./capacity.ts').Capacity,
+    capacity?: Capacity,
+    privateDatabase = false,
   ): Promise<Db> {
     path = resolve(path);
     if (path !== databaseFiles(dirname(path)).database) {
@@ -265,10 +272,12 @@ export class Db {
           checkpointlogbytes,
           admission,
           capacity,
+          privateDatabase,
         );
       }
       if (
         db.ffi !== ffi || db.gate.threshold !== checkpointlogbytes ||
+        db.privateDatabase !== privateDatabase ||
         (admission !== undefined && db.admission !== admission) ||
         (capacity !== undefined && db.capacity !== capacity)
       ) {
@@ -299,6 +308,7 @@ export class Db {
         checkpointlogbytes,
         admission,
         capacity,
+        privateDatabase,
       );
       try {
         const connection = await db.acquire();

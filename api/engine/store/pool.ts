@@ -454,10 +454,12 @@ export class Pool {
       throw new Deno.errors.NotFound(`removed ${kind} database: ${id}`);
     }
     const provider = this.providers[kind];
-    await Deno.mkdir(parent, { recursive: true });
+    if (this.capacity) await this.capacity.ensureDirectory(parent);
+    else await Deno.mkdir(parent, { recursive: true });
     let result!: T;
     await createDatabase(this.ffi, parent, key, {
       checkpointlogbytes: this.options.checkpointlogbytes,
+      capacity: this.capacity,
       discardOnFailure: true,
       publication: this.admission,
       schema: async (db) => {
@@ -659,10 +661,12 @@ export class Pool {
           `no ${kind} database for ${JSON.stringify(id)}: ${files.database}`,
         );
       }
-      await Deno.mkdir(parent, { recursive: true });
+      if (this.capacity) await this.capacity.ensureDirectory(parent);
+      else await Deno.mkdir(parent, { recursive: true });
       const provider = this.providers[kind];
       await createDatabase(this.ffi, parent, key, {
         checkpointlogbytes: this.options.checkpointlogbytes,
+        capacity: this.capacity,
         publication: this.admission,
         schema: async (db) => {
           await recordId(db, id);
