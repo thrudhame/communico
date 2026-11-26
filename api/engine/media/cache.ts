@@ -13,6 +13,7 @@ import {
 } from '#engine/server/media.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { storageFailure } from '#engine/store/pressure.ts';
+import { withStorageHold } from '#engine/store/holds.ts';
 import { abortable } from '#engine/net/abort.ts';
 
 export type Retention = {
@@ -318,7 +319,11 @@ export class MediaCache {
           size += chunk.length;
         },
       });
-      const meta = await producer(output, signal);
+      const meta = await (space
+        ? withStorageHold(() =>
+          producer(output, signal)
+        )
+        : producer(output, signal));
       signal.throwIfAborted();
       if (meta.size !== size) {
         throw new Error('media cache byte count mismatch');

@@ -1,4 +1,9 @@
 import { lstat, realpath, stat, statfs } from 'node:fs/promises';
+import {
+  storageHeld,
+  storageHold,
+  withStorageHold,
+} from '#engine/store/holds.ts';
 import { lstatSync } from 'node:fs';
 import { dirname, join, relative, resolve, SEPARATOR } from '@std/path';
 import { databaseFiles } from '#engine/store/layout.ts';
@@ -39,6 +44,7 @@ export type NativeReservation = Reservation & {
   blockSize: number;
   bytes: number;
   creates: number;
+  scratchRoot?: string;
 };
 
 async function physicalSpace(path: string, device: string): Promise<Space> {
@@ -79,6 +85,8 @@ function missing(error: unknown): boolean {
 /** The facade's capacity inventory is keyed by filesystem, not by root. */
 export class Capacity {
   private lane: Promise<unknown> = Promise.resolve();
+  private fifo: Promise<unknown> = Promise.resolve();
+  private waiting = 0;
   private readonly claims = new Set<Claim>();
   private readonly cache = new Map<string, RegisteredBlob>();
   private released = Promise.withResolvers<void>();
@@ -212,6 +220,20 @@ export class Capacity {
     return this.claim(path, { inodes: creates, metadataBlocks: creates * 5 });
   }
 
+  /** A live transaction may try once, but may only queue after rollback. */
+  tryReserveNative(path: string, creates: number): Promise<NativeReservation> {
+    if (this.waiting || this.checkpointActive) {
+      return Promise.reject(new StorageBusyError(this.released.promise));
+    }
+    return this.tryClaim(
+      path,
+      { inodes: creates, metadataBlocks: creates * 5 },
+      false,
+      storageHold(),
+      true,
+    );
+  }
+
   private claim(
     path: string,
     footprint: {
@@ -221,6 +243,47 @@ export class Capacity {
       files?: readonly number[];
     },
     publication = false,
+  ): Promise<NativeReservation> {
+    const hold = storageHold();
+    if (storageHeld()) {
+      return this.tryClaim(path, footprint, publication, hold, true);
+    }
+    this.waiting++;
+    const result = this.fifo.then(async () => {
+      try {
+        for (;;) {
+          try {
+            return await this.tryClaim(
+              path,
+              footprint,
+              publication,
+              hold,
+              false,
+            );
+          } catch (error) {
+            if (!(error instanceof StorageBusyError)) throw error;
+            await error.released;
+          }
+        }
+      } finally {
+        this.waiting--;
+      }
+    });
+    this.fifo = result.catch(() => {});
+    return result;
+  }
+
+  private tryClaim(
+    path: string,
+    footprint: {
+      bytes?: number;
+      inodes: number;
+      metadataBlocks: number;
+      files?: readonly number[];
+    },
+    publication: boolean,
+    hold: () => () => void,
+    guarded: boolean,
   ): Promise<NativeReservation> {
     const result = this.lane.then(async () => {
       const { promise: released } = this.released;
@@ -317,8 +380,14 @@ export class Capacity {
         space.freeBytes - claimedBytes(local),
         budgetLeft - claimedBytes(explicit ? outstanding : local),
       );
+      // Native work discovers its footprint during execution. Do not give it
+      // a smaller grant just because another operation temporarily holds the
+      // otherwise available envelope; that would surface a false native full.
+      const nativeContended = footprint.bytes === undefined &&
+        available < Math.min(space.freeBytes, budgetLeft);
       if (
-        this.checkpointActive || needs > available ||
+        this.checkpointActive || (guarded && this.waiting > 0) ||
+        nativeContended || needs > available ||
         footprint.inodes > inodesLeft -
             local.reduce((sum, claim) => sum + claim.inodes, 0)
       ) throw new StorageBusyError(released);
@@ -330,14 +399,19 @@ export class Capacity {
         bytes: data + metadata,
         inodes: footprint.inodes,
       };
+      const unhold = hold();
       this.claims.add(claim);
       return {
         release: () => {
-          if (this.claims.delete(claim)) this.notifyRelease();
+          if (this.claims.delete(claim)) {
+            unhold();
+            this.notifyRelease();
+          }
         },
         blockSize,
         bytes: data,
         creates: footprint.inodes,
+        scratchRoot: this.scratchRoot,
       };
     });
     this.lane = result.catch(() => {});
@@ -382,7 +456,7 @@ export class Capacity {
       metadataBlocks: 8,
     });
     try {
-      return await write();
+      return await withStorageHold(write);
     } catch (error) {
       throw storageFailure(error);
     } finally {

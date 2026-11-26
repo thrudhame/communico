@@ -15,9 +15,14 @@ import {
   storageFailure,
   StoragePressureError,
 } from '#engine/store/pressure.ts';
+import {
+  storageHeld,
+  storageScope,
+  withStorageHold,
+} from '#engine/store/holds.ts';
 import { commitAdmitted, type CommitCheck } from '#engine/store/commit.ts';
 import type { Admission } from '#engine/store/admission.ts';
-import type { Capacity, Reservation } from '#engine/store/capacity.ts';
+import type { Capacity, NativeReservation } from '#engine/store/capacity.ts';
 import { databaseFiles } from '#engine/store/layout.ts';
 import { publish } from '#engine/store/files.ts';
 import {
@@ -51,6 +56,13 @@ export type ConflictStats = {
 
 const TRANSACTION_ATTEMPTS = 20;
 const NO_GROWTH = { blockSize: 1, bytes: 0 };
+
+class DeferNativeWrite extends Error {}
+
+type Attempt<T> =
+  | { kind: 'committed'; value: T }
+  | { kind: 'retry'; error: StoreError | StoragePressureError }
+  | { kind: 'deferred' };
 
 export class Conn {
   private active = true;
@@ -376,7 +388,8 @@ export class Db {
   // A body may run more than once. Use only its Conn and attempt-local
   // values; never perform network I/O, notify listeners, or mutate captured
   // state. Return effects as values and publish them only after tx resolves.
-  // Native conflicts and temporarily held capacity retry after rollback.
+  // Native conflicts and temporarily held capacity retry after rollback. A
+  // managed transaction waiting for a grant owns neither slot nor file gate.
   async tx<T>(
     fn: (connection: Conn) => Promise<T>,
     options: { mode?: BeginMode; admit?: CommitCheck } = {},
@@ -385,11 +398,30 @@ export class Db {
       throw new Error('database is closing or closed');
     }
     this.users++;
+    const held = this.capacity !== undefined && storageHeld();
     try {
-      for (let attempt = 1;; attempt++) {
-        const result = await this.attempt(fn, options);
-        if (result.committed) return result.value;
+      for (let attempt = 1, deferred = false;;) {
+        const result = await (this.capacity
+          ? storageScope(async () => {
+            const grant = deferred
+              ? await this.capacity!.reserveNative(this.path, 2)
+              : undefined;
+            try {
+              return await withStorageHold(() =>
+                this.attempt(fn, options, grant, !held)
+              );
+            } finally {
+              // The attempt normally releases before leaving its file gate;
+              // also cover failure before the attempt could enter the gate.
+              grant?.release();
+            }
+          })
+          : this.attempt(fn, options));
+        if (result.kind === 'committed') return result.value;
+        deferred = result.kind === 'deferred';
+        if (result.kind === 'deferred') continue;
         const error = result.error;
+        if (held && error instanceof StorageBusyError) throw error;
         if (
           error instanceof StoragePressureError &&
           !(error instanceof StorageBusyError)
@@ -416,6 +448,7 @@ export class Db {
         if (error instanceof StoreError) {
           this.conflictCounters.backoffMs += performance.now() - started;
         }
+        attempt++;
       }
     } finally {
       this.users--;
@@ -426,17 +459,16 @@ export class Db {
   private async attempt<T>(
     fn: (connection: Conn) => Promise<T>,
     options: { mode?: BeginMode; admit?: CommitCheck },
-  ): Promise<
-    | { committed: true; value: T }
-    | { committed: false; error: StoreError | StoragePressureError }
-  > {
+    grant?: NativeReservation,
+    canDefer = false,
+  ): Promise<Attempt<T>> {
     await this.gate.enter();
     let handle: number | undefined;
     let connection: Conn | undefined;
     let reusable = true;
     let committed = false;
     let writing = false;
-    let lease: Reservation | undefined;
+    let lease = grant;
     let admission: Promise<void> | undefined;
     try {
       handle = await this.acquire();
@@ -450,13 +482,19 @@ export class Db {
         // Only a write-capable statement can take the rest of the envelope.
         if (this.capacity) {
           return admission ??= (async () => {
-            const grant = await this.capacity!.reserveNative(this.path, 2);
-            lease = grant;
+            try {
+              lease ??= await this.capacity!.tryReserveNative(this.path, 2);
+            } catch (error) {
+              if (canDefer && error instanceof StorageBusyError) {
+                throw new DeferNativeWrite();
+              }
+              throw error;
+            }
             // Keep a separate pool for rollback/destruction. In particular,
             // a failed commit cannot consume the last of its own grant.
-            const undo = Math.ceil(grant.bytes / grant.blockSize / 2) *
-              grant.blockSize;
-            await this.ffi.setLimit(handle!, grant, undo);
+            const undo = Math.ceil(lease.bytes / lease.blockSize / 2) *
+              lease.blockSize;
+            await this.ffi.setLimit(handle!, lease, undo);
           })();
         }
       }, this.capacity && (() => this.capacity!.observeScratch()));
@@ -464,6 +502,9 @@ export class Db {
         await this.ffi.begin(handle, options.mode ?? 'concurrent');
         if (options.admit) connection.admit(options.admit);
         const result = await fn(connection);
+        // A body cannot turn a refused first write into a successful commit
+        // by handling its statement error locally.
+        await admission;
         const commit = () =>
           commitAdmitted(checks, () => this.ffi.commit(handle!));
         if (this.admission) {
@@ -473,7 +514,7 @@ export class Db {
         }
         if (writing) this.revision++;
         committed = true;
-        return { committed: true, value: result };
+        return { kind: 'committed', value: result };
       } catch (error) {
         try {
           await this.ffi.rollback(handle);
@@ -487,16 +528,17 @@ export class Db {
             ? new StoragePressureError(failure)
             : failure;
         }
+        if (error instanceof DeferNativeWrite) return { kind: 'deferred' };
         if (
           error instanceof StorageBusyError ||
           (error instanceof StoreError && error.conflict)
         ) {
-          return { committed: false, error };
+          return { kind: 'retry', error };
         }
         if (this.capacity && error instanceof StoreError && error.storageFull) {
           // Only retry a native full outcome known to have rolled back, never
           // a failure reported by maintenance after a successful COMMIT.
-          return { committed: false, error: new StoragePressureError(error) };
+          return { kind: 'retry', error: new StoragePressureError(error) };
         }
         throw storageFailure(error);
       }
@@ -616,13 +658,15 @@ export class Db {
                     new TypeError('backup destination is the source database'),
                   );
                 }
-                return exporting = exportSnapshot(
-                  this.ffi,
-                  handle!,
-                  schema,
-                  destination,
-                  this.capacity,
-                  dirname(dirname(this.path)),
+                return exporting = withStorageHold(() =>
+                  exportSnapshot(
+                    this.ffi,
+                    handle!,
+                    schema,
+                    destination,
+                    this.capacity,
+                    dirname(dirname(this.path)),
+                  )
                 );
               },
               release,

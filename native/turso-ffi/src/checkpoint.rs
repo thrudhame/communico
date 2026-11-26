@@ -12,6 +12,7 @@ use turso_core::{Buffer, Completion, OpenFlags, Result, IO};
 
 pub struct Observer {
     paths: [PathBuf; 3],
+    scratch: Option<PathBuf>,
     peak: Mutex<Option<u64>>,
     open_limit: Mutex<Option<Grant>>,
     opens: Mutex<()>,
@@ -64,17 +65,42 @@ impl Grant {
 }
 
 impl Observer {
-    pub fn new(path: &str) -> Self {
+    pub fn new(path: &str, scratch: Option<PathBuf>) -> Self {
         Self {
             paths: [
                 path.into(),
                 format!("{path}-log").into(),
                 format!("{path}-wal").into(),
             ],
+            scratch,
             peak: Mutex::new(None),
             open_limit: Mutex::new(None),
             opens: Mutex::new(()),
         }
+    }
+
+    // A7: scratch is measured by the capacity owner, but does not spend the
+    // database grant. Match directory components of the actual destination.
+    fn is_scratch(&self, path: &str) -> bool {
+        let Some(root) = &self.scratch else {
+            return false;
+        };
+        let path = Path::new(path);
+        let actual = fs::canonicalize(path).or_else(|error| {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(error);
+            }
+            let Some((parent, name)) = path.parent().zip(path.file_name()) else {
+                return Err(error);
+            };
+            // If the last component is a dangling symlink we cannot attest
+            // that a create would land within the configured scratch root.
+            if fs::symlink_metadata(path).is_ok() {
+                return Err(error);
+            }
+            fs::canonicalize(parent).map(|dir| dir.join(name))
+        });
+        actual.is_ok_and(|actual| actual.starts_with(root))
     }
 
     fn bytes(path: &Path) -> u64 {
@@ -159,6 +185,9 @@ impl Clock for ObservedIo {
 impl IO for ObservedIo {
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
         let _open = self.1.opens.lock().unwrap();
+        if self.1.is_scratch(path) {
+            return self.0.open_file(path, flags, direct);
+        }
         self.1.check_create(path)?;
         let file = self.0.open_file(path, flags, direct)?;
         Ok(Arc::new(ObservedFile(file, self.1.clone())))
@@ -174,6 +203,9 @@ impl IO for ObservedIo {
 
     fn open_shared_wal_file(&self, path: &str) -> Result<Arc<dyn File>> {
         let _open = self.1.opens.lock().unwrap();
+        if self.1.is_scratch(path) {
+            return self.0.open_shared_wal_file(path);
+        }
         self.1.check_create(path)?;
         let file = self.0.open_shared_wal_file(path)?;
         Ok(Arc::new(ObservedFile(file, self.1.clone())))

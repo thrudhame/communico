@@ -58,16 +58,13 @@ Deno.test('contact observations resume after a capacity grant releases and close
   const budget = 256 * 1024;
   const capacity = new Capacity([dir], budget);
   const held = await capacity.reserveNative(dir, 2);
-  const blocked = Promise.withResolvers<void>();
+  const started = Promise.withResolvers<void>();
   const persisted: number[] = [];
   const reported: unknown[] = [];
   const contacts = new ContactObservations<number>(
     async (_key, value) => {
-      const grant = await capacity.reserveNative(dir, 2).catch((cause) => {
-        if (cause instanceof StorageBusyError) blocked.resolve();
-        else blocked.reject(cause);
-        throw cause;
-      });
+      started.resolve();
+      const grant = await capacity.reserveNative(dir, 2);
       persisted.push(value);
       grant.release();
     },
@@ -76,7 +73,7 @@ Deno.test('contact observations resume after a capacity grant releases and close
   );
   try {
     contacts.observe('edge', 1);
-    await blocked.promise;
+    await started.promise;
     assertEquals(persisted, []);
     held.release();
     await contacts.drain();

@@ -15,11 +15,15 @@ import { MediaCache } from '#engine/media/cache.ts';
 import { uploadMedia } from '#engine/media.ts';
 import { roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
+import { Admission } from '#engine/store/admission.ts';
 import { Capacity, type CapacityProbe } from '#engine/store/capacity.ts';
 import { createDatabase } from '#engine/store/create.ts';
 import { type Database, Db } from '#engine/store/db.ts';
 import { StoreError, Turso } from '#engine/store/ffi.ts';
-import { StoragePressureError } from '#engine/store/pressure.ts';
+import {
+  StorageBusyError,
+  StoragePressureError,
+} from '#engine/store/pressure.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { assert, assertEquals, assertRejects } from '@std/assert';
@@ -376,7 +380,7 @@ Deno.test('facade capacity: staged media and native journal writers cannot overs
       // The staging file is already allocated but not published; the native
       // transaction will need its own DB/log blocks before its ACK.
       await Promise.race([staged.promise, mediaWork]);
-      [native] = await Promise.allSettled([
+      const outcome = Promise.allSettled([
         journal.append('home', {
           ...source,
           type: 'control',
@@ -385,6 +389,8 @@ Deno.test('facade capacity: staged media and native journal writers cannot overs
           payload: { data: 'x'.repeat(size) },
         }),
       ]);
+      release.resolve();
+      [native] = await outcome;
     } finally {
       release.resolve();
       [media] = await Promise.allSettled([mediaWork]);
@@ -547,7 +553,7 @@ Deno.test('facade capacity: native open without a metadata grant cannot create i
   }
 });
 
-Deno.test('facade capacity: managed snapshots refuse under a live claim and retry after release', async () => {
+Deno.test('facade capacity: a paused snapshot refuses contention and retries after release', async () => {
   const root = await Deno.makeTempDir({ prefix: 'facade-native-snapshot-' });
   const source = root + '/server';
   const target = root + '/out/data.db';
@@ -565,10 +571,13 @@ Deno.test('facade capacity: managed snapshots refuse under a live claim and retr
     const used = (await capacity.status()).filesystems[0].usedBytes;
     const claim = await capacity.reserveStaging(
       root + '/held.part',
-      budget - used - 128 * 1024,
+      budget - used - 32768,
     );
     try {
-      await assertRejects(() => db!.vacuumInto(target), StoragePressureError);
+      await assertRejects(
+        () => new Admission().exclusive(() => db!.vacuumInto(target)),
+        StorageBusyError,
+      );
       assertEquals(
         (await Array.fromAsync(Deno.readDir(root))).map((e) => e.name).sort(),
         ['out', 'server'],
@@ -606,24 +615,82 @@ Deno.test('facade capacity: contending writers cannot borrow the live grant, but
     await db.exec('CREATE TABLE receipt(id INTEGER PRIMARY KEY)');
     first = db.tx(async (conn) => {
       await conn.execute('INSERT INTO receipt VALUES (1)');
+      await assertRejects(
+        () => db!.execute('INSERT INTO receipt VALUES (3)'),
+        StorageBusyError,
+      );
       ready.resolve();
       await finish.promise;
     });
     await Promise.race([ready.promise, first]);
-    await assertRejects(
-      () => db!.execute('INSERT INTO receipt VALUES (2)'),
-      StoragePressureError,
-    );
+    const second = db.execute('INSERT INTO receipt VALUES (2)');
+    const observed = Promise.allSettled([second]);
     assertEquals(await db.query('SELECT * FROM receipt'), []);
     finish.resolve();
     await first;
-    await db.execute('INSERT INTO receipt VALUES (2)');
+    assertEquals((await observed)[0].status, 'fulfilled');
     assertEquals(await db.query('SELECT * FROM receipt ORDER BY id'), [{
       id: 1,
     }, { id: 2 }]);
   } finally {
     finish.resolve();
     await first?.catch(() => undefined);
+    await db?.close();
+    ffi.close();
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test('facade capacity: reads do not wait behind a pool of queued writers', async () => {
+  const root = await Deno.makeTempDir({ prefix: 'facade-queued-writers-' });
+  const ffi = new Turso('./.native/libturso_ffi.so');
+  const path = root + '/data.db';
+  const capacity = new Capacity([root], 32 * MiB);
+  let db: Db | undefined;
+  try {
+    db = await Db.open(ffi, path, MiB, undefined, capacity);
+    await db.exec('CREATE TABLE receipt(id INTEGER PRIMARY KEY)');
+    const hold = await capacity.reserveNative(path, 0);
+    const started = Array.from(
+      { length: 8 },
+      () => Promise.withResolvers<void>(),
+    );
+    const writes = Promise.allSettled(
+      started.map((ready, id) =>
+        db!.tx(async (conn) => {
+          ready.resolve();
+          await conn.execute('INSERT INTO receipt VALUES (?)', [id]);
+        })
+      ),
+    );
+    await Promise.all(started.map((ready) => ready.promise));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const query = db.query('SELECT * FROM receipt');
+    const observed = Promise.allSettled([query]);
+    try {
+      assertEquals(
+        await Promise.race([
+          query,
+          new Promise((resolve) => {
+            timer = setTimeout(
+              () => resolve('blocked by queued writers'),
+              1000,
+            );
+          }),
+        ]),
+        [],
+      );
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      hold.release();
+      await writes;
+      await observed;
+    }
+    assert((await writes).every((result) => result.status === 'fulfilled'));
+    assertEquals(await db.query('SELECT COUNT(*) AS count FROM receipt'), [{
+      count: 8,
+    }]);
+  } finally {
     await db?.close();
     ffi.close();
     await Deno.remove(root, { recursive: true });
@@ -643,6 +710,52 @@ const schemas = {
   room: roomSchema,
 };
 
+Deno.test('facade capacity: cold room creation waits for an unrelated native writer', async () => {
+  const root = await Deno.makeTempDir({ prefix: 'facade-room-contend-' });
+  const ffi = new Turso('./.native/libturso_ffi.so');
+  const capacity = new Capacity([root], 16 * MiB);
+  const busy = Promise.withResolvers<void>();
+  const finish = Promise.withResolvers<void>();
+  let writer: Promise<unknown> | undefined;
+  let db: Db | undefined;
+  try {
+    db = await Db.open(ffi, root + '/data.db', MiB, undefined, capacity);
+    await db.exec('CREATE TABLE receipt(id INT)');
+    writer = db.tx(async (conn) => {
+      await conn.execute('INSERT INTO receipt VALUES (1)');
+      busy.resolve();
+      await finish.promise;
+    });
+    await Promise.race([busy.promise, writer]);
+    const creating = createDatabase(ffi, root, 'room', {
+      capacity,
+      checkpointlogbytes: MiB,
+      schema: (room) => room.exec('CREATE TABLE receipt(id INT)'),
+      verify: async (room) =>
+        assertEquals(await room.query('SELECT * FROM receipt'), []),
+    });
+    const state = await Promise.race([
+      creating.then(() => 'published', (error: Error) => error.name),
+      new Promise((resolve) => setTimeout(() => resolve('waiting'), 80)),
+    ]);
+    finish.resolve();
+    await writer;
+    assertEquals(
+      state,
+      'waiting',
+      'room staging must wait for the other writer',
+    );
+    assertEquals(await creating, root + '/room');
+    assertEquals((await capacity.status()).filesystems[0].reservedBytes, 0);
+  } finally {
+    finish.resolve();
+    await writer?.catch(() => undefined);
+    await db?.close();
+    ffi.close();
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
 Deno.test('facade capacity: outstanding claims fence concurrent staging and checkpoints', async () => {
   const root = await Deno.makeTempDir({ prefix: 'capacity-claims-' });
   const store = root + '/store';
@@ -659,35 +772,47 @@ Deno.test('facade capacity: outstanding claims fence concurrent staging and chec
       blockSize: 4096,
       device: path.startsWith(store) ? 1 : 2,
     }));
-    const [first, second] = await Promise.allSettled([
-      capacity.reserveStaging(media + '/first.part', 2 * MiB),
-      capacity.reserveStaging(store + '/second.part', 2 * MiB),
-    ]);
-    assert(first.status === 'fulfilled');
+    const first = await capacity.reserveStaging(media + '/first.part', 2 * MiB);
+    const order: number[] = [];
+    const second = capacity.reserveStaging(store + '/second.part', 2 * MiB)
+      .then((lease) => {
+        order.push(2);
+        return lease;
+      });
+    const third = capacity.reserveStaging(media + '/third.part', 2 * MiB)
+      .then((lease) => {
+        order.push(3);
+        return lease;
+      });
     try {
-      assert(
-        second.status === 'rejected' &&
-          second.reason instanceof StoragePressureError,
-      );
       assertEquals(await capacity.tryCheckpoint(path), undefined);
       assertEquals(
         (await capacity.status()).filesystems[1].reservedBytes,
         2 * MiB + 32768,
       );
     } finally {
-      first.value.release();
+      first.release();
     }
+    (await second).release();
+    (await third).release();
+    assertEquals(order, [2, 3]);
     const checkpoint = await capacity.tryCheckpoint(path);
     assert(checkpoint);
     try {
       await assertRejects(
-        () => capacity.reserveStaging(media + '/third.part', 2 * MiB),
-        StoragePressureError,
+        () =>
+          new Admission().run(() =>
+            capacity.reserveStaging(media + '/fourth.part', 2 * MiB)
+          ),
+        StorageBusyError,
       );
     } finally {
       checkpoint.finish();
     }
-    const retry = await capacity.reserveStaging(media + '/third.part', 2 * MiB);
+    const retry = await capacity.reserveStaging(
+      media + '/fourth.part',
+      2 * MiB,
+    );
     retry.release();
     assertEquals((await capacity.status()).filesystems[1].reservedBytes, 0);
   } finally {
@@ -1049,7 +1174,10 @@ Deno.test('facade capacity: authenticated client upload claims its full staging 
       96 * KiB,
     );
     try {
-      await assertRejects(() => upload(1, 1), StoragePressureError);
+      await assertRejects(
+        () => new Admission().run(() => upload(1, 1)),
+        StorageBusyError,
+      );
       assertEquals(parts, 0);
     } finally {
       competing.release();

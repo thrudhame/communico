@@ -11,6 +11,7 @@ import type { Tenant } from '#engine/tenant/index.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import type { Capacity } from '#engine/store/capacity.ts';
 import { isStoragePressure, storageFailure } from '#engine/store/pressure.ts';
+import { withStorageHold } from '#engine/store/holds.ts';
 import { b64encode } from '#engine/signing-primitives.js';
 
 export function mediaRoot(): string {
@@ -183,7 +184,8 @@ async function storeUploadBody(
   await capacity?.ensureDirectory(root, 0o700);
   const lease = await capacity?.reserveStaging(`${root}/${mediaId}`, limit);
   try {
-    return await writeUploadBody(stream, root, mediaId, limit);
+    const write = () => writeUploadBody(stream, root, mediaId, limit);
+    return await (lease ? withStorageHold(write) : write());
   } finally {
     // On successful publication inventory accounts for the final file. Release
     // before the metadata transaction so it can independently claim its WAL.

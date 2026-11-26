@@ -53,7 +53,7 @@ const definitions = {
     nonblocking: true,
   },
   ffi_open_bounded: {
-    parameters: ['buffer', 'u64', 'u64', 'u32'],
+    parameters: ['buffer', 'u64', 'u64', 'u32', 'buffer'],
     result: 'pointer',
     nonblocking: true,
   },
@@ -190,7 +190,12 @@ export class Turso {
 
   async open(
     path: string,
-    ceiling?: { blockSize: number; bytes: number; creates?: number },
+    ceiling?: {
+      blockSize: number;
+      bytes: number;
+      creates?: number;
+      scratchRoot?: string;
+    },
   ): Promise<number> {
     const handle = await this.value<number>(() =>
       ceiling
@@ -199,6 +204,7 @@ export class Turso {
           BigInt(ceiling.blockSize),
           BigInt(ceiling.bytes),
           ceiling.creates ?? 0,
+          ceiling.scratchRoot === undefined ? null : bytes(ceiling.scratchRoot),
         )
         : this.library.symbols.ffi_open(bytes(path))
     );

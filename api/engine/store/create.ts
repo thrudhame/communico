@@ -212,12 +212,11 @@ export async function createDatabase(
       await Deno.rename(temporary, final);
       await sync(parent);
     };
-    const publish = () =>
-      options.capacity
-        ? options.capacity.withMetadata(final, 0, rename)
-        : rename();
-    if (options.publication) await options.publication.run(publish);
-    else await publish();
+    const publish = () => options.publication?.run(rename) ?? rename();
+    // A fit-capable reservation may wait, but never inside publication.
+    if (options.capacity) {
+      await options.capacity.withMetadata(final, 0, publish);
+    } else await publish();
     return final;
   } catch (error) {
     if (options.discardOnFailure || options.capacity) {

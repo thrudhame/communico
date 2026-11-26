@@ -1,5 +1,5 @@
 import type { Database } from '#engine/store/db.ts';
-import { isStoragePressure, StorageBusyError } from '#engine/store/pressure.ts';
+import { isStoragePressure } from '#engine/store/pressure.ts';
 import { lookupPeer, type PendingRow, recordPending } from './peers.ts';
 
 type Writer<T> = {
@@ -20,7 +20,6 @@ export class ContactObservations<T> {
   private readonly writers = new Map<string, Writer<T>>();
   private closing = false;
   private closed?: Promise<void>;
-  private readonly closingSignal = Promise.withResolvers<void>();
 
   constructor(
     private readonly persist: (key: string, batch: T) => Promise<void>,
@@ -59,7 +58,7 @@ export class ContactObservations<T> {
         const batch = writer.pending;
         writer.pending = undefined;
         try {
-          await this.persistWhenAvailable(key, batch);
+          await this.persist(key, batch);
         } catch (cause) {
           this.retain(writer, batch);
           writer.error = { cause };
@@ -78,19 +77,6 @@ export class ContactObservations<T> {
       }
       this.writers.delete(key);
     });
-  }
-
-  private async persistWhenAvailable(key: string, batch: T): Promise<void> {
-    for (;;) {
-      try {
-        return await this.persist(key, batch);
-      } catch (cause) {
-        // persist has already left its failed transaction before we wait.
-        if (!(cause instanceof StorageBusyError) || this.closing) throw cause;
-        await Promise.race([cause.released, this.closingSignal.promise]);
-        if (this.closing) throw cause;
-      }
-    }
   }
 
   private retain(writer: Writer<T>, batch: T): void {
@@ -130,7 +116,6 @@ export class ContactObservations<T> {
 
   close(): Promise<void> {
     this.closing = true;
-    this.closingSignal.resolve();
     if (this.closed === undefined) this.closed = this.flush(true);
     return this.closed;
   }

@@ -307,7 +307,9 @@ fn canonical_file(path: &str) -> Result<PathBuf> {
 
 #[no_mangle]
 pub unsafe extern "C" fn ffi_open(path: *const c_char) -> *mut c_char {
-    reply(|| open_file(canonical_file(&text(path)?)?, initialize_database).map(|id| json!(id)))
+    reply(|| {
+        open_file(canonical_file(&text(path)?)?, None, initialize_database).map(|id| json!(id))
+    })
 }
 
 /// Query enforcement on this filesystem, not the limit assigned to an identity.
@@ -360,12 +362,21 @@ pub unsafe extern "C" fn ffi_open_bounded(
     block: u64,
     bytes: u64,
     creates: u32,
+    scratch_root: *const c_char,
 ) -> *mut c_char {
     reply(|| {
         if block == 0 {
             return Err(Failure::binding("invalid native grant"));
         }
-        open_file(canonical_file(&text(path)?)?, |name, observer| {
+        let scratch = if scratch_root.is_null() {
+            None
+        } else {
+            Some(
+                std::fs::canonicalize(text(scratch_root)?)
+                    .map_err(|e| Failure::binding(e.to_string()))?,
+            )
+        };
+        open_file(canonical_file(&text(path)?)?, scratch, |name, observer| {
             observer.limit_open(Some(checkpoint::Grant::new(block, bytes, 0, creates)));
             let result = initialize_database(name, observer.clone());
             observer.limit_open(None);
@@ -391,6 +402,7 @@ fn initialize_database(name: String, observer: Arc<checkpoint::Observer>) -> Res
 
 fn open_file(
     path: PathBuf,
+    scratch: Option<PathBuf>,
     initialize: impl FnOnce(String, Arc<checkpoint::Observer>) -> Result<Database>,
 ) -> Result<u32> {
     let reservation = loop {
@@ -428,7 +440,7 @@ fn open_file(
         .to_str()
         .ok_or_else(|| Failure::binding("non-UTF8 path"))?
         .to_owned();
-    let checkpoint = Arc::new(checkpoint::Observer::new(&name));
+    let checkpoint = Arc::new(checkpoint::Observer::new(&name, scratch));
     let database = Arc::new(initialize(name, checkpoint.clone())?);
     let handle = {
         let mut handles = handles()?;
