@@ -277,6 +277,23 @@ pub unsafe extern "C" fn ffi_open(path: *const c_char) -> *mut c_char {
     reply(|| open_file(canonical_file(&text(path)?)?, initialize_database).map(|id| json!(id)))
 }
 
+#[no_mangle]
+pub unsafe extern "C" fn ffi_open_bounded(
+    path: *const c_char,
+    block: u64,
+    bytes: u64,
+) -> *mut c_char {
+    reply(|| {
+        open_file(canonical_file(&text(path)?)?, |name, observer| {
+            observer.limit_open(block, bytes);
+            let result = initialize_database(name, observer.clone());
+            observer.limit_open(0, 0);
+            result
+        })
+        .map(|id| json!(id))
+    })
+}
+
 fn initialize_database(name: String, observer: Arc<checkpoint::Observer>) -> Result<Database> {
     run(async move {
         let io = turso_core::io::PlatformIO::new().map_err(|e| Failure::binding(e.to_string()))?;

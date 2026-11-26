@@ -76,6 +76,21 @@ export class Capacity {
     path: string,
     footprint: { bytes: number; inodes: number; metadataBlocks: number },
   ): Promise<Reservation> {
+    return this.claim(path, footprint);
+  }
+
+  /** Data-dependent native work gets an enforced ceiling, not a SQL estimate. */
+  reserveNative(
+    path: string,
+    metadata: { inodes: number; metadataBlocks: number },
+  ): Promise<Reservation & { blockSize: number; bytes: number }> {
+    return this.claim(path, metadata);
+  }
+
+  private claim(
+    path: string,
+    footprint: { bytes?: number; inodes: number; metadataBlocks: number },
+  ): Promise<Reservation & { blockSize: number; bytes: number }> {
     const result = this.lane.then(async () => {
       if (this.checkpointActive) throw new StoragePressureError();
       if (
@@ -96,24 +111,35 @@ export class Capacity {
       const snap = (await this.status()).filesystems;
       const disk = snap.find((disk) => disk.device === device);
       if (!disk) throw new Error('reservation device outside capacity roots');
-      const bytes = (Math.ceil(footprint.bytes / space.blockSize) +
-        footprint.metadataBlocks) * space.blockSize;
+      const blockSize = space.blockSize;
+      const metadata = footprint.metadataBlocks * blockSize;
       const local = outstanding.filter((claim) => claim.device === device);
       const explicit = typeof this.budget === 'number';
       const used = explicit
         ? snap.reduce((sum, disk) => sum + disk.usedBytes, 0)
         : disk.usedBytes;
+      const available = Math.min(
+        space.freeBytes - claimedBytes(local),
+        (disk.budgetBytes ?? Infinity) - used -
+          claimedBytes(explicit ? outstanding : local),
+      );
+      const data = footprint.bytes === undefined
+        ? Math.floor((available - metadata) / blockSize) * blockSize
+        : Math.ceil(footprint.bytes / blockSize) * blockSize;
+      const bytes = data + metadata;
       if (
         this.checkpointActive ||
-        bytes > space.freeBytes - claimedBytes(local) ||
+        data < 0 || bytes > available ||
         footprint.inodes > (space.freeInodes ?? Infinity) -
-            local.reduce((sum, claim) => sum + claim.inodes, 0) ||
-        bytes > (disk.budgetBytes ?? Infinity) - used -
-            claimedBytes(explicit ? outstanding : local)
+            local.reduce((sum, claim) => sum + claim.inodes, 0)
       ) throw new StoragePressureError();
       const claim = { device, bytes, inodes: footprint.inodes };
       this.claims.add(claim);
-      return { release: () => void this.claims.delete(claim) };
+      return {
+        release: () => void this.claims.delete(claim),
+        blockSize,
+        bytes: data,
+      };
     });
     this.lane = result.catch(() => {});
     return result;

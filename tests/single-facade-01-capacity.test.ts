@@ -16,6 +16,7 @@ import { uploadMedia } from '#engine/media.ts';
 import { roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
 import { Capacity, type CapacityProbe } from '#engine/store/capacity.ts';
+import { Db } from '#engine/store/db.ts';
 import { StoreError, Turso } from '#engine/store/ffi.ts';
 import { StoragePressureError } from '#engine/store/pressure.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
@@ -327,6 +328,44 @@ Deno.test('facade capacity: staged media and native journal writers cannot overs
 });
 
 const MiB = 1024 * 1024;
+
+Deno.test('facade capacity: native bootstrap obeys its grant before writing', async () => {
+  const root = await Deno.makeTempDir({ prefix: 'facade-native-open-' });
+  const ffi = new Turso('./.native/libturso_ffi.so');
+  const path = root + '/data.db';
+  const blockSize = 4096;
+  let db: Db | undefined;
+  let freeBytes = 15 * blockSize;
+  const capacity = new Capacity([root], null, () => ({
+    device: 'bootstrap',
+    totalBytes: MiB,
+    freeBytes,
+    freeInodes: 1000,
+    blockSize,
+  }));
+  try {
+    // An otherwise ample filesystem, but none of this grant can be used for
+    // file data. The native initializer must not write its database header.
+    await assertRejects(async () => {
+      db = await Db.open(ffi, path, MiB, undefined, capacity);
+    }, StoragePressureError);
+    assertEquals((await capacity.status()).filesystems[0].reservedBytes, 0);
+    assertEquals((await Deno.stat(path)).size, 0);
+
+    freeBytes = MiB;
+    db = await Db.open(ffi, path, MiB, undefined, capacity);
+    await db.exec('CREATE TABLE receipt(id INT)');
+    await db.execute('INSERT INTO receipt VALUES (42)');
+    await db.close();
+    db = await Db.open(ffi, path, MiB, undefined, capacity);
+    assertEquals(await db.query('SELECT id FROM receipt'), [{ id: 42 }]);
+  } finally {
+    await db?.close();
+    ffi.close();
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
 const settingsFor = (dir: string) => ({
   dir,
   library: './.native/libturso_ffi.so',

@@ -47,6 +47,11 @@ type OwnedCheckpoint =
 
 const definitions = {
   ffi_open: { parameters: ['buffer'], result: 'pointer', nonblocking: true },
+  ffi_open_bounded: {
+    parameters: ['buffer', 'u64', 'u64'],
+    result: 'pointer',
+    nonblocking: true,
+  },
   ffi_connect: { parameters: ['u32'], result: 'pointer', nonblocking: true },
   ffi_exec: {
     parameters: ['u32', 'buffer'],
@@ -164,9 +169,18 @@ export class Turso {
     }
   }
 
-  async open(path: string): Promise<number> {
+  async open(
+    path: string,
+    ceiling?: { blockSize: number; bytes: number },
+  ): Promise<number> {
     const handle = await this.value<number>(() =>
-      this.library.symbols.ffi_open(bytes(path))
+      ceiling
+        ? this.library.symbols.ffi_open_bounded(
+          bytes(path),
+          BigInt(ceiling.blockSize),
+          BigInt(ceiling.bytes),
+        )
+        : this.library.symbols.ffi_open(bytes(path))
     );
     this.files++;
     return handle;

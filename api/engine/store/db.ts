@@ -270,7 +270,21 @@ export class Db {
       db.references++;
       return db;
     }
-    const opened = ffi.open(path).then(async (handle) => {
+    const opened = (async () => {
+      // Bootstrap may create the database, logical log and WAL. Hold the
+      // shared grant before native initialization can touch any of them.
+      const lease = await capacity?.reserveNative(path, {
+        inodes: 3,
+        metadataBlocks: 3 * 5,
+      });
+      try {
+        return await ffi.open(path, lease);
+      } catch (error) {
+        throw storageFailure(error);
+      } finally {
+        lease?.release();
+      }
+    })().then(async (handle) => {
       const db = new Db(
         ffi,
         path,
