@@ -26,6 +26,12 @@ import type { Capacity, NativeReservation } from '#engine/store/capacity.ts';
 import { databaseFiles } from '#engine/store/layout.ts';
 import { publish } from '#engine/store/files.ts';
 import {
+  NO_GROWTH,
+  openNative,
+  shortfall,
+  writeFrames,
+} from '#engine/store/native-reservation.ts';
+import {
   exportSnapshot,
   type PreparedSnapshot,
   type ReadSnapshot,
@@ -55,14 +61,17 @@ export type ConflictStats = {
 };
 
 const TRANSACTION_ATTEMPTS = 20;
-const NO_GROWTH = { blockSize: 1, bytes: 0 };
 
-class DeferNativeWrite extends Error {}
+class DeferNativeWrite extends Error {
+  constructor(readonly bytes: number) {
+    super();
+  }
+}
 
 type Attempt<T> =
   | { kind: 'committed'; value: T }
   | { kind: 'retry'; error: StoreError | StoragePressureError }
-  | { kind: 'deferred' };
+  | { kind: 'deferred'; bytes: number };
 
 export class Conn {
   private active = true;
@@ -72,8 +81,12 @@ export class Conn {
     private readonly ffi: Turso,
     private readonly handle: number,
     private readonly checks = new Set<CommitCheck>(),
-    private readonly beginWrite: () => void | Promise<void> = () => {},
+    private readonly beginWrite: (
+      sql: string,
+      values: readonly Value[],
+    ) => void | Promise<void> = () => {},
     private readonly observeScratch?: () => Promise<unknown> | undefined,
+    private readonly writeFailed?: (error: unknown) => void,
   ) {}
 
   /** Retain a dependency for this attempt's actual native commit. */
@@ -97,7 +110,7 @@ export class Conn {
     const readOnly = /^\s*(SELECT|WITH)\b[^;]*;?\s*$/is.test(sql) &&
       !/\b(INSERT|UPDATE|DELETE|REPLACE)\b/i.test(sql);
     const query = () => this.ffi.query(this.handle, sql, values);
-    return readOnly ? this.statement(query) : this.write(query);
+    return readOnly ? this.statement(query) : this.write(sql, values, query);
   }
 
   /** Successful affected-row writes in this attempt, not global database work.
@@ -109,7 +122,11 @@ export class Conn {
 
   execute(sql: string, values: readonly Value[] = []): Promise<number> {
     this.check();
-    return this.write(() => this.ffi.execute(this.handle, sql, values)).then(
+    return this.write(
+      sql,
+      values,
+      () => this.ffi.execute(this.handle, sql, values),
+    ).then(
       (affected) => {
         if (affected > 0) this.writeVersion++;
         return affected;
@@ -119,14 +136,24 @@ export class Conn {
 
   exec(sql: string): Promise<void> {
     this.check();
-    return this.write(() => this.ffi.exec(this.handle, sql));
+    return this.write(sql, [], () => this.ffi.exec(this.handle, sql));
   }
 
-  private write<T>(run: () => Promise<T>): Promise<T> {
-    const admitted = this.beginWrite();
-    return admitted
+  private write<T>(
+    sql: string,
+    values: readonly Value[],
+    run: () => Promise<T>,
+  ): Promise<T> {
+    const admitted = this.beginWrite(sql, values);
+    const result = admitted
       ? admitted.then(() => this.statement(run))
       : this.statement(run);
+    return this.writeFailed
+      ? result.catch((error) => {
+        this.writeFailed!(error);
+        throw error;
+      })
+      : result;
   }
 
   private statement<T>(run: () => Promise<T>): Promise<T> {
@@ -309,18 +336,7 @@ export class Db {
       db.references++;
       return db;
     }
-    const opened = (async () => {
-      // Bootstrap may create the database, logical log and WAL. Hold the
-      // shared grant before native initialization can touch any of them.
-      const lease = await capacity?.reserveNative(path, 3);
-      try {
-        return await ffi.open(path, lease);
-      } catch (error) {
-        throw storageFailure(error);
-      } finally {
-        lease?.release();
-      }
-    })().then(async (handle) => {
+    const opened = openNative(ffi, path, capacity).then(async (handle) => {
       const db = new Db(
         ffi,
         path,
@@ -336,7 +352,9 @@ export class Db {
           // File admission owns checkpoints. Native auto-checkpoint runs inside
           // COMMIT, before the gate can drain peers, and makes unrelated begins
           // exhaust their conflict retries while maintenance holds its lock.
-          await ffi.query(connection, 'PRAGMA mvcc_checkpoint_threshold=-1');
+          if (!capacity) {
+            await ffi.query(connection, 'PRAGMA mvcc_checkpoint_threshold=-1');
+          }
         } finally {
           db.idle.push(connection);
         }
@@ -400,11 +418,12 @@ export class Db {
     this.users++;
     const held = this.capacity !== undefined && storageHeld();
     try {
-      for (let attempt = 1, deferred = false;;) {
+      let requested: number | undefined;
+      for (let attempt = 1;;) {
         const result = await (this.capacity
           ? storageScope(async () => {
-            const grant = deferred
-              ? await this.capacity!.reserveNative(this.path, 2)
+            const grant = requested !== undefined
+              ? await this.capacity!.reserveNative(this.path, 2, requested)
               : undefined;
             try {
               return await withStorageHold(() =>
@@ -418,8 +437,10 @@ export class Db {
           })
           : this.attempt(fn, options));
         if (result.kind === 'committed') return result.value;
-        deferred = result.kind === 'deferred';
-        if (result.kind === 'deferred') continue;
+        if (result.kind === 'deferred') {
+          requested = result.bytes;
+          continue;
+        }
         const error = result.error;
         if (held && error instanceof StorageBusyError) throw error;
         if (
@@ -473,31 +494,45 @@ export class Db {
     try {
       handle = await this.acquire();
       const checks = new Set<CommitCheck>();
-      connection = new Conn(this.ffi, handle, checks, () => {
-        if (!writing) {
-          writing = true;
-          this.writers++;
-        }
-        // A read-only attempt starts (and ends) under a zero-growth guard.
-        // Only a write-capable statement can take the rest of the envelope.
-        if (this.capacity) {
-          return admission ??= (async () => {
-            try {
-              lease ??= await this.capacity!.tryReserveNative(this.path, 2);
-            } catch (error) {
-              if (canDefer && error instanceof StorageBusyError) {
-                throw new DeferNativeWrite();
+      let refused: DeferNativeWrite | undefined;
+      connection = new Conn(
+        this.ffi,
+        handle,
+        checks,
+        (sql, values) => {
+          if (!writing) {
+            writing = true;
+            this.writers++;
+          }
+          // A read-only attempt starts (and ends) under a zero-growth guard.
+          // Only a write-capable statement can book space.
+          if (this.capacity) {
+            return admission ??= (async () => {
+              if (!lease) {
+                const bytes = writeFrames(sql, values);
+                try {
+                  lease = await this.capacity!.tryReserveNative(
+                    this.path,
+                    2,
+                    bytes,
+                  );
+                } catch (error) {
+                  if (canDefer && error instanceof StorageBusyError) {
+                    throw new DeferNativeWrite(bytes);
+                  }
+                  throw error;
+                }
               }
-              throw error;
-            }
-            // Keep a separate pool for rollback/destruction. In particular,
-            // a failed commit cannot consume the last of its own grant.
-            const undo = Math.ceil(lease.bytes / lease.blockSize / 2) *
-              lease.blockSize;
-            await this.ffi.setLimit(handle!, lease, undo);
-          })();
-        }
-      }, this.capacity && (() => this.capacity!.observeScratch()));
+              await this.ffi.setLimit(handle!, lease, lease.undoBytes);
+            })();
+          }
+        },
+        this.capacity && (() => this.capacity!.observeScratch()),
+        (error) => {
+          const bytes = shortfall(error, lease);
+          if (bytes !== undefined) refused = new DeferNativeWrite(bytes);
+        },
+      );
       try {
         await this.ffi.begin(handle, options.mode ?? 'concurrent');
         if (options.admit) connection.admit(options.admit);
@@ -505,6 +540,7 @@ export class Db {
         // A body cannot turn a refused first write into a successful commit
         // by handling its statement error locally.
         await admission;
+        if (refused) throw refused;
         const commit = () =>
           commitAdmitted(checks, () => this.ffi.commit(handle!));
         if (this.admission) {
@@ -528,7 +564,10 @@ export class Db {
             ? new StoragePressureError(failure)
             : failure;
         }
-        if (error instanceof DeferNativeWrite) return { kind: 'deferred' };
+        const bytes = error instanceof DeferNativeWrite
+          ? error.bytes
+          : shortfall(error, lease);
+        if (bytes !== undefined) return { kind: 'deferred', bytes };
         if (
           error instanceof StorageBusyError ||
           (error instanceof StoreError && error.conflict)

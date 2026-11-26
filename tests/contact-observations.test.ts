@@ -57,14 +57,15 @@ Deno.test('contact observations resume after a capacity grant releases and close
   const dir = await Deno.makeTempDir();
   const budget = 256 * 1024;
   const capacity = new Capacity([dir], budget);
-  const held = await capacity.reserveNative(dir, 2);
+  // Both known footprints fit separately, but not simultaneously.
+  const held = await capacity.reserveNative(dir, 2, 192 * 1024, false);
   const started = Promise.withResolvers<void>();
   const persisted: number[] = [];
   const reported: unknown[] = [];
   const contacts = new ContactObservations<number>(
     async (_key, value) => {
       started.resolve();
-      const grant = await capacity.reserveNative(dir, 2);
+      const grant = await capacity.reserveNative(dir, 2, 32 * 1024);
       persisted.push(value);
       grant.release();
     },

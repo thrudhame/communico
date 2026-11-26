@@ -511,7 +511,10 @@ Deno.test('facade capacity: native bootstrap obeys its grant before writing', as
       db = await Db.open(ffi, path, MiB, undefined, capacity);
     }, StoragePressureError);
     assertEquals((await capacity.status()).filesystems[0].reservedBytes, 0);
-    assertEquals((await Deno.stat(path)).size, 0);
+    const file = await Deno.stat(path).catch((error) => {
+      if (!(error instanceof Deno.errors.NotFound)) throw error;
+    });
+    assertEquals(file?.size ?? 0, 0);
 
     freeBytes = MiB;
     db = await Db.open(ffi, path, MiB, undefined, capacity);
@@ -605,14 +608,22 @@ Deno.test('facade capacity: a paused snapshot refuses contention and retries aft
 Deno.test('facade capacity: contending writers cannot borrow the live grant, but readers still work', async () => {
   const root = await Deno.makeTempDir({ prefix: 'facade-native-contenders-' });
   const ffi = new Turso('./.native/libturso_ffi.so');
-  const capacity = new Capacity([root], 32 * MiB);
+  const budget = 32 * MiB;
+  const capacity = new Capacity([root], budget);
   const ready = Promise.withResolvers<void>();
   const finish = Promise.withResolvers<void>();
   let db: Db | undefined;
   let first: Promise<unknown> | undefined;
+  let hold: { release(): void } | undefined;
   try {
     db = await Db.open(ffi, root + '/data.db', MiB, undefined, capacity);
     await db.exec('CREATE TABLE receipt(id INTEGER PRIMARY KEY)');
+    const used = (await capacity.status()).filesystems[0].usedBytes;
+    // The staging grant leaves room for one native writer, not two.
+    hold = await capacity.reserveStaging(
+      root + '/held.part',
+      budget - used - 96 * 1024,
+    );
     first = db.tx(async (conn) => {
       await conn.execute('INSERT INTO receipt VALUES (1)');
       await assertRejects(
@@ -628,6 +639,7 @@ Deno.test('facade capacity: contending writers cannot borrow the live grant, but
     assertEquals(await db.query('SELECT * FROM receipt'), []);
     finish.resolve();
     await first;
+    hold.release();
     assertEquals((await observed)[0].status, 'fulfilled');
     assertEquals(await db.query('SELECT * FROM receipt ORDER BY id'), [{
       id: 1,
@@ -635,6 +647,7 @@ Deno.test('facade capacity: contending writers cannot borrow the live grant, but
   } finally {
     finish.resolve();
     await first?.catch(() => undefined);
+    hold?.release();
     await db?.close();
     ffi.close();
     await Deno.remove(root, { recursive: true });
@@ -645,12 +658,17 @@ Deno.test('facade capacity: reads do not wait behind a pool of queued writers', 
   const root = await Deno.makeTempDir({ prefix: 'facade-queued-writers-' });
   const ffi = new Turso('./.native/libturso_ffi.so');
   const path = root + '/data.db';
-  const capacity = new Capacity([root], 32 * MiB);
+  const budget = 32 * MiB;
+  const capacity = new Capacity([root], budget);
   let db: Db | undefined;
   try {
     db = await Db.open(ffi, path, MiB, undefined, capacity);
     await db.exec('CREATE TABLE receipt(id INTEGER PRIMARY KEY)');
-    const hold = await capacity.reserveNative(path, 0);
+    const used = (await capacity.status()).filesystems[0].usedBytes;
+    const hold = await capacity.reserveStaging(
+      root + '/held.part',
+      budget - used - 32768,
+    );
     const started = Array.from(
       { length: 8 },
       () => Promise.withResolvers<void>(),
@@ -697,6 +715,140 @@ Deno.test('facade capacity: reads do not wait behind a pool of queued writers', 
   }
 });
 
+Deno.test('facade capacity: same-file writers do not queue with ample budget', async () => {
+  const root = await Deno.makeTempDir({ prefix: 'facade-native-parallel-' });
+  const path = root + '/data.db';
+  const ffi = new Turso('./.native/libturso_ffi.so');
+  const queued = Promise.withResolvers<string>();
+  class ObservedCapacity extends Capacity {
+    override async tryReserveNative(
+      path: string,
+      creates: number,
+      bytes: number,
+    ) {
+      try {
+        return await super.tryReserveNative(path, creates, bytes);
+      } catch (error) {
+        if (error instanceof StorageBusyError) {
+          const { usedBytes, freeBytes, reservedBytes, budgetBytes } =
+            (await this.status()).filesystems[0];
+          queued.resolve(
+            `queued: used=${usedBytes} free=${freeBytes} reserved=${reservedBytes} budget=${budgetBytes}`,
+          );
+        }
+        throw error;
+      }
+    }
+  }
+  const capacity = new ObservedCapacity([root], 48 * MiB);
+  const finish = Promise.withResolvers<void>();
+  const entered = Array.from(
+    { length: 4 },
+    () => Promise.withResolvers<void>(),
+  );
+  let db: Db | undefined;
+  let writes: Promise<PromiseSettledResult<void>[]> | undefined;
+  try {
+    db = await Db.open(ffi, path, MiB, undefined, capacity);
+    const managedGrouping = await db.query('PRAGMA mvcc_group_commit');
+    // Separate tables avoid write/write conflicts inside the storage engine.
+    for (const id of entered.keys()) {
+      await db.exec(`CREATE TABLE receipt${id}(id INTEGER PRIMARY KEY)`);
+    }
+    const write = (id: number) =>
+      db!.tx(async (conn) => {
+        await conn.execute(`INSERT INTO receipt${id} VALUES (${id})`);
+        entered[id].resolve();
+        await finish.promise;
+      });
+    const first = write(0);
+    writes = Promise.allSettled([first]);
+    await Promise.race([entered[0].promise, first]);
+    const rest = entered.slice(1).map((_, index) => write(index + 1));
+    writes = Promise.allSettled([first, ...rest]);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      assertEquals(
+        await Promise.race([
+          Promise.all(entered.map((writer) => writer.promise)).then(() =>
+            'all admitted'
+          ),
+          queued.promise,
+          new Promise((resolve) => {
+            timer = setTimeout(() => resolve('writers did not enter'), 5000);
+          }),
+        ]),
+        'all admitted',
+      );
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      finish.resolve();
+    }
+    const results = await writes;
+    await db.close();
+    db = await Db.open(ffi, path, MiB);
+    assertEquals(
+      Object.values((await db.query('PRAGMA mvcc_group_commit'))[0]),
+      [1],
+    );
+    for (const id of entered.keys()) {
+      assertEquals(
+        await db.query(`SELECT id FROM receipt${id}`),
+        results[id].status === 'fulfilled' ? [{ id }] : [],
+        `writer ${id}: reported result and cold durable contents must agree`,
+      );
+      const result = results[id];
+      if (result.status === 'rejected') throw result.reason;
+    }
+    assertEquals(Object.values(managedGrouping[0]), [0]);
+  } finally {
+    finish.resolve();
+    await writes;
+    await db?.close();
+    ffi.close();
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test('facade capacity: a computed write replays on measured native shortfall without losing data', async () => {
+  const root = await Deno.makeTempDir({ prefix: 'facade-native-grow-' });
+  const path = root + '/data.db';
+  const ffi = new Turso('./.native/libturso_ffi.so');
+  const capacity = new Capacity([root], 16 * MiB);
+  let db: Db | undefined;
+  try {
+    db = await Db.open(ffi, path, MiB, undefined, capacity);
+    await db.exec('CREATE TABLE receipt(id INTEGER PRIMARY KEY, body BLOB)');
+    await db.execute('INSERT INTO receipt VALUES (1, ?) ', ['ack']);
+    let attempts = 0;
+    await db.tx(async (conn) => {
+      attempts++;
+      await conn.execute('INSERT INTO receipt VALUES (2, zeroblob(524288))');
+    });
+    assert(attempts > 1, 'computed bytes must exceed the initial SQL estimate');
+    await assertRejects(
+      () => db!.execute('INSERT INTO receipt VALUES (3, zeroblob(10485760))'),
+      StoragePressureError,
+    );
+    assertEquals((await capacity.status()).filesystems[0].reservedBytes, 0);
+    await db.close();
+    db = await Db.open(ffi, path, MiB, undefined, capacity);
+    assertEquals(
+      await db.query(
+        'SELECT id, length(body) AS size FROM receipt ORDER BY id',
+      ),
+      [
+        { id: 1, size: 3 },
+        { id: 2, size: 524288 },
+      ],
+    );
+  } finally {
+    await db?.close();
+    ffi.close();
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
 const settingsFor = (dir: string) => ({
   dir,
   library: './.native/libturso_ffi.so',
@@ -710,23 +862,19 @@ const schemas = {
   room: roomSchema,
 };
 
-Deno.test('facade capacity: cold room creation waits for an unrelated native writer', async () => {
+Deno.test('facade capacity: cold room creation waits for a genuinely competing grant', async () => {
   const root = await Deno.makeTempDir({ prefix: 'facade-room-contend-' });
   const ffi = new Turso('./.native/libturso_ffi.so');
-  const capacity = new Capacity([root], 16 * MiB);
-  const busy = Promise.withResolvers<void>();
-  const finish = Promise.withResolvers<void>();
-  let writer: Promise<unknown> | undefined;
-  let db: Db | undefined;
+  const budget = 16 * MiB;
+  const capacity = new Capacity([root], budget);
   try {
-    db = await Db.open(ffi, root + '/data.db', MiB, undefined, capacity);
-    await db.exec('CREATE TABLE receipt(id INT)');
-    writer = db.tx(async (conn) => {
-      await conn.execute('INSERT INTO receipt VALUES (1)');
-      busy.resolve();
-      await finish.promise;
-    });
-    await Promise.race([busy.promise, writer]);
+    const used = (await capacity.status()).filesystems[0].usedBytes;
+    const writer = await capacity.reserveNative(
+      root + '/data.db',
+      0,
+      budget - used - 4096,
+      false,
+    );
     const creating = createDatabase(ffi, root, 'room', {
       capacity,
       checkpointlogbytes: MiB,
@@ -734,12 +882,15 @@ Deno.test('facade capacity: cold room creation waits for an unrelated native wri
       verify: async (room) =>
         assertEquals(await room.query('SELECT * FROM receipt'), []),
     });
-    const state = await Promise.race([
-      creating.then(() => 'published', (error: Error) => error.name),
-      new Promise((resolve) => setTimeout(() => resolve('waiting'), 80)),
-    ]);
-    finish.resolve();
-    await writer;
+    let state;
+    try {
+      state = await Promise.race([
+        creating.then(() => 'published', (error: Error) => error.name),
+        new Promise((resolve) => setTimeout(() => resolve('waiting'), 80)),
+      ]);
+    } finally {
+      writer.release();
+    }
     assertEquals(
       state,
       'waiting',
@@ -748,9 +899,6 @@ Deno.test('facade capacity: cold room creation waits for an unrelated native wri
     assertEquals(await creating, root + '/room');
     assertEquals((await capacity.status()).filesystems[0].reservedBytes, 0);
   } finally {
-    finish.resolve();
-    await writer?.catch(() => undefined);
-    await db?.close();
     ffi.close();
     await Deno.remove(root, { recursive: true });
   }
@@ -785,6 +933,10 @@ Deno.test('facade capacity: outstanding claims fence concurrent staging and chec
         return lease;
       });
     try {
+      // Queue both oversized requests before releasing the holder. This
+      // small independent claim fits and must not wait behind either one.
+      const small = await capacity.reserveStaging(store + '/small.part', 4096);
+      small.release();
       assertEquals(await capacity.tryCheckpoint(path), undefined);
       assertEquals(
         (await capacity.status()).filesystems[1].reservedBytes,

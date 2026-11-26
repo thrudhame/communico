@@ -15,6 +15,7 @@ struct Failure {
     code: i32,
     message: String,
     last_error: String,
+    required_write_bytes: Option<u64>,
 }
 
 type Result<T> = std::result::Result<T, Failure>;
@@ -26,6 +27,7 @@ impl Failure {
             code: 21,
             last_error: message.clone(),
             message,
+            required_write_bytes: None,
         }
     }
 }
@@ -49,6 +51,7 @@ impl From<turso::Error> for Failure {
             code,
             message: error.to_string(),
             last_error: format!("{error:?}"),
+            required_write_bytes: None,
         }
     }
 }
@@ -165,7 +168,8 @@ fn reply(call: impl FnOnce() -> Result<Json>) -> *mut c_char {
         let value = match call() {
             Ok(value) => json!({"code": 0, "value": value}),
             Err(error) => json!({"code": error.code, "message": error.message,
-                                 "last_error": error.last_error}),
+                                 "last_error": error.last_error,
+                                 "required_write_bytes": error.required_write_bytes}),
         };
         CString::new(value.to_string())
     }));
@@ -282,7 +286,13 @@ fn run_limited<T: Send + 'static>(
     cleanup: bool,
     work: impl std::future::Future<Output = Result<T>> + Send + 'static,
 ) -> Result<T> {
-    run(checkpoint::LIMIT.scope(limit.map(|grant| (grant, cleanup)), work))
+    let result = run(checkpoint::LIMIT.scope(limit.clone().map(|grant| (grant, cleanup)), work));
+    result.map_err(|mut error| {
+        if !cleanup {
+            error.required_write_bytes = limit.and_then(|grant| grant.required_write_bytes());
+        }
+        error
+    })
 }
 
 fn canonical_file(path: &str) -> Result<PathBuf> {
@@ -308,7 +318,10 @@ fn canonical_file(path: &str) -> Result<PathBuf> {
 #[no_mangle]
 pub unsafe extern "C" fn ffi_open(path: *const c_char) -> *mut c_char {
     reply(|| {
-        open_file(canonical_file(&text(path)?)?, None, initialize_database).map(|id| json!(id))
+        open_file(canonical_file(&text(path)?)?, None, |name, observer| {
+            initialize_database(name, observer, false)
+        })
+        .map(|id| json!(id))
     })
 }
 
@@ -377,16 +390,24 @@ pub unsafe extern "C" fn ffi_open_bounded(
             )
         };
         open_file(canonical_file(&text(path)?)?, scratch, |name, observer| {
-            observer.limit_open(Some(checkpoint::Grant::new(block, bytes, 0, creates)));
-            let result = initialize_database(name, observer.clone());
+            let grant = Arc::new(checkpoint::Grant::new(block, bytes, 0, creates));
+            observer.limit_open(Some(grant.clone()));
+            let result = initialize_database(name, observer.clone(), true);
             observer.limit_open(None);
-            result
+            result.map_err(|mut error| {
+                error.required_write_bytes = grant.required_write_bytes();
+                error
+            })
         })
         .map(|id| json!(id))
     })
 }
 
-fn initialize_database(name: String, observer: Arc<checkpoint::Observer>) -> Result<Database> {
+fn initialize_database(
+    name: String,
+    observer: Arc<checkpoint::Observer>,
+    managed: bool,
+) -> Result<Database> {
     run(async move {
         let io = turso_core::io::PlatformIO::new().map_err(|e| Failure::binding(e.to_string()))?;
         let database = turso::Builder::new_local(&name)
@@ -396,6 +417,14 @@ fn initialize_database(name: String, observer: Arc<checkpoint::Observer>) -> Res
         let connection = database.connect()?;
         query(&connection, "PRAGMA journal_mode=mvcc", vec![]).await?;
         query(&connection, "PRAGMA synchronous=FULL", vec![]).await?;
+        if managed {
+            // A group leader can write a peer's frame under its task-local
+            // grant, then report the peer's refusal after writing its own.
+            // Keep one log pwrite + sync per managed commit, and leave all
+            // checkpoint writes to the explicit maintenance path.
+            query(&connection, "PRAGMA mvcc_group_commit=off", vec![]).await?;
+            query(&connection, "PRAGMA mvcc_checkpoint_threshold=-1", vec![]).await?;
+        }
         Ok(database)
     })
 }

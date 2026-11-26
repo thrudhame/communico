@@ -25,6 +25,15 @@ export type CapacityProbe = (path: string) => Space | Promise<Space>;
 type QuotaProbe = (path: string) => Promise<boolean>;
 
 type Claim = { device: string; bytes: number; inodes: number };
+type NativeFrame = { offset: number; length: number };
+type Footprint = {
+  bytes: number;
+  inodes: number;
+  metadataBlocks: number;
+  files?: readonly number[];
+  frames?: readonly NativeFrame[];
+  undo?: boolean;
+};
 type CacheBlob = {
   accessedMs: number;
   unleased(): boolean;
@@ -43,6 +52,7 @@ export type Reservation = { release(): void };
 export type NativeReservation = Reservation & {
   blockSize: number;
   bytes: number;
+  undoBytes: number;
   creates: number;
   scratchRoot?: string;
 };
@@ -86,7 +96,6 @@ function missing(error: unknown): boolean {
 export class Capacity {
   private lane: Promise<unknown> = Promise.resolve();
   private fifo: Promise<unknown> = Promise.resolve();
-  private waiting = 0;
   private readonly claims = new Set<Claim>();
   private readonly cache = new Map<string, RegisteredBlob>();
   private released = Promise.withResolvers<void>();
@@ -212,61 +221,57 @@ export class Capacity {
     return this.claim(path, footprint);
   }
 
-  /** Data-dependent native work gets an enforced ceiling, not a SQL estimate. */
+  /** The estimate determines this attempt's ceiling, not a transaction limit. */
   reserveNative(
     path: string,
     creates: number,
+    bytes: number | readonly NativeFrame[],
+    undo = true,
   ): Promise<NativeReservation> {
-    return this.claim(path, { inodes: creates, metadataBlocks: creates * 5 });
+    return this.claim(path, nativeFootprint(creates, bytes, undo));
   }
 
   /** A live transaction may try once, but may only queue after rollback. */
-  tryReserveNative(path: string, creates: number): Promise<NativeReservation> {
-    if (this.waiting || this.checkpointActive) {
-      return Promise.reject(new StorageBusyError(this.released.promise));
-    }
+  tryReserveNative(
+    path: string,
+    creates: number,
+    bytes: number,
+  ): Promise<NativeReservation> {
     return this.tryClaim(
       path,
-      { inodes: creates, metadataBlocks: creates * 5 },
+      nativeFootprint(creates, bytes, true),
       false,
       storageHold(),
-      true,
     );
   }
 
-  private claim(
+  private async claim(
     path: string,
-    footprint: {
-      bytes?: number;
-      inodes: number;
-      metadataBlocks: number;
-      files?: readonly number[];
-    },
+    footprint: Footprint,
     publication = false,
   ): Promise<NativeReservation> {
+    const guarded = storageHeld();
     const hold = storageHold();
-    if (storageHeld()) {
-      return this.tryClaim(path, footprint, publication, hold, true);
+    const attempt = () => this.tryClaim(path, footprint, publication, hold);
+    let release: Promise<void>;
+    try {
+      return await attempt();
+    } catch (error) {
+      if (guarded || !(error instanceof StorageBusyError)) throw error;
+      release = error.released;
     }
-    this.waiting++;
+    // Only requests that actually encountered pressure enter the FIFO. A
+    // request that fits can proceed even if another device or a larger request
+    // is waiting for room. Retry only after the blocking capacity changes.
     const result = this.fifo.then(async () => {
-      try {
-        for (;;) {
-          try {
-            return await this.tryClaim(
-              path,
-              footprint,
-              publication,
-              hold,
-              false,
-            );
-          } catch (error) {
-            if (!(error instanceof StorageBusyError)) throw error;
-            await error.released;
-          }
+      for (;;) {
+        await release;
+        try {
+          return await attempt();
+        } catch (error) {
+          if (!(error instanceof StorageBusyError)) throw error;
+          release = error.released;
         }
-      } finally {
-        this.waiting--;
       }
     });
     this.fifo = result.catch(() => {});
@@ -275,25 +280,22 @@ export class Capacity {
 
   private tryClaim(
     path: string,
-    footprint: {
-      bytes?: number;
-      inodes: number;
-      metadataBlocks: number;
-      files?: readonly number[];
-    },
+    footprint: Footprint,
     publication: boolean,
     hold: () => () => void,
-    guarded: boolean,
   ): Promise<NativeReservation> {
     const result = this.lane.then(async () => {
       const { promise: released } = this.released;
       if (this.checkpointActive) throw new StorageBusyError(released);
       if (
         [
-          footprint.bytes ?? 0,
+          footprint.bytes,
           footprint.inodes,
           footprint.metadataBlocks,
           ...(footprint.files ?? []),
+          ...(footprint.frames ?? []).flatMap((
+            { offset, length },
+          ) => [offset, length]),
         ]
           .some((n) => !Number.isSafeInteger(n) || n < 0)
       ) {
@@ -315,13 +317,18 @@ export class Capacity {
       const device = String(space.device);
       const metadata = footprint.metadataBlocks * blockSize;
       const local = outstanding.filter((claim) => claim.device === device);
-      const minimum = footprint.bytes === undefined
-        ? 0
-        : [footprint.bytes, ...(footprint.files ?? [])].reduce(
-          (sum, size) => sum + Math.ceil(size / blockSize) * blockSize,
-          0,
-        );
-      const needs = minimum + metadata;
+      const work = [footprint.bytes, ...(footprint.files ?? [])].reduce(
+        (sum, size) => sum + Math.ceil(size / blockSize) * blockSize,
+        0,
+      ) + (footprint.frames ?? []).reduce(
+        (sum, { offset, length }) =>
+          sum +
+          Math.ceil((offset % blockSize + length) / blockSize) * blockSize,
+        0,
+      );
+      const undoBytes = footprint.undo ? work : 0;
+      const data = work + undoBytes;
+      const needs = data + metadata;
       let snap = await this.inventory();
       const budgetRemaining = () => {
         const disk = snap.filesystems.find((disk) => disk.device === device);
@@ -380,23 +387,14 @@ export class Capacity {
         space.freeBytes - claimedBytes(local),
         budgetLeft - claimedBytes(explicit ? outstanding : local),
       );
-      // Native work discovers its footprint during execution. Do not give it
-      // a smaller grant just because another operation temporarily holds the
-      // otherwise available envelope; that would surface a false native full.
-      const nativeContended = footprint.bytes === undefined &&
-        available < Math.min(space.freeBytes, budgetLeft);
       if (
-        this.checkpointActive || (guarded && this.waiting > 0) ||
-        nativeContended || needs > available ||
+        this.checkpointActive || needs > available ||
         footprint.inodes > inodesLeft -
             local.reduce((sum, claim) => sum + claim.inodes, 0)
       ) throw new StorageBusyError(released);
-      const data = footprint.bytes === undefined
-        ? Math.floor((available - metadata) / blockSize) * blockSize
-        : minimum;
       const claim = {
         device,
-        bytes: data + metadata,
+        bytes: needs,
         inodes: footprint.inodes,
       };
       const unhold = hold();
@@ -410,6 +408,7 @@ export class Capacity {
         },
         blockSize,
         bytes: data,
+        undoBytes,
         creates: footprint.inodes,
         scratchRoot: this.scratchRoot,
       };
@@ -693,6 +692,20 @@ export class Capacity {
       },
     };
   }
+}
+
+function nativeFootprint(
+  creates: number,
+  bytes: number | readonly NativeFrame[],
+  undo: boolean,
+): Footprint {
+  return {
+    bytes: typeof bytes === 'number' ? bytes : 0,
+    frames: typeof bytes === 'number' ? undefined : bytes,
+    inodes: creates,
+    metadataBlocks: creates * 5,
+    undo,
+  };
 }
 
 function claimedBytes(claims: readonly Claim[]): number {

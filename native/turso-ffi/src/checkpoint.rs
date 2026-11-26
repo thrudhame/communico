@@ -14,15 +14,21 @@ pub struct Observer {
     paths: [PathBuf; 3],
     scratch: Option<PathBuf>,
     peak: Mutex<Option<u64>>,
-    open_limit: Mutex<Option<Grant>>,
+    open_limit: Mutex<Option<Arc<Grant>>>,
     opens: Mutex<()>,
 }
 
 pub struct Grant {
     block: u64,
+    bytes: u64,
     undo: u64,
-    remaining: Mutex<u64>,
+    usage: Mutex<Usage>,
     creates: Mutex<u32>,
+}
+
+struct Usage {
+    remaining: u64,
+    required_write_bytes: Option<u64>,
 }
 
 tokio::task_local! {
@@ -33,8 +39,12 @@ impl Grant {
     pub fn new(block: u64, bytes: u64, undo: u64, creates: u32) -> Self {
         Self {
             block,
+            bytes,
             undo,
-            remaining: Mutex::new(bytes),
+            usage: Mutex::new(Usage {
+                remaining: bytes,
+                required_write_bytes: None,
+            }),
             creates: Mutex::new(creates),
         }
     }
@@ -51,16 +61,30 @@ impl Grant {
         if len == 0 {
             return Ok(());
         }
-        let mut remaining = self.remaining.lock().unwrap();
+        let mut usage = self.usage.lock().unwrap();
         let cost = (pos % self.block)
             .checked_add(len)
             .and_then(|span| span.div_ceil(self.block).checked_mul(self.block));
         let floor = if cleanup { 0 } else { self.undo };
-        *remaining = cost
-            .and_then(|n| remaining.checked_sub(n))
+        if let Some(left) = cost
+            .and_then(|n| usage.remaining.checked_sub(n))
             .filter(|left| *left >= floor)
-            .ok_or(turso_core::LimboError::DatabaseFull)?;
-        Ok(())
+        {
+            usage.remaining = left;
+            return Ok(());
+        }
+        if !cleanup {
+            // Measure the failed charge before submitting it to the OS. Only
+            // report the work footprint: the owner separately books undo.
+            let spent = self.bytes - usage.remaining;
+            let required = cost.and_then(|n| spent.checked_add(n));
+            usage.required_write_bytes = usage.required_write_bytes.max(required);
+        }
+        Err(turso_core::LimboError::DatabaseFull)
+    }
+
+    pub fn required_write_bytes(&self) -> Option<u64> {
+        self.usage.lock().unwrap().required_write_bytes
     }
 }
 
@@ -126,7 +150,7 @@ impl Observer {
         *peak
     }
 
-    pub fn limit_open(&self, grant: Option<Grant>) {
+    pub fn limit_open(&self, grant: Option<Arc<Grant>>) {
         *self.open_limit.lock().unwrap() = grant;
     }
 
@@ -141,7 +165,7 @@ impl Observer {
             .lock()
             .unwrap()
             .as_ref()
-            .map_or(Ok(()), Grant::create)
+            .map_or(Ok(()), |grant| grant.create())
     }
 
     fn check_write(&self, pos: u64, len: u64) -> Result<()> {

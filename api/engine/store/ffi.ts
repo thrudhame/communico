@@ -12,6 +12,7 @@ export class StoreError extends Error {
     readonly code: number,
     message: string,
     readonly lastError: string,
+    readonly requiredWriteBytes?: number,
   ) {
     super(message);
     this.name = 'StoreError';
@@ -177,7 +178,12 @@ export class Turso {
           new Deno.UnsafePointerView(pointer).getCString(),
         );
         if (reply.code !== 0) {
-          throw new StoreError(reply.code, reply.message, reply.last_error);
+          throw new StoreError(
+            reply.code,
+            reply.message,
+            reply.last_error,
+            reply.required_write_bytes ?? undefined,
+          );
         }
         return reply.value as T;
       } finally {
