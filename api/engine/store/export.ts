@@ -3,6 +3,8 @@
 import { dirname, join } from '@std/path';
 import { type Row, type Turso, type Value } from '#engine/store/ffi.ts';
 import { publish, removeOwned } from '#engine/store/files.ts';
+import type { Capacity } from './capacity.ts';
+import { storageFailure } from './pressure.ts';
 
 export type ReadSnapshot = {
   export(destination: string): Promise<void>;
@@ -21,20 +23,57 @@ export async function exportSnapshot(
   reader: number,
   schema: Row[],
   destination: string,
+  capacity?: Capacity,
+  root = dirname(destination),
 ): Promise<void> {
-  const staging = await Deno.makeTempDir({
-    dir: dirname(destination),
-    prefix: '.logical-',
-    suffix: '.new',
-  });
+  const makeStage = () =>
+    Deno.makeTempDir({
+      dir: root,
+      prefix: '.logical-',
+      suffix: '.new',
+    });
+  const staging = capacity
+    ? await capacity.withMetadata(root, 1, makeStage)
+    : await makeStage();
   let file: number | undefined;
   let writer: number | undefined;
+  const path = join(staging, 'data.db');
+  const closeWriter = async () => {
+    const handle = writer!;
+    writer = undefined;
+    await ffi.closeConnection(handle);
+  };
+  const write = async (operation: (handle: number) => Promise<void>) => {
+    if (!capacity) return await operation(writer!);
+    const grant = await capacity.reserveNative(path, 2);
+    try {
+      const undo = Math.ceil(grant.bytes / grant.blockSize / 2) *
+        grant.blockSize;
+      await ffi.setLimit(writer!, grant, undo);
+      await operation(writer!);
+      if (writer !== undefined) {
+        await ffi.setLimit(writer, { blockSize: 1, bytes: 0 }, 0);
+      }
+    } catch (error) {
+      if (writer !== undefined) await closeWriter();
+      throw error;
+    } finally {
+      grant.release();
+    }
+  };
   try {
-    const path = join(staging, 'data.db');
-    (await Deno.open(path, { createNew: true, write: true, mode: 0o600 }))
-      .close();
-    file = await ffi.open(path);
-    writer = await ffi.connect(file);
+    const create = async () =>
+      (await Deno.open(path, { createNew: true, write: true, mode: 0o600 }))
+        .close();
+    if (capacity) await capacity.withMetadata(path, 1, create);
+    else await create();
+    const open = await capacity?.reserveNative(path, 3);
+    try {
+      file = await ffi.open(path, open);
+    } finally {
+      open?.release();
+    }
+    writer = await ffi.connect(file, !!capacity);
     await ffi.query(writer, 'PRAGMA mvcc_checkpoint_threshold=-1');
     const objects = schema.filter((row) =>
       typeof row.sql === 'string' && typeof row.name === 'string' &&
@@ -42,7 +81,7 @@ export async function exportSnapshot(
       !row.name.startsWith('__turso_internal_')
     );
     for (const table of objects.filter((row) => row.type === 'table')) {
-      await ffi.exec(writer, String(table.sql));
+      await write((handle) => ffi.exec(handle, String(table.sql)));
       const name = identifier(String(table.name));
       const columns = await ffi.query(reader, `PRAGMA table_info(${name})`);
       const names = columns.map((row) => String(row.name));
@@ -72,42 +111,47 @@ export async function exportSnapshot(
         if (rows.length === 0) break;
         // Commit bounded pages: neither JS nor the native target transaction
         // retains a write set proportional to the entire source database.
-        await ffi.begin(writer, 'deferred');
-        try {
-          // One native statement owns the entire page. Crossing the async FFI
-          // boundary per row multiplies scheduling/serialization overhead by
-          // the source population even though both sides already own a page.
-          await ffi.execute(
-            writer,
-            insert + rows.map(() => parameters).join(','),
-            rows.flatMap((row) => selected.map((_, n) => row[`c${n}`])),
-          );
-          await ffi.commit(writer);
-        } catch (error) {
-          await ffi.rollback(writer);
-          throw error;
-        }
+        await write(async (handle) => {
+          await ffi.begin(handle, 'deferred');
+          try {
+            // One native statement owns the entire page. Crossing the async FFI
+            // boundary per row multiplies scheduling/serialization overhead by
+            // the source population even though both sides already own a page.
+            await ffi.execute(
+              handle,
+              insert + rows.map(() => parameters).join(','),
+              rows.flatMap((row) => selected.map((_, n) => row[`c${n}`])),
+            );
+            await ffi.commit(handle);
+          } catch (error) {
+            await ffi.rollback(handle);
+            throw error;
+          }
+        });
         last = rows.at(-1)!.c0;
       }
     }
     for (const object of objects.filter((row) => row.type !== 'table')) {
-      await ffi.exec(writer, String(object.sql));
+      await write((handle) => ffi.exec(handle, String(object.sql)));
     }
-    const checkpoint = await ffi.checkpoint(writer, 'TRUNCATE');
-    if (checkpoint.some((row) => Number(row.busy ?? 0) !== 0)) {
-      throw new Error('private snapshot target checkpoint is busy');
-    }
-    await ffi.closeConnection(writer);
-    writer = undefined;
-    await ffi.closeFile(file);
+    await write(async (handle) => {
+      const checkpoint = await ffi.checkpoint(handle, 'TRUNCATE');
+      if (checkpoint.some((row) => Number(row.busy ?? 0) !== 0)) {
+        throw new Error('private snapshot target checkpoint is busy');
+      }
+      await closeWriter();
+    });
+    await ffi.closeFile(file, !!capacity);
     file = undefined;
-    await publish(ffi, path, destination);
+    await publish(ffi, path, destination, capacity);
+  } catch (error) {
+    throw storageFailure(error);
   } finally {
     try {
-      if (writer !== undefined) await ffi.closeConnection(writer);
+      if (writer !== undefined) await closeWriter();
     } finally {
       try {
-        if (file !== undefined) await ffi.closeFile(file);
+        if (file !== undefined) await ffi.closeFile(file, !!capacity);
       } finally {
         await removeOwned(staging);
       }

@@ -3,6 +3,8 @@ import { dirname, join } from '@std/path';
 import type { Turso } from './ffi.ts';
 import { type FileHandle, open } from 'node:fs/promises';
 import { constants } from 'node:fs';
+import type { Capacity } from './capacity.ts';
+import { storageFailure } from './pressure.ts';
 
 export type InputFile = Pick<Deno.FileInfo, 'dev' | 'ino' | 'uid' | 'mode'>;
 
@@ -133,23 +135,35 @@ export async function publish(
   ffi: Turso,
   source: string,
   destination: string,
+  capacity?: Capacity,
 ): Promise<void> {
   await syncTree(source);
-  if (await ffi.renameNoReplace(source, destination)) {
-    await syncPath(dirname(destination));
-    if (dirname(source) !== dirname(destination)) {
-      await syncPath(dirname(source));
+  const rename = await capacity?.reservePublication(destination, 0, []);
+  try {
+    if (await ffi.renameNoReplace(source, destination)) {
+      await syncPath(dirname(destination));
+      if (dirname(source) !== dirname(destination)) {
+        await syncPath(dirname(source));
+      }
+      return;
     }
-    return;
+  } catch (error) {
+    throw storageFailure(error);
+  } finally {
+    rename?.release();
   }
   // EXDEV: first copy privately on the destination filesystem, then rename.
-  const stage = await Deno.makeTempDir({
-    dir: dirname(destination),
-    prefix: '.communico-publish-',
-    suffix: '.new',
-  });
-  const copy = join(stage, 'data');
+  const duplicate = capacity
+    ? await copyReservation(capacity, source, destination)
+    : undefined;
+  let stage: string | undefined;
   try {
+    stage = await Deno.makeTempDir({
+      dir: dirname(destination),
+      prefix: '.communico-publish-',
+      suffix: '.new',
+    });
+    const copy = join(stage, 'data');
     await copyPrivate(source, copy);
     if (!await ffi.renameNoReplace(copy, destination)) {
       throw new Error('publication filesystem changed during copy');
@@ -159,8 +173,37 @@ export async function publish(
       recursive: (await Deno.lstat(source)).isDirectory,
     });
     await syncPath(dirname(source));
+  } catch (error) {
+    throw storageFailure(error);
   } finally {
-    await Deno.remove(stage, { recursive: true });
-    await syncPath(dirname(destination));
+    try {
+      if (stage !== undefined) {
+        await removeOwned(stage);
+        await syncPath(dirname(destination));
+      }
+    } finally {
+      duplicate?.release();
+    }
   }
+}
+
+async function copyReservation(
+  capacity: Capacity,
+  source: string,
+  destination: string,
+) {
+  let inodes = 1; // The private destination-side staging directory.
+  const files: number[] = [];
+  async function visit(path: string) {
+    const stat = await Deno.lstat(path);
+    inodes++;
+    if (stat.isFile) files.push(stat.size);
+    else if (stat.isDirectory) {
+      for await (const entry of Deno.readDir(path)) {
+        await visit(join(path, entry.name));
+      }
+    } else throw new Error('backup contains a non-regular filesystem entry');
+  }
+  await visit(source);
+  return await capacity.reservePublication(destination, inodes, files);
 }

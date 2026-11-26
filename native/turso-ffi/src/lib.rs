@@ -254,7 +254,13 @@ fn connection(handle: u32) -> Result<(SharedConnection, ConnectionLimit)> {
 }
 
 #[no_mangle]
-pub extern "C" fn ffi_set_limit(handle: u32, block: u64, bytes: u64, undo: u64) -> *mut c_char {
+pub extern "C" fn ffi_set_limit(
+    handle: u32,
+    block: u64,
+    bytes: u64,
+    undo: u64,
+    creates: u32,
+) -> *mut c_char {
     reply(|| {
         if block == 0 || undo > bytes {
             return Err(Failure::binding("invalid native grant"));
@@ -264,7 +270,9 @@ pub extern "C" fn ffi_set_limit(handle: u32, block: u64, bytes: u64, undo: u64) 
             .connections
             .get_mut(&handle)
             .ok_or_else(|| Failure::binding("invalid connection"))?;
-        *limit = Some(Arc::new(checkpoint::Grant::new(block, bytes, undo)));
+        *limit = Some(Arc::new(checkpoint::Grant::new(
+            block, bytes, undo, creates,
+        )));
         Ok(Json::Null)
     })
 }
@@ -307,12 +315,16 @@ pub unsafe extern "C" fn ffi_open_bounded(
     path: *const c_char,
     block: u64,
     bytes: u64,
+    creates: u32,
 ) -> *mut c_char {
     reply(|| {
+        if block == 0 {
+            return Err(Failure::binding("invalid native grant"));
+        }
         open_file(canonical_file(&text(path)?)?, |name, observer| {
-            observer.limit_open(block, bytes);
+            observer.limit_open(Some(checkpoint::Grant::new(block, bytes, 0, creates)));
             let result = initialize_database(name, observer.clone());
-            observer.limit_open(0, 0);
+            observer.limit_open(None);
             result
         })
         .map(|id| json!(id))
@@ -479,7 +491,7 @@ mod registry_tests {
         ready.recv_timeout(Duration::from_secs(5)).unwrap();
         let (completed, result) = mpsc::channel();
         let closing = std::thread::spawn(move || {
-            let pointer = ffi_close(handle, 0);
+            let pointer = ffi_close(handle, 0, false);
             let result = unsafe { text(pointer) }.unwrap();
             unsafe { ffi_free(pointer) };
             completed
@@ -490,8 +502,8 @@ mod registry_tests {
         release.send(()).unwrap();
         let connection = connecting.join().unwrap().unwrap();
         closing.join().unwrap();
-        unsafe { ffi_free(ffi_close(connection, 1)) };
-        unsafe { ffi_free(ffi_close(handle, 0)) };
+        unsafe { ffi_free(ffi_close(connection, 1, false)) };
+        unsafe { ffi_free(ffi_close(handle, 0, false)) };
         std::fs::remove_dir_all(dir).unwrap();
         assert_eq!(close_result.unwrap()["code"], 21);
     }
@@ -504,7 +516,7 @@ pub extern "C" fn ffi_connect(handle: u32) -> *mut c_char {
 
 #[no_mangle]
 pub extern "C" fn ffi_connect_bounded(handle: u32) -> *mut c_char {
-    connect(handle, Some(Arc::new(checkpoint::Grant::new(1, 0, 0))))
+    connect(handle, Some(Arc::new(checkpoint::Grant::new(1, 0, 0, 0))))
 }
 
 fn connect(handle: u32, limit: ConnectionLimit) -> *mut c_char {
@@ -730,16 +742,20 @@ pub extern "C" fn ffi_commit(handle: u32) -> *mut c_char {
 }
 
 #[no_mangle]
-pub extern "C" fn ffi_rollback(handle: u32) -> *mut c_char {
+pub extern "C" fn ffi_rollback(handle: u32, owned_checkpoint: bool) -> *mut c_char {
     reply(|| {
         let (connection, limit) = connection(handle)?;
-        run_limited(limit, true, async move {
-            let connection = connection.lock().await;
-            if !connection.is_autocommit()? {
-                query(&connection, "ROLLBACK", vec![]).await?;
-            }
-            Ok(Json::Null)
-        })
+        run_limited(
+            if owned_checkpoint { None } else { limit },
+            true,
+            async move {
+                let connection = connection.lock().await;
+                if !connection.is_autocommit()? {
+                    query(&connection, "ROLLBACK", vec![]).await?;
+                }
+                Ok(Json::Null)
+            },
+        )
     })
 }
 
@@ -794,7 +810,7 @@ pub extern "C" fn ffi_owned_checkpoint(handle: u32) -> *mut c_char {
 }
 
 #[no_mangle]
-pub extern "C" fn ffi_close(handle: u32, kind: u32) -> *mut c_char {
+pub extern "C" fn ffi_close(handle: u32, kind: u32, owned_checkpoint: bool) -> *mut c_char {
     reply(|| {
         let mut handles = handles()?;
         match kind {
@@ -810,12 +826,16 @@ pub extern "C" fn ffi_close(handle: u32, kind: u32) -> *mut c_char {
                     .remove(&handle)
                     .ok_or_else(|| Failure::binding("invalid connection"))?;
                 drop(handles);
-                return run_limited(limit, true, async move {
-                    drop(connection);
-                    Ok(Json::Null)
-                });
+                return run_limited(
+                    if owned_checkpoint { None } else { limit },
+                    true,
+                    async move {
+                        drop(connection);
+                        Ok(Json::Null)
+                    },
+                );
             }
-            0 => {
+            0 | 3 => {
                 let file = handles
                     .files
                     .get(&handle)
@@ -828,7 +848,11 @@ pub extern "C" fn ffi_close(handle: u32, kind: u32) -> *mut c_char {
                 }
                 if file.references == 1 {
                     let path = file.path.clone();
-                    handles.files.remove(&handle);
+                    // Final drop is cleanup, not an implicit checkpoint or a
+                    // second opportunity to grow files after a grant ended.
+                    let limit =
+                        (kind == 3).then(|| (Arc::new(checkpoint::Grant::new(1, 0, 0, 0)), true));
+                    checkpoint::LIMIT.sync_scope(limit, || drop(handles.files.remove(&handle)));
                     handles.paths.remove(&path);
                 } else if let Some(file) = handles.files.get_mut(&handle) {
                     file.references -= 1;

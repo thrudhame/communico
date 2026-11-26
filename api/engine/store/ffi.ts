@@ -48,7 +48,7 @@ type OwnedCheckpoint =
 const definitions = {
   ffi_open: { parameters: ['buffer'], result: 'pointer', nonblocking: true },
   ffi_open_bounded: {
-    parameters: ['buffer', 'u64', 'u64'],
+    parameters: ['buffer', 'u64', 'u64', 'u32'],
     result: 'pointer',
     nonblocking: true,
   },
@@ -59,7 +59,7 @@ const definitions = {
     nonblocking: true,
   },
   ffi_set_limit: {
-    parameters: ['u32', 'u64', 'u64', 'u64'],
+    parameters: ['u32', 'u64', 'u64', 'u64', 'u32'],
     result: 'pointer',
     nonblocking: true,
   },
@@ -99,7 +99,11 @@ const definitions = {
     nonblocking: true,
   },
   ffi_commit: { parameters: ['u32'], result: 'pointer', nonblocking: true },
-  ffi_rollback: { parameters: ['u32'], result: 'pointer', nonblocking: true },
+  ffi_rollback: {
+    parameters: ['u32', 'bool'],
+    result: 'pointer',
+    nonblocking: true,
+  },
   ffi_checkpoint: {
     parameters: ['u32', 'u32'],
     result: 'pointer',
@@ -111,7 +115,7 @@ const definitions = {
     nonblocking: true,
   },
   ffi_close: {
-    parameters: ['u32', 'u32'],
+    parameters: ['u32', 'u32', 'bool'],
     result: 'pointer',
     nonblocking: true,
   },
@@ -181,7 +185,7 @@ export class Turso {
 
   async open(
     path: string,
-    ceiling?: { blockSize: number; bytes: number },
+    ceiling?: { blockSize: number; bytes: number; creates?: number },
   ): Promise<number> {
     const handle = await this.value<number>(() =>
       ceiling
@@ -189,6 +193,7 @@ export class Turso {
           bytes(path),
           BigInt(ceiling.blockSize),
           BigInt(ceiling.bytes),
+          ceiling.creates ?? 0,
         )
         : this.library.symbols.ffi_open(bytes(path))
     );
@@ -206,7 +211,11 @@ export class Turso {
 
   setLimit(
     connection: number,
-    { blockSize, bytes }: { blockSize: number; bytes: number },
+    { blockSize, bytes, creates = 0 }: {
+      blockSize: number;
+      bytes: number;
+      creates?: number;
+    },
     undoBytes: number,
   ): Promise<void> {
     return this.value(() =>
@@ -215,6 +224,7 @@ export class Turso {
         BigInt(blockSize),
         BigInt(bytes),
         BigInt(undoBytes),
+        creates,
       )
     );
   }
@@ -255,7 +265,7 @@ export class Turso {
   }
 
   async unlockStore(handle: number): Promise<void> {
-    await this.value(() => this.library.symbols.ffi_close(handle, 2));
+    await this.value(() => this.library.symbols.ffi_close(handle, 2, false));
     this.files--;
   }
 
@@ -315,8 +325,10 @@ export class Turso {
     return this.value(() => this.library.symbols.ffi_commit(connection));
   }
 
-  rollback(connection: number): Promise<void> {
-    return this.value(() => this.library.symbols.ffi_rollback(connection));
+  rollback(connection: number, ownedCheckpoint = false): Promise<void> {
+    return this.value(() =>
+      this.library.symbols.ffi_rollback(connection, ownedCheckpoint)
+    );
   }
 
   checkpoint(connection: number, mode: CheckpointMode): Promise<Row[]> {
@@ -334,12 +346,16 @@ export class Turso {
     );
   }
 
-  closeConnection(connection: number): Promise<void> {
-    return this.value(() => this.library.symbols.ffi_close(connection, 1));
+  closeConnection(connection: number, ownedCheckpoint = false): Promise<void> {
+    return this.value(() =>
+      this.library.symbols.ffi_close(connection, 1, ownedCheckpoint)
+    );
   }
 
-  async closeFile(file: number): Promise<void> {
-    await this.value(() => this.library.symbols.ffi_close(file, 0));
+  async closeFile(file: number, bounded = false): Promise<void> {
+    await this.value(() =>
+      this.library.symbols.ffi_close(file, bounded ? 3 : 0, false)
+    );
     this.files--;
   }
 

@@ -15,6 +15,11 @@ export type CapacityProbe = (path: string) => Space | Promise<Space>;
 
 type Claim = { device: string; bytes: number; inodes: number };
 export type Reservation = { release(): void };
+export type NativeReservation = Reservation & {
+  blockSize: number;
+  bytes: number;
+  creates: number;
+};
 
 async function physicalSpace(path: string, device: string): Promise<Space> {
   const fs = await statfs(path, { bigint: true });
@@ -82,19 +87,31 @@ export class Capacity {
   /** Data-dependent native work gets an enforced ceiling, not a SQL estimate. */
   reserveNative(
     path: string,
-    metadata: { inodes: number; metadataBlocks: number },
-  ): Promise<Reservation & { blockSize: number; bytes: number }> {
-    return this.claim(path, metadata);
+    creates: number,
+  ): Promise<NativeReservation> {
+    return this.claim(path, { inodes: creates, metadataBlocks: creates * 5 });
   }
 
   private claim(
     path: string,
-    footprint: { bytes?: number; inodes: number; metadataBlocks: number },
-  ): Promise<Reservation & { blockSize: number; bytes: number }> {
+    footprint: {
+      bytes?: number;
+      inodes: number;
+      metadataBlocks: number;
+      files?: readonly number[];
+    },
+    publication = false,
+  ): Promise<NativeReservation> {
     const result = this.lane.then(async () => {
       if (this.checkpointActive) throw new StoragePressureError();
       if (
-        Object.values(footprint).some((n) => !Number.isSafeInteger(n) || n < 0)
+        [
+          footprint.bytes ?? 0,
+          footprint.inodes,
+          footprint.metadataBlocks,
+          ...(footprint.files ?? []),
+        ]
+          .some((n) => !Number.isSafeInteger(n) || n < 0)
       ) {
         throw new RangeError('invalid storage footprint');
       }
@@ -103,29 +120,41 @@ export class Capacity {
       const outstanding = [...this.claims];
       const at = await ancestor(path);
       const roots = await Promise.all(this.roots.map(ancestor));
-      if (!roots.some((root) => contains(root.target, at.target))) {
+      if (
+        !publication && !roots.some((root) => contains(root.target, at.target))
+      ) {
         throw new Error('reservation outside capacity roots');
       }
       const space = await this.space(at);
       const device = String(space.device);
       const snap = (await this.status()).filesystems;
       const disk = snap.find((disk) => disk.device === device);
-      if (!disk) throw new Error('reservation device outside capacity roots');
+      if (!disk && !publication) {
+        throw new Error('reservation device outside capacity roots');
+      }
       const blockSize = space.blockSize;
       const metadata = footprint.metadataBlocks * blockSize;
       const local = outstanding.filter((claim) => claim.device === device);
       const explicit = typeof this.budget === 'number';
       const used = explicit
         ? snap.reduce((sum, disk) => sum + disk.usedBytes, 0)
-        : disk.usedBytes;
+        : disk?.usedBytes ?? 0;
+      const budget = disk
+        ? disk.budgetBytes
+        : this.budget === null
+        ? null
+        : this.budget ?? Math.floor(space.totalBytes * 0.99);
       const available = Math.min(
         space.freeBytes - claimedBytes(local),
-        (disk.budgetBytes ?? Infinity) - used -
+        (budget ?? Infinity) - used -
           claimedBytes(explicit ? outstanding : local),
       );
       const data = footprint.bytes === undefined
         ? Math.floor((available - metadata) / blockSize) * blockSize
-        : Math.ceil(footprint.bytes / blockSize) * blockSize;
+        : [footprint.bytes, ...(footprint.files ?? [])].reduce(
+          (sum, size) => sum + Math.ceil(size / blockSize) * blockSize,
+          0,
+        );
       const bytes = data + metadata;
       if (
         this.checkpointActive ||
@@ -139,10 +168,26 @@ export class Capacity {
         release: () => void this.claims.delete(claim),
         blockSize,
         bytes: data,
+        creates: footprint.inodes,
       };
     });
     this.lane = result.catch(() => {});
     return result;
+  }
+
+  // Only publication can target an operator-managed location. Its temporary
+  // duplicate still competes with every other grant until publish or cleanup.
+  reservePublication(
+    path: string,
+    inodes: number,
+    files: readonly number[],
+  ): Promise<Reservation> {
+    return this.claim(path, {
+      bytes: 0,
+      inodes,
+      metadataBlocks: 8 + inodes * 5,
+      files,
+    }, true);
   }
 
   reserveStaging(path: string, maxBytes: number): Promise<Reservation> {

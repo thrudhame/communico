@@ -207,7 +207,7 @@ export class Db {
           );
           if (failure.storageFull) outcome = 'full';
           try {
-            await this.ffi.rollback(connection);
+            await this.ffi.rollback(connection, true);
           } catch (rollback) {
             reusable = false;
             if (!failure.storageFull) {
@@ -232,7 +232,7 @@ export class Db {
             if (reusable) this.idle.push(connection);
             else {
               this.connections--;
-              await this.ffi.closeConnection(connection);
+              await this.ffi.closeConnection(connection, true);
             }
           }
         } finally {
@@ -289,10 +289,7 @@ export class Db {
     const opened = (async () => {
       // Bootstrap may create the database, logical log and WAL. Hold the
       // shared grant before native initialization can touch any of them.
-      const lease = await capacity?.reserveNative(path, {
-        inodes: 3,
-        metadataBlocks: 3 * 5,
-      });
+      const lease = await capacity?.reserveNative(path, 3);
       try {
         return await ffi.open(path, lease);
       } catch (error) {
@@ -427,10 +424,7 @@ export class Db {
         // Only a write-capable statement can take the rest of the envelope.
         if (this.capacity) {
           return admission ??= (async () => {
-            const grant = await this.capacity!.reserveNative(this.path, {
-              inodes: 0,
-              metadataBlocks: 0,
-            });
+            const grant = await this.capacity!.reserveNative(this.path, 2);
             lease = grant;
             // Keep a separate pool for rollback/destruction. In particular,
             // a failed commit cannot consume the last of its own grant.
@@ -557,7 +551,7 @@ export class Db {
       })();
     try {
       releaseGate = await this.gate.retain();
-      handle = await this.ffi.connect(this.handle);
+      handle = await this.ffi.connect(this.handle, !!this.capacity);
       return {
         pin: async () => {
           if (released || pinned) {
@@ -593,6 +587,8 @@ export class Db {
                   handle!,
                   schema,
                   destination,
+                  this.capacity,
+                  dirname(dirname(this.path)),
                 );
               },
               release,
@@ -625,6 +621,17 @@ export class Db {
     }
     if (resolve(destination) === this.path) {
       throw new TypeError('backup destination is the source database');
+    }
+    if (this.capacity) {
+      // Managed backups use the logical writer, whose target runs through
+      // the same observed IO as our ordinary databases.
+      const reader = await this.readSnapshot();
+      try {
+        await reader.export(destination);
+      } finally {
+        await reader.release();
+      }
+      return;
     }
     this.users++;
     let entered = false;
@@ -694,7 +701,7 @@ export class Db {
       this.idle.pop();
       this.connections--;
     }
-    await this.ffi.closeFile(this.handle);
+    await this.ffi.closeFile(this.handle, !!this.capacity);
     this.closed = true;
     Db.openFiles.delete(this.path);
   }

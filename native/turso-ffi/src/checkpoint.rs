@@ -13,13 +13,15 @@ use turso_core::{Buffer, Completion, OpenFlags, Result, IO};
 pub struct Observer {
     paths: [PathBuf; 3],
     peak: Mutex<Option<u64>>,
-    open_limit: Mutex<Option<(u64, u64)>>,
+    open_limit: Mutex<Option<Grant>>,
+    opens: Mutex<()>,
 }
 
 pub struct Grant {
     block: u64,
     undo: u64,
     remaining: Mutex<u64>,
+    creates: Mutex<u32>,
 }
 
 tokio::task_local! {
@@ -27,12 +29,21 @@ tokio::task_local! {
 }
 
 impl Grant {
-    pub fn new(block: u64, bytes: u64, undo: u64) -> Self {
+    pub fn new(block: u64, bytes: u64, undo: u64, creates: u32) -> Self {
         Self {
             block,
             undo,
             remaining: Mutex::new(bytes),
+            creates: Mutex::new(creates),
         }
+    }
+
+    fn create(&self) -> Result<()> {
+        let mut remaining = self.creates.lock().unwrap();
+        *remaining = remaining
+            .checked_sub(1)
+            .ok_or(turso_core::LimboError::DatabaseFull)?;
+        Ok(())
     }
 
     fn charge(&self, pos: u64, len: u64, cleanup: bool) -> Result<()> {
@@ -62,6 +73,7 @@ impl Observer {
             ],
             peak: Mutex::new(None),
             open_limit: Mutex::new(None),
+            opens: Mutex::new(()),
         }
     }
 
@@ -88,8 +100,22 @@ impl Observer {
         *peak
     }
 
-    pub fn limit_open(&self, block: u64, bytes: u64) {
-        *self.open_limit.lock().unwrap() = (block != 0).then_some((block, bytes));
+    pub fn limit_open(&self, grant: Option<Grant>) {
+        *self.open_limit.lock().unwrap() = grant;
+    }
+
+    fn check_create(&self, path: &str) -> Result<()> {
+        if !fs::metadata(path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) {
+            return Ok(());
+        }
+        LIMIT
+            .try_with(|limit| limit.as_ref().map_or(Ok(()), |(grant, _)| grant.create()))
+            .unwrap_or(Ok(()))?;
+        self.open_limit
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map_or(Ok(()), Grant::create)
     }
 
     fn check_write(&self, pos: u64, len: u64) -> Result<()> {
@@ -101,19 +127,8 @@ impl Observer {
                 Ok(())
             })
             .unwrap_or(Ok(()))?;
-        if let Some((block, remaining)) = self.open_limit.lock().unwrap().as_mut() {
-            // Charge every block the call can touch, including an unaligned
-            // tail, even when a filesystem can reuse an existing allocation.
-            let cost = if len == 0 {
-                Some(0)
-            } else {
-                (pos % *block)
-                    .checked_add(len)
-                    .and_then(|span| span.div_ceil(*block).checked_mul(*block))
-            };
-            *remaining = cost
-                .and_then(|cost| remaining.checked_sub(cost))
-                .ok_or(turso_core::LimboError::DatabaseFull)?;
+        if let Some(grant) = self.open_limit.lock().unwrap().as_ref() {
+            grant.charge(pos, len, false)?;
         }
         Ok(())
     }
@@ -143,11 +158,14 @@ impl Clock for ObservedIo {
 
 impl IO for ObservedIo {
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
+        let _open = self.1.opens.lock().unwrap();
+        self.1.check_create(path)?;
         let file = self.0.open_file(path, flags, direct)?;
         Ok(Arc::new(ObservedFile(file, self.1.clone())))
     }
 
     fn remove_file(&self, path: &str) -> Result<()> {
+        let _open = self.1.opens.lock().unwrap();
         if self.1.paths.iter().any(|owned| owned == Path::new(path)) {
             self.1.sample();
         }
@@ -155,6 +173,8 @@ impl IO for ObservedIo {
     }
 
     fn open_shared_wal_file(&self, path: &str) -> Result<Arc<dyn File>> {
+        let _open = self.1.opens.lock().unwrap();
+        self.1.check_create(path)?;
         let file = self.0.open_shared_wal_file(path)?;
         Ok(Arc::new(ObservedFile(file, self.1.clone())))
     }

@@ -450,6 +450,115 @@ Deno.test('facade capacity: native bootstrap obeys its grant before writing', as
   }
 });
 
+Deno.test('facade capacity: native open without a metadata grant cannot create its database', async () => {
+  const root = await Deno.makeTempDir({ prefix: 'facade-native-metadata-' });
+  const ffi = new Turso('./.native/libturso_ffi.so');
+  const path = root + '/data.db';
+  let file: number | undefined;
+  try {
+    const error = await assertRejects(async () => {
+      file = await ffi.open(path, {
+        blockSize: 4096,
+        bytes: 32 * MiB,
+        creates: 0,
+      });
+    }, StoreError);
+    assert(error.storageFull, error.message);
+    assertEquals(
+      (await Array.fromAsync(Deno.readDir(root))).map((entry) => entry.name),
+      [],
+      'native file created without metadata reservation',
+    );
+  } finally {
+    if (file !== undefined) await ffi.closeFile(file);
+    ffi.close();
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test('facade capacity: managed snapshots refuse under a live claim and retry after release', async () => {
+  const root = await Deno.makeTempDir({ prefix: 'facade-native-snapshot-' });
+  const source = root + '/server';
+  const target = root + '/out/data.db';
+  const ffi = new Turso('./.native/libturso_ffi.so');
+  const budget = 32 * MiB;
+  const capacity = new Capacity([root], budget);
+  let db: Db | undefined;
+  let copy: Db | undefined;
+  try {
+    await Deno.mkdir(source);
+    await Deno.mkdir(root + '/out');
+    db = await Db.open(ffi, source + '/data.db', MiB, undefined, capacity);
+    await db.exec('CREATE TABLE receipt(id INTEGER PRIMARY KEY, body TEXT)');
+    await db.execute('INSERT INTO receipt VALUES (42, ?)', ['x'.repeat(65536)]);
+    const used = (await capacity.status()).filesystems[0].usedBytes;
+    const claim = await capacity.reserveStaging(
+      root + '/held.part',
+      budget - used - 128 * 1024,
+    );
+    try {
+      await assertRejects(() => db!.vacuumInto(target), StoragePressureError);
+      assertEquals(
+        (await Array.fromAsync(Deno.readDir(root))).map((e) => e.name).sort(),
+        ['out', 'server'],
+      );
+      await assertRejects(() => Deno.stat(target), Deno.errors.NotFound);
+    } finally {
+      claim.release();
+    }
+    await db.vacuumInto(target);
+    assertEquals((await capacity.status()).filesystems[0].reservedBytes, 0);
+    await db.close();
+    copy = await Db.open(ffi, target, MiB);
+    assertEquals(
+      await copy.query('SELECT id,length(body) AS bytes FROM receipt'),
+      [{ id: 42, bytes: 65536 }],
+    );
+  } finally {
+    await copy?.close();
+    await db?.close();
+    ffi.close();
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test('facade capacity: contending writers cannot borrow the live grant, but readers still work', async () => {
+  const root = await Deno.makeTempDir({ prefix: 'facade-native-contenders-' });
+  const ffi = new Turso('./.native/libturso_ffi.so');
+  const capacity = new Capacity([root], 32 * MiB);
+  const ready = Promise.withResolvers<void>();
+  const finish = Promise.withResolvers<void>();
+  let db: Db | undefined;
+  let first: Promise<unknown> | undefined;
+  try {
+    db = await Db.open(ffi, root + '/data.db', MiB, undefined, capacity);
+    await db.exec('CREATE TABLE receipt(id INTEGER PRIMARY KEY)');
+    first = db.tx(async (conn) => {
+      await conn.execute('INSERT INTO receipt VALUES (1)');
+      ready.resolve();
+      await finish.promise;
+    });
+    await Promise.race([ready.promise, first]);
+    await assertRejects(
+      () => db!.execute('INSERT INTO receipt VALUES (2)'),
+      StoragePressureError,
+    );
+    assertEquals(await db.query('SELECT * FROM receipt'), []);
+    finish.resolve();
+    await first;
+    await db.execute('INSERT INTO receipt VALUES (2)');
+    assertEquals(await db.query('SELECT * FROM receipt ORDER BY id'), [{
+      id: 1,
+    }, { id: 2 }]);
+  } finally {
+    finish.resolve();
+    await first?.catch(() => undefined);
+    await db?.close();
+    ffi.close();
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
 const settingsFor = (dir: string) => ({
   dir,
   library: './.native/libturso_ffi.so',

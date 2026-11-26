@@ -147,7 +147,7 @@ export class Store implements StartupStore {
   // no-replace publication. Shutdown drains this maintenance operation too.
   publishSnapshot(source: string, destination: string): Promise<void> {
     if (this.stopped) return Promise.reject(new Error('store is closed'));
-    return this.maintain(publish(this.ffi, source, destination));
+    return this.maintain(publish(this.ffi, source, destination, this.capacity));
   }
 
   // Accepted work owns a lifetime independently of the short commit/publication
@@ -275,11 +275,15 @@ export class Store implements StartupStore {
   private async captureSnapshot(
     destination: string,
   ): Promise<{ files: SnapshotFile[]; pauseMs: number; native: BuildInfo }> {
-    const staging = await Deno.makeTempDir({
-      dir: dirname(dirname(this.serverDb.path)),
-      prefix: '.backup-',
-      suffix: '.new',
-    });
+    const makeStage = () =>
+      Deno.makeTempDir({
+        dir: this.directory,
+        prefix: '.backup-',
+        suffix: '.new',
+      });
+    const staging = this.capacity
+      ? await this.capacity.withMetadata(this.directory, 1, makeStage)
+      : await makeStage();
     const sources = new Map<string, SnapshotSource>();
     const readers: {
       file: SnapshotFile;
@@ -348,7 +352,12 @@ export class Store implements StartupStore {
       for (const { file, reader, release } of readers) {
         try {
           const path = join(staging, file.path);
-          await Deno.mkdir(dirname(path), { recursive: true, mode: 0o700 });
+          if (this.capacity) {
+            await this.capacity.ensureDirectory(dirname(path), 0o700);
+          } else {await Deno.mkdir(dirname(path), {
+              recursive: true,
+              mode: 0o700,
+            });}
           await reader.export(path);
         } catch (error) {
           try {
@@ -370,7 +379,7 @@ export class Store implements StartupStore {
       // release failure must not turn an already-published cut into a rejection.
       await releaseSources();
       const native = await this.ffi.buildInfo();
-      await publish(this.ffi, staging, destination);
+      await publish(this.ffi, staging, destination, this.capacity);
       return {
         files: readers.map(({ file }) => file),
         pauseMs,
