@@ -97,11 +97,12 @@ export async function openFacadeRuntime(
     server: serverName(),
     node: settings.nodeid,
   };
+  const capacity = new Capacity([storeConfig.dir, config().media.root]);
   const store = await openStore(storeConfig, {
     schemas: { server: serverSchema, tenant: tenantSchema, room: roomSchema },
     beforeStartup: (store) => bindRole(store, identity),
+    capacityOwner: capacity,
   });
-  const capacity = new Capacity([store.directory, config().media.root]);
   const server = await store.server();
   const journal = new Journal(
     server,

@@ -428,6 +428,7 @@ export async function openStore(
   config: StoreConfig,
   options: {
     schemas?: StoreSchemas;
+    capacityOwner?: import('./capacity.ts').Capacity;
     beforeStartup?(store: Store): Promise<unknown>;
   } = {},
 ): Promise<Store> {
@@ -474,16 +475,24 @@ export async function openStore(
       serverPath,
       config.checkpointlogbytes,
       admission,
+      options.capacityOwner,
     );
     await ensureSchema(serverDb, serverProvider);
-    pool = new Pool(ffi, config.dir, {
-      checkpointlogbytes: config.checkpointlogbytes,
-      maxopenfiles: config.maxopenfiles,
-      idleseconds: config.idleseconds,
-    }, {
-      rooms: options.schemas?.room,
-      tenants: options.schemas?.tenant,
-    }, admission);
+    pool = new Pool(
+      ffi,
+      config.dir,
+      {
+        checkpointlogbytes: config.checkpointlogbytes,
+        maxopenfiles: config.maxopenfiles,
+        idleseconds: config.idleseconds,
+      },
+      {
+        rooms: options.schemas?.room,
+        tenants: options.schemas?.tenant,
+      },
+      admission,
+      options.capacityOwner,
+    );
     const store = new Store(ffi, serverDb, pool, ownership, admission);
     // The composition root binds runtime authority before a recovery hook may
     // project data or schedule owner-specific intents. Failure unwinds the pool.

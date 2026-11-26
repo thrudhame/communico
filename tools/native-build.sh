@@ -44,6 +44,7 @@ export COMMUNICO_TURSO_DEFAULT_FEATURES="$default_features"
 export COMMUNICO_TURSO_FEATURES="$features"
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-"$cache/target"}
 cargo build --release -j 2 --manifest-path "$root/native/turso-ffi/Cargo.toml" \
-  --config "patch.crates-io.turso.path=\"$source/bindings/rust\""
+  --config "patch.crates-io.turso.path=\"$source/bindings/rust\"" \
+  --config "patch.crates-io.turso_core.path=\"$source/core\""
 cp "$CARGO_TARGET_DIR/release/libturso_ffi.so" "$root/.native/libturso_ffi.so"
 sha256sum "$root/.native/libturso_ffi.so"

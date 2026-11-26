@@ -185,6 +185,7 @@ export class Pool {
     private readonly options: PoolOptions,
     providers: Partial<Record<FileKind, SchemaProvider>> = {},
     private readonly admission?: Admission,
+    private readonly capacity?: import('./capacity.ts').Capacity,
   ) {
     this.providers = {
       rooms: providers.rooms ?? EMPTY_SCHEMA,
@@ -274,6 +275,7 @@ export class Pool {
         path,
         this.options.checkpointlogbytes,
         this.admission,
+        this.capacity,
       );
       const rows = await db.query('SELECT value FROM id');
       if (
@@ -392,6 +394,7 @@ export class Pool {
             files.database,
             this.options.checkpointlogbytes,
             this.admission,
+            this.capacity,
           );
         } catch (error) {
           if (error instanceof Deno.errors.NotFound) continue;
@@ -676,6 +679,7 @@ export class Pool {
       files.database,
       this.options.checkpointlogbytes,
       this.admission,
+      this.capacity,
     );
     try {
       await checkId(db, id);

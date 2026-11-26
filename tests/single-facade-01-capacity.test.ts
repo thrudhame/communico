@@ -59,6 +59,13 @@ Deno.test('facade capacity: local status exposes the default budget before pairi
       assertEquals(disk.budgetBytes, Math.floor(disk.totalBytes * 0.99));
       assertEquals(disk.usedBytes, disk.protectedBytes + disk.reclaimableBytes);
       assertEquals(typeof disk.quotaBackstop, 'boolean');
+      assertEquals(disk.filesystemFull, false);
+      assertEquals(disk.checkpoint, {
+        active: false,
+        overshootBytes: 0,
+        peakOvershootBytes: 0,
+        retainedWalBytes: 0,
+      });
     } finally {
       await edge.stop();
     }

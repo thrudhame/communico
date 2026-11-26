@@ -23,6 +23,7 @@ export class Gate extends EventTarget {
   private paused = false;
   private checkpointing = false;
   private retained = 0;
+  private retryCheckpoint = false;
   private waiters: (() => void)[] = [];
   private drained?: () => void;
   private barrier?: Promise<void>;
@@ -40,7 +41,9 @@ export class Gate extends EventTarget {
   constructor(
     readonly path: string,
     readonly threshold: number,
-    private readonly checkpoint: (started: () => void) => Promise<Row[]>,
+    private readonly checkpoint: (
+      started: () => void,
+    ) => Promise<Row[] | undefined>,
   ) {
     super();
     if (!Number.isSafeInteger(threshold) || threshold < 1) {
@@ -94,7 +97,7 @@ export class Gate extends EventTarget {
     // while writing (RETURNING). No SQL-text guesses can bypass maintenance.
     if (this.retained) return;
     if (this.barrier) return await this.barrier;
-    if (await this.logBytes() < this.threshold) return;
+    if (!this.retryCheckpoint && await this.logBytes() < this.threshold) return;
     // retain() can have acquired ownership while stat was in flight.
     if (this.retained) return;
     if (this.barrier) return await this.barrier;
@@ -132,6 +135,10 @@ export class Gate extends EventTarget {
             this.checkpointing = true;
             this.dispatchEvent(new Event('checkpoint'));
           });
+          if (rows === undefined) {
+            this.retryCheckpoint = true;
+            return;
+          }
           busy = rows.some((row) => Number(row.busy ?? 0) !== 0);
         } catch (error) {
           if (!(error instanceof StoreError) || !error.busy) throw error;
@@ -141,6 +148,7 @@ export class Gate extends EventTarget {
           this.dispatchEvent(new Event('checkpointend'));
         }
         if (!busy) {
+          this.retryCheckpoint = false;
           this.counters.completed++;
           this.counters.lastLogBytes = await this.logBytes();
           return;

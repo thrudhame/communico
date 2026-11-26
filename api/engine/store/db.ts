@@ -162,16 +162,65 @@ export class Db {
     private readonly handle: number,
     checkpointlogbytes: number,
     private readonly admission?: Admission,
+    private readonly capacity?: import('./capacity.ts').Capacity,
   ) {
     this.gate = new Gate(path, checkpointlogbytes, async (started) => {
-      const connection = await this.acquire();
+      const lease = await this.capacity?.tryCheckpoint(path);
+      if (this.capacity && !lease) return;
+      let outcome: 'full' | 'completed' | undefined;
+      let connection: number | undefined;
+      let reusable = true;
       try {
-        const result = this.ffi.checkpoint(connection, 'TRUNCATE');
+        connection = await this.acquire();
+        if (!lease) {
+          const result = this.ffi.checkpoint(connection, 'TRUNCATE');
+          started();
+          return await result;
+        }
+        const result = this.ffi.ownedCheckpoint(connection);
         started();
-        return await result;
+        const { rows, error, peakBytes } = await result;
+        lease.observe(peakBytes);
+        if (error) {
+          const failure = new StoreError(
+            error.code,
+            error.message,
+            error.lastError,
+          );
+          if (failure.storageFull) outcome = 'full';
+          try {
+            await this.ffi.rollback(connection);
+          } catch (rollback) {
+            reusable = false;
+            if (!failure.storageFull) {
+              throw new AggregateError(
+                [failure, rollback],
+                'checkpoint and rollback failed',
+              );
+            }
+          }
+          // COMMIT already succeeded: ENOSPC in maintenance must neither
+          // replay the transaction nor report its confirmed write as refused.
+          if (failure.storageFull) return;
+          throw failure;
+        }
+        if (!rows.some((row) => Number(row.busy ?? 0) !== 0)) {
+          outcome = 'completed';
+        }
+        return rows;
       } finally {
-        this.idle.push(connection);
-        this.notify();
+        try {
+          if (connection !== undefined) {
+            if (reusable) this.idle.push(connection);
+            else {
+              this.connections--;
+              await this.ffi.closeConnection(connection);
+            }
+          }
+        } finally {
+          lease?.finish(outcome);
+          this.notify();
+        }
       }
     });
   }
@@ -181,6 +230,7 @@ export class Db {
     path: string,
     checkpointlogbytes: number,
     admission?: Admission,
+    capacity?: import('./capacity.ts').Capacity,
   ): Promise<Db> {
     path = resolve(path);
     if (path !== databaseFiles(dirname(path)).database) {
@@ -197,11 +247,18 @@ export class Db {
       const db = await existing;
       if (db.closingTask !== undefined) {
         await db.closingTask;
-        return await this.open(ffi, path, checkpointlogbytes, admission);
+        return await this.open(
+          ffi,
+          path,
+          checkpointlogbytes,
+          admission,
+          capacity,
+        );
       }
       if (
         db.ffi !== ffi || db.gate.threshold !== checkpointlogbytes ||
-        (admission !== undefined && db.admission !== admission)
+        (admission !== undefined && db.admission !== admission) ||
+        (capacity !== undefined && db.capacity !== capacity)
       ) {
         throw new Error('database already owned by another library');
       }
@@ -209,7 +266,14 @@ export class Db {
       return db;
     }
     const opened = ffi.open(path).then(async (handle) => {
-      const db = new Db(ffi, path, handle, checkpointlogbytes, admission);
+      const db = new Db(
+        ffi,
+        path,
+        handle,
+        checkpointlogbytes,
+        admission,
+        capacity,
+      );
       try {
         const connection = await db.acquire();
         try {

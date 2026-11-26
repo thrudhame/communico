@@ -29,7 +29,21 @@ export class StoreError extends Error {
       this.message === 'Write-write conflict' &&
       this.lastError === 'Error("Write-write conflict")');
   }
+
+  get storageFull(): boolean {
+    return (this.code & 255) === 13 ||
+      (this.code === 10 && this.lastError.startsWith('IoError(StorageFull, '));
+  }
 }
+
+type OwnedCheckpoint =
+  & { peakBytes: number }
+  & (
+    { rows: Row[]; error?: never } | {
+      rows?: never;
+      error: { code: number; message: string; lastError: string };
+    }
+  );
 
 const definitions = {
   ffi_open: { parameters: ['buffer'], result: 'pointer', nonblocking: true },
@@ -73,6 +87,11 @@ const definitions = {
   ffi_rollback: { parameters: ['u32'], result: 'pointer', nonblocking: true },
   ffi_checkpoint: {
     parameters: ['u32', 'u32'],
+    result: 'pointer',
+    nonblocking: true,
+  },
+  ffi_owned_checkpoint: {
+    parameters: ['u32'],
     result: 'pointer',
     nonblocking: true,
   },
@@ -263,6 +282,12 @@ export class Turso {
         connection,
         { PASSIVE: 0, FULL: 1, RESTART: 2, TRUNCATE: 3 }[mode],
       )
+    );
+  }
+
+  ownedCheckpoint(connection: number): Promise<OwnedCheckpoint> {
+    return this.value(() =>
+      this.library.symbols.ffi_owned_checkpoint(connection)
     );
   }
 

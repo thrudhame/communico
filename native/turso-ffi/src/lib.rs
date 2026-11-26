@@ -8,6 +8,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use turso::{Connection, Database, Value};
+mod checkpoint;
 
 #[derive(Debug)]
 struct Failure {
@@ -54,6 +55,7 @@ impl From<turso::Error> for Failure {
 
 struct File {
     database: Arc<Database>,
+    checkpoint: Arc<checkpoint::Observer>,
     references: usize,
     connecting: usize,
     path: PathBuf,
@@ -275,9 +277,13 @@ pub unsafe extern "C" fn ffi_open(path: *const c_char) -> *mut c_char {
     reply(|| open_file(canonical_file(&text(path)?)?, initialize_database).map(|id| json!(id)))
 }
 
-fn initialize_database(name: String) -> Result<Database> {
+fn initialize_database(name: String, observer: Arc<checkpoint::Observer>) -> Result<Database> {
     run(async move {
-        let database = turso::Builder::new_local(&name).build().await?;
+        let io = turso_core::io::PlatformIO::new().map_err(|e| Failure::binding(e.to_string()))?;
+        let database = turso::Builder::new_local(&name)
+            .with_io_impl(Arc::new(checkpoint::ObservedIo(io, observer)))
+            .build()
+            .await?;
         let connection = database.connect()?;
         query(&connection, "PRAGMA journal_mode=mvcc", vec![]).await?;
         query(&connection, "PRAGMA synchronous=FULL", vec![]).await?;
@@ -285,7 +291,10 @@ fn initialize_database(name: String) -> Result<Database> {
     })
 }
 
-fn open_file(path: PathBuf, initialize: impl FnOnce(String) -> Result<Database>) -> Result<u32> {
+fn open_file(
+    path: PathBuf,
+    initialize: impl FnOnce(String, Arc<checkpoint::Observer>) -> Result<Database>,
+) -> Result<u32> {
     let reservation = loop {
         let mut handles = handles()?;
         if let Some(handle) = handles.paths.get(&path).copied() {
@@ -321,7 +330,8 @@ fn open_file(path: PathBuf, initialize: impl FnOnce(String) -> Result<Database>)
         .to_str()
         .ok_or_else(|| Failure::binding("non-UTF8 path"))?
         .to_owned();
-    let database = Arc::new(initialize(name)?);
+    let checkpoint = Arc::new(checkpoint::Observer::new(&name));
+    let database = Arc::new(initialize(name, checkpoint.clone())?);
     let handle = {
         let mut handles = handles()?;
         let handle = handles.id()?;
@@ -330,6 +340,7 @@ fn open_file(path: PathBuf, initialize: impl FnOnce(String) -> Result<Database>)
             handle,
             File {
                 database,
+                checkpoint,
                 references: 1,
                 connecting: 0,
                 path,
@@ -352,7 +363,7 @@ mod registry_tests {
         let (entered, ready) = mpsc::channel();
         let (release, held) = mpsc::channel();
         let slow = std::thread::spawn(move || {
-            open_file(PathBuf::from("slow-registry-test"), |_| {
+            open_file(PathBuf::from("slow-registry-test"), |_, _| {
                 entered.send(()).unwrap();
                 held.recv().unwrap();
                 Err(Failure::binding("injected initialization failure"))
@@ -361,7 +372,7 @@ mod registry_tests {
         ready.recv_timeout(Duration::from_secs(5)).unwrap();
         let (completed, result) = mpsc::channel();
         let fast = std::thread::spawn(move || {
-            let outcome = open_file(PathBuf::from("other-registry-test"), |_| {
+            let outcome = open_file(PathBuf::from("other-registry-test"), |_, _| {
                 Err(Failure::binding("independent initialization"))
             });
             completed.send(outcome.is_err()).unwrap();
@@ -382,7 +393,7 @@ mod registry_tests {
         let (entered, ready) = mpsc::channel();
         let (release, held) = mpsc::channel();
         let first = std::thread::spawn(move || {
-            open_file(PathBuf::from("same-registry-test"), |_| {
+            open_file(PathBuf::from("same-registry-test"), |_, _| {
                 entered.send(()).unwrap();
                 held.recv().unwrap();
                 Err(Failure::binding("first initialization fails"))
@@ -391,7 +402,7 @@ mod registry_tests {
         ready.recv_timeout(Duration::from_secs(5)).unwrap();
         let (entered_second, second_ready) = mpsc::channel();
         let second = std::thread::spawn(move || {
-            open_file(PathBuf::from("same-registry-test"), |_| {
+            open_file(PathBuf::from("same-registry-test"), |_, _| {
                 entered_second.send(()).unwrap();
                 Err(Failure::binding("retry initialization fails"))
             })
@@ -684,6 +695,40 @@ pub extern "C" fn ffi_checkpoint(handle: u32, mode: u32) -> *mut c_char {
                 _ => return Err(Failure::binding("invalid checkpoint mode")),
             },
         )
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ffi_owned_checkpoint(handle: u32) -> *mut c_char {
+    reply(|| {
+        let (connection, observer) = {
+            let handles = handles()?;
+            let (file, connection) = handles
+                .connections
+                .get(&handle)
+                .ok_or_else(|| Failure::binding("invalid connection"))?;
+            let observer = handles
+                .files
+                .get(file)
+                .ok_or_else(|| Failure::binding("invalid database"))?
+                .checkpoint
+                .clone();
+            (connection.clone(), observer)
+        };
+        run(async move {
+            let connection = connection.lock().await;
+            let _measurement = observer.begin();
+            let result = query(&connection, "PRAGMA wal_checkpoint(TRUNCATE)", vec![]).await;
+            let peak = observer.sample();
+            // Report the peak even if the pager failed. JS owns rollback and
+            // decides whether this connection is safe to return to the pool.
+            Ok(match result {
+                Ok(rows) => json!({"peakBytes": peak, "rows": rows}),
+                Err(error) => json!({"peakBytes": peak, "error": {
+                    "code": error.code, "message": error.message, "lastError": error.last_error,
+                }}),
+            })
+        })
     })
 }
 
