@@ -390,6 +390,16 @@ export class Db {
         const result = await this.attempt(fn, options);
         if (result.committed) return result.value;
         const error = result.error;
+        if (
+          error instanceof StoragePressureError &&
+          !(error instanceof StorageBusyError)
+        ) {
+          if (
+            attempt < TRANSACTION_ATTEMPTS &&
+            await this.capacity?.reclaimAfterFull(this.path)
+          ) continue;
+          throw error;
+        }
         if (error instanceof StoreError) this.conflictCounters.conflicts++;
         if (attempt === TRANSACTION_ATTEMPTS) {
           if (error instanceof StorageBusyError) throw error;
@@ -418,7 +428,7 @@ export class Db {
     options: { mode?: BeginMode; admit?: CommitCheck },
   ): Promise<
     | { committed: true; value: T }
-    | { committed: false; error: StoreError | StorageBusyError }
+    | { committed: false; error: StoreError | StoragePressureError }
   > {
     await this.gate.enter();
     let handle: number | undefined;
@@ -482,6 +492,11 @@ export class Db {
           (error instanceof StoreError && error.conflict)
         ) {
           return { committed: false, error };
+        }
+        if (this.capacity && error instanceof StoreError && error.storageFull) {
+          // Only retry a native full outcome known to have rolled back, never
+          // a failure reported by maintenance after a successful COMMIT.
+          return { committed: false, error: new StoragePressureError(error) };
         }
         throw storageFailure(error);
       }

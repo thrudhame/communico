@@ -1,4 +1,5 @@
 import { lstat, realpath, stat, statfs } from 'node:fs/promises';
+import { lstatSync } from 'node:fs';
 import { dirname, join, relative, resolve, SEPARATOR } from '@std/path';
 import { databaseFiles } from '#engine/store/layout.ts';
 import {
@@ -18,6 +19,20 @@ type Space = {
 export type CapacityProbe = (path: string) => Space | Promise<Space>;
 
 type Claim = { device: string; bytes: number; inodes: number };
+type CacheBlob = {
+  accessedMs: number;
+  unleased(): boolean;
+  removed(): void;
+};
+type RegisteredBlob = CacheBlob & { inode: bigint; device: string };
+type Reclaimable = {
+  path: string;
+  inode: bigint;
+  device: string;
+  physicalDevice: string;
+  bytes: number;
+  blob: RegisteredBlob;
+};
 export type Reservation = { release(): void };
 export type NativeReservation = Reservation & {
   blockSize: number;
@@ -64,6 +79,7 @@ function missing(error: unknown): boolean {
 export class Capacity {
   private lane: Promise<unknown> = Promise.resolve();
   private readonly claims = new Set<Claim>();
+  private readonly cache = new Map<string, RegisteredBlob>();
   private released = Promise.withResolvers<void>();
   private checkpointActive?: { device?: string; peakOvershootBytes: number };
   private readonly checkpointPeaks = new Map<string, number>();
@@ -84,6 +100,53 @@ export class Capacity {
 
   setScratchRoot(path: string): void {
     this.scratchRoot = path;
+  }
+
+  /** The cache owner registers committed, replaceable blobs, never staging. */
+  registerCacheBlob(path: string, blob: CacheBlob): () => void {
+    const file = lstatSync(path, { bigint: true });
+    const registered = Object.assign(blob, {
+      inode: file.ino,
+      device: String(file.dev),
+    });
+    this.cache.set(path, registered);
+    return () => {
+      if (this.cache.get(path) === registered) this.cache.delete(path);
+    };
+  }
+
+  private oldest(blobs: Reclaimable[]): Reclaimable[] {
+    return blobs.sort((a, b) =>
+      a.blob.accessedMs - b.blob.accessedMs ||
+      (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)
+    );
+  }
+
+  private evict(entry: Reclaimable): boolean {
+    // No await between checking the serving lease/identity and unlinking.
+    // This path cannot take the cache lane or write its DB: the reservation
+    // may itself be for a cache index transaction, with the disk full.
+    const { path, blob } = entry;
+    if (this.cache.get(path) !== blob || !blob.unleased()) return false;
+    try {
+      const file = lstatSync(path, { bigint: true });
+      if (
+        !file.isFile() || file.nlink !== 1n || file.ino !== entry.inode ||
+        String(file.dev) !== entry.physicalDevice
+      ) return false;
+      Deno.removeSync(path);
+    } catch (error) {
+      if (
+        missing(error) || error instanceof Deno.errors.NotFound ||
+        error instanceof Deno.errors.PermissionDenied ||
+        (error instanceof Error && 'code' in error && error.code === 'EROFS') ||
+        storageFailure(error) instanceof StoragePressureError
+      ) return false;
+      throw storageFailure(error);
+    }
+    this.cache.delete(path);
+    blob.removed();
+    return true;
   }
 
   // At statement/checkpoint boundaries, sample just scratch rather than
@@ -182,41 +245,73 @@ export class Capacity {
       ) {
         throw new Error('reservation outside capacity roots');
       }
-      const space = await this.space(at);
+      const explicit = typeof this.budget === 'number';
+      let space = await this.space(at);
+      const { blockSize } = space;
       const device = String(space.device);
-      const snap = (await this.status()).filesystems;
-      const disk = snap.find((disk) => disk.device === device);
-      if (!disk && !publication) {
-        throw new Error('reservation device outside capacity roots');
-      }
-      const blockSize = space.blockSize;
       const metadata = footprint.metadataBlocks * blockSize;
       const local = outstanding.filter((claim) => claim.device === device);
-      const explicit = typeof this.budget === 'number';
-      const used = explicit
-        ? snap.reduce((sum, disk) => sum + disk.usedBytes, 0)
-        : disk?.usedBytes ?? 0;
-      const budget = disk
-        ? disk.budgetBytes
-        : this.budget === null
-        ? null
-        : this.budget ?? Math.floor(space.totalBytes * 0.99);
-      const budgetLeft = (budget ?? Infinity) - used;
       const minimum = footprint.bytes === undefined
         ? 0
         : [footprint.bytes, ...(footprint.files ?? [])].reduce(
           (sum, size) => sum + Math.ceil(size / blockSize) * blockSize,
           0,
         );
-      const inodesLeft = space.freeInodes ?? Infinity;
       const needs = minimum + metadata;
-      // Actual exhaustion is independent of claims. A data-dependent native
-      // operation needs its metadata up front; it can only use a checked
-      // ceiling on payload, not a guessed SQL byte cost.
-      if (
-        needs > Math.min(space.freeBytes, budgetLeft) ||
-        footprint.inodes > inodesLeft
-      ) throw new StoragePressureError();
+      let snap = await this.inventory();
+      const budgetRemaining = () => {
+        const disk = snap.filesystems.find((disk) => disk.device === device);
+        if (!disk && !publication) {
+          throw new Error('reservation device outside capacity roots');
+        }
+        const used = explicit
+          ? snap.filesystems.reduce((sum, disk) => sum + disk.usedBytes, 0)
+          : disk?.usedBytes ?? 0;
+        const budget = this.budget === null
+          ? Infinity
+          : disk?.budgetBytes ?? this.budget ??
+            Math.floor(space.totalBytes * 0.99);
+        return budget - used;
+      };
+      let budgetLeft = budgetRemaining();
+      let inodesLeft = space.freeInodes ?? Infinity;
+      let inodes = footprint.inodes - inodesLeft;
+      let physical = needs - space.freeBytes;
+      let software = needs - budgetLeft;
+      if (this.checkpointActive) throw new StorageBusyError(released);
+      if (physical > 0 || software > 0 || inodes > 0) {
+        const eligible = this.oldest(snap.reclaimable);
+        const here = eligible.filter((entry) => entry.device === device);
+        const blocks = (entries: Reclaimable[]) =>
+          entries.reduce((sum, entry) => sum + entry.bytes, 0);
+        // An impossible request must not empty the cache as a side effect.
+        if (
+          physical > blocks(here) || inodes > here.length ||
+          software > blocks(explicit ? eligible : here)
+        ) throw new StoragePressureError();
+        for (const entry of eligible) {
+          if (
+            !((entry.device === device && (physical > 0 || inodes > 0)) ||
+              ((explicit || entry.device === device) && software > 0))
+          ) continue;
+          if (!this.evict(entry)) continue;
+          if (entry.device === device) {
+            physical -= entry.bytes;
+            inodes--;
+          }
+          if (explicit || entry.device === device) software -= entry.bytes;
+          if (physical <= 0 && software <= 0 && inodes <= 0) break;
+        }
+        space = await this.space(at);
+        snap = await this.inventory();
+        budgetLeft = budgetRemaining();
+        inodesLeft = space.freeInodes ?? Infinity;
+        if (this.checkpointActive) throw new StorageBusyError(released);
+        if (
+          needs > Math.min(space.freeBytes, budgetLeft) ||
+          footprint.inodes > inodesLeft
+        ) throw new StoragePressureError();
+      }
       const available = Math.min(
         space.freeBytes - claimedBytes(local),
         budgetLeft - claimedBytes(explicit ? outstanding : local),
@@ -314,6 +409,23 @@ export class Capacity {
     }
   }
 
+  /** Native work discovers its footprint only as it writes. Reclaim only
+   * after rollback and release of its reservation, never inside Turso IO. */
+  reclaimAfterFull(path: string): Promise<boolean> {
+    const result = this.lane.then(async () => {
+      if (this.checkpointActive || this.cache.size === 0) return false;
+      const device = String((await this.space(await ancestor(path))).device);
+      const { reclaimable } = await this.inventory();
+      if (this.checkpointActive) return false;
+      return this.oldest(reclaimable).some((entry) =>
+        (entry.device === device || typeof this.budget === 'number') &&
+        this.evict(entry)
+      );
+    });
+    this.lane = result.catch(() => {});
+    return result;
+  }
+
   /** Never wait here: the file gate already has ordinary transactions paused. */
   async tryCheckpoint(path: string): Promise<
     {
@@ -332,7 +444,14 @@ export class Capacity {
       const device = active.device = String(
         (await this.space(await ancestor(path))).device,
       );
-      const { filesystems } = await this.status();
+      let { filesystems, reclaimable } = await this.inventory();
+      if (
+        this.checkpointFailures.has(files.wal) &&
+        this.oldest(reclaimable).some((entry) =>
+          entry.device === device && this.evict(entry)
+        )
+      ) ({ filesystems } = await this.inventory());
+      await this.observeScratch();
       const disk = filesystems.find((disk) => disk.device === device);
       if (!disk) throw new Error('checkpoint outside capacity roots');
       const dbBytes = await allocated(files.database) +
@@ -366,11 +485,9 @@ export class Capacity {
     }
   }
 
-  async status(): Promise<{
-    filesystems: FilesystemCapacity[];
-    scratch: { currentBytes: number; observedPeakBytes: number };
-  }> {
+  private async inventory() {
     const filesystems = new Map<string, FilesystemCapacity>();
+    const reclaimable: Reclaimable[] = [];
     const seen = new Set<string>();
     const filesystem = (space: Space) => {
       const device = String(space.device);
@@ -422,8 +539,21 @@ export class Capacity {
           );
         const bytes = Number(entry.blocks * 512n);
         disk.usedBytes += bytes;
-        // Until the cache owner can vouch for eviction, treat bytes as protected.
-        disk.protectedBytes += bytes;
+        const blob = this.cache.get(path);
+        if (
+          blob?.unleased() && entry.isFile() && entry.nlink === 1n &&
+          blob.inode === entry.ino && blob.device === device
+        ) {
+          disk.reclaimableBytes += bytes;
+          reclaimable.push({
+            path,
+            inode: entry.ino,
+            device: disk.device,
+            physicalDevice: device,
+            bytes,
+            blob,
+          });
+        } else disk.protectedBytes += bytes;
         if (entry.isDirectory()) {
           for await (const child of Deno.readDir(path)) {
             await visit(join(path, child.name), disk, device);
@@ -466,9 +596,14 @@ export class Capacity {
         overshoot,
       );
     }
+    return { filesystems: disks, reclaimable };
+  }
+
+  async status() {
+    const { filesystems } = await this.inventory();
     const currentBytes = await this.observeScratch() ?? 0;
     return {
-      filesystems: disks,
+      filesystems,
       scratch: {
         currentBytes,
         observedPeakBytes: this.scratchObservedPeakBytes,

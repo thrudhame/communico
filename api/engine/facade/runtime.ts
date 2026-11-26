@@ -4,6 +4,7 @@ import { config, serverName } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { splitId } from '#engine/ids.ts';
 import { drainResources } from '#engine/lifetime.ts';
+import { MediaCache } from '#engine/media/cache.ts';
 import { ContactObservations } from '#engine/federation/pending-contacts.ts';
 import { inboxFailure, workerFailure } from '#engine/request-diagnostics.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
@@ -110,6 +111,13 @@ export async function openFacadeRuntime(
     capacityOwner: capacity,
   });
   const server = await store.server();
+  // Own reclaimable bytes even when this facade phase has no media routes.
+  const mediaCache = new MediaCache(
+    server,
+    config().media.root,
+    undefined,
+    capacity,
+  );
   const journal = new Journal(
     server,
     LINK_SUPPORTED,
@@ -417,6 +425,7 @@ export async function openFacadeRuntime(
     }
   };
   try {
+    await mediaCache.start({ inventoryOnly: true });
     const binding = await bindRole(store, identity);
     if (binding.initialized) {
       node = await loadNode(server, identity.server, identity.node);
@@ -424,7 +433,7 @@ export async function openFacadeRuntime(
     await acceptConfigured();
     await refresh();
   } catch (error) {
-    await store.close();
+    await drainResources([() => mediaCache.close(), () => store.close()]);
     throw error;
   }
   if (caps.service('link-inbox')) {
@@ -963,7 +972,11 @@ export async function openFacadeRuntime(
         await deactivation?.close();
         await profileFanout?.close();
         await releaseServices();
-        await drainResources([() => contacts.close(), () => store.close()]);
+        await drainResources([
+          () => contacts.close(),
+          () => mediaCache.close(),
+          () => store.close(),
+        ]);
       })(),
   };
 }

@@ -38,6 +38,28 @@ Deno.test('facade capacity: local status exposes the default budget before pairi
     const socket = `${tls.dir}/capacity.sock`;
     const settings = `${tls.dir}/capacity.toml`;
     await Deno.mkdir(`${tls.dir}/media`);
+    const store = await openStore(settingsFor(`${tls.dir}/store`), { schemas });
+    let cachedBytes: number;
+    try {
+      const cache = new MediaCache(await store.server(), `${tls.dir}/media`);
+      await cache.start();
+      try {
+        const row = await publish(
+          cache,
+          cacheId('cold-cached-thumbnail', true),
+          8192,
+        );
+        cachedBytes = Number(
+          (await lstat(cache.directory + '/' + row.blob, { bigint: true }))
+            .blocks * 512n,
+        );
+        assert(cachedBytes > 0);
+      } finally {
+        await cache.close();
+      }
+    } finally {
+      await store.close();
+    }
     await Deno.writeTextFile(
       settings,
       `[server]\nname="logical.test"\nrole="facade"\nport=0\n` +
@@ -66,6 +88,7 @@ Deno.test('facade capacity: local status exposes the default budget before pairi
       assert(disk.totalBytes > 0 && disk.freeBytes >= 0);
       assertEquals(disk.budgetBytes, Math.floor(disk.totalBytes * 0.99));
       assertEquals(disk.usedBytes, disk.protectedBytes + disk.reclaimableBytes);
+      assertEquals(disk.reclaimableBytes, cachedBytes);
       assertEquals(typeof disk.quotaBackstop, 'boolean');
       assertEquals(disk.filesystemFull, false);
       assertEquals(disk.checkpoint, {
@@ -406,6 +429,7 @@ Deno.test('facade capacity: staged media and native journal writers cannot overs
       1,
     );
     cache = new MediaCache(reopened, mediaRoot, 32, capacityOwner);
+    await cache.start({ inventoryOnly: true });
     assertEquals((await cache.get(identity))?.size, size);
   } finally {
     await cache?.close();
@@ -676,7 +700,7 @@ Deno.test('facade capacity: outstanding claims fence concurrent staging and chec
 // ENOSPC by changing the OS beneath the other tests.
 async function mediaFixture(
   options: { budgetBytes?: number | null; probe?: CapacityProbe },
-  run: (cache: MediaCache, root: string) => Promise<void>,
+  run: (cache: MediaCache, root: string, capacity: Capacity) => Promise<void>,
 ) {
   const root = await Deno.makeTempDir({ prefix: 'capacity-' });
   const mediaRoot = root + '/media';
@@ -700,7 +724,7 @@ async function mediaFixture(
       capacity,
     );
     await cache.start();
-    await run(cache, mediaRoot);
+    await run(cache, mediaRoot, capacity);
   } finally {
     await cache?.close();
     await store?.close();
@@ -712,7 +736,7 @@ const cacheId = (mediaId: string, thumbnail = false) => ({
   origin: 'remote.test',
   mediaId,
   variant: thumbnail ? 'crop:1:1:png:false' : 'original',
-  scope: 'remote' as const,
+  scope: thumbnail ? 'thumbnail' as const : 'remote' as const,
 });
 const publish = (
   cache: MediaCache,
@@ -776,6 +800,7 @@ Deno.test('facade capacity: exhausted inodes prohibit new files even with the ca
   });
   await mediaFixture({ budgetBytes: null, probe }, async (cache) => {
     const previous = await publish(cache, cacheId('before-inode-full'), 16);
+    const lease = await cache.open(previous);
     const next = cacheId('after-inode-full');
     freeInodes = 0;
     const refusal = await publish(cache, next, 16).then(
@@ -793,51 +818,80 @@ Deno.test('facade capacity: exhausted inodes prohibit new files even with the ca
     );
     freeInodes = 1000;
     assertEquals((await publish(cache, next, 16)).size, 16);
+    await lease.cancel();
   });
 });
 
 Deno.test('facade capacity: evicts the oldest eligible object, never leased bytes or an upload', async () => {
-  await mediaFixture({ budgetBytes: 12 * MiB }, async (cache, root) => {
-    const protectedFile = root + '/previously-confirmed-upload';
-    const protectedBytes = new Uint8Array(4096).fill(59);
-    await Deno.writeFile(protectedFile, protectedBytes);
-    const leased = cacheId('leased');
-    const older = cacheId('older-eligible', true);
-    const newer = cacheId('newer-eligible');
-    const dateNow = Date.now;
-    const start = dateNow();
-    let tick = start;
-    Date.now = () => ++tick;
-    const lease = await (async () => {
+  await mediaFixture(
+    { budgetBytes: 12 * MiB },
+    async (cache, root, capacity) => {
+      const protectedFile = root + '/previously-confirmed-upload';
+      const protectedBytes = new Uint8Array(4096).fill(59);
+      await Deno.writeFile(protectedFile, protectedBytes);
+      const leased = cacheId('leased');
+      const older = cacheId('older-eligible', true);
+      const newer = cacheId('newer-eligible');
+      const allocated = async (id: ReturnType<typeof cacheId>) => {
+        const row = await cache.get(id);
+        assert(row);
+        return Number(
+          (await lstat(cache.directory + '/' + row.blob, { bigint: true }))
+            .blocks * 512n,
+        );
+      };
+      const dateNow = Date.now;
+      const start = dateNow();
+      let tick = start;
+      Date.now = () => ++tick;
+      const lease = await (async () => {
+        try {
+          const pinned = await publish(cache, leased, 3 * MiB);
+          const stream = await cache.open(pinned);
+          const touched = await publish(cache, newer, 3 * MiB);
+          await publish(cache, older, 3 * MiB);
+          await (await cache.open(touched)).cancel();
+          return stream;
+        } finally {
+          Date.now = dateNow;
+        }
+      })();
       try {
-        const pinned = await publish(cache, leased, 3 * MiB);
-        const stream = await cache.open(pinned);
-        await publish(cache, older, 3 * MiB);
-        await publish(cache, newer, 3 * MiB);
-        return stream;
+        const next = cacheId('new-admission');
+        assertEquals(
+          (await capacity.status()).filesystems[0].reclaimableBytes,
+          await allocated(older) + await allocated(newer),
+        );
+        await assertRejects(
+          () => publish(cache, next, 12 * MiB),
+          StoragePressureError,
+        );
+        assertEquals((await cache.get(older))?.size, 3 * MiB);
+        await publish(cache, next, 4 * MiB);
+        assertEquals(
+          await cache.get(older),
+          null,
+          'evict the oldest eligible bytes under pressure',
+        );
+        assertEquals((await cache.get(newer))?.size, 3 * MiB);
+        assertEquals((await cache.get(leased))?.size, 3 * MiB);
+        assertEquals((await cache.get(next))?.size, 4 * MiB);
+        assertEquals(
+          (await capacity.status()).filesystems[0].reclaimableBytes,
+          await allocated(next) + await allocated(newer),
+        );
+        assertEquals(await Deno.readFile(protectedFile), protectedBytes);
+        const read = new Uint8Array(await new Response(lease).arrayBuffer());
+        assertEquals(read.byteLength, 3 * MiB);
+        assert(read.every((value) => value === 73));
+        // The pressure unlink leaves a stale index row; a miss refetches and
+        // republishes it without manual cleanup or a process restart.
+        assertEquals((await publish(cache, older, 1024)).size, 1024);
       } finally {
-        Date.now = dateNow;
+        if (!lease.locked) await lease.cancel();
       }
-    })();
-    try {
-      const next = cacheId('new-admission');
-      await publish(cache, next, 4 * MiB);
-      assertEquals(
-        await cache.get(older),
-        null,
-        'evict the oldest eligible bytes under pressure',
-      );
-      assertEquals((await cache.get(newer))?.size, 3 * MiB);
-      assertEquals((await cache.get(leased))?.size, 3 * MiB);
-      assertEquals((await cache.get(next))?.size, 4 * MiB);
-      assertEquals(await Deno.readFile(protectedFile), protectedBytes);
-      const read = new Uint8Array(await new Response(lease).arrayBuffer());
-      assertEquals(read.byteLength, 3 * MiB);
-      assert(read.every((value) => value === 73));
-    } finally {
-      if (!lease.locked) await lease.cancel();
-    }
-  });
+    },
+  );
 });
 
 Deno.test('facade capacity: authenticated client upload maps storage pressure, not the request size limit', async (t) => {
