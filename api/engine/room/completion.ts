@@ -77,9 +77,10 @@ async function completionSnapshot(
   const receipt = eventId === undefined
     ? 'NULL'
     : '(SELECT through FROM completion_receipts WHERE event=?)';
+  // Seek the last rowid: Turso scans the log for the scalar MAX aggregate.
   const rows = await conn.query(
     `SELECT completion_state.*,
-      (SELECT COALESCE(MAX(pos),0) FROM changes) AS head,
+      COALESCE((SELECT pos FROM changes ORDER BY pos DESC LIMIT 1),0) AS head,
       ${receipt} AS receipt_through FROM completion_state`,
     eventId === undefined ? [] : [eventId],
   );

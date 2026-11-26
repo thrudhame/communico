@@ -300,10 +300,13 @@ export async function eventStateRefs(conn: Conn, ids: readonly string[]) {
     { before: EventStateRef | null; after: EventStateRef | null }
   >();
   if (!ids.length) return out;
+  // Drive the lookup by the input IDs and compare as TEXT so Turso seeks
+  // the existing event key instead of scanning the room's state refs.
   for (
     const row of await conn.query(
       `SELECT s.event, s.before_group, s.after_group, s.provenance
-     FROM json_each(?) AS i JOIN event_state s ON s.event = i.value`,
+     FROM json_each(?) AS i CROSS JOIN event_state s
+     WHERE s.event = CAST(i.value AS TEXT)`,
       [JSON.stringify(ids)],
     )
   ) {
