@@ -948,6 +948,17 @@ function bind(
         media.advanceMediaCopy(conn, id, bytes, sha256),
       finishCopy: (row: media.MediaRow, sha256: string) =>
         media.finishMediaCopy(conn, row, sha256),
+      wanted: (id: string) => media.wantedMedia(conn, id),
+      want: (id: string, demand: string) => media.wantMedia(conn, id, demand),
+      listWanted: (after: string, limit: number) =>
+        media.listWantedMedia(conn, after, limit),
+      stageWant: (id: string, manifest: string, bytes: number) =>
+        media.stageWantedMedia(conn, id, manifest, bytes),
+      finishWant: (id: string) => media.finishMediaWant(conn, id),
+      backing: (id: string) => media.mediaBacking(conn, id),
+      recordBacking: (id: string, pairing: string, fingerprint: string) =>
+        media.recordMediaBacking(conn, id, pairing, fingerprint),
+      insertCopy: (row: media.MediaRow) => media.insertCopiedMedia(conn, row),
     },
     delayedEvents: {
       newId: () => delayedEvents.newId(conn),

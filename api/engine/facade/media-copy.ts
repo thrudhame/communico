@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { canonicalJson } from '#engine/canonical.ts';
 import { mediaIssuedBy } from '#engine/media.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
-import type { ExportRow } from '#engine/tenant/media.ts';
+import type { ExportRow, MediaRow } from '#engine/tenant/media.ts';
 import type { PageLimits } from './journal.ts';
 import { integer, LinkError, object, text } from './protocol.ts';
 
@@ -19,7 +19,7 @@ export function isMediaCopyRoute(route: string): route is MediaCopyRoute {
   return MEDIA_COPY_ROUTES.some((candidate) => candidate === route);
 }
 
-type Manifest = {
+export type Manifest = {
   origin: string;
   id: string;
   owner: string;
@@ -33,19 +33,21 @@ type Manifest = {
   uploaded: number;
 };
 const encoder = new TextEncoder();
-const sizeOf = (value: unknown) => encoder.encode(canonicalJson(value)).length;
-const sha256 = (bytes: Uint8Array | string) =>
+export const sizeOf = (value: unknown) =>
+  encoder.encode(canonicalJson(value)).length;
+export const sha256 = (bytes: Uint8Array | string) =>
   createHash('sha256').update(bytes).digest('hex');
 const emptyDigest = sha256('');
-const fingerprint = (manifest: Manifest) => sha256(canonicalJson(manifest));
-const diverged = (why: string): never => {
+export const fingerprint = (manifest: Manifest) =>
+  sha256(canonicalJson(manifest));
+export const diverged = (why: string): never => {
   throw new LinkError('LINK_DIVERGED', why);
 };
-const bad = (why: string): never => {
+export const bad = (why: string): never => {
   throw new LinkError('LINK_BAD_RECORD', why, 400);
 };
 
-function digest(raw: unknown): string {
+export function digest(raw: unknown): string {
   const value = text(raw);
   if (!/^[a-f0-9]{64}$/.test(value)) bad('invalid media digest');
   return value;
@@ -57,7 +59,11 @@ function idOf(raw: unknown, node: string): string {
   return id;
 }
 
-function manifestOf(raw: unknown, origin: string, node: string): Manifest {
+export function manifestOf(
+  raw: unknown,
+  origin: string,
+  parseId: (raw: unknown) => string,
+): Manifest {
   const m = object(raw);
   if (m.origin !== origin || m.access !== 'origin-media-v1') {
     bad('wrong media origin or access policy');
@@ -76,7 +82,7 @@ function manifestOf(raw: unknown, origin: string, node: string): Manifest {
   }
   return {
     origin,
-    id: idOf(m.id, node),
+    id: parseId(m.id),
     owner: text(m.owner),
     access: 'origin-media-v1',
     contentType,
@@ -88,7 +94,11 @@ function manifestOf(raw: unknown, origin: string, node: string): Manifest {
   };
 }
 
-function exported(row: ExportRow, origin: string, node: string): Manifest {
+export function exported(
+  row: ExportRow,
+  origin: string,
+  parseId: (raw: unknown) => string,
+): Manifest {
   return manifestOf(
     {
       origin,
@@ -103,17 +113,30 @@ function exported(row: ExportRow, origin: string, node: string): Manifest {
       uploaded: row.uploaded_ms,
     },
     origin,
-    node,
+    parseId,
   );
 }
 
-async function readExactly(file: Deno.FsFile, bytes: Uint8Array) {
+export async function readExactly(file: Deno.FsFile, bytes: Uint8Array) {
   let read = 0;
   while (read < bytes.length) {
     const n = await file.read(bytes.subarray(read));
     if (!n) diverged('media file ended below its durable size');
     read += n!;
   }
+}
+
+export function copiedMetadata(m: Manifest): MediaRow {
+  return {
+    media_id: m.id,
+    localpart: m.owner,
+    state: 'uploaded',
+    content_type: m.contentType,
+    filename: m.filename,
+    size_bytes: m.size,
+    created_ms: m.created,
+    uploaded_ms: m.uploaded,
+  };
 }
 
 export class FacadeMediaExports {
@@ -146,7 +169,11 @@ export class FacadeMediaExports {
       const manifests: Manifest[] = [];
       let bytes = sizeOf(manifests);
       for (const row of rows) {
-        const manifest = exported(row, this.tenant.serverName, this.node);
+        const manifest = exported(
+          row,
+          this.tenant.serverName,
+          (raw) => idOf(raw, this.node),
+        );
         bytes += sizeOf(manifest) + (manifests.length ? 1 : 0);
         if (bytes > maxBytes) {
           if (!manifests.length) bad('media manifest exceeds link page budget');
@@ -160,7 +187,11 @@ export class FacadeMediaExports {
     const expected = digest(body.fingerprint);
     const check = (row: ExportRow | null) => {
       if (!row) return diverged('unknown media export');
-      const m = exported(row, this.tenant.serverName, this.node);
+      const m = exported(
+        row,
+        this.tenant.serverName,
+        (raw) => idOf(raw, this.node),
+      );
       if (fingerprint(m) !== expected) {
         diverged('media export fingerprint changed');
       }
@@ -223,7 +254,7 @@ export type MediaPull = (
 
 // Hash from the beginning when resuming. The size alone doesn't prove a cut,
 // and an uncommitted tail (write before DB commit) is never trusted.
-async function hashPrefix(
+export async function hashPrefix(
   file: Deno.FsFile,
   size: number,
   signal?: AbortSignal,
@@ -242,7 +273,7 @@ async function hashPrefix(
   return hash;
 }
 
-async function openExisting(path: string) {
+export async function openExisting(path: string) {
   try {
     return await Deno.open(path, { read: true });
   } catch (e) {
@@ -251,7 +282,7 @@ async function openExisting(path: string) {
   }
 }
 
-async function syncDir(path: string) {
+export async function syncDir(path: string) {
   using dir = await Deno.open(path, { read: true });
   await dir.sync();
 }
@@ -283,7 +314,7 @@ export class HomeMediaCopies {
       }
       if (!raw.length) return;
       const manifests = raw.map((value) =>
-        manifestOf(value, this.tenant.serverName, node)
+        manifestOf(value, this.tenant.serverName, (raw) => idOf(raw, node))
       );
       for (const m of manifests) {
         if (m.id <= after) diverged('unordered media manifest page');
@@ -450,16 +481,7 @@ export class HomeMediaCopies {
     }
     await syncDir(this.root);
     await this.tenant.tx((tx) =>
-      tx.media.finishCopy({
-        media_id: m.id,
-        localpart: m.owner,
-        state: 'uploaded',
-        content_type: m.contentType,
-        filename: m.filename,
-        size_bytes: m.size,
-        created_ms: m.created,
-        uploaded_ms: m.uploaded,
-      }, m.sha256)
+      tx.media.finishCopy(copiedMetadata(m), m.sha256)
     );
   }
 }

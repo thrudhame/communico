@@ -14,6 +14,7 @@ import {
   LIVE_ACTIVITY_CAPABILITY,
   type LiveActivity,
   MEDIA_COPY_CAPABILITY,
+  MEDIA_WANTS_CAPABILITY,
   negotiate,
   object,
   recordOf,
@@ -23,6 +24,7 @@ import {
 } from './protocol.ts';
 import { LINK_PREFIX, LinkClient, type LinkTls } from './transport.ts';
 import { type FacadeMediaExports, isMediaCopyRoute } from './media-copy.ts';
+import { type FacadeMediaWants, isMediaWantRoute } from './media-wants.ts';
 
 async function message(request: Request): Promise<Record<string, unknown>> {
   try {
@@ -212,6 +214,7 @@ export function linkHandler(options: {
   signKeyDocument?(raw: unknown): Promise<string>;
   activity?: LiveActivity;
   mediaExports?(): FacadeMediaExports | undefined;
+  mediaWants?(): FacadeMediaWants | undefined;
 }): (request: Request, peerPin: string) => Promise<Response> {
   const challenges = new Map<string, { token: string; started: number }>();
   const enroll = enrollmentHandler(options);
@@ -238,7 +241,7 @@ export function linkHandler(options: {
         ['hello', 'records', 'notices'].includes(route)) ||
         (request.method === 'POST' &&
           (['records', 'ack', 'key-signature', 'activity'].includes(route) ||
-            isMediaCopyRoute(route))))
+            isMediaCopyRoute(route) || isMediaWantRoute(route))))
     ) {
       return new Response(null, { status: 404 });
     }
@@ -272,6 +275,25 @@ export function linkHandler(options: {
         pairing: id,
         ...value,
       });
+    if (isMediaWantRoute(route)) {
+      const wants = options.mediaWants?.();
+      if (
+        !wants ||
+        !required.some((entry) =>
+          entry.type === MEDIA_WANTS_CAPABILITY.type &&
+          entry.version === MEDIA_WANTS_CAPABILITY.version
+        )
+      ) {
+        throw new LinkError(
+          'LINK_CAPABILITY_MISMATCH',
+          'media wants not negotiated',
+        );
+      }
+      return response({
+        ...await wants.exchange(route, id, body),
+        required: [...LINK_CAPABILITIES, MEDIA_WANTS_CAPABILITY],
+      });
+    }
     if (isMediaCopyRoute(route)) {
       const exports = options.mediaExports?.();
       if (
@@ -415,8 +437,10 @@ export function linkHandler(options: {
       return response({
         revision: grant.body.revision,
         supported: journal.supported.filter((entry) =>
-          entry.type !== MEDIA_COPY_CAPABILITY.type ||
-          options.mediaExports?.() !== undefined
+          (entry.type !== MEDIA_COPY_CAPABILITY.type ||
+            options.mediaExports?.() !== undefined) &&
+          (entry.type !== MEDIA_WANTS_CAPABILITY.type ||
+            options.mediaWants?.() !== undefined)
         ),
         scopes: [],
         outgoing,

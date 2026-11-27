@@ -5,6 +5,7 @@ export default async function (request: PathfinderRequest) {
   const response = await serveMedia(
     request.params.serverName as string,
     request.params.mediaId as string,
+    request._raw.signal,
   );
   response.headers.set(
     'Content-Disposition',

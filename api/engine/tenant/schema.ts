@@ -8,7 +8,11 @@
 // transaction as the write it stamps (no sequences). The store owns the
 // id row and the meta table; this provider owns everything else.
 import type { SchemaProvider } from '#engine/store/create.ts';
-import { MEDIA_COPIES_SQL, MEDIA_EXPORTS_SQL } from '#engine/tenant/media.ts';
+import {
+  MEDIA_COPIES_SQL,
+  MEDIA_EXPORTS_SQL,
+  MEDIA_WANTS_SQL,
+} from '#engine/tenant/media.ts';
 import { recordPusherChange } from '#engine/tenant/pushers.ts';
 import { OWNER_CONTROL_SQL } from '#engine/facade/schema.ts';
 import {
@@ -311,11 +315,12 @@ INSERT INTO deactivation_work SELECT localpart,EXISTS(SELECT 1 FROM erased_users
 `;
 
 export const tenantSchema: SchemaProvider = {
-  version: 47,
+  version: 48,
   apply: async (db) => {
     await db.exec(TENANT_SCHEMA_SQL);
     await db.exec(MEDIA_EXPORTS_SQL);
     await db.exec(MEDIA_COPIES_SQL);
+    await db.exec(MEDIA_WANTS_SQL);
     await db.exec(E2EE_SQL);
     await db.exec(INBOX_SQL);
     await db.exec(TRANSPORT_SQL);
@@ -359,6 +364,7 @@ export const tenantSchema: SchemaProvider = {
     await db.exec(TO_DEVICE_ROUTE_LOOKUPS_SQL);
   },
   migrations: {
+    47: (conn) => conn.exec(MEDIA_WANTS_SQL),
     46: (conn) => conn.exec(MEDIA_COPIES_SQL),
     45: (conn) => conn.exec(MEDIA_EXPORTS_SQL),
     44: (conn) => conn.exec(BACKUP_PUBLICATION_SQL),

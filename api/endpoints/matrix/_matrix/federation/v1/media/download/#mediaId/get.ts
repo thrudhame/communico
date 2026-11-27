@@ -6,6 +6,10 @@ import type { PathfinderRequest } from '@pathfinder/pathfinder';
 export default async function (request: PathfinderRequest) {
   assertFederationEnabled();
   return multipartResponse(
-    await serveMedia(serverName(), request.params.mediaId as string),
+    await serveMedia(
+      serverName(),
+      request.params.mediaId as string,
+      request._raw.signal,
+    ),
   );
 }

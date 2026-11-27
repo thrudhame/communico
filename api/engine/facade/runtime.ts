@@ -35,6 +35,7 @@ import {
 import { Journal } from './journal.ts';
 import { linkHandler } from './link.ts';
 import { FacadeMediaExports } from './media-copy.ts';
+import { FacadeMediaWants } from './media-wants.ts';
 import { ActivityExchange } from './activity.ts';
 import { NoticeHub } from './notices.ts';
 import { Pairings, pairingStatus } from './pairing.ts';
@@ -163,6 +164,7 @@ export async function openFacadeRuntime(
   const notices = new NoticeHub();
   let node: NodeIdentity | undefined;
   let tenant: Tenant | undefined;
+  let mediaWants: FacadeMediaWants | undefined;
   const devicePublished = async (user: string, id: number) => {
     const { localpart, server } = splitId(user);
     if (!user.startsWith('@') || !localpart || server !== identity.server) {
@@ -274,6 +276,20 @@ export async function openFacadeRuntime(
         ? new FacadeAuth(server, owner, node, authHealth, settings)
         : undefined,
     );
+    if (caps.service('media')) {
+      mediaWants ??= new FacadeMediaWants(
+        tenant,
+        mediaRoot,
+        identity.node,
+        {
+          maxItems: settings.batchmaxitems,
+          maxBytes: settings.batchmaxbytes,
+        },
+        capacity,
+        readiness,
+        config().media.timeoutms,
+      );
+    }
     if (caps.service('deactivation') && !deactivation) {
       deactivation = startDeactivationWork({
         store,
@@ -599,6 +615,13 @@ export async function openFacadeRuntime(
     notices,
     capabilities: caps,
     localMediaCache: caps.service('media') ? mediaCache : undefined,
+    async wantMedia(id: string, signal: AbortSignal) {
+      if (!mediaWants) {
+        throw new MatrixError(503, 'M_UNAVAILABLE', 'Media unavailable');
+      }
+      const grant = await (await pairings()).active();
+      await mediaWants.read(id, grant.body.transcript.body.context.id, signal);
+    },
     mediaEgress: mediaEgress.check,
     pairings,
     verificationKeys: async () => (await keyOwner()).verificationKeys(),
@@ -965,6 +988,7 @@ export async function openFacadeRuntime(
               maxBytes: settings.batchmaxbytes,
             })
           : undefined,
+        mediaWants: () => mediaWants,
         notices,
         changed: refresh,
         received: () => {
