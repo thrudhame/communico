@@ -1,9 +1,12 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { capabilities } from '#engine/facade/capabilities.ts';
 import { setConfigForTests } from '#engine/config.ts';
+import { newMediaId } from '#engine/media.ts';
 import { signJson } from '#engine/signing-primitives.js';
 import { openStore } from '#engine/store/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
+import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
+import { createMedia, getMedia } from '#engine/tenant/media.ts';
 import { adminCall } from './admin-client.ts';
 import { makeServer, seedServer } from './federation/doc-helper.ts';
 import { facadeProcess as process } from './helpers/facade-process.ts';
@@ -53,6 +56,7 @@ Deno.test('single facade media: offline wire upload and signed cold read', async
   const remote = await makeServer('media-peer.test');
   let edge: Awaited<ReturnType<typeof process>> | undefined;
   let home: Awaited<ReturnType<typeof process>> | undefined;
+  let homeProbe: Deno.HttpServer | undefined;
   try {
     for (const side of ['home', 'facade']) {
       await Deno.writeTextFile(
@@ -68,13 +72,19 @@ Deno.test('single facade media: offline wire upload and signed cold read', async
             : ''),
       );
     }
-    const seed = await openStore({
-      dir: `${tls.dir}/facade-store`,
-      library: './.native/libturso_ffi.so',
-      checkpointlogbytes: 65536,
-      maxopenfiles: 8,
-      idleseconds: 300,
-    }, { schemas: { server: serverSchema } });
+    const facadeStore = () =>
+      openStore({
+        dir: `${tls.dir}/facade-store`,
+        library: './.native/libturso_ffi.so',
+        checkpointlogbytes: 65536,
+        maxopenfiles: 8,
+        idleseconds: 300,
+      }, { schemas: { server: serverSchema, tenant: tenantSchema } });
+    const outbound = async (store: Awaited<ReturnType<typeof facadeStore>>) =>
+      await (await store.server()).query(
+        "SELECT * FROM facade_streams WHERE direction='out' ORDER BY peer,source,incarnation,stream",
+      );
+    const seed = await facadeStore();
     try {
       await seedServer(await seed.server(), remote);
     } finally {
@@ -99,17 +109,20 @@ Deno.test('single facade media: offline wire upload and signed cold read', async
       username: 'media-owner',
       password: 'local-media-password',
     };
-    const registration = await register(credentials);
-    assertEquals(registration.status, 401);
-    const enrolled = await register({
-      ...credentials,
-      auth: {
-        type: 'm.login.dummy',
-        session: (await registration.json()).session,
-      },
-    });
-    assertEquals(enrolled.status, 200);
-    await enrolled.body?.cancel();
+    for (const username of [credentials.username, 'other-owner']) {
+      const registration = await register({ ...credentials, username });
+      assertEquals(registration.status, 401);
+      const enrolled = await register({
+        ...credentials,
+        username,
+        auth: {
+          type: 'm.login.dummy',
+          session: (await registration.json()).session,
+        },
+      });
+      assertEquals(enrolled.status, 200);
+      await enrolled.body?.cancel();
+    }
     const paired = await adminCall(socket('home'), 'facade/pair', {
       node: 'edge_a',
       url: `https://127.0.0.1:${linkPort}`,
@@ -123,13 +136,15 @@ Deno.test('single facade media: offline wire upload and signed cold read', async
         .status,
       200,
     );
-    for (const stream of ['auth', 'key-bootstrap', 'devices']) {
-      await edge.observations.fact({
-        peer: 'home',
-        source: 'home',
-        incarnation: paired.body.result.id,
-        stream: `${stream}:@media-owner:logical.test`,
-      }, () => true);
+    for (const username of [credentials.username, 'other-owner']) {
+      for (const stream of ['auth', 'key-bootstrap', 'devices']) {
+        await edge.observations.fact({
+          peer: 'home',
+          source: 'home',
+          incarnation: paired.body.result.id,
+          stream: `${stream}:@${username}:logical.test`,
+        }, () => true);
+      }
     }
     let port = await edge.port('client');
     await home.stop();
@@ -137,6 +152,21 @@ Deno.test('single facade media: offline wire upload and signed cold read', async
       Deno.connect({ hostname: '127.0.0.1', port: homePort })
     );
     await edge.stop();
+    setConfigForTests({
+      server: { name: 'logical.test', role: 'facade' },
+      facade: { nodeid: 'edge_b' },
+    });
+    const foreignId = newMediaId();
+    setConfigForTests({ server: { name: 'logical.test' } });
+    const disconnected = await facadeStore();
+    try {
+      const tenant = await openTenant(disconnected, 'logical.test');
+      // Make the issuer check discriminating: same tenant, correct user,
+      // durable unexpired reservation, but minted by a different edge.
+      await createMedia(tenant, credentials.username, foreignId, 'pending');
+    } finally {
+      await disconnected.close();
+    }
     edge = await process(file('facade'), 'facade: link/local admin ready');
     const state =
       (await adminCall(socket('facade'), 'facade/status')).body.result;
@@ -148,32 +178,55 @@ Deno.test('single facade media: offline wire upload and signed cold read', async
       ),
     );
     port = await edge.port('client');
-    const login = await fetch(
-      `http://127.0.0.1:${port}/_matrix/client/v3/login`,
-      {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          type: 'm.login.password',
-          identifier: { type: 'm.id.user', user: credentials.username },
-          password: credentials.password,
-          device_id: 'offline-media',
-        }),
-      },
-    );
-    const session = await login.json();
-    assertEquals(login.status, 200, login.ok ? undefined : session.error);
-    const token = session.access_token;
+    const loginAtEdge = async (username: string) => {
+      const login = await fetch(
+        `http://127.0.0.1:${port}/_matrix/client/v3/login`,
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            type: 'm.login.password',
+            identifier: { type: 'm.id.user', user: username },
+            password: credentials.password,
+            device_id: 'offline-media',
+          }),
+        },
+      );
+      const session = await login.json();
+      assertEquals(login.status, 200, login.ok ? undefined : session.error);
+      return session.access_token as string;
+    };
+    const token = await loginAtEdge(credentials.username);
+    const other = await loginAtEdge('other-owner');
+    // Login publishes device authority; take the baseline after both logins,
+    // before any media requests, with no writer sharing the store.
+    await edge.stop();
+    const before = await facadeStore();
+    const outboundBefore = await outbound(before).finally(() => before.close());
+    const seen: string[] = [];
+    homeProbe = Deno.serve({
+      hostname: '127.0.0.1',
+      port: homePort,
+      onListen() {},
+    }, (r) => {
+      seen.push(new URL(r.url).pathname);
+      return new Response('probe');
+    });
+    const target = `127.0.0.1:${homePort}`;
+    assertEquals(await (await fetch(`http://${target}/probe`)).text(), 'probe');
+    edge = await process(file('facade'), 'facade: link/local admin ready');
+    port = await edge.port('client');
     const request = (
       path: string,
       method = 'GET',
       body?: string,
       auth = true,
+      acting = token,
     ) =>
       fetch(`http://127.0.0.1:${port}${path}`, {
         method,
         headers: {
-          ...(auth ? { authorization: 'Bearer ' + token } : {}),
+          ...(auth ? { authorization: 'Bearer ' + acting } : {}),
           ...(body ? { 'content-type': 'text/plain' } : {}),
         },
         body,
@@ -221,6 +274,24 @@ Deno.test('single facade media: offline wire upload and signed cold read', async
     assertEquals(unfilled.status, 504);
     assertEquals((await unfilled.json()).errcode, 'M_NOT_YET_UPLOADED');
     const put = media + '/upload/logical.test/' + pendingId;
+    await test.step('wrong owner cannot fill a live local reservation', async () => {
+      const result = await request(put, 'PUT', 'wrong', true, other);
+      assertEquals([result.status, (await result.json()).errcode], [
+        403,
+        'M_FORBIDDEN',
+      ]);
+    });
+    await test.step('wrong issuer cannot fill even a durable own reservation', async () => {
+      const result = await request(
+        media + '/upload/logical.test/' + foreignId,
+        'PUT',
+        'wrong',
+      );
+      assertEquals([result.status, (await result.json()).errcode], [
+        404,
+        'M_NOT_FOUND',
+      ]);
+    });
     const completed = await request(
       put + '?filename=reserved.txt',
       'PUT',
@@ -286,6 +357,33 @@ Deno.test('single facade media: offline wire upload and signed cold read', async
       );
       assert(multipart.endsWith(`\r\n\r\n${expected}\r\n--${boundary}--\r\n`));
     }
+
+    await test.step('foreign media cannot open an outbound path or queue home work', async () => {
+      for (const route of ['download', 'thumbnail']) {
+        const result = await request(
+          `/_matrix/client/v1/media/${route}/${target}/${directId}?width=32&height=32`,
+        );
+        assertEquals([result.status, (await result.json()).errcode], [
+          404,
+          'M_NOT_FOUND',
+        ]);
+      }
+      await edge!.stop();
+      await homeProbe!.shutdown();
+      homeProbe = undefined;
+      assertEquals(seen, ['/probe']);
+      const after = await facadeStore();
+      try {
+        assertEquals(await outbound(after), outboundBefore);
+        assertEquals(
+          (await getMedia(await openTenant(after, 'logical.test'), foreignId))
+            ?.state,
+          'pending',
+        );
+      } finally {
+        await after.close();
+      }
+    });
 
     const ready = 'facade: link/local admin ready';
     const importMap = await mediaPublicationOverlay(tls.dir);
@@ -402,6 +500,7 @@ Deno.test('single facade media: offline wire upload and signed cold read', async
       );
     }
   } finally {
+    await homeProbe?.shutdown();
     await home?.dispose();
     await edge?.dispose();
     await tls.close();
