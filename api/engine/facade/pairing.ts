@@ -266,6 +266,7 @@ export class Pairings {
     private readonly pin: string,
     private readonly node?: NodeIdentity,
     private readonly supported: readonly Capability[] = LINK_SUPPORTED,
+    private readonly retiring?: (pairing: string) => void,
   ) {
     this.key = keyOf({ keyId: signer.keyId, publicKey });
     pinOf(pin);
@@ -625,6 +626,8 @@ export class Pairings {
       if (revocation.body.revision <= Number(control.revision)) {
         refused('regressing control revision');
       }
+      // Stop relying on remote retention before the authority can change.
+      this.retiring?.(row.id);
       await conn.execute(
         'UPDATE facade_control SET revision=? WHERE singleton=1',
         [revocation.body.revision],

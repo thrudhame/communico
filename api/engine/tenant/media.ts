@@ -126,6 +126,38 @@ export async function mediaBacking(conn: Conn, id: string) {
     : null;
 }
 
+// Complete local originals with proof from the current home. Keep the proof
+// and uploaded row when capacity evicts the bytes. A staged cut is not proof.
+export async function backedMedia(
+  conn: Conn,
+  pairing: string,
+  issuer: string,
+) {
+  const rows = await conn.query(
+    `SELECT m.*, b.fingerprint FROM media m JOIN media_backing b USING(media_id)
+     WHERE b.pairing = ? AND m.state = 'uploaded'
+     AND NOT EXISTS (SELECT 1 FROM media_wants w WHERE w.media_id = m.media_id)
+     UNION
+     SELECT m.*, c.fingerprint FROM media m JOIN media_exports e USING(media_id)
+     JOIN media_export_confirmations c USING(media_id)
+     WHERE c.pairing = ? AND e.issuer = ? AND m.state = 'uploaded'
+     AND NOT EXISTS (SELECT 1 FROM media_wants w WHERE w.media_id = m.media_id)`,
+    [pairing, pairing, issuer],
+  );
+  return rows.map((row) => ({
+    row: rowOf(row),
+    mark: String(row.fingerprint),
+  }));
+}
+
+export async function exportConfirmation(conn: Conn, id: string) {
+  const [row] = await conn.query(
+    'SELECT fingerprint FROM media_export_confirmations WHERE media_id = ? LIMIT 1',
+    [id],
+  );
+  return row ? String(row.fingerprint) : null;
+}
+
 export async function recordMediaBacking(
   conn: Conn,
   id: string,

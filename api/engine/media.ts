@@ -14,6 +14,7 @@ import { isStoragePressure, storageFailure } from '#engine/store/pressure.ts';
 import { withStorageHold } from '#engine/store/holds.ts';
 import { b64encode } from '#engine/signing-primitives.js';
 import { createHash } from 'node:crypto';
+import { leasedReadable } from '#engine/media/cache.ts';
 
 export function mediaRoot(): string {
   return config().media.root;
@@ -416,13 +417,32 @@ export async function serveMedia(
       'Content is not yet available',
     );
   }
-  const file = await Deno.open(`${mediaRoot()}/${mediaId}`, { read: true })
-    .catch((error) => {
-      if (error instanceof Deno.errors.NotFound) {
-        throw new MatrixError(503, 'M_UNAVAILABLE', 'Media bytes unavailable');
-      }
-      throw error;
-    });
+  const open = app.replica?.openLocalMedia;
+  const unavailable = () =>
+    new MatrixError(503, 'M_UNAVAILABLE', 'Media unavailable; try again later');
+  let body: ReadableStream<Uint8Array>;
+  if (open) {
+    let lease = await open(mediaId);
+    if (!lease) {
+      await app.replica?.wantMedia?.(mediaId, signal);
+      lease = await open(mediaId);
+      if (!lease) throw unavailable();
+    }
+    body = leasedReadable(lease);
+  } else {
+    const file = await Deno.open(`${mediaRoot()}/${mediaId}`, { read: true })
+      .catch((error) => {
+        if (error instanceof Deno.errors.NotFound) {
+          throw new MatrixError(
+            503,
+            'M_UNAVAILABLE',
+            'Media bytes unavailable',
+          );
+        }
+        throw error;
+      });
+    body = file.readable;
+  }
   const contentType = row.content_type ?? 'application/octet-stream';
   const headers = new Headers({
     'Content-Type': contentType,
@@ -435,5 +455,5 @@ export async function serveMedia(
   if (row.size_bytes !== null) {
     headers.set('Content-Length', String(row.size_bytes));
   }
-  return new Response(file.readable, { headers });
+  return new Response(body, { headers });
 }

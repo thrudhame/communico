@@ -4,10 +4,12 @@ import { Buffer } from 'node:buffer';
 import { canonicalJson } from '#engine/canonical.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { mediaIssuedBy, mediaReservationExpires } from '#engine/media.ts';
+import type { MediaCache } from '#engine/media/cache.ts';
 import type { Capacity } from '#engine/store/capacity.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import type { PageLimits } from './journal.ts';
 import {
+  admitHomeBackedOriginal,
   bad,
   copiedMetadata,
   digest,
@@ -62,6 +64,7 @@ export class FacadeMediaWants {
     private readonly capacity: Capacity,
     private readonly readiness: ReplicaReadiness,
     private readonly remoteWaitMs: number,
+    private readonly cache: MediaCache,
   ) {}
 
   private async locked<T>(id: string, write: () => Promise<T>): Promise<T> {
@@ -77,6 +80,17 @@ export class FacadeMediaWants {
 
   private part(id: string) {
     return `${this.root}/${id}.wanted.part`;
+  }
+
+  async open(id: string) {
+    return await this.locked(id, async () => {
+      // A process can stop after installing the file but before committing its
+      // backing and clearing the staged cut. Never serve across that cut.
+      if ((await this.tenant.tx((tx) => tx.media.wanted(id)))?.manifest) {
+        return null;
+      }
+      return await this.cache.openOriginal(id);
+    });
   }
 
   private async staged(id: string) {
@@ -102,6 +116,26 @@ export class FacadeMediaWants {
         async (observe) => {
           observe(pairing, stream(id));
           return await this.locked(id, async () => {
+            const { want, manifest, pairing: owner } = await this.staged(id);
+            if (
+              want && manifest && owner === pairing &&
+              want.bytes === manifest.size
+            ) {
+              await this.apply(pairing, manifest);
+              return;
+            }
+            const row = await this.tenant.tx((tx) => tx.media.byId(id));
+            if (row?.state === 'uploaded' && !manifest) {
+              using lease = await this.cache.openOriginal(id);
+              if (lease) return;
+            }
+            if (
+              mediaIssuedBy(id, this.node) &&
+              !await this.tenant.tx(async (tx) =>
+                await tx.media.backing(id) ||
+                await tx.media.exportConfirmation(id)
+              )
+            ) throw unavailable();
             if (reader?.answer === 'absent') {
               throw new MatrixError(404, 'M_NOT_FOUND', 'Unknown media');
             }
@@ -113,19 +147,6 @@ export class FacadeMediaWants {
                 'M_NOT_YET_UPLOADED',
                 'Content is not yet available',
               );
-            }
-            const row = await this.tenant.tx((tx) => tx.media.byId(id));
-            if (row?.state === 'uploaded') {
-              using file = await openExisting(`${this.root}/${id}`);
-              if (file) return;
-            }
-            const { want, manifest, pairing: owner } = await this.staged(id);
-            if (
-              want && manifest && owner === pairing &&
-              want.bytes === manifest.size
-            ) {
-              await this.apply(pairing, manifest);
-              return;
             }
             if (!reader) {
               const demand = crypto.randomUUID();
@@ -229,9 +250,13 @@ export class FacadeMediaWants {
         const bytes = held.want.bytes;
         await this.tenant.tx(async (tx) => {
           const backing = await tx.media.backing(id);
+          const confirmed = await tx.media.exportConfirmation(id);
           const local = await tx.media.byId(id);
           if (backing && backing.fingerprint !== mark) {
             diverged('wanted backing changed');
+          }
+          if (confirmed && confirmed !== mark) {
+            diverged('wanted confirmation changed');
           }
           if (
             local &&
@@ -342,6 +367,7 @@ export class FacadeMediaWants {
     // request cancellation or link disconnect is not an input to publication.
     const final = `${this.root}/${m.id}`;
     const part = this.part(m.id);
+    using _pin = this.cache.pinOriginal(m.id);
     await this.capacity.ensureDirectory(this.root);
     await this.capacity.withMetadata(final, 1, async (space) => {
       space.track(part);
@@ -391,6 +417,13 @@ export class FacadeMediaWants {
       await tx.media.recordBacking(m.id, pairing, fingerprint(m));
       await tx.media.finishWant(m.id);
     });
+    await admitHomeBackedOriginal(
+      this.cache,
+      copiedMetadata(m),
+      this.tenant.serverName,
+      pairing,
+      fingerprint(m),
+    );
     this.readiness.applied(pairing, stream(m.id));
   }
 }

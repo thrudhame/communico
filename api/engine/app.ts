@@ -135,6 +135,9 @@ export type ReplicaAccess = {
   pushSender?(): Promise<PushSender | undefined>;
   delayedEvents?(tenant: Tenant): Promise<DelayedEvents | undefined>;
   localMediaCache?: MediaCache;
+  openLocalMedia?(
+    id: string,
+  ): Promise<import('./media/cache.ts').OriginalLease | null>;
   wantMedia?(id: string, signal: AbortSignal): Promise<void>;
   mediaEgress?: (ip: string) => void;
   sender?(): Promise<Sender | undefined>;

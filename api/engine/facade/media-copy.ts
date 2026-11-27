@@ -1,6 +1,7 @@
 // A separate typed pull stream over the enrolled home link. Only metadata and
 // verified progress cuts live in the database; the staged bytes live on disk.
 import { Buffer } from 'node:buffer';
+import type { MediaCache } from '#engine/media/cache.ts';
 import { createHash } from 'node:crypto';
 import { canonicalJson } from '#engine/canonical.ts';
 import { mediaIssuedBy } from '#engine/media.ts';
@@ -126,6 +127,31 @@ export async function readExactly(file: Deno.FsFile, bytes: Uint8Array) {
   }
 }
 
+export async function admitHomeBackedOriginal(
+  cache: MediaCache,
+  row: MediaRow,
+  server: string,
+  pairing: string,
+  mark: string,
+) {
+  if (row.size_bytes === null) return;
+  const size = row.size_bytes;
+  await cache.verifyOriginal(
+    row.media_id,
+    pairing,
+    row.created_ms,
+    async (file) =>
+      (await file.stat()).size === size && fingerprint(exported(
+          {
+            ...row,
+            sha256: (await hashPrefix(file, size)).digest('hex'),
+          },
+          server,
+          (id) => text(id),
+        )) === mark,
+  );
+}
+
 export function copiedMetadata(m: Manifest): MediaRow {
   return {
     media_id: m.id,
@@ -142,9 +168,9 @@ export function copiedMetadata(m: Manifest): MediaRow {
 export class FacadeMediaExports {
   constructor(
     private readonly tenant: Tenant,
-    private readonly root: string,
     private readonly node: string,
     private readonly limits: PageLimits,
+    private readonly cache: MediaCache,
   ) {}
 
   async exchange(
@@ -199,13 +225,20 @@ export class FacadeMediaExports {
     };
     if (route === 'media-applied') {
       // The exact object result belongs to the current authenticated pairing.
-      // Keep original retention unchanged until wanted/refetch is available.
-      await this.tenant.tx(async (tx) => {
-        check(await tx.media.exportById(this.node, id));
+      const m = await this.tenant.tx(async (tx) => {
+        const m = check(await tx.media.exportById(this.node, id));
         if (!await tx.media.confirmExport(id, pairing, expected)) {
           diverged('media confirmation changed');
         }
+        return m;
       });
+      await admitHomeBackedOriginal(
+        this.cache,
+        copiedMetadata(m),
+        this.tenant.serverName,
+        pairing,
+        expected,
+      );
       return { applied: { id, fingerprint: expected } };
     }
     const m = check(
@@ -225,24 +258,24 @@ export class FacadeMediaExports {
       sizeOf(header);
     const length = Math.min(m.size - offset, Math.floor(encodedBudget / 4) * 3);
     if (length <= 0) bad('media chunk cannot fit link page budget');
-    const file = await Deno.open(`${this.root}/${id}`, { read: true });
-    try {
-      if ((await file.stat()).size !== m.size) {
-        diverged('media source size changed');
-      }
-      await file.seek(offset, Deno.SeekMode.Start);
-      const bytes = Buffer.alloc(length);
-      await readExactly(file, bytes);
-      return {
-        chunk: {
-          ...header,
-          sha256: sha256(bytes),
-          base64: bytes.toString('base64'),
-        },
-      };
-    } finally {
-      file.close();
+    using lease = await this.cache.openOriginal(id);
+    if (!lease) {
+      throw new LinkError('LINK_UNAVAILABLE', 'Media bytes unavailable', 503);
     }
+    const { file } = lease;
+    if ((await file.stat()).size !== m.size) {
+      diverged('media source size changed');
+    }
+    await file.seek(offset, Deno.SeekMode.Start);
+    const bytes = Buffer.alloc(length);
+    await readExactly(file, bytes);
+    return {
+      chunk: {
+        ...header,
+        sha256: sha256(bytes),
+        base64: bytes.toString('base64'),
+      },
+    };
   }
 }
 

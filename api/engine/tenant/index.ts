@@ -956,6 +956,7 @@ function bind(
         media.stageWantedMedia(conn, id, manifest, bytes),
       finishWant: (id: string) => media.finishMediaWant(conn, id),
       backing: (id: string) => media.mediaBacking(conn, id),
+      exportConfirmation: (id: string) => media.exportConfirmation(conn, id),
       recordBacking: (id: string, pairing: string, fingerprint: string) =>
         media.recordMediaBacking(conn, id, pairing, fingerprint),
       insertCopy: (row: media.MediaRow) => media.insertCopiedMedia(conn, row),

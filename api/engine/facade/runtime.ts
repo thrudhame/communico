@@ -22,6 +22,7 @@ import {
   StoragePressureError,
 } from '#engine/store/pressure.ts';
 import { type Tenant, tenantSchema } from '#engine/tenant/index.ts';
+import { backedMedia } from '#engine/tenant/media.ts';
 import { capabilities } from './capabilities.ts';
 import { FacadeKeys } from './control.ts';
 import {
@@ -34,7 +35,7 @@ import {
 } from './identity.ts';
 import { Journal } from './journal.ts';
 import { linkHandler } from './link.ts';
-import { FacadeMediaExports } from './media-copy.ts';
+import { admitHomeBackedOriginal, FacadeMediaExports } from './media-copy.ts';
 import { FacadeMediaWants } from './media-wants.ts';
 import { ActivityExchange } from './activity.ts';
 import { NoticeHub } from './notices.ts';
@@ -138,6 +139,40 @@ export async function openFacadeRuntime(
       prepared = { binding, server, mediaCache, mediaEgress };
       await mediaEgress.load();
       await mediaCache.start({ inventoryOnly: true });
+      if (!caps.service('media') || !binding.initialized) return;
+      const node = await loadNode(server, identity.server, identity.node);
+      const pairings = new Pairings(
+        server,
+        node.signer(),
+        node.publicKey,
+        pin,
+        node,
+      );
+      const grant = await pairings.active().catch((error) => {
+        if (error instanceof LinkError && error.code === 'LINK_UNPAIRED') {
+          return;
+        }
+        throw error;
+      });
+      if (
+        !grant || grant.body.transcript.body.context.url !== settings.url ||
+        !(await store.tenants()).includes(identity.server)
+      ) return;
+      const pairing = grant.body.transcript.body.context.id;
+      const db = await store.tenant(identity.server);
+      const originals = await db.tx((conn) =>
+        backedMedia(conn, pairing, node.node)
+      );
+      mediaCache.bindOriginals(pairing);
+      for (const { row, mark } of originals) {
+        await admitHomeBackedOriginal(
+          mediaCache,
+          row,
+          identity.server,
+          pairing,
+          mark,
+        );
+      }
     },
     capacityOwner: capacity,
   }).catch(async (error: unknown) => {
@@ -212,7 +247,15 @@ export async function openFacadeRuntime(
       );
     }
     return Promise.resolve(
-      new Pairings(server, node.signer(), node.publicKey, pin, node),
+      new Pairings(
+        server,
+        node.signer(),
+        node.publicKey,
+        pin,
+        node,
+        LINK_SUPPORTED,
+        (pairing) => mediaCache.retireOriginals(pairing),
+      ),
     );
   };
   const keyOwner = async () => {
@@ -255,6 +298,7 @@ export async function openFacadeRuntime(
       grant = await owner.active();
     } catch (error) {
       if (error instanceof LinkError && error.code === 'LINK_UNPAIRED') {
+        mediaCache.bindOriginals(undefined);
         await releaseRoomExports();
         return;
       }
@@ -277,6 +321,7 @@ export async function openFacadeRuntime(
         : undefined,
     );
     if (caps.service('media')) {
+      mediaCache.bindOriginals(grant.body.transcript.body.context.id);
       mediaWants ??= new FacadeMediaWants(
         tenant,
         mediaRoot,
@@ -288,6 +333,7 @@ export async function openFacadeRuntime(
         capacity,
         readiness,
         config().media.timeoutms,
+        mediaCache,
       );
     }
     if (caps.service('deactivation') && !deactivation) {
@@ -615,6 +661,7 @@ export async function openFacadeRuntime(
     notices,
     capabilities: caps,
     localMediaCache: caps.service('media') ? mediaCache : undefined,
+    openLocalMedia: (id: string) => mediaWants!.open(id),
     async wantMedia(id: string, signal: AbortSignal) {
       if (!mediaWants) {
         throw new MatrixError(503, 'M_UNAVAILABLE', 'Media unavailable');
@@ -983,10 +1030,10 @@ export async function openFacadeRuntime(
         },
         mediaExports: settings.phase === 'f2'
           ? () =>
-            tenant && new FacadeMediaExports(tenant, mediaRoot, identity.node, {
+            tenant && new FacadeMediaExports(tenant, identity.node, {
               maxItems: settings.batchmaxitems,
               maxBytes: settings.batchmaxbytes,
-            })
+            }, mediaCache)
           : undefined,
         mediaWants: () => mediaWants,
         notices,
