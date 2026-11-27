@@ -266,21 +266,9 @@ async function writeUploadBody(
   strict: boolean,
 ): Promise<{ sizeBytes: number; digest: string }> {
   const finalPath = `${root}/${mediaId}`;
-  // The store lock grants this node exclusive use of its publication root and
-  // the per-ID lock spans the file and tenant commit. Do not replace a final
-  // left behind after an ambiguous error; recovery reconciles it first.
-  if (strict) {
-    try {
-      await Deno.lstat(finalPath);
-      throw new MatrixError(
-        503,
-        'M_UNAVAILABLE',
-        'Media publication unavailable',
-      );
-    } catch (error) {
-      if (!(error instanceof Deno.errors.NotFound)) throw error;
-    }
-  }
+  // The media root belongs to this facade; a store lock is not a lock on a
+  // separately configured media root. Install without replacement even if an
+  // earlier ambiguous attempt or another writer left a final at this path.
   let file: Deno.FsFile | null = await Deno.open(partPath, {
     createNew: true,
     write: true,
@@ -288,7 +276,7 @@ async function writeUploadBody(
   });
   let size = 0;
   const hash = createHash('sha256');
-  let renamed = false;
+  let installed = false;
   try {
     if (stream !== null) {
       for await (const chunk of stream) {
@@ -312,8 +300,23 @@ async function writeUploadBody(
     await file.sync();
     file.close();
     file = null;
-    await Deno.rename(partPath, finalPath);
-    renamed = true;
+    if (strict) {
+      try {
+        await Deno.link(partPath, finalPath);
+      } catch (error) {
+        if (!(error instanceof Deno.errors.AlreadyExists)) throw error;
+        throw new MatrixError(
+          503,
+          'M_UNAVAILABLE',
+          'Media publication unavailable',
+        );
+      }
+      installed = true;
+      await Deno.remove(partPath);
+    } else {
+      await Deno.rename(partPath, finalPath);
+      installed = true;
+    }
     const directory = await Deno.open(root, { read: true });
     try {
       await directory.sync();
@@ -322,9 +325,8 @@ async function writeUploadBody(
     }
   } catch (error) {
     file?.close();
-    await Deno.remove(renamed ? finalPath : partPath).catch((cleanup) => {
-      if (!(cleanup instanceof Deno.errors.NotFound)) throw cleanup;
-    });
+    await removeUploadFile(partPath);
+    if (installed) await removeUploadFile(finalPath);
     throw error;
   }
   return { sizeBytes: size, digest: hash.digest('hex') };

@@ -487,7 +487,7 @@ export async function facadeProcess(
   config: string,
   ready: string,
   heldPublications: string[] = [],
-  options: { probeScratch?: string } = {},
+  options: { probeScratch?: string; importMap?: string } = {},
 ) {
   const observations = new FacadeObservations();
   const initialHolds = new Set(heldPublications);
@@ -496,6 +496,7 @@ export async function facadeProcess(
   const child = new Deno.Command(Deno.execPath(), {
     args: [
       ...metadata.tasks.start.split(' ').slice(1, -1),
+      ...(options.importMap ? ['--import-map', options.importMap] : []),
       'tests/fixtures/facade-child.ts',
     ],
     env: {
@@ -658,6 +659,12 @@ export async function facadeProcess(
       const status = await bounded(output);
       assertEquals(status.code, 0, out + '\n' + err);
       assert(out.includes('shutdown: store closed'));
+    },
+    async crash() {
+      assert(!ended, out + '\n' + err);
+      child.kill('SIGKILL');
+      assertEquals((await bounded(output)).signal, 'SIGKILL');
+      await closeCommands();
     },
     dispose,
   };

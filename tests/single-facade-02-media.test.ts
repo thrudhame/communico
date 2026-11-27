@@ -8,6 +8,7 @@ import { adminCall } from './admin-client.ts';
 import { makeServer, seedServer } from './federation/doc-helper.ts';
 import { facadeProcess as process } from './helpers/facade-process.ts';
 import { fixtureLink } from './helpers/fixture-listeners.ts';
+import { mediaPublicationOverlay } from './helpers/media-publication.ts';
 import { facadeTls } from './support/facade-tls.ts';
 
 Deno.test('single facade media: F2 admits local upload and origin read without home', () => {
@@ -43,7 +44,7 @@ Deno.test('single facade media: F2 admits local upload and origin read without h
   }
 });
 
-Deno.test('single facade media: offline wire upload and signed cold read', async () => {
+Deno.test('single facade media: offline wire upload and signed cold read', async (test) => {
   const tls = await facadeTls();
   const file = (side: string) => `${tls.dir}/${side}.toml`;
   const socket = (side: string) => `${tls.dir}/${side}.sock`;
@@ -284,6 +285,121 @@ Deno.test('single facade media: offline wire upload and signed cold read', async
         ),
       );
       assert(multipart.endsWith(`\r\n\r\n${expected}\r\n--${boundary}--\r\n`));
+    }
+
+    const ready = 'facade: link/local admin ready';
+    const importMap = await mediaPublicationOverlay(tls.dir);
+    const mediaRoot = `${tls.dir}/facade-media`;
+    const restart = async (hold?: string) => {
+      await edge?.stop();
+      edge = await process(file('facade'), ready, hold ? [hold] : [], {
+        importMap: hold ? importMap : undefined,
+      });
+      port = await edge.port('client');
+      return edge;
+    };
+    const newReservation = async () => {
+      const response = await request(reserve, 'POST');
+      assertEquals(response.status, 200);
+      return (await response.json()).content_uri.slice(prefix.length) as string;
+    };
+    assert(
+      await test.step('installation cannot overwrite a final that already exists', async () => {
+        const child = await restart('before-install');
+        const cut = await child.holdPublication('before-install');
+        const id = await newReservation();
+        const pending = request(
+          media + '/upload/logical.test/' + id,
+          'PUT',
+          'candidate',
+        );
+        await cut.held();
+        const final = `${mediaRoot}/${id}`;
+        await Deno.writeTextFile(final, 'incumbent', { createNew: true });
+        await cut.release();
+        const response = await pending;
+        await response.body?.cancel();
+        assertEquals(await Deno.readTextFile(final), 'incumbent');
+        assertEquals(response.status, 503);
+        await Deno.remove(final);
+      }),
+    );
+    const acked = new Map([[directId, 'direct bytes'], [
+      pendingId,
+      'reserved bytes',
+    ]]);
+    for (
+      const cutName of [
+        'file-sync',
+        'install',
+        'metadata-insert',
+        'metadata-update',
+        'intent',
+        'before-response',
+        'after-response',
+      ]
+    ) {
+      assert(
+        await test.step(`SIGKILL at ${cutName}`, async () => {
+          const after = cutName === 'after-response';
+          const child = await restart(after ? undefined : cutName);
+          const hold = after ? undefined : await child.holdPublication(cutName);
+          let id = cutName === 'metadata-insert' ? '' : await newReservation();
+          const body = `bytes at ${cutName}`;
+          const filling = id !== '';
+          const result = request(
+            filling ? media + '/upload/logical.test/' + id : media + '/upload',
+            filling ? 'PUT' : 'POST',
+            body,
+          );
+          // Handle the expected disconnect immediately; assert it after the kill.
+          result.catch(() => {});
+          if (after) {
+            const response = await result;
+            assertEquals(response.status, 200);
+            assertEquals(await response.json(), {});
+            acked.set(id, body);
+          } else {
+            await hold!.held();
+            if (!filling) {
+              const files = [];
+              for await (const entry of Deno.readDir(mediaRoot)) {
+                if (entry.isFile && !acked.has(entry.name)) {
+                  files.push(entry.name);
+                }
+              }
+              assertEquals(files.length, 1);
+              id = files[0];
+            }
+          }
+          await child.crash();
+          edge = undefined;
+          if (!after) await assertRejects(() => result);
+          await restart();
+          for (const [ack, bytes] of acked) {
+            const response = await request(download + ack);
+            assertEquals(response.status, 200, ack);
+            assertEquals(await response.text(), bytes);
+          }
+          if (!after) {
+            const response = await request(download + id);
+            if (cutName === 'before-response') {
+              // Commit succeeded but the caller did not see its ACK.
+              assertEquals(response.status, 200);
+              assertEquals(await response.text(), body);
+              acked.set(id, body);
+            } else {
+              assertEquals(response.status, filling ? 504 : 404);
+              await response.body?.cancel();
+            }
+          }
+          const originals = [];
+          for await (const entry of Deno.readDir(mediaRoot)) {
+            if (entry.isFile) originals.push(entry.name);
+          }
+          assertEquals(originals.sort(), [...acked.keys()].sort());
+        }),
+      );
     }
   } finally {
     await home?.dispose();
