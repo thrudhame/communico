@@ -2,7 +2,7 @@
 // indexes, bounded walks with limits and stop sets, status transitions.
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import type { Conn } from '#engine/store/db.ts';
-import type { Value } from '#engine/store/ffi.ts';
+import { StoreError, type Value } from '#engine/store/ffi.ts';
 import {
   ancestors,
   authChildrenOf,
@@ -136,7 +136,16 @@ Deno.test('room events: insert/get/list and edges from the PDU', async () => {
         ['$c'],
       );
       // A duplicate id is a constraint error; events never change.
-      await assertRejects(() => insertEvent(conn, '$c', create));
+      const duplicate = await assertRejects(
+        () => insertEvent(conn, '$c', create),
+        StoreError,
+        'UNIQUE constraint failed: events.id',
+      );
+      // The first INSERT failed before any event or edges were changed.
+      conn.recoverStatement(
+        duplicate,
+        (error) => error.message === 'UNIQUE constraint failed: events.id',
+      );
       const repeated = pdu({
         prev_events: ['$c', '$c', '$m1'],
         auth_events: ['$m1', '$m1', '$c'],

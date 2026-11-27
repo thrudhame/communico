@@ -12,7 +12,7 @@ import {
   touchCachedMedia,
 } from '#engine/server/media.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
-import { storageFailure } from '#engine/store/pressure.ts';
+import { isStoragePressure, storageFailure } from '#engine/store/pressure.ts';
 import { withStorageHold } from '#engine/store/holds.ts';
 import { abortable } from '#engine/net/abort.ts';
 
@@ -84,17 +84,21 @@ export class MediaCache {
       if (this.capacity) await this.capacity.ensureDirectory(this.directory);
       else await Deno.mkdir(this.directory, { recursive: true });
     }
+    let directoryPresent = true;
     if (this.capacity) {
       try {
         // The inventory uses canonical roots and never follows child links.
         if (!(await Deno.lstat(this.directory)).isDirectory) {
-          if (inventoryOnly) return;
-          throw new Error('invalid managed cache directory');
-        }
-        this.canonicalDirectory = await Deno.realPath(this.directory);
+          if (!inventoryOnly) {
+            throw new Error('invalid managed cache directory');
+          }
+          directoryPresent = false;
+        } else this.canonicalDirectory = await Deno.realPath(this.directory);
       } catch (error) {
-        if (inventoryOnly && error instanceof Deno.errors.NotFound) return;
-        throw error;
+        if (!(inventoryOnly && error instanceof Deno.errors.NotFound)) {
+          throw error;
+        }
+        directoryPresent = false;
       }
     }
     const rows = await listCachedMedia(this.db);
@@ -103,16 +107,20 @@ export class MediaCache {
       if (!BLOB.test(row.blob)) {
         throw new Error('invalid media cache blob identity');
       }
+      if (!directoryPresent) continue;
       try {
         const stat = await Deno.lstat(this.directory + '/' + row.blob);
         if (!stat.isFile || stat.size !== row.size) {
           throw new Deno.errors.NotFound();
         }
         known.add(row.blob);
-        this.register(row);
       } catch (error) {
         if (!(error instanceof Deno.errors.NotFound)) throw error;
       }
+    }
+    // Verify the entire index before making any entry eligible for eviction.
+    for (const row of rows) {
+      if (known.has(row.blob)) this.register(row);
     }
     if (inventoryOnly) return;
     for (const row of rows) {
@@ -295,7 +303,7 @@ export class MediaCache {
         if (maxBytes === undefined) {
           throw new Error('media size bound required');
         }
-        space = await this.capacity.reserveStaging(part, maxBytes);
+        space = await this.capacity.reserveStaging(part, maxBytes, signal);
         space.track(this.directory + '/' + blob);
       }
       signal.throwIfAborted();
@@ -405,7 +413,15 @@ export class MediaCache {
       try {
         file = await Deno.open(this.directory + '/' + row.blob, { read: true });
         const now = Date.now();
-        await touchCachedMedia(this.db, row.cache_key, now);
+        try {
+          // The serving lease already protects the file; recency is best
+          // effort under pressure and stays current in the live cache index.
+          await withStorageHold(() =>
+            touchCachedMedia(this.db, row.cache_key, now)
+          );
+        } catch (error) {
+          if (!isStoragePressure(error)) throw error;
+        }
         current.accessed_ms = now;
       } catch (error) {
         file?.close();
@@ -453,9 +469,20 @@ export class MediaCache {
     await this.locked(async () => {
       const rows = [];
       for (const row of await listCachedMedia(this.db)) {
-        if (this.capacity && !this.registered.has(row.cache_key)) {
+        const current = this.capacity
+          ? this.registered.get(row.cache_key)?.row
+          : row;
+        if (!current) {
           await deleteCachedMedia(this.db, row.cache_key);
-        } else rows.push(row);
+        } else rows.push(current);
+      }
+      if (this.capacity) {
+        // Recency updates can succeed in memory but not on disk. Reorder
+        // the managed rows as well as using them for the expiry threshold.
+        rows.sort((a, b) =>
+          a.accessed_ms - b.accessed_ms ||
+          (a.cache_key < b.cache_key ? -1 : a.cache_key > b.cache_key ? 1 : 0)
+        );
       }
       let total = rows.reduce((n, r) => n + r.size, 0);
       const scopes = { remote: 0, thumbnail: 0 };

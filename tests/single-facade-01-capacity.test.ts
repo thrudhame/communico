@@ -4,10 +4,13 @@ import { initializeNode } from '#engine/facade/identity.ts';
 import { enrollLink, linkHandler } from '#engine/facade/link.ts';
 import { NoticeHub } from '#engine/facade/notices.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
+import { bindRole } from '#engine/facade/role.ts';
+import { openFacadeRuntime } from '#engine/facade/runtime.ts';
 import {
   EMPTY_CUT,
   LINK_CAPABILITIES,
   LINK_VERSION,
+  LinkError,
   type LinkRecord,
 } from '#engine/facade/protocol.ts';
 import { LinkClient, startLinkTransport } from '#engine/facade/transport.ts';
@@ -20,11 +23,13 @@ import { Capacity, type CapacityProbe } from '#engine/store/capacity.ts';
 import { createDatabase } from '#engine/store/create.ts';
 import { type Database, Db } from '#engine/store/db.ts';
 import { StoreError, Turso } from '#engine/store/ffi.ts';
+import { databaseFiles, serverDirectory } from '#engine/store/layout.ts';
 import {
   StorageBusyError,
   StoragePressureError,
 } from '#engine/store/pressure.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
+import { onStartup } from '#engine/store/watermark.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { lstat } from 'node:fs/promises';
@@ -87,6 +92,10 @@ Deno.test('facade capacity: local status exposes the default budget before pairi
       assertEquals(response.body.result.initialized, false);
       const capacity = response.body.result.capacity;
       assert(capacity, 'local facade status must show storage capacity');
+      assertEquals(
+        capacity.coldStartReclamation,
+        'after-identity-and-cache-index',
+      );
       assertEquals(capacity.filesystems.length, 1);
       const [disk] = capacity.filesystems;
       assert(disk.totalBytes > 0 && disk.freeBytes >= 0);
@@ -123,6 +132,185 @@ Deno.test('facade capacity: local status exposes the default budget before pairi
     }
   } finally {
     await tls.close();
+  }
+});
+
+Deno.test('facade capacity review: register only verified cache before recovery writes', async (t) => {
+  const tls = await facadeTls();
+  const settings = settingsFor(`${tls.dir}/store`);
+  const mediaRoot = `${tls.dir}/media`;
+  const identity = {
+    role: 'facade',
+    server: 'logical.test',
+    node: 'edge_a',
+  } as const;
+  let writeDuringStartup: (() => Promise<void>) | undefined;
+  onStartup(async (opening) => {
+    const db = await opening.server();
+    if (writeDuringStartup && db.path.startsWith(`${settings.dir}/`)) {
+      await db.execute('INSERT INTO startup_receipt VALUES (1)');
+      await writeDuringStartup();
+    }
+  });
+  try {
+    const owner = new Capacity([settings.dir, mediaRoot], null);
+    const store = await openStore(settings, { schemas, capacityOwner: owner });
+    let blobPath: string;
+    try {
+      await bindRole(store, identity);
+      const db = await store.server();
+      await db.exec('CREATE TABLE startup_receipt (id INTEGER PRIMARY KEY)');
+      const cache = new MediaCache(db, mediaRoot, undefined, owner);
+      try {
+        await cache.start();
+        const row = await publish(cache, cacheId('startup'), MiB);
+        blobPath = `${cache.directory}/${row.blob}`;
+      } finally {
+        await cache.close();
+      }
+      await db.execute(
+        `INSERT INTO media_cache SELECT 'bad',origin,'bad',variant,scope,'invalid',size,content_type,filename,created_ms,accessed_ms+1 FROM media_cache`,
+      );
+    } finally {
+      await store.close();
+    }
+    const configure = (budget: number, nodeid: string = identity.node) =>
+      setConfigForTests({
+        server: { name: identity.server, role: identity.role },
+        media: { root: mediaRoot },
+        facade: {
+          phase: 'f0',
+          nodeid,
+          storagebudgetbytes: budget,
+          linkcert: `${tls.dir}/facade.crt`,
+          linkkey: `${tls.dir}/facade.key`,
+          linkcacerts: [`${tls.dir}/ca.crt`],
+        },
+      });
+    const usage = (await owner.status()).filesystems[0].usedBytes;
+    let recovered = false;
+    writeDuringStartup = () => {
+      recovered = true;
+      return Promise.resolve();
+    };
+    const start = async () => {
+      const runtime = await openFacadeRuntime(settings);
+      await runtime.close();
+    };
+    await t.step(
+      'wrong durable identity leaves the cache untouched',
+      async () => {
+        configure(usage - MiB / 2, 'edge_b');
+        const error = await assertRejects(start, LinkError);
+        assertEquals(error.code, 'LINK_IDENTITY_MISMATCH');
+        assertEquals(recovered, false);
+        assertEquals((await Deno.stat(blobPath)).size, MiB);
+      },
+    );
+    await t.step(
+      'a malformed index never exposes a partially verified cache',
+      async () => {
+        configure(usage - MiB / 2);
+        const register = Capacity.prototype.registerCacheBlob;
+        let registered = false;
+        Capacity.prototype.registerCacheBlob = function (path, blob) {
+          if (path === blobPath) registered = true;
+          return register.call(this, path, blob);
+        };
+        try {
+          await assertRejects(
+            start,
+            Error,
+            'invalid media cache blob identity',
+          );
+        } finally {
+          Capacity.prototype.registerCacheBlob = register;
+        }
+        assertEquals(registered, false);
+        assertEquals(recovered, false);
+        assertEquals((await Deno.stat(blobPath)).size, MiB);
+      },
+    );
+    // Repair the fixture without running its startup write. A fresh owner
+    // below will account the store with the valid cache still on disk.
+    const files = databaseFiles(serverDirectory(settings.dir));
+    const fix = new Turso(settings.library);
+    try {
+      const db = await Db.open(fix, files.database, MiB);
+      try {
+        await db.execute("DELETE FROM media_cache WHERE cache_key='bad'");
+      } finally {
+        await db.close();
+      }
+    } finally {
+      fix.close();
+    }
+    await t.step(
+      'unreservable open reports retryable pressure without cache deletion',
+      async () => {
+        // Force the native open to need an inode, without discarding any WAL
+        // records. Restore the fixture for the clean-reopen case below.
+        assertEquals((await Deno.stat(files.wal)).size, 0);
+        await Deno.rename(files.wal, `${tls.dir}/saved-wal`);
+        try {
+          configure(usage - MiB / 2);
+          await assertRejects(
+            start,
+            StoragePressureError,
+            'Facade startup blocked by storage pressure',
+          );
+          await assertRejects(() => Deno.stat(files.wal), Deno.errors.NotFound);
+          assertEquals(recovered, false);
+          assertEquals((await Deno.stat(blobPath)).size, MiB);
+        } finally {
+          await Deno.rename(`${tls.dir}/saved-wal`, files.wal);
+        }
+      },
+    );
+    await t.step(
+      'a clean store can reclaim indexed cache for startup work',
+      async () => {
+        configure(usage - MiB / 2);
+        await start();
+        assertEquals(recovered, true);
+        await assertRejects(() => Deno.stat(blobPath), Deno.errors.NotFound);
+      },
+    );
+  } finally {
+    writeDuringStartup = undefined;
+    setConfigForTests({});
+    await tls.close();
+  }
+});
+
+Deno.test('facade capacity review: sweep private staging before reserving scratch', async () => {
+  const root = await Deno.makeTempDir({ prefix: 'facade-sweep-scratch-' });
+  const settings = settingsFor(`${root}/store`);
+  const stage = `${settings.dir}/rooms/abandoned.new`;
+  await Deno.mkdir(stage, { recursive: true });
+  await Deno.writeTextFile(`${stage}/payload`, 'unpublished');
+  const capacityOwner = new Capacity([settings.dir], null, async () => {
+    const occupied = await Deno.stat(stage).then(() => true, (error) => {
+      if (error instanceof Deno.errors.NotFound) return false;
+      throw error;
+    });
+    return {
+      totalBytes: 64 * MiB,
+      freeBytes: occupied ? 0 : 64 * MiB,
+      freeInodes: occupied ? 0 : 100,
+      blockSize: 4096,
+      device: 'test',
+    };
+  });
+  let store: Store | undefined;
+  try {
+    store = await openStore(settings, { schemas, capacityOwner });
+    assertEquals(Deno.env.get('TMPDIR'), `${settings.dir}/.scratch`);
+    assert((await Deno.stat(`${settings.dir}/.scratch`)).isDirectory);
+    await assertRejects(() => Deno.stat(stage), Deno.errors.NotFound);
+  } finally {
+    await store?.close();
+    await Deno.remove(root, { recursive: true });
   }
 });
 
@@ -267,6 +455,316 @@ Deno.test('facade capacity: incremental grants continue during a status walk', a
   }
 });
 
+Deno.test('facade capacity review: moving the last alias preserves its inode charge', async () => {
+  const root = await Deno.makeTempDir();
+  try {
+    const from = `${root}/from`;
+    const to = `${root}/to`;
+    const known = `${root}/known`;
+    await Deno.mkdir(from);
+    await Deno.writeFile(known, new Uint8Array(4096).fill(1));
+    await Deno.link(known, `${from}/alias`);
+    const capacity = new Capacity([root]);
+    await capacity.initialize();
+    await Deno.writeFile(known, new Uint8Array(65536).fill(2));
+    capacity.refresh(known);
+    await capacity.remove(known);
+    await Deno.rename(from, to);
+    capacity.moved(from, to);
+    assertEquals(
+      capacity.accountedBytes(),
+      (await new Capacity([root]).status()).filesystems[0].usedBytes,
+    );
+  } finally {
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test('facade capacity review: a scan preserves settled growth through a surviving alias', async () => {
+  const root = await Deno.makeTempDir();
+  const readDir = Deno.readDir;
+  const scanned = Promise.withResolvers<void>();
+  const resume = Promise.withResolvers<void>();
+  let status: ReturnType<Capacity['status']> | undefined;
+  try {
+    const file = `${root}/first`;
+    const alias = `${root}/second`;
+    await Deno.writeFile(file, new Uint8Array(4096).fill(1));
+    await Deno.link(file, alias);
+    const capacity = new Capacity([root]);
+    await capacity.initialize();
+    Deno.readDir = async function* (path) {
+      yield* readDir(path);
+      if (path === root) {
+        scanned.resolve();
+        await resume.promise;
+      }
+    };
+    status = capacity.status();
+    await Promise.race([scanned.promise, status]);
+    const grant = await capacity.reserveStaging(file, 65536);
+    try {
+      await Deno.writeFile(file, new Uint8Array(65536).fill(2));
+    } finally {
+      grant.release();
+    }
+    await capacity.remove(file);
+    const settled = capacity.accountedBytes();
+    resume.resolve();
+    assertEquals((await status).filesystems[0].usedBytes, settled);
+    assertEquals(capacity.accountedBytes(), settled);
+    await capacity.remove(alias);
+    const withoutAliases = capacity.accountedBytes();
+    assert(withoutAliases < settled);
+    assertEquals(
+      (await capacity.status()).filesystems[0].usedBytes,
+      withoutAliases,
+    );
+  } finally {
+    Deno.readDir = readDir;
+    resume.resolve();
+    await status?.catch(() => undefined);
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test('facade capacity review: pressure reclaims a registered file only after its other link is gone', async () => {
+  const root = await Deno.makeTempDir();
+  try {
+    const file = `${root}/blob`;
+    const alias = `${root}/alias`;
+    await Deno.writeFile(file, new Uint8Array(65536).fill(1));
+    await Deno.link(file, alias);
+    const capacity = new Capacity([root], 65536);
+    await capacity.initialize();
+    let evicted = false;
+    capacity.registerCacheBlob(file, {
+      accessedMs: 0,
+      unleased: () => true,
+      removed: () => evicted = true,
+    });
+    const reserve = () => capacity.reserveStaging(`${root}/pending`, 4096);
+    await assertRejects(reserve, StoragePressureError);
+    assert(!evicted);
+    await capacity.remove(alias);
+    (await reserve()).release();
+    assert(evicted);
+    await assertRejects(() => Deno.lstat(file), Deno.errors.NotFound);
+  } finally {
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test('facade capacity review: status accounts for a live staging file only through its grant', async () => {
+  const root = await Deno.makeTempDir();
+  try {
+    const capacity = new Capacity([root]);
+    const path = `${root}/stage`;
+    const lease = await capacity.reserveStaging(path, 64 * 1024);
+    const before = capacity.accountedBytes();
+    try {
+      await Deno.writeFile(path, new Uint8Array(64 * 1024).fill(1));
+      const [disk] = (await capacity.status()).filesystems;
+      assertEquals(disk.usedBytes, before);
+      assertEquals(disk.protectedBytes, before);
+      assertEquals(disk.reclaimableBytes, 0);
+      assert(disk.reservedBytes >= 64 * 1024);
+    } finally {
+      lease.release();
+    }
+    const [committed] = (await capacity.status()).filesystems;
+    assertEquals(committed.reservedBytes, 0);
+    assert(committed.usedBytes >= before + 64 * 1024);
+  } finally {
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test('facade capacity review: observing scratch does not leave an admission charge', async () => {
+  const root = await Deno.makeTempDir();
+  try {
+    const scratch = `${root}/.scratch`;
+    await Deno.mkdir(scratch);
+    const before =
+      (await new Capacity([root]).status()).filesystems[0].usedBytes;
+    const capacity = new Capacity([root], before + 64 * 1024);
+    capacity.setScratchRoot(scratch);
+    const spill = `${scratch}/spill`;
+    await Deno.writeFile(spill, new Uint8Array(128 * 1024).fill(1));
+    const observed = await capacity.status();
+    assert(observed.scratch.currentBytes >= 128 * 1024);
+    assertEquals(
+      observed.scratch.observedPeakBytes,
+      observed.scratch.currentBytes,
+    );
+    assertEquals(
+      observed.filesystems[0].protectedBytes,
+      before + observed.scratch.currentBytes,
+    );
+    await Deno.remove(spill);
+    (await capacity.reserveStaging(`${root}/stage`, 4096)).release();
+    const clean = await capacity.status();
+    assertEquals(clean.scratch.currentBytes, 0);
+    assertEquals(
+      clean.scratch.observedPeakBytes,
+      observed.scratch.currentBytes,
+    );
+  } finally {
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test('facade capacity review: materialized staging makes a recoverable physical shortfall busy', async () => {
+  const root = await Deno.makeTempDir();
+  try {
+    let freeBytes = 163840;
+    let freeInodes = 1;
+    const capacity = new Capacity([root], null, () => ({
+      totalBytes: MiB,
+      freeBytes,
+      freeInodes,
+      device: 1,
+      blockSize: 4096,
+    }));
+    const path = `${root}/stage`;
+    const lease = await capacity.reserveStaging(path, 128 * 1024);
+    try {
+      await Deno.writeFile(path, new Uint8Array(128 * 1024).fill(1));
+      freeBytes -= 128 * 1024;
+      freeInodes--;
+      await assertRejects(
+        () =>
+          new Admission().run(() =>
+            capacity.reserveStaging(`${root}/next`, 4096)
+          ),
+        StorageBusyError,
+      );
+      const impossible = await assertRejects(
+        () =>
+          new Admission().run(() =>
+            capacity.reserveStaging(`${root}/too-big`, MiB)
+          ),
+        StoragePressureError,
+      );
+      assert(!(impossible instanceof StorageBusyError));
+    } finally {
+      await Deno.remove(path);
+      freeBytes += 128 * 1024;
+      freeInodes++;
+      lease.release();
+    }
+    (await capacity.reserveStaging(`${root}/next`, 4096)).release();
+  } finally {
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test('facade capacity review: re-probe when a physical sample straddles settlement', async () => {
+  const root = await Deno.makeTempDir();
+  try {
+    for (const materializes of [false, true]) {
+      const observing = Promise.withResolvers<void>();
+      const resume = Promise.withResolvers<void>();
+      const path = `${root}/stage`;
+      const target = `${root}/next`;
+      let freeBytes = 128 * 1024;
+      let samples = 0;
+      const capacity = new Capacity([root], null, async (candidate) => {
+        const observed = freeBytes;
+        if (candidate === target && ++samples === 1) {
+          observing.resolve();
+          await resume.promise;
+        }
+        return {
+          totalBytes: MiB,
+          freeBytes: observed,
+          freeInodes: 10,
+          device: 1,
+          blockSize: 4096,
+        };
+      });
+      const holder = await capacity.reserveStaging(path, 96 * 1024);
+      const next = new Admission().run(() =>
+        capacity.reserveStaging(target, 4096)
+      );
+      void next.catch(() => {});
+      try {
+        await observing.promise;
+        if (materializes) {
+          await Deno.writeFile(path, new Uint8Array(96 * 1024).fill(1));
+          freeBytes -= 96 * 1024;
+        }
+        holder.release();
+        resume.resolve();
+        if (materializes) {
+          const error = await assertRejects(() => next, StoragePressureError);
+          assert(!(error instanceof StorageBusyError));
+        } else (await next).release();
+        assertEquals(samples, 2);
+      } finally {
+        holder.release();
+        resume.resolve();
+        (await next.catch(() => undefined))?.release();
+      }
+    }
+  } finally {
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test('facade capacity review: large publication path sets settle without unbounded arguments', async () => {
+  const root = await Deno.makeTempDir();
+  try {
+    const path = `${root}/published`;
+    const capacity = new Capacity([root]);
+    const lease = await capacity.reservePublication(path, 1, [4096]);
+    try {
+      // Paths already cleaned after an EXDEV copy do not need a disk fixture.
+      for (let i = 0; i < 140_000; i++) lease.track(`${root}/gone-${i}`);
+      await Deno.writeFile(path, new Uint8Array(4096).fill(1));
+    } finally {
+      lease.release();
+    }
+    const accounted = capacity.accountedBytes();
+    const [disk] = (await capacity.status()).filesystems;
+    assertEquals(disk.reservedBytes, 0);
+    assertEquals(accounted, disk.usedBytes);
+  } finally {
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test('facade capacity review: a statement rejection before callback return still vetoes commit', async () => {
+  const root = await Deno.makeTempDir();
+  const ffi = new Turso('./.native/libturso_ffi.so');
+  const capacity = new Capacity([root]);
+  let db: Db | undefined;
+  try {
+    db = await Db.open(ffi, `${root}/data.db`, MiB, undefined, capacity);
+    await db.exec('CREATE TABLE receipt(id INTEGER PRIMARY KEY)');
+    const error = await assertRejects(() =>
+      db!.tx(async (tx) => {
+        await tx.execute('INSERT INTO receipt VALUES (1)');
+        const observed = Promise.withResolvers<void>();
+        void tx.execute('INSERT INTO receipt VALUES (1)').then(
+          () => observed.resolve(),
+          observed.resolve,
+        );
+        // The caller abandons the statement outcome, but a separate latch
+        // makes its early settlement deterministic.
+        await observed.promise;
+      }), StoreError);
+    assert(/constraint|unique/i.test(error.message));
+    assertEquals(await db.query('SELECT id FROM receipt'), []);
+    await db.execute('INSERT INTO receipt VALUES (2)');
+    assertEquals(await db.query('SELECT id FROM receipt'), [{ id: 2 }]);
+  } finally {
+    await db?.close();
+    ffi.close();
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
 Deno.test('facade capacity: scratch peak samples checkpoints and status, not statements', async () => {
   const root = await Deno.makeTempDir({ prefix: 'facade-observed-scratch-' });
   const ffi = new Turso('./.native/libturso_ffi.so');
@@ -386,18 +884,14 @@ Deno.test('facade capacity: file exhaustion with the software cap unset leaves n
   let store: Store | undefined;
   let cache: MediaCache | undefined;
   try {
-    // The storage fixture supplies the same owner option for native and file
-    // writers. The baseline ignores this property; a null cap is not a bypass
-    // for physical exhaustion.
-    const capacity = { budgetBytes: null, roots: [root + '/media'] };
-    store = await openStore({
-      dir: root + '/store',
-      library: './.native/libturso_ffi.so',
-      checkpointlogbytes: 65536,
-      maxopenfiles: 8,
-      idleseconds: 300,
-    }, { schemas: { server: serverSchema }, ...{ capacity } });
-    cache = new MediaCache(await store.server(), root + '/media');
+    const settings = settingsFor(root + '/store');
+    const mediaRoot = root + '/media';
+    const capacityOwner = new Capacity([settings.dir, mediaRoot], null);
+    store = await openStore(settings, {
+      schemas: { server: serverSchema },
+      capacityOwner,
+    });
+    cache = new MediaCache(await store.server(), mediaRoot, 32, capacityOwner);
     const media = cache;
     await media.start();
     const identity = (mediaId: string) => ({
@@ -407,16 +901,22 @@ Deno.test('facade capacity: file exhaustion with the software cap unset leaves n
       scope: 'remote' as const,
     });
     const publish = (id: string) =>
-      media.fetch(identity(id), 1, async (output) => {
-        const writer = output.getWriter();
-        await writer.write(new Uint8Array([1, 2, 3, 4]));
-        await writer.close();
-        return {
-          contentType: 'application/octet-stream',
-          filename: null,
-          size: 4,
-        };
-      });
+      media.fetch(
+        identity(id),
+        1,
+        async (output) => {
+          const writer = output.getWriter();
+          await writer.write(new Uint8Array([1, 2, 3, 4]));
+          await writer.close();
+          return {
+            contentType: 'application/octet-stream',
+            filename: null,
+            size: 4,
+          };
+        },
+        undefined,
+        4,
+      );
     const old = await publish('previous');
     const open = Deno.open;
     const sync = Deno.FsFile.prototype.sync;
@@ -480,10 +980,25 @@ Deno.test('facade capacity: staged media and native journal writers cannot overs
   const size = 8 * MiB;
   const staged = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
+  const admitted = Promise.withResolvers<true>();
+  let observeNative = false;
+  class ObservedCapacity extends Capacity {
+    override async tryReserveNative(
+      path: string,
+      creates: number,
+      bytes: number,
+    ) {
+      try {
+        return await super.tryReserveNative(path, creates, bytes);
+      } finally {
+        if (observeNative) admitted.resolve(true);
+      }
+    }
+  }
   let store: Store | undefined;
   let cache: MediaCache | undefined;
   try {
-    const capacityOwner = new Capacity(
+    const capacityOwner = new ObservedCapacity(
       [root + '/store', mediaRoot],
       budgetBytes,
     );
@@ -529,11 +1044,14 @@ Deno.test('facade capacity: staged media and native journal writers cannot overs
     );
     let native!: PromiseSettledResult<LinkRecord>;
     let media!: PromiseSettledResult<Awaited<typeof mediaWork>>;
+    let outcome: Promise<PromiseSettledResult<LinkRecord>[]> | undefined;
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
     try {
       // The staging file is already allocated but not published; the native
       // transaction will need its own DB/log blocks before its ACK.
       await Promise.race([staged.promise, mediaWork]);
-      const outcome = Promise.allSettled([
+      observeNative = true;
+      outcome = Promise.allSettled([
         journal.append('home', {
           ...source,
           type: 'control',
@@ -542,11 +1060,29 @@ Deno.test('facade capacity: staged media and native journal writers cannot overs
           payload: { data: 'x'.repeat(size) },
         }),
       ]);
+      assert(
+        await Promise.race([
+          admitted.promise,
+          outcome.then(() => false),
+          new Promise<never>((_, reject) => {
+            watchdog = setTimeout(
+              () => reject(new Error('native admission waited for staging')),
+              5000,
+            );
+          }),
+        ]),
+        'native admission must see the live staging grant',
+      );
+      clearTimeout(watchdog);
+      observeNative = false;
       release.resolve();
       [native] = await outcome;
     } finally {
+      clearTimeout(watchdog);
+      observeNative = false;
       release.resolve();
       [media] = await Promise.allSettled([mediaWork]);
+      await outcome;
     }
     assert(
       native.status === 'rejected' || media.status === 'rejected',
@@ -834,20 +1370,24 @@ Deno.test('facade capacity: reads do not wait behind a pool of queued writers', 
         })
       ),
     );
-    await Promise.all(started.map((ready) => ready.promise));
+    let observed: Promise<PromiseSettledResult<unknown>[]> | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const query = db.query('SELECT * FROM receipt');
-    const observed = Promise.allSettled([query]);
+    const watchdog = (message: string) =>
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), 1000);
+      });
     try {
+      await Promise.race([
+        Promise.all(started.map((ready) => ready.promise)),
+        watchdog('writers did not enter their callbacks'),
+      ]);
+      clearTimeout(timer);
+      const query = db.query('SELECT * FROM receipt');
+      observed = Promise.allSettled([query]);
       assertEquals(
         await Promise.race([
           query,
-          new Promise((resolve) => {
-            timer = setTimeout(
-              () => resolve('blocked by queued writers'),
-              1000,
-            );
-          }),
+          watchdog('read blocked by queued writers'),
         ]),
         [],
       );
@@ -1130,7 +1670,12 @@ Deno.test('facade capacity: outstanding claims fence concurrent staging and chec
 // ENOSPC by changing the OS beneath the other tests.
 async function mediaFixture(
   options: { budgetBytes?: number | null; probe?: CapacityProbe },
-  run: (cache: MediaCache, root: string, capacity: Capacity) => Promise<void>,
+  run: (
+    cache: MediaCache,
+    root: string,
+    capacity: Capacity,
+    db: Database,
+  ) => Promise<void>,
 ) {
   const root = await Deno.makeTempDir({ prefix: 'capacity-' });
   const mediaRoot = root + '/media';
@@ -1147,14 +1692,10 @@ async function mediaFixture(
       schemas,
       capacityOwner: capacity,
     });
-    cache = new MediaCache(
-      await store.server(),
-      mediaRoot,
-      undefined,
-      capacity,
-    );
+    const db = await store.server();
+    cache = new MediaCache(db, mediaRoot, undefined, capacity);
     await cache.start();
-    await run(cache, mediaRoot, capacity);
+    await run(cache, mediaRoot, capacity, db);
   } finally {
     await cache?.close();
     await store?.close();
@@ -1272,6 +1813,122 @@ Deno.test('facade capacity: exhausted inodes prohibit new files even with the ca
     freeInodes = 1000;
     assertEquals((await publish(cache, next, 16)).size, 16);
     await lease.cancel();
+  });
+});
+
+Deno.test('facade capacity review: disconnect cancels the owner waiting for staging', async () => {
+  const queued = Promise.withResolvers<void>();
+  let freeBytes = 32 * MiB;
+  await mediaFixture({
+    budgetBytes: null,
+    probe: (path) => {
+      if (path.endsWith('.part')) queued.resolve();
+      return {
+        totalBytes: 32 * MiB,
+        freeBytes,
+        freeInodes: 1000,
+        device: 1,
+        blockSize: 4096,
+      };
+    },
+  }, async (cache, root, capacity) => {
+    freeBytes = 4 * MiB;
+    const holder = await capacity.reserveStaging(`${root}/held`, 3 * MiB);
+    const controller = new AbortController();
+    const disconnected = cache.fetch(
+      cacheId('cancelled'),
+      1,
+      () => {
+        throw new Error('cancelled producer must not run');
+      },
+      controller.signal,
+      3 * MiB,
+    );
+    void disconnected.catch(() => {});
+    const entered = Promise.withResolvers<void>();
+    let next: Promise<unknown> | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let marker: Awaited<ReturnType<Capacity['reserveStaging']>> | undefined;
+    try {
+      await queued.promise;
+      // A later grant on the lane proves that the first attempt has left it.
+      marker = await capacity.reserveStaging(`${root}/marker`, 0);
+      controller.abort();
+      await assertRejects(() => disconnected, DOMException, 'aborted');
+      next = cache.fetch(
+        cacheId('small'),
+        1,
+        async (out) => {
+          entered.resolve();
+          await out.getWriter().close();
+          return { contentType: 'image/png', filename: null, size: 0 };
+        },
+        undefined,
+        4096,
+      );
+      await Promise.race([
+        entered.promise,
+        next,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() =>
+            reject(
+              new Error('cancelled cache fill still owns a producer slot'),
+            ), 1000);
+        }),
+      ]);
+      await entered.promise;
+    } finally {
+      clearTimeout(timer);
+      controller.abort();
+      freeBytes = 32 * MiB;
+      marker?.release();
+      holder.release();
+      await next?.catch(() => undefined);
+    }
+    assertEquals((await cache.get(cacheId('small')))?.size, 0);
+  });
+});
+
+Deno.test('facade capacity review: a cache hit remains readable under timestamp write pressure', async () => {
+  let freeBytes = 32 * MiB;
+  const unexpected = new Error('unrelated I/O failure');
+  let broken = false;
+  await mediaFixture({
+    probe: () => {
+      if (broken) throw unexpected;
+      return {
+        totalBytes: 32 * MiB,
+        freeBytes,
+        freeInodes: 10,
+        device: 1,
+        blockSize: 4096,
+      };
+    },
+  }, async (cache, _root, _capacity, db) => {
+    const row = await publish(cache, cacheId('hit'), 4);
+    await db.execute(
+      'UPDATE media_cache SET accessed_ms = 0 WHERE cache_key = ?',
+      [row.cache_key],
+    );
+    freeBytes = 0;
+    const stream = await cache.open(row);
+    assertEquals(
+      new Uint8Array(await new Response(stream).arrayBuffer()),
+      new Uint8Array(4).fill(73),
+    );
+    broken = true;
+    assertEquals(await assertRejects(() => cache.open(row)), unexpected);
+    broken = false;
+    freeBytes = 32 * MiB;
+    assertEquals(await db.query('SELECT accessed_ms FROM media_cache'), [{
+      accessed_ms: 0,
+    }]);
+    await cache.cleanup({
+      maxbytes: 0,
+      remote: { maxagedays: 0, unopenedday: 1, maxbytes: 0 },
+      thumbnail: { maxagedays: 0, unopenedday: 0, maxbytes: 0 },
+    });
+    assertEquals((await cache.get(cacheId('hit')))?.blob, row.blob);
   });
 });
 

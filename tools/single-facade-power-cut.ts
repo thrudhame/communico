@@ -200,6 +200,11 @@ async function run() {
           `ACK_LOST ${step}`,
         );
         assertEquals(page.head.sequence, page.records.length);
+        assertEquals(
+          page.head.hash,
+          page.records.at(-1)?.hash ?? '',
+          `${step}: received head hash`,
+        );
         for (const [i, record] of page.records.entries()) {
           assertEquals(record.sequence, i + 1);
           assertEquals(record.operationId, `op-${i + 1}`);
@@ -227,6 +232,22 @@ async function run() {
       assertEquals(
         head.applied.hash,
         incoming.records[head.applied.sequence - 1]?.hash ?? '',
+      );
+      const acknowledgement = await journal.acknowledgement(
+        'home',
+        stream,
+        { sequence: 0, hash: '' },
+        limits,
+      );
+      assertEquals(acknowledgement.applied, head.applied);
+      assertEquals(
+        acknowledgement.results,
+        incoming.records.slice(0, head.applied.sequence).map((record) => ({
+          sequence: record.sequence,
+          hash: record.hash,
+          result: { accepted: record.sequence },
+        })),
+        'retained terminal results',
       );
       const published = new Set<string>();
       for (let id = 1; id <= rounds; id++) {

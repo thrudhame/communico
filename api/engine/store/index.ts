@@ -460,6 +460,11 @@ export async function openStore(
     await Deno.mkdir(dirname(config.dir), { recursive: true, mode: 0o700 });
     ownership = await ffi.lockStore(await ownershipPath(config.dir));
     await assertNoPromotion(config.dir);
+    // Abandoned, unpublished trees can be removed without a write grant.
+    // Reclaim them under the ownership lock before reserving scratch metadata.
+    await sweep(config.dir, options.capacityOwner);
+    await sweep(join(config.dir, 'rooms'), options.capacityOwner);
+    await sweep(join(config.dir, 'tenants'), options.capacityOwner);
     if (options.capacityOwner) {
       await options.capacityOwner.ensureDirectory(config.dir, 0o700);
       restoreScratch = await routeStoreScratch(
@@ -467,9 +472,6 @@ export async function openStore(
         options.capacityOwner,
       );
     } else await Deno.mkdir(config.dir, { recursive: true, mode: 0o700 });
-    await sweep(config.dir, options.capacityOwner);
-    await sweep(join(config.dir, 'rooms'), options.capacityOwner);
-    await sweep(join(config.dir, 'tenants'), options.capacityOwner);
     const serverProvider: SchemaProvider = {
       version: (options.schemas?.server ?? EMPTY_SCHEMA).version,
       migrations: options.schemas?.server?.migrations,

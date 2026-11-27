@@ -16,6 +16,8 @@ struct Failure {
     message: String,
     last_error: String,
     required_write_bytes: Option<u64>,
+    open_needs_allocation: bool,
+    os_errno: Option<i32>,
 }
 
 type Result<T> = std::result::Result<T, Failure>;
@@ -28,6 +30,8 @@ impl Failure {
             last_error: message.clone(),
             message,
             required_write_bytes: None,
+            open_needs_allocation: false,
+            os_errno: None,
         }
     }
 }
@@ -44,6 +48,7 @@ impl From<turso::Error> for Failure {
             turso::Error::DatabaseFull(_) => 13,
             turso::Error::NotAdb(_) => 26,
             turso::Error::Corrupt(_) => 11,
+            turso::Error::IoError(kind, _) if exhausted(*kind) => 13,
             turso::Error::IoError(..) => 10,
             _ => 1,
         };
@@ -52,8 +57,17 @@ impl From<turso::Error> for Failure {
             message: error.to_string(),
             last_error: format!("{error:?}"),
             required_write_bytes: None,
+            open_needs_allocation: false,
+            os_errno: None,
         }
     }
+}
+
+fn exhausted(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+    )
 }
 
 struct File {
@@ -62,6 +76,7 @@ struct File {
     references: usize,
     connecting: usize,
     path: PathBuf,
+    managed: bool,
 }
 
 #[derive(Default)]
@@ -169,7 +184,9 @@ fn reply(call: impl FnOnce() -> Result<Json>) -> *mut c_char {
             Ok(value) => json!({"code": 0, "value": value}),
             Err(error) => json!({"code": error.code, "message": error.message,
                                  "last_error": error.last_error,
-                                 "required_write_bytes": error.required_write_bytes}),
+                                 "required_write_bytes": error.required_write_bytes,
+                                 "open_needs_allocation": error.open_needs_allocation,
+                                 "os_errno": error.os_errno}),
         };
         CString::new(value.to_string())
     }));
@@ -318,9 +335,12 @@ fn canonical_file(path: &str) -> Result<PathBuf> {
 #[no_mangle]
 pub unsafe extern "C" fn ffi_open(path: *const c_char) -> *mut c_char {
     reply(|| {
-        open_file(canonical_file(&text(path)?)?, None, |name, observer| {
-            initialize_database(name, observer, false)
-        })
+        open_file(
+            canonical_file(&text(path)?)?,
+            None,
+            false,
+            |name, observer| initialize_database(name, observer, false),
+        )
         .map(|id| json!(id))
     })
 }
@@ -389,16 +409,22 @@ pub unsafe extern "C" fn ffi_open_bounded(
                     .map_err(|e| Failure::binding(e.to_string()))?,
             )
         };
-        open_file(canonical_file(&text(path)?)?, scratch, |name, observer| {
-            let grant = Arc::new(checkpoint::Grant::new(block, bytes, 0, creates));
-            observer.limit_open(Some(grant.clone()));
-            let result = initialize_database(name, observer.clone(), true);
-            observer.limit_open(None);
-            result.map_err(|mut error| {
-                error.required_write_bytes = grant.required_write_bytes();
-                error
-            })
-        })
+        open_file(
+            canonical_file(&text(path)?)?,
+            scratch,
+            true,
+            |name, observer| {
+                let grant = Arc::new(checkpoint::Grant::new(block, bytes, 0, creates));
+                observer.limit_open(Some(grant.clone()));
+                let result = initialize_database(name, observer.clone(), true);
+                observer.limit_open(None);
+                result.map_err(|mut error| {
+                    error.required_write_bytes = grant.required_write_bytes();
+                    error.open_needs_allocation = error.code == 13 && grant.refused_allocation();
+                    error
+                })
+            },
+        )
         .map(|id| json!(id))
     })
 }
@@ -432,6 +458,7 @@ fn initialize_database(
 fn open_file(
     path: PathBuf,
     scratch: Option<PathBuf>,
+    managed: bool,
     initialize: impl FnOnce(String, Arc<checkpoint::Observer>) -> Result<Database>,
 ) -> Result<u32> {
     let reservation = loop {
@@ -441,6 +468,11 @@ fn open_file(
                 .files
                 .get_mut(&handle)
                 .ok_or_else(|| Failure::binding("missing file handle"))?;
+            if file.managed != managed {
+                return Err(Failure::binding(
+                    "database already open in a different capacity mode",
+                ));
+            }
             file.references += 1;
             return Ok(handle);
         }
@@ -483,6 +515,7 @@ fn open_file(
                 references: 1,
                 connecting: 0,
                 path,
+                managed,
             },
         );
         handle
@@ -497,12 +530,87 @@ mod registry_tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    fn decoded(pointer: *mut c_char) -> Json {
+        let result = unsafe { text(pointer) }.unwrap();
+        unsafe { ffi_free(pointer) };
+        serde_json::from_str(&result).unwrap()
+    }
+
+    #[test]
+    fn same_mode_shares_but_mixed_mode_cannot_borrow_a_handle() {
+        let dir = PathBuf::from(std::env::var("TMPDIR").unwrap())
+            .join(format!("registry-mode-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        for managed in [false, true] {
+            let path = CString::new(
+                dir.join(if managed { "managed" } else { "plain" })
+                    .to_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            let open = |bounded| unsafe {
+                decoded(if bounded {
+                    ffi_open_bounded(path.as_ptr(), 4096, 1024 * 1024, 3, std::ptr::null())
+                } else {
+                    ffi_open(path.as_ptr())
+                })
+            };
+            let first = open(managed);
+            assert_eq!(first["code"], 0, "{first}");
+            let id = first["value"].as_u64().unwrap() as u32;
+            assert_eq!(open(managed), first);
+            let mixed = open(!managed);
+            if mixed["code"] == 0 {
+                decoded(ffi_close(mixed["value"].as_u64().unwrap() as u32, 0, false));
+            }
+            for _ in 0..2 {
+                assert_eq!(decoded(ffi_close(id, 0, false))["code"], 0);
+            }
+            assert_eq!(mixed["code"], 21, "{mixed}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn native_io_distinguishes_quota_from_other_io_errors() {
+        use std::io::ErrorKind;
+        for kind in [ErrorKind::StorageFull, ErrorKind::QuotaExceeded] {
+            assert_eq!(
+                Failure::from(turso::Error::IoError(kind, "pwrite")).code,
+                13
+            );
+        }
+        assert_eq!(
+            Failure::from(turso::Error::IoError(ErrorKind::PermissionDenied, "pwrite")).code,
+            10
+        );
+    }
+
+    #[test]
+    fn publication_distinguishes_errno_without_reclassifying_io() {
+        for (errno, code) in [
+            (libc::EDQUOT, 13),
+            (libc::ENOSPC, 13),
+            (libc::EEXIST, 19),
+            (libc::EACCES, 10),
+        ] {
+            let failure =
+                publication_failure(std::io::Error::from_raw_os_error(errno)).unwrap_err();
+            assert_eq!(failure.code, code);
+            assert!(failure.last_error.contains(&format!("code: {errno},")));
+        }
+        assert_eq!(
+            publication_failure(std::io::Error::from_raw_os_error(libc::EXDEV)).unwrap(),
+            json!(false)
+        );
+    }
+
     #[test]
     fn slow_open_does_not_block_unrelated_registry_work() {
         let (entered, ready) = mpsc::channel();
         let (release, held) = mpsc::channel();
         let slow = std::thread::spawn(move || {
-            open_file(PathBuf::from("slow-registry-test"), |_, _| {
+            open_file(PathBuf::from("slow-registry-test"), None, false, |_, _| {
                 entered.send(()).unwrap();
                 held.recv().unwrap();
                 Err(Failure::binding("injected initialization failure"))
@@ -511,7 +619,7 @@ mod registry_tests {
         ready.recv_timeout(Duration::from_secs(5)).unwrap();
         let (completed, result) = mpsc::channel();
         let fast = std::thread::spawn(move || {
-            let outcome = open_file(PathBuf::from("other-registry-test"), |_, _| {
+            let outcome = open_file(PathBuf::from("other-registry-test"), None, false, |_, _| {
                 Err(Failure::binding("independent initialization"))
             });
             completed.send(outcome.is_err()).unwrap();
@@ -532,7 +640,7 @@ mod registry_tests {
         let (entered, ready) = mpsc::channel();
         let (release, held) = mpsc::channel();
         let first = std::thread::spawn(move || {
-            open_file(PathBuf::from("same-registry-test"), |_, _| {
+            open_file(PathBuf::from("same-registry-test"), None, false, |_, _| {
                 entered.send(()).unwrap();
                 held.recv().unwrap();
                 Err(Failure::binding("first initialization fails"))
@@ -541,7 +649,7 @@ mod registry_tests {
         ready.recv_timeout(Duration::from_secs(5)).unwrap();
         let (entered_second, second_ready) = mpsc::channel();
         let second = std::thread::spawn(move || {
-            open_file(PathBuf::from("same-registry-test"), |_, _| {
+            open_file(PathBuf::from("same-registry-test"), None, false, |_, _| {
                 entered_second.send(()).unwrap();
                 Err(Failure::binding("retry initialization fails"))
             })
@@ -563,7 +671,10 @@ mod registry_tests {
         let dir = std::path::PathBuf::from(std::env::var("TMPDIR").unwrap())
             .join(format!("registry-connect-{}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
-        let handle = open_file(dir.join("data.db"), initialize_database).unwrap();
+        let handle = open_file(dir.join("data.db"), None, false, |name, observer| {
+            initialize_database(name, observer, false)
+        })
+        .unwrap();
         let (entered, ready) = mpsc::channel();
         let (release, held) = mpsc::channel();
         let connecting = std::thread::spawn(move || {
@@ -715,13 +826,25 @@ pub unsafe extern "C" fn ffi_rename_noreplace(
         if renameat2(-100, source.as_ptr(), -100, destination.as_ptr(), 1) == 0 {
             return Ok(json!(true));
         }
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(18) {
-            return Ok(json!(false));
-        }
-        Err(Failure::binding(format!(
-            "no-replace publication failed: {error}"
-        )))
+        publication_failure(std::io::Error::last_os_error())
+    })
+}
+
+fn publication_failure(error: std::io::Error) -> Result<Json> {
+    let os_errno = error.raw_os_error();
+    let code = match os_errno {
+        Some(libc::EXDEV) => return Ok(json!(false)),
+        Some(libc::EEXIST) => 19,
+        _ if exhausted(error.kind()) => 13,
+        _ => 10,
+    };
+    Err(Failure {
+        code,
+        message: format!("no-replace publication failed: {error}"),
+        last_error: format!("{error:?}"),
+        required_write_bytes: None,
+        open_needs_allocation: false,
+        os_errno,
     })
 }
 
