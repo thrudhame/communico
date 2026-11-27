@@ -378,6 +378,8 @@ const F2_LOCAL_MEDIA: Rule[] = [
   route('PUT', /^\/_matrix\/media\/v3\/upload\/[^/]+\/[^/]+$/, 'auth'),
   route('GET', literal('/_matrix/client/v1/media/config'), 'auth'),
   route('GET', literal('/_matrix/media/v3/config'), 'auth'),
+  route('GET', literal('/_matrix/client/v1/media/preview_url'), 'auth'),
+  route('GET', literal('/_matrix/media/v3/preview_url'), 'auth'),
   route(
     'GET',
     /^\/_matrix\/client\/v1\/media\/download\/[^/]+\/[^/]+(?:\/[^/]+)?$/,

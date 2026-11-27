@@ -55,16 +55,20 @@ export async function previewUrl(
     );
   }
   let page;
+  const { tenant, store, replica } = theApp();
+  const checkAddress = replica?.mediaEgress;
   try {
     page = await guardedGet(url, {
       maxBytes: cfg.maxbytes,
       blocklist: cfg.blocklist,
       allowlist: cfg.allowlist,
       acceptLanguage,
+      checkAddress,
     });
   } catch (error) {
     if (
-      error instanceof UpstreamError && error.context.phase === 'preview-policy'
+      error instanceof UpstreamError &&
+      ['preview-policy', 'egress-policy'].includes(error.context.phase)
     ) throw new MatrixError(403, 'M_FORBIDDEN', error.context.reason);
     throw error;
   }
@@ -92,6 +96,7 @@ export async function previewUrl(
       blocklist: cfg.blocklist,
       allowlist: cfg.allowlist,
       acceptLanguage,
+      checkAddress,
     });
   } catch (error) {
     if (!recoverableUpstream(error)) throw error;
@@ -106,7 +111,6 @@ export async function previewUrl(
   });
   const filename = filenameOf(absolute);
   const contentType = img.contentType.split(';')[0].trim();
-  const { tenant, store } = theApp();
   const { mediaId, sizeBytes } = await uploadMedia(
     tenant,
     localpartOf(userId),

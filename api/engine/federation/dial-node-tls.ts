@@ -45,6 +45,7 @@ export type DialOpts = {
   maxBytes: number;
   signal?: AbortSignal;
   sink?: Http1WireOpts['sink'];
+  checkAddress?: (ip: string) => void;
 };
 
 // Configured PEM arrays are snapshots owned by resolve.ts. Its reset replaces
@@ -170,6 +171,7 @@ export async function dialNodeTls(opts: DialOpts): Promise<Http1Response> {
     for await (const address of addresses()) {
       ac.signal.throwIfAborted();
       try {
+        opts.checkAddress?.(address.connectIp);
         const connection = await networkOperation(
           'tls',
           ac.signal,

@@ -5,6 +5,7 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import { splitId } from '#engine/ids.ts';
 import { drainResources } from '#engine/lifetime.ts';
 import { MediaCache } from '#engine/media/cache.ts';
+import { MediaEgress } from './media-egress.ts';
 import { ContactObservations } from '#engine/federation/pending-contacts.ts';
 import { inboxFailure, workerFailure } from '#engine/request-diagnostics.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
@@ -118,6 +119,7 @@ export async function openFacadeRuntime(
     binding: Awaited<ReturnType<typeof bindRole>>;
     server: Awaited<ReturnType<Store['server']>>;
     mediaCache: MediaCache;
+    mediaEgress: MediaEgress;
   };
   const store = await openStore(storeConfig, {
     schemas: { server: serverSchema, tenant: tenantSchema, room: roomSchema },
@@ -130,7 +132,9 @@ export async function openFacadeRuntime(
         config().media.maxvariants,
         capacity,
       );
-      prepared = { binding, server, mediaCache };
+      const mediaEgress = new MediaEgress(server, settings.homecidrs);
+      prepared = { binding, server, mediaCache, mediaEgress };
+      await mediaEgress.load();
       await mediaCache.start({ inventoryOnly: true });
     },
     capacityOwner: capacity,
@@ -146,7 +150,7 @@ export async function openFacadeRuntime(
     }
     throw error;
   });
-  const { binding, server, mediaCache } = prepared;
+  const { binding, server, mediaCache, mediaEgress } = prepared;
   const journal = new Journal(
     server,
     LINK_SUPPORTED,
@@ -594,6 +598,7 @@ export async function openFacadeRuntime(
     notices,
     capabilities: caps,
     localMediaCache: caps.service('media') ? mediaCache : undefined,
+    mediaEgress: mediaEgress.check,
     pairings,
     verificationKeys: async () => (await keyOwner()).verificationKeys(),
     requestSigner: async () => (await keyOwner()).requestSigner(),
@@ -923,8 +928,16 @@ export async function openFacadeRuntime(
         pairings: bindings,
       };
     },
-    authorize: async (peerPin: string) =>
-      node ? await (await pairings()).allowsHome(peerPin) : false,
+    async authorize(peerPin: string, address: string | undefined) {
+      if (
+        !node || address === undefined ||
+        !await (await pairings()).allowsHome(peerPin)
+      ) {
+        return false;
+      }
+      await mediaEgress.observe(address);
+      return true;
+    },
     async handle(request: Request, peerPin: string): Promise<Response> {
       if (!node) {
         throw new LinkError(

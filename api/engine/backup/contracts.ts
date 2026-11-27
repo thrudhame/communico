@@ -243,6 +243,8 @@ export const tableContracts = {
       'facade_export_acks',
       'facade_control',
       'facade_pairings',
+      // Keep authenticated home addresses in the restored media egress policy.
+      'facade_home_addresses',
       'runtime_identity',
       'facade_key_roster',
       'facade_exports',
