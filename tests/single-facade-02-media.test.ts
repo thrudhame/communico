@@ -14,6 +14,154 @@ import { fixtureLink } from './helpers/fixture-listeners.ts';
 import { mediaPublicationOverlay } from './helpers/media-publication.ts';
 import { facadeTls } from './support/facade-tls.ts';
 
+async function waitForMediaPublication(
+  name: string,
+  hold: { held(signal?: AbortSignal): Promise<unknown> },
+  response: Promise<Response>,
+  timeoutMs = 20_000,
+): Promise<void> {
+  const observation = new AbortController();
+  const timer = setTimeout(() => {
+    observation.abort(
+      new Error(`deadline waiting for publication cut ${name}`),
+    );
+  }, timeoutMs);
+  try {
+    const first = await Promise.race([
+      hold.held(observation.signal).then(() => null),
+      response,
+    ]);
+    if (first) {
+      throw new Error(`before publication cut ${name}: HTTP ${first.status}`);
+    }
+  } catch (error) {
+    // No caller consumes an HTTP body on this path, even if it arrives late.
+    // Don't wait on stream cancellation to report the original failure.
+    void response.then((res) => res.body?.cancel()).catch(() => {});
+    throw error;
+  } finally {
+    clearTimeout(timer);
+    observation.abort();
+  }
+}
+
+async function withMediaCleanup(
+  run: () => Promise<void>,
+  cleanup: (() => Promise<void> | undefined)[],
+): Promise<void> {
+  const failures: unknown[] = [];
+  try {
+    await run();
+  } catch (error) {
+    failures.push(error);
+  }
+  for (const release of cleanup) {
+    try {
+      await release();
+    } catch (error) {
+      failures.push(error);
+    }
+  }
+  if (failures.length === 1) throw failures[0];
+  if (failures.length > 1) {
+    throw new AggregateError(failures, 'media fixture failed', {
+      cause: failures[0],
+    });
+  }
+}
+
+Deno.test('single facade media R1: publication waits report early HTTP results and missing cuts', async () => {
+  const never = Promise.withResolvers<never>().promise;
+  let observing: AbortSignal | undefined;
+  const missing = {
+    held: (signal?: AbortSignal) =>
+      signal
+        ? new Promise<never>((_, reject) => {
+          observing = signal;
+          signal.addEventListener('abort', () => reject(signal.reason), {
+            once: true,
+          });
+        })
+        : never,
+  };
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const watchdog = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error('test watchdog expired')), 1000);
+  });
+  try {
+    let cancelled = false;
+    const response = new Response(
+      new ReadableStream({
+        cancel() {
+          cancelled = true;
+        },
+      }),
+      { status: 503 },
+    );
+    await assertRejects(
+      () =>
+        Promise.race([
+          waitForMediaPublication(
+            'before-install',
+            missing,
+            Promise.resolve(response),
+          ),
+          watchdog,
+        ]),
+      Error,
+      'HTTP 503',
+    );
+    assert(cancelled);
+    assert(observing?.aborted, 'the losing observation must be cancelled');
+    await assertRejects(
+      () =>
+        Promise.race([
+          waitForMediaPublication('file-sync', missing, never, 0),
+          watchdog,
+        ]),
+      Error,
+      'deadline waiting for publication cut file-sync',
+    );
+    const late = Promise.withResolvers<Response>();
+    await waitForMediaPublication('install', {
+      held: () => Promise.resolve(),
+    }, late.promise);
+    late.resolve(new Response('ack'));
+    assertEquals(await (await late.promise).text(), 'ack');
+  } finally {
+    clearTimeout(timer);
+  }
+});
+
+Deno.test('single facade media R1: cleanup visits every resource and keeps both failures', async () => {
+  const primary = new Error('assertion failed');
+  const disposal = new Error('home disposal failed');
+  const calls: string[] = [];
+  const error = await assertRejects(() =>
+    withMediaCleanup(() => Promise.reject(primary), [
+      () => {
+        calls.push('probe');
+        return Promise.resolve();
+      },
+      () => {
+        calls.push('home');
+        return Promise.reject(disposal);
+      },
+      () => {
+        calls.push('edge');
+        return Promise.resolve();
+      },
+      () => {
+        calls.push('files');
+        return Promise.resolve();
+      },
+    ])
+  );
+  assertEquals(calls, ['probe', 'home', 'edge', 'files']);
+  assert(error instanceof AggregateError);
+  assert(error.errors[0] === primary && error.errors[1] === disposal);
+});
+
 Deno.test('single facade media: F2 admits local upload and origin read without home', () => {
   const facade = capabilities('facade', 'f2');
   const routes = [
@@ -52,12 +200,12 @@ Deno.test('single facade media: offline wire upload and signed cold read', async
   const file = (side: string) => `${tls.dir}/${side}.toml`;
   const socket = (side: string) => `${tls.dir}/${side}.sock`;
   const bundlefile = `${tls.dir}/bundle.json`;
-  setConfigForTests({ server: { name: 'logical.test' } });
-  const remote = await makeServer('media-peer.test');
   let edge: Awaited<ReturnType<typeof process>> | undefined;
   let home: Awaited<ReturnType<typeof process>> | undefined;
   let homeProbe: Deno.HttpServer | undefined;
-  try {
+  async function exercise() {
+    setConfigForTests({ server: { name: 'logical.test' } });
+    const remote = await makeServer('media-peer.test');
     for (const side of ['home', 'facade']) {
       await Deno.writeTextFile(
         file(side),
@@ -411,7 +559,7 @@ Deno.test('single facade media: offline wire upload and signed cold read', async
           'PUT',
           'candidate',
         );
-        await cut.held();
+        await waitForMediaPublication('before-install', cut, pending);
         const final = `${mediaRoot}/${id}`;
         await Deno.writeTextFile(final, 'incumbent', { createNew: true });
         await cut.release();
@@ -458,7 +606,7 @@ Deno.test('single facade media: offline wire upload and signed cold read', async
             assertEquals(await response.json(), {});
             acked.set(id, body);
           } else {
-            await hold!.held();
+            await waitForMediaPublication(cutName, hold!, result);
             if (!filling) {
               const files = [];
               for await (const entry of Deno.readDir(mediaRoot)) {
@@ -499,10 +647,11 @@ Deno.test('single facade media: offline wire upload and signed cold read', async
         }),
       );
     }
-  } finally {
-    await homeProbe?.shutdown();
-    await home?.dispose();
-    await edge?.dispose();
-    await tls.close();
   }
+  await withMediaCleanup(exercise, [
+    () => homeProbe?.shutdown(),
+    () => home?.dispose(),
+    () => edge?.dispose(),
+    () => tls.close(),
+  ]);
 });
