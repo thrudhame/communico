@@ -267,6 +267,210 @@ Deno.test('facade capacity: incremental grants continue during a status walk', a
   }
 });
 
+Deno.test('facade capacity review: moving the last alias preserves its inode charge', async () => {
+  const root = await Deno.makeTempDir();
+  try {
+    const from = `${root}/from`;
+    const to = `${root}/to`;
+    const known = `${root}/known`;
+    await Deno.mkdir(from);
+    await Deno.writeFile(known, new Uint8Array(4096).fill(1));
+    await Deno.link(known, `${from}/alias`);
+    const capacity = new Capacity([root]);
+    await capacity.initialize();
+    await Deno.writeFile(known, new Uint8Array(65536).fill(2));
+    capacity.refresh(known);
+    await capacity.remove(known);
+    await Deno.rename(from, to);
+    capacity.moved(from, to);
+    assertEquals(
+      capacity.accountedBytes(),
+      (await new Capacity([root]).status()).filesystems[0].usedBytes,
+    );
+  } finally {
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test('facade capacity review: status accounts for a live staging file only through its grant', async () => {
+  const root = await Deno.makeTempDir();
+  try {
+    const capacity = new Capacity([root]);
+    const path = `${root}/stage`;
+    const lease = await capacity.reserveStaging(path, 64 * 1024);
+    const before = capacity.accountedBytes();
+    try {
+      await Deno.writeFile(path, new Uint8Array(64 * 1024).fill(1));
+      const [disk] = (await capacity.status()).filesystems;
+      assertEquals(disk.usedBytes, before);
+      assertEquals(disk.protectedBytes, before);
+      assertEquals(disk.reclaimableBytes, 0);
+      assert(disk.reservedBytes >= 64 * 1024);
+    } finally {
+      lease.release();
+    }
+    const [committed] = (await capacity.status()).filesystems;
+    assertEquals(committed.reservedBytes, 0);
+    assert(committed.usedBytes >= before + 64 * 1024);
+  } finally {
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test('facade capacity review: observing scratch does not leave an admission charge', async () => {
+  const root = await Deno.makeTempDir();
+  try {
+    const scratch = `${root}/.scratch`;
+    await Deno.mkdir(scratch);
+    const before =
+      (await new Capacity([root]).status()).filesystems[0].usedBytes;
+    const capacity = new Capacity([root], before + 64 * 1024);
+    capacity.setScratchRoot(scratch);
+    const spill = `${scratch}/spill`;
+    await Deno.writeFile(spill, new Uint8Array(128 * 1024).fill(1));
+    const observed = await capacity.status();
+    assert(observed.scratch.currentBytes >= 128 * 1024);
+    assertEquals(
+      observed.scratch.observedPeakBytes,
+      observed.scratch.currentBytes,
+    );
+    assertEquals(
+      observed.filesystems[0].protectedBytes,
+      before + observed.scratch.currentBytes,
+    );
+    await Deno.remove(spill);
+    (await capacity.reserveStaging(`${root}/stage`, 4096)).release();
+    const clean = await capacity.status();
+    assertEquals(clean.scratch.currentBytes, 0);
+    assertEquals(
+      clean.scratch.observedPeakBytes,
+      observed.scratch.currentBytes,
+    );
+  } finally {
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test('facade capacity review: materialized staging makes a recoverable physical shortfall busy', async () => {
+  const root = await Deno.makeTempDir();
+  try {
+    let freeBytes = 163840;
+    let freeInodes = 1;
+    const capacity = new Capacity([root], null, () => ({
+      totalBytes: MiB,
+      freeBytes,
+      freeInodes,
+      device: 1,
+      blockSize: 4096,
+    }));
+    const path = `${root}/stage`;
+    const lease = await capacity.reserveStaging(path, 128 * 1024);
+    try {
+      await Deno.writeFile(path, new Uint8Array(128 * 1024).fill(1));
+      freeBytes -= 128 * 1024;
+      freeInodes--;
+      await assertRejects(
+        () =>
+          new Admission().run(() =>
+            capacity.reserveStaging(`${root}/next`, 4096)
+          ),
+        StorageBusyError,
+      );
+      const impossible = await assertRejects(
+        () =>
+          new Admission().run(() =>
+            capacity.reserveStaging(`${root}/too-big`, MiB)
+          ),
+        StoragePressureError,
+      );
+      assert(!(impossible instanceof StorageBusyError));
+    } finally {
+      await Deno.remove(path);
+      freeBytes += 128 * 1024;
+      freeInodes++;
+      lease.release();
+    }
+    (await capacity.reserveStaging(`${root}/next`, 4096)).release();
+  } finally {
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test('facade capacity review: re-probe when a physical sample straddles settlement', async () => {
+  const root = await Deno.makeTempDir();
+  try {
+    for (const materializes of [false, true]) {
+      const observing = Promise.withResolvers<void>();
+      const resume = Promise.withResolvers<void>();
+      const path = `${root}/stage`;
+      const target = `${root}/next`;
+      let freeBytes = 128 * 1024;
+      let samples = 0;
+      const capacity = new Capacity([root], null, async (candidate) => {
+        const observed = freeBytes;
+        if (candidate === target && ++samples === 1) {
+          observing.resolve();
+          await resume.promise;
+        }
+        return {
+          totalBytes: MiB,
+          freeBytes: observed,
+          freeInodes: 10,
+          device: 1,
+          blockSize: 4096,
+        };
+      });
+      const holder = await capacity.reserveStaging(path, 96 * 1024);
+      const next = new Admission().run(() =>
+        capacity.reserveStaging(target, 4096)
+      );
+      void next.catch(() => {});
+      try {
+        await observing.promise;
+        if (materializes) {
+          await Deno.writeFile(path, new Uint8Array(96 * 1024).fill(1));
+          freeBytes -= 96 * 1024;
+        }
+        holder.release();
+        resume.resolve();
+        if (materializes) {
+          const error = await assertRejects(() => next, StoragePressureError);
+          assert(!(error instanceof StorageBusyError));
+        } else (await next).release();
+        assertEquals(samples, 2);
+      } finally {
+        holder.release();
+        resume.resolve();
+        (await next.catch(() => undefined))?.release();
+      }
+    }
+  } finally {
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test('facade capacity review: large publication path sets settle without unbounded arguments', async () => {
+  const root = await Deno.makeTempDir();
+  try {
+    const path = `${root}/published`;
+    const capacity = new Capacity([root]);
+    const lease = await capacity.reservePublication(path, 1, [4096]);
+    try {
+      // Paths already cleaned after an EXDEV copy do not need a disk fixture.
+      for (let i = 0; i < 140_000; i++) lease.track(`${root}/gone-${i}`);
+      await Deno.writeFile(path, new Uint8Array(4096).fill(1));
+    } finally {
+      lease.release();
+    }
+    const accounted = capacity.accountedBytes();
+    const [disk] = (await capacity.status()).filesystems;
+    assertEquals(disk.reservedBytes, 0);
+    assertEquals(accounted, disk.usedBytes);
+  } finally {
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
 Deno.test('facade capacity: scratch peak samples checkpoints and status, not statements', async () => {
   const root = await Deno.makeTempDir({ prefix: 'facade-observed-scratch-' });
   const ffi = new Turso('./.native/libturso_ffi.so');
@@ -1272,6 +1476,107 @@ Deno.test('facade capacity: exhausted inodes prohibit new files even with the ca
     freeInodes = 1000;
     assertEquals((await publish(cache, next, 16)).size, 16);
     await lease.cancel();
+  });
+});
+
+Deno.test('facade capacity review: disconnect cancels the owner waiting for staging', async () => {
+  const queued = Promise.withResolvers<void>();
+  let freeBytes = 32 * MiB;
+  await mediaFixture({
+    budgetBytes: null,
+    probe: (path) => {
+      if (path.endsWith('.part')) queued.resolve();
+      return {
+        totalBytes: 32 * MiB,
+        freeBytes,
+        freeInodes: 1000,
+        device: 1,
+        blockSize: 4096,
+      };
+    },
+  }, async (cache, root, capacity) => {
+    freeBytes = 4 * MiB;
+    const holder = await capacity.reserveStaging(`${root}/held`, 3 * MiB);
+    const controller = new AbortController();
+    const disconnected = cache.fetch(
+      cacheId('cancelled'),
+      1,
+      () => {
+        throw new Error('cancelled producer must not run');
+      },
+      controller.signal,
+      3 * MiB,
+    );
+    void disconnected.catch(() => {});
+    const entered = Promise.withResolvers<void>();
+    let next: Promise<unknown> | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let marker: Awaited<ReturnType<Capacity['reserveStaging']>> | undefined;
+    try {
+      await queued.promise;
+      // A later grant on the lane proves that the first attempt has left it.
+      marker = await capacity.reserveStaging(`${root}/marker`, 0);
+      controller.abort();
+      await assertRejects(() => disconnected, DOMException, 'aborted');
+      next = cache.fetch(
+        cacheId('small'),
+        1,
+        async (out) => {
+          entered.resolve();
+          await out.getWriter().close();
+          return { contentType: 'image/png', filename: null, size: 0 };
+        },
+        undefined,
+        4096,
+      );
+      await Promise.race([
+        entered.promise,
+        next,
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() =>
+            reject(
+              new Error('cancelled cache fill still owns a producer slot'),
+            ), 1000);
+        }),
+      ]);
+      await entered.promise;
+    } finally {
+      clearTimeout(timer);
+      controller.abort();
+      freeBytes = 32 * MiB;
+      marker?.release();
+      holder.release();
+      await next?.catch(() => undefined);
+    }
+    assertEquals((await cache.get(cacheId('small')))?.size, 0);
+  });
+});
+
+Deno.test('facade capacity review: a cache hit remains readable under timestamp write pressure', async () => {
+  let freeBytes = 32 * MiB;
+  const unexpected = new Error('unrelated I/O failure');
+  let broken = false;
+  await mediaFixture({
+    probe: () => {
+      if (broken) throw unexpected;
+      return {
+        totalBytes: 32 * MiB,
+        freeBytes,
+        freeInodes: 10,
+        device: 1,
+        blockSize: 4096,
+      };
+    },
+  }, async (cache) => {
+    const row = await publish(cache, cacheId('hit'), 4);
+    freeBytes = 0;
+    const stream = await cache.open(row);
+    assertEquals(
+      new Uint8Array(await new Response(stream).arrayBuffer()),
+      new Uint8Array(4).fill(73),
+    );
+    broken = true;
+    assertEquals(await assertRejects(() => cache.open(row)), unexpected);
   });
 });
 

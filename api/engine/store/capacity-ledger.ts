@@ -11,6 +11,7 @@ export type Allocation = {
   physicalDevice: string;
   inode: bigint;
   bytes: number;
+  links: bigint;
   directory: boolean;
   symlink: boolean;
 };
@@ -53,12 +54,29 @@ export class CapacityLedger {
         prior.allocation.device,
         allocation.bytes - prior.allocation.bytes,
       );
-      prior.allocation = { ...allocation, device: prior.allocation.device };
+      this.paths.set(
+        path,
+        Object.assign(prior.allocation, {
+          ...allocation,
+          device: prior.allocation.device,
+        }),
+      );
     } else {
-      this.inodes.set(key(allocation), { count: 1, allocation });
+      const canonical = { ...allocation };
+      this.inodes.set(key(allocation), { count: 1, allocation: canonical });
+      this.paths.set(path, canonical);
       this.charge(allocation.device, allocation.bytes);
     }
-    this.paths.set(path, allocation);
+  }
+
+  /** Moving a name cannot update the observed allocation of its inode. */
+  move(source: string, destination: string): void {
+    if (source === destination) return;
+    const entry = this.paths.get(source);
+    if (!entry) return;
+    this.set(destination);
+    this.paths.set(destination, entry);
+    this.paths.delete(source);
   }
 
   /** Look up the nearest known directory without filesystem I/O. */

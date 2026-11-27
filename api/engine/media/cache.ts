@@ -12,7 +12,7 @@ import {
   touchCachedMedia,
 } from '#engine/server/media.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
-import { storageFailure } from '#engine/store/pressure.ts';
+import { isStoragePressure, storageFailure } from '#engine/store/pressure.ts';
 import { withStorageHold } from '#engine/store/holds.ts';
 import { abortable } from '#engine/net/abort.ts';
 
@@ -292,7 +292,7 @@ export class MediaCache {
         if (maxBytes === undefined) {
           throw new Error('media size bound required');
         }
-        space = await this.capacity.reserveStaging(part, maxBytes);
+        space = await this.capacity.reserveStaging(part, maxBytes, signal);
         space.track(this.directory + '/' + blob);
       }
       signal.throwIfAborted();
@@ -402,7 +402,15 @@ export class MediaCache {
       try {
         file = await Deno.open(this.directory + '/' + row.blob, { read: true });
         const now = Date.now();
-        await touchCachedMedia(this.db, row.cache_key, now);
+        try {
+          // The serving lease already protects the file; recency is best
+          // effort under pressure and stays current in the live cache index.
+          await withStorageHold(() =>
+            touchCachedMedia(this.db, row.cache_key, now)
+          );
+        } catch (error) {
+          if (!isStoragePressure(error)) throw error;
+        }
         current.accessed_ms = now;
       } catch (error) {
         file?.close();
