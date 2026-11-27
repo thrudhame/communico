@@ -22,6 +22,8 @@ export type FakeRequest = {
   path: string;
   origin: string | null;
   verified: boolean;
+  hasAuthorization: boolean;
+  hasCookie: boolean;
   body: Uint8Array | null;
 };
 
@@ -39,8 +41,6 @@ export type FakeServer = {
   // the fake's own document for seeding the remembered-keys tables
   keyDoc: () => Promise<Record<string, unknown>>;
 };
-
-type OurKey = { serverName: string; keyId: string; pub: CryptoKey };
 
 export async function startFakeServer(opts: {
   // witness role: documents to notarize, by server name
@@ -68,11 +68,13 @@ export async function startFakeServer(opts: {
   const ourKeyEntries = Object.entries(
     ourRaw.verify_keys as Record<string, { key: string }>,
   );
-  const ourKey: OurKey = {
-    serverName: ourName,
-    keyId: ourKeyEntries[0][0],
-    pub: await importPublicKeyFromRaw(b64decode(ourKeyEntries[0][1].key)),
-  };
+  const ourKeys = new Map(
+    await Promise.all(
+      ourKeyEntries.map(async ([id, doc]) =>
+        [id, await importPublicKeyFromRaw(b64decode(doc.key))] as const
+      ),
+    ),
+  );
 
   async function keyDoc(): Promise<Record<string, unknown>> {
     const doc: Record<string, unknown> = {
@@ -98,6 +100,9 @@ export async function startFakeServer(opts: {
       const url = new URL(request.url);
       const uri = url.pathname + url.search;
       for (const c of parseXMatrixHeaders([authHeader])) {
+        if (c.origin !== ourName) continue;
+        const publicKey = ourKeys.get(c.key);
+        if (!publicKey) continue;
         if (c.destination !== null && !ownNames.includes(c.destination)) {
           continue;
         }
@@ -116,7 +121,7 @@ export async function startFakeServer(opts: {
         const data = new TextEncoder().encode(canonicalJson(obj));
         const ok = await crypto.subtle.verify(
           { name: 'Ed25519' },
-          ourKey.pub,
+          publicKey,
           sig,
           data,
         );
@@ -144,6 +149,8 @@ export async function startFakeServer(opts: {
       path: url.pathname + url.search,
       origin,
       verified: origin !== null,
+      hasAuthorization: request.headers.has('authorization'),
+      hasCookie: request.headers.has('cookie'),
       body: bodyBytes,
       url,
       json: () =>
