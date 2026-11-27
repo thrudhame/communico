@@ -931,6 +931,23 @@ function bind(
         media.markMediaUploaded(conn, mediaId, meta),
       recordExport: (mediaId: string, issuer: string, sha256: string) =>
         media.recordMediaExport(conn, mediaId, issuer, sha256),
+      exportById: (issuer: string, id: string) =>
+        media.mediaExportById(conn, issuer, id),
+      pendingExports: (
+        issuer: string,
+        pairing: string,
+        after: string,
+        limit: number,
+      ) => media.pendingMediaExports(conn, issuer, pairing, after, limit),
+      confirmExport: (id: string, pairing: string, fingerprint: string) =>
+        media.confirmMediaExport(conn, id, pairing, fingerprint),
+      homeCopy: (id: string) => media.homeMediaCopy(conn, id),
+      beginCopy: (id: string, fingerprint: string, sha256: string) =>
+        media.beginMediaCopy(conn, id, fingerprint, sha256),
+      advanceCopy: (id: string, bytes: number, sha256: string) =>
+        media.advanceMediaCopy(conn, id, bytes, sha256),
+      finishCopy: (row: media.MediaRow, sha256: string) =>
+        media.finishMediaCopy(conn, row, sha256),
     },
     delayedEvents: {
       newId: () => delayedEvents.newId(conn),

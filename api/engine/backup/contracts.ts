@@ -89,6 +89,10 @@ export const tableContracts = {
       'pushers',
       'media',
       'media_exports',
+      // Preserve exact applied confirmations and copy identities. Incomplete
+      // prefixes are revalidated on resume; private part files are not media.
+      'media_export_confirmations',
+      'media_home_copies',
       'filters',
       'openid_tokens',
       'profile_fields',

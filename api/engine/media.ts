@@ -43,7 +43,7 @@ function issuerPrefix(node: string): string {
   return 'n1_' + createHash('sha256').update(node).digest('hex') + '_';
 }
 
-function issuedHere(mediaId: string, node: string): boolean {
+export function mediaIssuedBy(mediaId: string, node: string): boolean {
   const prefix = issuerPrefix(node);
   return mediaId.startsWith(prefix) &&
     /^[A-Za-z0-9_-]{24}$/.test(mediaId.slice(prefix.length));
@@ -145,7 +145,7 @@ export async function uploadMedia(
   const issuer = localIssuer();
   if (
     !MXC_MEDIA_ID.test(mediaId) ||
-    (issuer !== null && !issuedHere(mediaId, issuer))
+    (issuer !== null && !mediaIssuedBy(mediaId, issuer))
   ) {
     throw new MatrixError(404, 'M_NOT_FOUND', 'Unknown media ID');
   }
@@ -352,7 +352,7 @@ export async function recoverLocalUploads(tenant: Tenant, capacity?: Capacity) {
       if (!entry.isFile) continue;
       const part = /^([^.]+)\.[a-f0-9-]{36}\.part$/.exec(entry.name);
       const id = part?.[1] ?? entry.name;
-      if (!issuedHere(id, issuer)) continue;
+      if (!mediaIssuedBy(id, issuer)) continue;
       // Publication intent and uploaded state are committed together. A final
       // without an uploaded row cannot have reached an upload ACK.
       if (!part && (await getMedia(tenant, id))?.state === 'uploaded') continue;
@@ -377,10 +377,19 @@ export async function serveMedia(
   mediaId: string,
 ): Promise<Response> {
   assertLocalMxc(mxcServerName, mediaId);
-  const row = await getMedia(theApp().tenant, mediaId);
+  const row = await theApp().tenant.tx(async (tx) => {
+    const row = await tx.media.byId(mediaId);
+    if (
+      row === null && config().server.role === 'home' &&
+      mediaId.startsWith('n1_') && await tx.media.homeCopy(mediaId)
+    ) {
+      throw new MatrixError(503, 'M_UNAVAILABLE', 'Media copy unavailable');
+    }
+    return row;
+  });
   if (row === null) {
     const issuer = localIssuer();
-    if (issuer !== null && !issuedHere(mediaId, issuer)) {
+    if (issuer !== null && !mediaIssuedBy(mediaId, issuer)) {
       // Not enough information to rule out an existing original at home.
       throw new MatrixError(503, 'M_UNAVAILABLE', 'Media unavailable');
     }

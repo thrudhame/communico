@@ -293,6 +293,7 @@ export function startHomeLinkWorker(
     notify: 'websocket' | 'sse' | 'poll';
     pollseconds: number;
     reconnectmaxseconds: number;
+    copyMedia?(signal: AbortSignal): Promise<void>;
   },
 ): { wake(): void; close(): Promise<void> } {
   const controller = new AbortController();
@@ -309,6 +310,7 @@ export function startHomeLinkWorker(
     if (options.activity) wake();
   });
   const periodic = setInterval(wake, options.pollseconds * 1000);
+  let copying: Promise<void> | undefined;
   const loop = (async () => {
     while (!signal.aborted) {
       if (!dirty) {
@@ -348,7 +350,14 @@ export function startHomeLinkWorker(
         }
       }
       try {
-        await reconciler.reconcile(signal);
+        const hello = await reconciler.reconcile(signal);
+        if (
+          hello.mediaCopy && options.copyMedia && !copying && !signal.aborted
+        ) {
+          copying = options.copyMedia(signal).catch((error) => {
+            if (!signal.aborted) options.failed(error);
+          }).finally(() => copying = undefined);
+        }
       } catch (error) {
         if (!signal.aborted) options.failed(error);
       }
@@ -386,6 +395,7 @@ export function startHomeLinkWorker(
         controller.abort();
         wake();
         await Promise.all([loop, notices]);
+        await copying;
         // Domain work already admitted is not cancelled by transport shutdown.
         await reconciler.drain();
       })();

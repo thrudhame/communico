@@ -13,6 +13,7 @@ import {
   LinkError,
   LIVE_ACTIVITY_CAPABILITY,
   type LiveActivity,
+  MEDIA_COPY_CAPABILITY,
   negotiate,
   object,
   recordOf,
@@ -21,6 +22,7 @@ import {
   text,
 } from './protocol.ts';
 import { LINK_PREFIX, LinkClient, type LinkTls } from './transport.ts';
+import { type FacadeMediaExports, isMediaCopyRoute } from './media-copy.ts';
 
 async function message(request: Request): Promise<Record<string, unknown>> {
   try {
@@ -209,6 +211,7 @@ export function linkHandler(options: {
   connected?(pairing: string, signal: AbortSignal): void;
   signKeyDocument?(raw: unknown): Promise<string>;
   activity?: LiveActivity;
+  mediaExports?(): FacadeMediaExports | undefined;
 }): (request: Request, peerPin: string) => Promise<Response> {
   const challenges = new Map<string, { token: string; started: number }>();
   const enroll = enrollmentHandler(options);
@@ -234,14 +237,15 @@ export function linkHandler(options: {
       !((request.method === 'GET' &&
         ['hello', 'records', 'notices'].includes(route)) ||
         (request.method === 'POST' &&
-          ['records', 'ack', 'key-signature', 'activity'].includes(route)))
+          (['records', 'ack', 'key-signature', 'activity'].includes(route) ||
+            isMediaCopyRoute(route))))
     ) {
       return new Response(null, { status: 404 });
     }
     const body = request.method === 'GET'
       ? object(json(request.headers.get('x-communico-link')))
       : await message(request);
-    negotiate(body, options.server, LINK_SUPPORTED);
+    const { required } = negotiate(body, options.server, LINK_SUPPORTED);
     const id = text(body.pairing);
     if (body.source !== 'home' || body.incarnation !== id) {
       throw new LinkError('LINK_IDENTITY_MISMATCH', 'wrong link source', 403);
@@ -268,6 +272,25 @@ export function linkHandler(options: {
         pairing: id,
         ...value,
       });
+    if (isMediaCopyRoute(route)) {
+      const exports = options.mediaExports?.();
+      if (
+        !exports ||
+        !required.some((entry) =>
+          entry.type === MEDIA_COPY_CAPABILITY.type &&
+          entry.version === MEDIA_COPY_CAPABILITY.version
+        )
+      ) {
+        throw new LinkError(
+          'LINK_CAPABILITY_MISMATCH',
+          'media copy not negotiated',
+        );
+      }
+      return response({
+        ...await exports.exchange(route, id, body),
+        required: [...LINK_CAPABILITIES, MEDIA_COPY_CAPABILITY],
+      });
+    }
     if (route === 'activity') {
       const required = body.required as { type: string; version: number }[];
       if (
@@ -391,7 +414,10 @@ export function linkHandler(options: {
       const outgoing = await activeStreams('out');
       return response({
         revision: grant.body.revision,
-        supported: journal.supported,
+        supported: journal.supported.filter((entry) =>
+          entry.type !== MEDIA_COPY_CAPABILITY.type ||
+          options.mediaExports?.() !== undefined
+        ),
         scopes: [],
         outgoing,
         incoming: await activeStreams('in'),
