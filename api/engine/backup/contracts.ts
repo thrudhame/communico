@@ -88,6 +88,7 @@ export const tableContracts = {
       'backup_rooms',
       'pushers',
       'media',
+      'media_exports',
       'filters',
       'openid_tokens',
       'profile_fields',
