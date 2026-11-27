@@ -1,7 +1,12 @@
 // Faults at the home side of the authenticated link. Keep the real peer,
 // worker, stores, and HTTP consumers. Log only route/cut observations.
 import { canonicalJson } from '#engine/canonical.ts';
-import { LinkError, MEDIA_COPY_CAPABILITY } from '#engine/facade/protocol.ts';
+import {
+  type Capability,
+  LinkError,
+  MEDIA_COPY_CAPABILITY,
+  MEDIA_WANTS_CAPABILITY,
+} from '#engine/facade/protocol.ts';
 import { LINK_PREFIX, LinkClient } from '#engine/facade/transport.ts';
 
 const control = Deno.env.get('COMMUNICO_CONFIG') + '.media-copy';
@@ -10,7 +15,7 @@ const log = (event: string, offset = 0) =>
   Deno.writeTextFileSync(`${control}.trace`, `${event} ${offset}\n`, {
     append: true,
   });
-const withoutCopy = (capabilities: typeof MEDIA_COPY_CAPABILITY[]) =>
+const withoutCopy = (capabilities: Capability[]) =>
   capabilities.filter(({ type }) => type !== MEDIA_COPY_CAPABILITY.type);
 
 LinkClient.prototype.fetch = async function (path, init) {
@@ -52,7 +57,11 @@ LinkClient.prototype.fetch = async function (path, init) {
   if (route === 'hello' && phase === 'legacy-peer') {
     const value = await response.json();
     log('legacy-peer:hello');
-    return Response.json({ ...value, supported: withoutCopy(value.supported) });
+    // Model a peer from before either media exchange was introduced.
+    const supported = withoutCopy(value.supported).filter(({ type }) =>
+      type !== MEDIA_WANTS_CAPABILITY.type
+    );
+    return Response.json({ ...value, supported });
   }
   if (route === 'media-manifests') {
     const value = await response.json();

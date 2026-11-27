@@ -93,6 +93,10 @@ export const tableContracts = {
       // prefixes are revalidated on resume; private part files are not media.
       'media_export_confirmations',
       'media_home_copies',
+      // Keep outstanding demand and exact pair-bound backing evidence. The
+      // media owner revalidates staged bytes and backing before use.
+      'media_wants',
+      'media_backing',
       'filters',
       'openid_tokens',
       'profile_fields',
