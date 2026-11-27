@@ -64,15 +64,36 @@ export async function openNative(
   path: string,
   capacity?: Capacity,
 ): Promise<number> {
-  // This initializer is not a replayable transaction. A failed private open
-  // is discarded by its creator; never replay partially initialized MVCC
-  // metadata or remove an existing database here.
-  const grant = await capacity?.reserveNative(path, 3, bootstrapFrames, false);
   try {
-    return await ffi.open(path, grant);
+    if (!capacity) return await ffi.open(path);
+    // Do not charge a fresh bootstrap on a clean pool miss or cold reopen.
+    // A probe cannot create files or write nonempty buffers. Retry it once
+    // only if the native guard refused allocation, not for a physical I/O
+    // failure or after any allocating initialization attempt.
+    const existing = await Deno.stat(path).catch((error) => {
+      if (!(error instanceof Deno.errors.NotFound)) throw error;
+    });
+    if (existing?.isFile && existing.size > 0) {
+      // Closing the file settles canonical paths even when no grant ran.
+      await capacity.initialize();
+      try {
+        return await ffi.open(path, {
+          ...NO_GROWTH,
+          scratchRoot: capacity.nativeScratchRoot,
+        });
+      } catch (error) {
+        if (!(error instanceof StoreError && error.openNeedsAllocation)) {
+          throw error;
+        }
+      }
+    }
+    const grant = await capacity.reserveNative(path, 3, bootstrapFrames, false);
+    try {
+      return await ffi.open(path, grant);
+    } finally {
+      grant.release();
+    }
   } catch (error) {
     throw storageFailure(error);
-  } finally {
-    grant?.release();
   }
 }

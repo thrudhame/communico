@@ -9,6 +9,7 @@ import {
   type Value,
 } from '#engine/store/ffi.ts';
 import { Gate } from '#engine/store/gate.ts';
+import { isReadQuery } from '#engine/store/read-sql.ts';
 import {
   isStoragePressure,
   StorageBusyError,
@@ -75,6 +76,7 @@ type Attempt<T> =
 
 export class Conn {
   private active = true;
+  private readonly pending = new Set<Promise<unknown>>();
   private writeVersion = 0;
 
   constructor(
@@ -103,13 +105,10 @@ export class Conn {
 
   query(sql: string, values: readonly Value[] = []): Promise<Row[]> {
     this.check();
-    // query also accepts row-producing writes (for example RETURNING).
-    // WITH can lead to a SELECT or DML. Err toward a write for any ambiguous
-    // statement (including keywords inside strings/comments).
-    const readOnly = /^\s*(SELECT|WITH)\b[^;]*;?\s*$/is.test(sql) &&
-      !/\b(INSERT|UPDATE|DELETE|REPLACE)\b/i.test(sql);
     const query = () => this.ffi.query(this.handle, sql, values);
-    return readOnly ? query() : this.write(sql, values, query);
+    return this.track(
+      isReadQuery(sql) ? query() : this.write(sql, values, query),
+    );
   }
 
   /** Successful affected-row writes in this attempt, not global database work.
@@ -121,21 +120,33 @@ export class Conn {
 
   execute(sql: string, values: readonly Value[] = []): Promise<number> {
     this.check();
-    return this.write(
-      sql,
-      values,
-      () => this.ffi.execute(this.handle, sql, values),
-    ).then(
-      (affected) => {
-        if (affected > 0) this.writeVersion++;
-        return affected;
-      },
+    return this.track(
+      this.write(
+        sql,
+        values,
+        () => this.ffi.execute(this.handle, sql, values),
+      ).then(
+        (affected) => {
+          if (affected > 0) this.writeVersion++;
+          return affected;
+        },
+      ),
     );
   }
 
   exec(sql: string): Promise<void> {
     this.check();
-    return this.write(sql, [], () => this.ffi.exec(this.handle, sql));
+    return this.track(
+      this.write(sql, [], () => this.ffi.exec(this.handle, sql)),
+    );
+  }
+
+  private track<T>(result: Promise<T>): Promise<T> {
+    this.pending.add(result);
+    const settled = () => this.pending.delete(result);
+    // Observe both outcomes even when the callback abandons the promise.
+    void result.then(settled, settled);
+    return result;
   }
 
   private write<T>(
@@ -153,8 +164,9 @@ export class Conn {
       : result;
   }
 
-  release(): void {
+  drain(): Promise<PromiseSettledResult<unknown>[]> {
     this.active = false;
+    return Promise.allSettled(this.pending);
   }
 }
 
@@ -352,7 +364,7 @@ export class Db {
         return db;
       } catch (error) {
         await db.shutdown();
-        throw error;
+        throw storageFailure(error);
       }
     });
     this.openFiles.set(path, opened);
@@ -441,7 +453,10 @@ export class Db {
           if (
             attempt < TRANSACTION_ATTEMPTS &&
             await this.capacity?.reclaimAfterFull(this.path)
-          ) continue;
+          ) {
+            attempt++;
+            continue;
+          }
           throw error;
         }
         if (error instanceof StoreError) this.conflictCounters.conflicts++;
@@ -527,10 +542,14 @@ export class Db {
         await this.ffi.begin(handle, options.mode ?? 'concurrent');
         if (options.admit) connection.admit(options.admit);
         const result = await fn(connection);
+        const pending = await connection.drain();
         // A body cannot turn a refused first write into a successful commit
         // by handling its statement error locally.
         await admission;
         if (refused) throw refused;
+        for (const outcome of pending) {
+          if (outcome.status === 'rejected') throw outcome.reason;
+        }
         const commit = () =>
           commitAdmitted(checks, () => this.ffi.commit(handle!));
         if (this.admission) {
@@ -542,6 +561,10 @@ export class Db {
         committed = true;
         return { kind: 'committed', value: result };
       } catch (error) {
+        // Admission is part of the issued write promise. Drain before any
+        // rollback, limit reset or release; a late setLimit must not target
+        // a recycled handle. The original body failure owns this outcome.
+        await connection.drain();
         try {
           await this.ffi.rollback(handle);
         } catch (rollback) {
@@ -573,7 +596,6 @@ export class Db {
       }
     } finally {
       if (writing) this.writers--;
-      connection?.release();
       try {
         if (handle !== undefined) {
           if (reusable) {

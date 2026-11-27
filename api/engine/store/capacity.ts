@@ -310,6 +310,10 @@ export class Capacity {
     }
   }
 
+  get nativeScratchRoot(): string | undefined {
+    return this.scratchRoot;
+  }
+
   /** The cache owner registers committed, replaceable blobs, never staging. */
   registerCacheBlob(path: string, blob: CacheBlob): () => void {
     const file = lstatSync(path, { bigint: true });

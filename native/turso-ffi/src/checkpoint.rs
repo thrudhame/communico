@@ -23,12 +23,13 @@ pub struct Grant {
     bytes: u64,
     undo: u64,
     usage: Mutex<Usage>,
-    creates: Mutex<u32>,
 }
 
 struct Usage {
     remaining: u64,
     required_write_bytes: Option<u64>,
+    creates: u32,
+    refused_create: bool,
 }
 
 tokio::task_local! {
@@ -44,17 +45,21 @@ impl Grant {
             usage: Mutex::new(Usage {
                 remaining: bytes,
                 required_write_bytes: None,
+                creates,
+                refused_create: false,
             }),
-            creates: Mutex::new(creates),
         }
     }
 
     fn create(&self) -> Result<()> {
-        let mut remaining = self.creates.lock().unwrap();
-        *remaining = remaining
-            .checked_sub(1)
-            .ok_or(turso_core::LimboError::DatabaseFull)?;
-        Ok(())
+        let mut usage = self.usage.lock().unwrap();
+        if let Some(left) = usage.creates.checked_sub(1) {
+            usage.creates = left;
+            Ok(())
+        } else {
+            usage.refused_create = true;
+            Err(turso_core::LimboError::DatabaseFull)
+        }
     }
 
     fn charge(&self, pos: u64, len: u64, cleanup: bool) -> Result<()> {
@@ -85,6 +90,11 @@ impl Grant {
 
     pub fn required_write_bytes(&self) -> Option<u64> {
         self.usage.lock().unwrap().required_write_bytes
+    }
+
+    pub fn refused_allocation(&self) -> bool {
+        let usage = self.usage.lock().unwrap();
+        usage.refused_create || usage.required_write_bytes.is_some()
     }
 }
 

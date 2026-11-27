@@ -13,6 +13,8 @@ export class StoreError extends Error {
     message: string,
     readonly lastError: string,
     readonly requiredWriteBytes?: number,
+    readonly openNeedsAllocation = false,
+    readonly osErrno?: number,
   ) {
     super(message);
     this.name = 'StoreError';
@@ -33,7 +35,8 @@ export class StoreError extends Error {
 
   get storageFull(): boolean {
     return (this.code & 255) === 13 ||
-      (this.code === 10 && this.lastError.startsWith('IoError(StorageFull, '));
+      (this.code === 10 &&
+        /^IoError\((StorageFull|QuotaExceeded), /.test(this.lastError));
   }
 }
 
@@ -183,6 +186,8 @@ export class Turso {
             reply.message,
             reply.last_error,
             reply.required_write_bytes ?? undefined,
+            reply.open_needs_allocation ?? false,
+            reply.os_errno ?? undefined,
           );
         }
         return reply.value as T;
