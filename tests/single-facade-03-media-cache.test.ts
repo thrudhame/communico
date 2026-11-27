@@ -1,5 +1,6 @@
-import { assert, assertEquals } from '@std/assert';
+import { assert, assertEquals, assertRejects } from '@std/assert';
 import { Image } from 'imagescript';
+import { mediaCacheKey } from '#engine/media/cache.ts';
 import { multipartResponse } from '#engine/media/multipart.ts';
 import { adminCall } from './admin-client.ts';
 import { startFakeServer } from './federation/fake-server.ts';
@@ -7,6 +8,7 @@ import { facadeProcess as process } from './helpers/facade-process.ts';
 import { fixtureLink } from './helpers/fixture-listeners.ts';
 import { facadeTls } from './support/facade-tls.ts';
 import { homeIp, mappedHome, peerIp } from './support/facade-media-wire.ts';
+import { latch, watchdog } from './support/ordering.ts';
 
 Deno.test('single facade media cache: offline foreign and derived reads never dial home', async (test) => {
   const tls = await facadeTls();
@@ -20,8 +22,8 @@ Deno.test('single facade media cache: offline foreign and derived reads never di
   const preview = (url: string, mount = 'client/v1/media') =>
     `/_matrix/${mount}/preview_url?url=${encodeURIComponent(url)}`;
   const ready = 'facade: link/local admin ready';
-  const start = () =>
-    process(file('facade'), ready, [], {
+  const start = (holds: string[] = []) =>
+    process(file('facade'), ready, holds, {
       entrypoint: 'tests/fixtures/facade-media-child.ts',
     });
   const connects = async () =>
@@ -158,6 +160,9 @@ Deno.test('single facade media cache: offline foreign and derived reads never di
     assert('port' in previewServer.addr);
     webPort = previewServer.addr.port;
     const cdn: Array<{ path: string; signed: boolean }> = [];
+    const mediaBytes = 4 * 1024 * 1024;
+    const upstream = latch(), sendBytes = latch();
+    const signedReads = new Map<string, number>();
     let peerPort = 0;
     peer = await startFakeServer({
       async ourKeyDoc() {
@@ -189,6 +194,22 @@ Deno.test('single facade media cache: offline foreign and derived reads never di
         if (!path.startsWith('/_matrix/federation/v1/media/')) return null;
         assertEquals(req.origin, 'logical.test', 'real X-Matrix signature');
         const id = path.split('/').at(-1)!;
+        signedReads.set(id, (signedReads.get(id) ?? 0) + 1);
+        if (id === 'cache-leased' || id === 'cache-eligible') {
+          const fill = () =>
+            multipartResponse(
+              new Response(
+                new Uint8Array(mediaBytes).fill(
+                  id === 'cache-leased' ? 91 : 173,
+                ),
+              ),
+            );
+          if (id === 'cache-leased') {
+            upstream.release();
+            return sendBytes.wait.then(fill);
+          }
+          return fill();
+        }
         if (id === 'old' || id === 'missing' || id === 'forbidden') {
           const errcode = {
             old: 'M_UNRECOGNIZED',
@@ -365,6 +386,131 @@ Deno.test('single facade media cache: offline foreign and derived reads never di
         '/blocked-image',
       ]);
       assertEquals(cdn.at(-1), { path: '/cdn/go-home', signed: false });
+    });
+
+    await test.step('one canceled waiter leaves the signed fill and live lease safe under storage pressure', async () => {
+      const upload = await request('/_matrix/media/v3/upload', true, {
+        method: 'POST',
+        headers: { 'content-type': 'application/octet-stream' },
+        body: ciphertext,
+      });
+      assertEquals(upload.status, 200);
+      const original = (await upload.json()).content_uri.slice('mxc://'.length);
+      const status = await adminCall(socket('facade'), 'facade/status');
+      assertEquals(status.status, 200);
+      const [disk] = status.body.result.capacity.filesystems;
+      // Leave room for two full blobs but not a third staging grant. Use
+      // live usage to accommodate different native DB and filesystem sizes.
+      const budget = disk.usedBytes + 2.5 * mediaBytes;
+      await edge!.stop();
+      const settings = await Deno.readTextFile(file('facade'));
+      await Deno.writeTextFile(
+        file('facade'),
+        settings.replace('maxbytes=262144', `maxbytes=${mediaBytes}`) +
+          `storagebudgetbytes=${budget}\n`,
+      );
+      edge = await start(['media-joined', 'media-left', 'media-lease']);
+      port = await edge.port('client');
+      const joined = await edge.holdPublication('media-joined');
+      const left = await edge.holdPublication('media-left');
+      const lease = await edge.holdPublication('media-lease');
+      const cacheDir = `${tls.dir}/facade-media/cache`;
+      const blobs = async (mediaId: string) => {
+        const key = await mediaCacheKey({
+          origin: peer!.name,
+          mediaId,
+          variant: 'original',
+          scope: 'remote',
+        });
+        const matches: string[] = [];
+        for await (const entry of Deno.readDir(cacheDir)) {
+          if (
+            entry.name.startsWith(key + '-') && entry.name.endsWith('.blob')
+          ) {
+            matches.push(entry.name);
+          }
+        }
+        return matches;
+      };
+      const assertFill = async (r: Response, value: number) => {
+        assertEquals(r.status, 200);
+        const data = await encoded(r);
+        assertEquals(data.length, mediaBytes);
+        assert(data.every((byte) => byte === value), 'exact remote bytes');
+      };
+      const cancel = new AbortController();
+      const path = download + foreign;
+      const canceled = assertRejects(
+        () => request(path + 'cache-leased', true, { signal: cancel.signal }),
+        DOMException,
+        'aborted',
+      );
+      let survivor: Promise<Response> | undefined;
+      let released = false;
+      try {
+        await watchdog(upstream.wait, 'first signed media request');
+        survivor = request(path + 'cache-leased');
+        void survivor.catch(() => {});
+        await joined.held();
+        cancel.abort();
+        await canceled;
+        await left.held();
+        assertEquals(signedReads.get('cache-leased'), 1);
+        sendBytes.release();
+        await lease.held();
+        const pinned = await blobs('cache-leased');
+        assertEquals(pinned.length, 1);
+
+        await assertFill(await request(path + 'cache-eligible'), 173);
+        const evictable = await blobs('cache-eligible');
+        assertEquals(evictable.length, 1);
+        assertEquals(signedReads.get('cache-eligible'), 1);
+
+        await assertBytes(await request(path + 'cache-pressure'), ciphertext);
+        assertEquals(
+          await blobs('cache-eligible'),
+          [],
+          'pressure unlinks the eligible blob',
+        );
+        assertEquals(
+          await blobs('cache-leased'),
+          pinned,
+          'the live lease stays linked',
+        );
+        await assertBytes(await request(download + original), ciphertext);
+        await assertBytes(await request(download + localImage), png);
+
+        await lease.release();
+        released = true;
+        await assertFill(await survivor, 91);
+        assertEquals(signedReads.get('cache-leased'), 1);
+        await assertFill(await request(path + 'cache-eligible'), 173);
+        const refilled = await blobs('cache-eligible');
+        assertEquals(refilled.length, 1);
+        assert(
+          refilled[0] !== evictable[0],
+          'the refetch publishes a new blob',
+        );
+        await assertFill(await request(path + 'cache-eligible'), 173);
+        assertEquals(
+          signedReads.get('cache-eligible'),
+          2,
+          'one refetch, then a cache hit',
+        );
+      } finally {
+        cancel.abort();
+        sendBytes.release();
+        // A failed assertion must not leave the child holding the serving lease.
+        await Promise.allSettled([
+          joined.release(),
+          left.release(),
+          released ? undefined : lease.release(),
+        ]);
+        await Promise.allSettled([
+          canceled,
+          survivor?.then((r) => r.body?.cancel()),
+        ]);
+      }
     });
   } finally {
     await Promise.allSettled([

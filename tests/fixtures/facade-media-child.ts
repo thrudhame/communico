@@ -1,7 +1,10 @@
-// Keep real TLS, HTTP, signatures and link authorization. Replace only fixture
-// DNS, the address reported by the incoming TLS socket, and final socket routing.
+// Keep real TLS, HTTP, signatures and link authorization. Route fixture sockets
+// locally and observe the real cache's waiters and serving lease.
 import tls from 'node:tls';
 import { Server } from 'node:https';
+import { MediaCache } from '#engine/media/cache.ts';
+import { beforeFacadePublication } from '#tests/helpers/facade-process.ts';
+import { mediaDemand } from '#tests/support/media-demand.ts';
 import {
   homeIp,
   mappedHome,
@@ -57,5 +60,21 @@ Server.prototype.listen = new Proxy(listen, {
     return Reflect.apply(listen, server, args);
   },
 });
+
+const holds: string[] = JSON.parse(Deno.env.get('FACADE_TEST_HOLDS') ?? '[]');
+if (holds.includes('media-joined')) {
+  const demand = mediaDemand();
+  void demand.joined.then(() => beforeFacadePublication('media-joined'));
+  void demand.firstLeft.then(() => beforeFacadePublication('media-left'));
+  const open = MediaCache.prototype.open;
+  MediaCache.prototype.open = async function (row) {
+    const stream = await open.call(this, row);
+    // Keep the real lease live, without taking the cache's serialized lane.
+    if (row.media_id === 'cache-leased') {
+      await beforeFacadePublication('media-lease');
+    }
+    return stream;
+  };
+}
 
 await import('./facade-child.ts');
