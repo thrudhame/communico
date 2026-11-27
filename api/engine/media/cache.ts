@@ -84,17 +84,21 @@ export class MediaCache {
       if (this.capacity) await this.capacity.ensureDirectory(this.directory);
       else await Deno.mkdir(this.directory, { recursive: true });
     }
+    let directoryPresent = true;
     if (this.capacity) {
       try {
         // The inventory uses canonical roots and never follows child links.
         if (!(await Deno.lstat(this.directory)).isDirectory) {
-          if (inventoryOnly) return;
-          throw new Error('invalid managed cache directory');
-        }
-        this.canonicalDirectory = await Deno.realPath(this.directory);
+          if (!inventoryOnly) {
+            throw new Error('invalid managed cache directory');
+          }
+          directoryPresent = false;
+        } else this.canonicalDirectory = await Deno.realPath(this.directory);
       } catch (error) {
-        if (inventoryOnly && error instanceof Deno.errors.NotFound) return;
-        throw error;
+        if (!(inventoryOnly && error instanceof Deno.errors.NotFound)) {
+          throw error;
+        }
+        directoryPresent = false;
       }
     }
     const rows = await listCachedMedia(this.db);
@@ -103,16 +107,20 @@ export class MediaCache {
       if (!BLOB.test(row.blob)) {
         throw new Error('invalid media cache blob identity');
       }
+      if (!directoryPresent) continue;
       try {
         const stat = await Deno.lstat(this.directory + '/' + row.blob);
         if (!stat.isFile || stat.size !== row.size) {
           throw new Deno.errors.NotFound();
         }
         known.add(row.blob);
-        this.register(row);
       } catch (error) {
         if (!(error instanceof Deno.errors.NotFound)) throw error;
       }
+    }
+    // Verify the entire index before making any entry eligible for eviction.
+    for (const row of rows) {
+      if (known.has(row.blob)) this.register(row);
     }
     if (inventoryOnly) return;
     for (const row of rows) {

@@ -814,10 +814,14 @@ On the admin socket, `POST /v1/facade/status` reports capacity per filesystem.
 If the filesystem runs out of space during a checkpoint, WAL blocks can remain
 allocated. Status reports `filesystemFull` and `checkpoint.retainedWalBytes`;
 those bytes count as protected until a scheduled retry succeeds. Cache eviction
-can make room for the retry. A completely full filesystem can prevent a cold
-restart from opening the database. Free space on the affected filesystem before
-retrying the restart; do not delete database or WAL files. Confirmed data is
-not lost.
+can make room for the retry. On cold startup, the facade can reclaim indexed
+cache only after it opens the database and verifies its identity and cache
+index (`capacity.coldStartReclamation`). A clean database can open without a
+growth reservation. If opening needs space it cannot reserve, startup fails
+with retryable storage pressure before the admin socket is available. Free
+space on the affected filesystem or increase the configured budget as
+appropriate, then retry. Do not delete database or WAL files. Confirmed data
+is not lost.
 
 Native temporary files live in `.scratch` under the facade store.
 `capacity.scratch.currentBytes` is sampled on status reads.

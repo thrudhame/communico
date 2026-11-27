@@ -2,8 +2,8 @@ import { StoreError } from '#engine/store/ffi.ts';
 
 /** A refused write that may succeed after storage becomes available. */
 export class StoragePressureError extends Error {
-  constructor(cause?: unknown) {
-    super('Storage capacity exhausted', { cause });
+  constructor(cause?: unknown, message = 'Storage capacity exhausted') {
+    super(message, { cause });
     this.name = 'StoragePressureError';
   }
 }

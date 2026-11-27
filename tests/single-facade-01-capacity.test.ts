@@ -4,10 +4,13 @@ import { initializeNode } from '#engine/facade/identity.ts';
 import { enrollLink, linkHandler } from '#engine/facade/link.ts';
 import { NoticeHub } from '#engine/facade/notices.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
+import { bindRole } from '#engine/facade/role.ts';
+import { openFacadeRuntime } from '#engine/facade/runtime.ts';
 import {
   EMPTY_CUT,
   LINK_CAPABILITIES,
   LINK_VERSION,
+  LinkError,
   type LinkRecord,
 } from '#engine/facade/protocol.ts';
 import { LinkClient, startLinkTransport } from '#engine/facade/transport.ts';
@@ -20,11 +23,13 @@ import { Capacity, type CapacityProbe } from '#engine/store/capacity.ts';
 import { createDatabase } from '#engine/store/create.ts';
 import { type Database, Db } from '#engine/store/db.ts';
 import { StoreError, Turso } from '#engine/store/ffi.ts';
+import { databaseFiles, serverDirectory } from '#engine/store/layout.ts';
 import {
   StorageBusyError,
   StoragePressureError,
 } from '#engine/store/pressure.ts';
 import { openStore, type Store } from '#engine/store/index.ts';
+import { onStartup } from '#engine/store/watermark.ts';
 import { openTenant, tenantSchema } from '#engine/tenant/index.ts';
 import { assert, assertEquals, assertRejects } from '@std/assert';
 import { lstat } from 'node:fs/promises';
@@ -87,6 +92,10 @@ Deno.test('facade capacity: local status exposes the default budget before pairi
       assertEquals(response.body.result.initialized, false);
       const capacity = response.body.result.capacity;
       assert(capacity, 'local facade status must show storage capacity');
+      assertEquals(
+        capacity.coldStartReclamation,
+        'after-identity-and-cache-index',
+      );
       assertEquals(capacity.filesystems.length, 1);
       const [disk] = capacity.filesystems;
       assert(disk.totalBytes > 0 && disk.freeBytes >= 0);
@@ -123,6 +132,185 @@ Deno.test('facade capacity: local status exposes the default budget before pairi
     }
   } finally {
     await tls.close();
+  }
+});
+
+Deno.test('facade capacity review: register only verified cache before recovery writes', async (t) => {
+  const tls = await facadeTls();
+  const settings = settingsFor(`${tls.dir}/store`);
+  const mediaRoot = `${tls.dir}/media`;
+  const identity = {
+    role: 'facade',
+    server: 'logical.test',
+    node: 'edge_a',
+  } as const;
+  let writeDuringStartup: (() => Promise<void>) | undefined;
+  onStartup(async (opening) => {
+    const db = await opening.server();
+    if (writeDuringStartup && db.path.startsWith(`${settings.dir}/`)) {
+      await db.execute('INSERT INTO startup_receipt VALUES (1)');
+      await writeDuringStartup();
+    }
+  });
+  try {
+    const owner = new Capacity([settings.dir, mediaRoot], null);
+    const store = await openStore(settings, { schemas, capacityOwner: owner });
+    let blobPath: string;
+    try {
+      await bindRole(store, identity);
+      const db = await store.server();
+      await db.exec('CREATE TABLE startup_receipt (id INTEGER PRIMARY KEY)');
+      const cache = new MediaCache(db, mediaRoot, undefined, owner);
+      try {
+        await cache.start();
+        const row = await publish(cache, cacheId('startup'), MiB);
+        blobPath = `${cache.directory}/${row.blob}`;
+      } finally {
+        await cache.close();
+      }
+      await db.execute(
+        `INSERT INTO media_cache SELECT 'bad',origin,'bad',variant,scope,'invalid',size,content_type,filename,created_ms,accessed_ms+1 FROM media_cache`,
+      );
+    } finally {
+      await store.close();
+    }
+    const configure = (budget: number, nodeid: string = identity.node) =>
+      setConfigForTests({
+        server: { name: identity.server, role: identity.role },
+        media: { root: mediaRoot },
+        facade: {
+          phase: 'f0',
+          nodeid,
+          storagebudgetbytes: budget,
+          linkcert: `${tls.dir}/facade.crt`,
+          linkkey: `${tls.dir}/facade.key`,
+          linkcacerts: [`${tls.dir}/ca.crt`],
+        },
+      });
+    const usage = (await owner.status()).filesystems[0].usedBytes;
+    let recovered = false;
+    writeDuringStartup = () => {
+      recovered = true;
+      return Promise.resolve();
+    };
+    const start = async () => {
+      const runtime = await openFacadeRuntime(settings);
+      await runtime.close();
+    };
+    await t.step(
+      'wrong durable identity leaves the cache untouched',
+      async () => {
+        configure(usage - MiB / 2, 'edge_b');
+        const error = await assertRejects(start, LinkError);
+        assertEquals(error.code, 'LINK_IDENTITY_MISMATCH');
+        assertEquals(recovered, false);
+        assertEquals((await Deno.stat(blobPath)).size, MiB);
+      },
+    );
+    await t.step(
+      'a malformed index never exposes a partially verified cache',
+      async () => {
+        configure(usage - MiB / 2);
+        const register = Capacity.prototype.registerCacheBlob;
+        let registered = false;
+        Capacity.prototype.registerCacheBlob = function (path, blob) {
+          if (path === blobPath) registered = true;
+          return register.call(this, path, blob);
+        };
+        try {
+          await assertRejects(
+            start,
+            Error,
+            'invalid media cache blob identity',
+          );
+        } finally {
+          Capacity.prototype.registerCacheBlob = register;
+        }
+        assertEquals(registered, false);
+        assertEquals(recovered, false);
+        assertEquals((await Deno.stat(blobPath)).size, MiB);
+      },
+    );
+    // Repair the fixture without running its startup write. A fresh owner
+    // below will account the store with the valid cache still on disk.
+    const files = databaseFiles(serverDirectory(settings.dir));
+    const fix = new Turso(settings.library);
+    try {
+      const db = await Db.open(fix, files.database, MiB);
+      try {
+        await db.execute("DELETE FROM media_cache WHERE cache_key='bad'");
+      } finally {
+        await db.close();
+      }
+    } finally {
+      fix.close();
+    }
+    await t.step(
+      'unreservable open reports retryable pressure without cache deletion',
+      async () => {
+        // Force the native open to need an inode, without discarding any WAL
+        // records. Restore the fixture for the clean-reopen case below.
+        assertEquals((await Deno.stat(files.wal)).size, 0);
+        await Deno.rename(files.wal, `${tls.dir}/saved-wal`);
+        try {
+          configure(usage - MiB / 2);
+          await assertRejects(
+            start,
+            StoragePressureError,
+            'Facade startup blocked by storage pressure',
+          );
+          await assertRejects(() => Deno.stat(files.wal), Deno.errors.NotFound);
+          assertEquals(recovered, false);
+          assertEquals((await Deno.stat(blobPath)).size, MiB);
+        } finally {
+          await Deno.rename(`${tls.dir}/saved-wal`, files.wal);
+        }
+      },
+    );
+    await t.step(
+      'a clean store can reclaim indexed cache for startup work',
+      async () => {
+        configure(usage - MiB / 2);
+        await start();
+        assertEquals(recovered, true);
+        await assertRejects(() => Deno.stat(blobPath), Deno.errors.NotFound);
+      },
+    );
+  } finally {
+    writeDuringStartup = undefined;
+    setConfigForTests({});
+    await tls.close();
+  }
+});
+
+Deno.test('facade capacity review: sweep private staging before reserving scratch', async () => {
+  const root = await Deno.makeTempDir({ prefix: 'facade-sweep-scratch-' });
+  const settings = settingsFor(`${root}/store`);
+  const stage = `${settings.dir}/rooms/abandoned.new`;
+  await Deno.mkdir(stage, { recursive: true });
+  await Deno.writeTextFile(`${stage}/payload`, 'unpublished');
+  const capacityOwner = new Capacity([settings.dir], null, async () => {
+    const occupied = await Deno.stat(stage).then(() => true, (error) => {
+      if (error instanceof Deno.errors.NotFound) return false;
+      throw error;
+    });
+    return {
+      totalBytes: 64 * MiB,
+      freeBytes: occupied ? 0 : 64 * MiB,
+      freeInodes: occupied ? 0 : 100,
+      blockSize: 4096,
+      device: 'test',
+    };
+  });
+  let store: Store | undefined;
+  try {
+    store = await openStore(settings, { schemas, capacityOwner });
+    assertEquals(Deno.env.get('TMPDIR'), `${settings.dir}/.scratch`);
+    assert((await Deno.stat(`${settings.dir}/.scratch`)).isDirectory);
+    await assertRejects(() => Deno.stat(stage), Deno.errors.NotFound);
+  } finally {
+    await store?.close();
+    await Deno.remove(root, { recursive: true });
   }
 });
 
@@ -590,18 +778,14 @@ Deno.test('facade capacity: file exhaustion with the software cap unset leaves n
   let store: Store | undefined;
   let cache: MediaCache | undefined;
   try {
-    // The storage fixture supplies the same owner option for native and file
-    // writers. The baseline ignores this property; a null cap is not a bypass
-    // for physical exhaustion.
-    const capacity = { budgetBytes: null, roots: [root + '/media'] };
-    store = await openStore({
-      dir: root + '/store',
-      library: './.native/libturso_ffi.so',
-      checkpointlogbytes: 65536,
-      maxopenfiles: 8,
-      idleseconds: 300,
-    }, { schemas: { server: serverSchema }, ...{ capacity } });
-    cache = new MediaCache(await store.server(), root + '/media');
+    const settings = settingsFor(root + '/store');
+    const mediaRoot = root + '/media';
+    const capacityOwner = new Capacity([settings.dir, mediaRoot], null);
+    store = await openStore(settings, {
+      schemas: { server: serverSchema },
+      capacityOwner,
+    });
+    cache = new MediaCache(await store.server(), mediaRoot, 32, capacityOwner);
     const media = cache;
     await media.start();
     const identity = (mediaId: string) => ({
@@ -611,16 +795,22 @@ Deno.test('facade capacity: file exhaustion with the software cap unset leaves n
       scope: 'remote' as const,
     });
     const publish = (id: string) =>
-      media.fetch(identity(id), 1, async (output) => {
-        const writer = output.getWriter();
-        await writer.write(new Uint8Array([1, 2, 3, 4]));
-        await writer.close();
-        return {
-          contentType: 'application/octet-stream',
-          filename: null,
-          size: 4,
-        };
-      });
+      media.fetch(
+        identity(id),
+        1,
+        async (output) => {
+          const writer = output.getWriter();
+          await writer.write(new Uint8Array([1, 2, 3, 4]));
+          await writer.close();
+          return {
+            contentType: 'application/octet-stream',
+            filename: null,
+            size: 4,
+          };
+        },
+        undefined,
+        4,
+      );
     const old = await publish('previous');
     const open = Deno.open;
     const sync = Deno.FsFile.prototype.sync;
@@ -684,10 +874,25 @@ Deno.test('facade capacity: staged media and native journal writers cannot overs
   const size = 8 * MiB;
   const staged = Promise.withResolvers<void>();
   const release = Promise.withResolvers<void>();
+  const admitted = Promise.withResolvers<true>();
+  let observeNative = false;
+  class ObservedCapacity extends Capacity {
+    override async tryReserveNative(
+      path: string,
+      creates: number,
+      bytes: number,
+    ) {
+      try {
+        return await super.tryReserveNative(path, creates, bytes);
+      } finally {
+        if (observeNative) admitted.resolve(true);
+      }
+    }
+  }
   let store: Store | undefined;
   let cache: MediaCache | undefined;
   try {
-    const capacityOwner = new Capacity(
+    const capacityOwner = new ObservedCapacity(
       [root + '/store', mediaRoot],
       budgetBytes,
     );
@@ -733,11 +938,13 @@ Deno.test('facade capacity: staged media and native journal writers cannot overs
     );
     let native!: PromiseSettledResult<LinkRecord>;
     let media!: PromiseSettledResult<Awaited<typeof mediaWork>>;
+    let outcome: Promise<PromiseSettledResult<LinkRecord>[]> | undefined;
     try {
       // The staging file is already allocated but not published; the native
       // transaction will need its own DB/log blocks before its ACK.
       await Promise.race([staged.promise, mediaWork]);
-      const outcome = Promise.allSettled([
+      observeNative = true;
+      outcome = Promise.allSettled([
         journal.append('home', {
           ...source,
           type: 'control',
@@ -746,11 +953,18 @@ Deno.test('facade capacity: staged media and native journal writers cannot overs
           payload: { data: 'x'.repeat(size) },
         }),
       ]);
+      assert(
+        await Promise.race([admitted.promise, outcome.then(() => false)]),
+        'native admission must see the live staging grant',
+      );
+      observeNative = false;
       release.resolve();
       [native] = await outcome;
     } finally {
+      observeNative = false;
       release.resolve();
       [media] = await Promise.allSettled([mediaWork]);
+      await outcome;
     }
     assert(
       native.status === 'rejected' || media.status === 'rejected',
@@ -1038,20 +1252,24 @@ Deno.test('facade capacity: reads do not wait behind a pool of queued writers', 
         })
       ),
     );
-    await Promise.all(started.map((ready) => ready.promise));
+    let observed: Promise<PromiseSettledResult<unknown>[]> | undefined;
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const query = db.query('SELECT * FROM receipt');
-    const observed = Promise.allSettled([query]);
+    const watchdog = (message: string) =>
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), 1000);
+      });
     try {
+      await Promise.race([
+        Promise.all(started.map((ready) => ready.promise)),
+        watchdog('writers did not enter their callbacks'),
+      ]);
+      clearTimeout(timer);
+      const query = db.query('SELECT * FROM receipt');
+      observed = Promise.allSettled([query]);
       assertEquals(
         await Promise.race([
           query,
-          new Promise((resolve) => {
-            timer = setTimeout(
-              () => resolve('blocked by queued writers'),
-              1000,
-            );
-          }),
+          watchdog('read blocked by queued writers'),
         ]),
         [],
       );
