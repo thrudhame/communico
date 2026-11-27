@@ -502,7 +502,7 @@ mod registry_tests {
         let (entered, ready) = mpsc::channel();
         let (release, held) = mpsc::channel();
         let slow = std::thread::spawn(move || {
-            open_file(PathBuf::from("slow-registry-test"), |_, _| {
+            open_file(PathBuf::from("slow-registry-test"), None, |_, _| {
                 entered.send(()).unwrap();
                 held.recv().unwrap();
                 Err(Failure::binding("injected initialization failure"))
@@ -511,7 +511,7 @@ mod registry_tests {
         ready.recv_timeout(Duration::from_secs(5)).unwrap();
         let (completed, result) = mpsc::channel();
         let fast = std::thread::spawn(move || {
-            let outcome = open_file(PathBuf::from("other-registry-test"), |_, _| {
+            let outcome = open_file(PathBuf::from("other-registry-test"), None, |_, _| {
                 Err(Failure::binding("independent initialization"))
             });
             completed.send(outcome.is_err()).unwrap();
@@ -532,7 +532,7 @@ mod registry_tests {
         let (entered, ready) = mpsc::channel();
         let (release, held) = mpsc::channel();
         let first = std::thread::spawn(move || {
-            open_file(PathBuf::from("same-registry-test"), |_, _| {
+            open_file(PathBuf::from("same-registry-test"), None, |_, _| {
                 entered.send(()).unwrap();
                 held.recv().unwrap();
                 Err(Failure::binding("first initialization fails"))
@@ -541,7 +541,7 @@ mod registry_tests {
         ready.recv_timeout(Duration::from_secs(5)).unwrap();
         let (entered_second, second_ready) = mpsc::channel();
         let second = std::thread::spawn(move || {
-            open_file(PathBuf::from("same-registry-test"), |_, _| {
+            open_file(PathBuf::from("same-registry-test"), None, |_, _| {
                 entered_second.send(()).unwrap();
                 Err(Failure::binding("retry initialization fails"))
             })
@@ -563,7 +563,10 @@ mod registry_tests {
         let dir = std::path::PathBuf::from(std::env::var("TMPDIR").unwrap())
             .join(format!("registry-connect-{}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
-        let handle = open_file(dir.join("data.db"), initialize_database).unwrap();
+        let handle = open_file(dir.join("data.db"), None, |name, observer| {
+            initialize_database(name, observer, false)
+        })
+        .unwrap();
         let (entered, ready) = mpsc::channel();
         let (release, held) = mpsc::channel();
         let connecting = std::thread::spawn(move || {

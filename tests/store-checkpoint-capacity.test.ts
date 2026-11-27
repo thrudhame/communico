@@ -7,14 +7,18 @@ for (const kind of ['early', 'main', 'peak']) {
     const directory = await Deno.makeTempDir({
       prefix: 'checkpoint-capacity-',
     });
-    const database = join(directory, 'data.db');
-    const preload = join(directory, 'enospc.so');
-    const arm = join(directory, 'arm');
     const operation = kind === 'early' ? 'pwritev' : 'pwrite';
-    const target = kind === 'early' ? database + '-wal' : database;
     const env: Record<string, string> = {};
     const decoder = new TextDecoder();
     try {
+      // The preload compares its target with Linux's resolved /proc fd path.
+      const fixture = kind === 'peak'
+        ? directory
+        : await Deno.realPath(directory);
+      const database = join(fixture, 'data.db');
+      const preload = join(fixture, 'enospc.so');
+      const arm = join(fixture, 'arm');
+      const target = kind === 'early' ? database + '-wal' : database;
       if (kind !== 'peak') {
         const compiler = await new DiagnosticCommand('cc', {
           args: [
@@ -43,7 +47,7 @@ for (const kind of ['early', 'main', 'peak']) {
           '--allow-ffi',
           '--allow-sys=statfs',
           'tests/fixtures/checkpoint-capacity.ts',
-          directory,
+          fixture,
           kind,
         ],
         env,

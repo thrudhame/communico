@@ -810,7 +810,7 @@ expiry in the current core. CLI punctuation uses ASCII.
 
 ### Facade storage pressure
 
-On the admin socket, `GET /v1/facade/status` reports capacity per filesystem.
+On the admin socket, `POST /v1/facade/status` reports capacity per filesystem.
 If the filesystem runs out of space during a checkpoint, WAL blocks can remain
 allocated. Status reports `filesystemFull` and `checkpoint.retainedWalBytes`;
 those bytes count as protected until a scheduled retry succeeds. Cache eviction
