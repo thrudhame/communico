@@ -4,6 +4,47 @@ import { assert, assertEquals, assertRejects, assertThrows } from '@std/assert';
 import { Conn, Db } from '#engine/store/db.ts';
 import { StoreError, Turso } from '#engine/store/ffi.ts';
 
+Deno.test('store Db: only an explicitly recovered expected statement lets commit proceed', async () => {
+  const dir = await Deno.makeTempDir();
+  const ffi = new Turso('./.native/libturso_ffi.so');
+  const db = await Db.open(ffi, dir + '/data.db', 4120000);
+  const duplicate = (error: StoreError) =>
+    error.message === 'UNIQUE constraint failed: receipt.id';
+  try {
+    await db.exec('CREATE TABLE receipt(id INTEGER PRIMARY KEY)');
+    await db.tx(async (conn) => {
+      await conn.execute('INSERT INTO receipt VALUES (1)');
+      try {
+        await conn.execute('INSERT INTO receipt VALUES (1)');
+      } catch (error) {
+        conn.recoverStatement(error, duplicate);
+      }
+      await conn.execute('INSERT INTO receipt VALUES (2)');
+    });
+    await assertRejects(
+      () =>
+        db.tx(async (conn) => {
+          await conn.execute('INSERT INTO receipt VALUES (3)');
+          const error = await assertRejects(
+            () => conn.execute('INSERT INTO receipt VALUES (3)'),
+            StoreError,
+          );
+          assertThrows(() => conn.recoverStatement(error, () => false));
+        }),
+      StoreError,
+      'UNIQUE constraint failed: receipt.id',
+    );
+    assertEquals(await db.query('SELECT id FROM receipt ORDER BY id'), [
+      { id: 1 },
+      { id: 2 },
+    ]);
+  } finally {
+    await db.close();
+    ffi.close();
+    await Deno.remove(dir, { recursive: true });
+  }
+});
+
 Deno.test('store FFI: nonfinite REAL results fail instead of becoming SQL null', async () => {
   const dir = await Deno.makeTempDir();
   const ffi = new Turso('./.native/libturso_ffi.so');

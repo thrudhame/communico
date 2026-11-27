@@ -480,6 +480,81 @@ Deno.test('facade capacity review: moving the last alias preserves its inode cha
   }
 });
 
+Deno.test('facade capacity review: a scan preserves settled growth through a surviving alias', async () => {
+  const root = await Deno.makeTempDir();
+  const readDir = Deno.readDir;
+  const scanned = Promise.withResolvers<void>();
+  const resume = Promise.withResolvers<void>();
+  let status: ReturnType<Capacity['status']> | undefined;
+  try {
+    const file = `${root}/first`;
+    const alias = `${root}/second`;
+    await Deno.writeFile(file, new Uint8Array(4096).fill(1));
+    await Deno.link(file, alias);
+    const capacity = new Capacity([root]);
+    await capacity.initialize();
+    Deno.readDir = async function* (path) {
+      yield* readDir(path);
+      if (path === root) {
+        scanned.resolve();
+        await resume.promise;
+      }
+    };
+    status = capacity.status();
+    await Promise.race([scanned.promise, status]);
+    const grant = await capacity.reserveStaging(file, 65536);
+    try {
+      await Deno.writeFile(file, new Uint8Array(65536).fill(2));
+    } finally {
+      grant.release();
+    }
+    await capacity.remove(file);
+    const settled = capacity.accountedBytes();
+    resume.resolve();
+    assertEquals((await status).filesystems[0].usedBytes, settled);
+    assertEquals(capacity.accountedBytes(), settled);
+    await capacity.remove(alias);
+    const withoutAliases = capacity.accountedBytes();
+    assert(withoutAliases < settled);
+    assertEquals(
+      (await capacity.status()).filesystems[0].usedBytes,
+      withoutAliases,
+    );
+  } finally {
+    Deno.readDir = readDir;
+    resume.resolve();
+    await status?.catch(() => undefined);
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test('facade capacity review: pressure reclaims a registered file only after its other link is gone', async () => {
+  const root = await Deno.makeTempDir();
+  try {
+    const file = `${root}/blob`;
+    const alias = `${root}/alias`;
+    await Deno.writeFile(file, new Uint8Array(65536).fill(1));
+    await Deno.link(file, alias);
+    const capacity = new Capacity([root], 65536);
+    await capacity.initialize();
+    let evicted = false;
+    capacity.registerCacheBlob(file, {
+      accessedMs: 0,
+      unleased: () => true,
+      removed: () => evicted = true,
+    });
+    const reserve = () => capacity.reserveStaging(`${root}/pending`, 4096);
+    await assertRejects(reserve, StoragePressureError);
+    assert(!evicted);
+    await capacity.remove(alias);
+    (await reserve()).release();
+    assert(evicted);
+    await assertRejects(() => Deno.lstat(file), Deno.errors.NotFound);
+  } finally {
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
 Deno.test('facade capacity review: status accounts for a live staging file only through its grant', async () => {
   const root = await Deno.makeTempDir();
   try {
@@ -655,6 +730,37 @@ Deno.test('facade capacity review: large publication path sets settle without un
     assertEquals(disk.reservedBytes, 0);
     assertEquals(accounted, disk.usedBytes);
   } finally {
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test('facade capacity review: a statement rejection before callback return still vetoes commit', async () => {
+  const root = await Deno.makeTempDir();
+  const ffi = new Turso('./.native/libturso_ffi.so');
+  const capacity = new Capacity([root]);
+  let db: Db | undefined;
+  try {
+    db = await Db.open(ffi, `${root}/data.db`, MiB, undefined, capacity);
+    await db.exec('CREATE TABLE receipt(id INTEGER PRIMARY KEY)');
+    const error = await assertRejects(() =>
+      db!.tx(async (tx) => {
+        await tx.execute('INSERT INTO receipt VALUES (1)');
+        const observed = Promise.withResolvers<void>();
+        void tx.execute('INSERT INTO receipt VALUES (1)').then(
+          () => observed.resolve(),
+          observed.resolve,
+        );
+        // The caller abandons the statement outcome, but a separate latch
+        // makes its early settlement deterministic.
+        await observed.promise;
+      }), StoreError);
+    assert(/constraint|unique/i.test(error.message));
+    assertEquals(await db.query('SELECT id FROM receipt'), []);
+    await db.execute('INSERT INTO receipt VALUES (2)');
+    assertEquals(await db.query('SELECT id FROM receipt'), [{ id: 2 }]);
+  } finally {
+    await db?.close();
+    ffi.close();
     await Deno.remove(root, { recursive: true });
   }
 });
@@ -939,6 +1045,7 @@ Deno.test('facade capacity: staged media and native journal writers cannot overs
     let native!: PromiseSettledResult<LinkRecord>;
     let media!: PromiseSettledResult<Awaited<typeof mediaWork>>;
     let outcome: Promise<PromiseSettledResult<LinkRecord>[]> | undefined;
+    let watchdog: ReturnType<typeof setTimeout> | undefined;
     try {
       // The staging file is already allocated but not published; the native
       // transaction will need its own DB/log blocks before its ACK.
@@ -954,13 +1061,24 @@ Deno.test('facade capacity: staged media and native journal writers cannot overs
         }),
       ]);
       assert(
-        await Promise.race([admitted.promise, outcome.then(() => false)]),
+        await Promise.race([
+          admitted.promise,
+          outcome.then(() => false),
+          new Promise<never>((_, reject) => {
+            watchdog = setTimeout(
+              () => reject(new Error('native admission waited for staging')),
+              5000,
+            );
+          }),
+        ]),
         'native admission must see the live staging grant',
       );
+      clearTimeout(watchdog);
       observeNative = false;
       release.resolve();
       [native] = await outcome;
     } finally {
+      clearTimeout(watchdog);
       observeNative = false;
       release.resolve();
       [media] = await Promise.allSettled([mediaWork]);
@@ -1552,7 +1670,12 @@ Deno.test('facade capacity: outstanding claims fence concurrent staging and chec
 // ENOSPC by changing the OS beneath the other tests.
 async function mediaFixture(
   options: { budgetBytes?: number | null; probe?: CapacityProbe },
-  run: (cache: MediaCache, root: string, capacity: Capacity) => Promise<void>,
+  run: (
+    cache: MediaCache,
+    root: string,
+    capacity: Capacity,
+    db: Database,
+  ) => Promise<void>,
 ) {
   const root = await Deno.makeTempDir({ prefix: 'capacity-' });
   const mediaRoot = root + '/media';
@@ -1569,14 +1692,10 @@ async function mediaFixture(
       schemas,
       capacityOwner: capacity,
     });
-    cache = new MediaCache(
-      await store.server(),
-      mediaRoot,
-      undefined,
-      capacity,
-    );
+    const db = await store.server();
+    cache = new MediaCache(db, mediaRoot, undefined, capacity);
     await cache.start();
-    await run(cache, mediaRoot, capacity);
+    await run(cache, mediaRoot, capacity, db);
   } finally {
     await cache?.close();
     await store?.close();
@@ -1785,8 +1904,12 @@ Deno.test('facade capacity review: a cache hit remains readable under timestamp 
         blockSize: 4096,
       };
     },
-  }, async (cache) => {
+  }, async (cache, _root, _capacity, db) => {
     const row = await publish(cache, cacheId('hit'), 4);
+    await db.execute(
+      'UPDATE media_cache SET accessed_ms = 0 WHERE cache_key = ?',
+      [row.cache_key],
+    );
     freeBytes = 0;
     const stream = await cache.open(row);
     assertEquals(
@@ -1795,6 +1918,17 @@ Deno.test('facade capacity review: a cache hit remains readable under timestamp 
     );
     broken = true;
     assertEquals(await assertRejects(() => cache.open(row)), unexpected);
+    broken = false;
+    freeBytes = 32 * MiB;
+    assertEquals(await db.query('SELECT accessed_ms FROM media_cache'), [{
+      accessed_ms: 0,
+    }]);
+    await cache.cleanup({
+      maxbytes: 0,
+      remote: { maxagedays: 0, unopenedday: 1, maxbytes: 0 },
+      thumbnail: { maxagedays: 0, unopenedday: 0, maxbytes: 0 },
+    });
+    assertEquals((await cache.get(cacheId('hit')))?.blob, row.blob);
   });
 });
 

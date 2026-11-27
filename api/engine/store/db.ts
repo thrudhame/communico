@@ -77,6 +77,7 @@ type Attempt<T> =
 export class Conn {
   private active = true;
   private readonly pending = new Set<Promise<unknown>>();
+  private failures?: Map<unknown, number>;
   private writeVersion = 0;
 
   constructor(
@@ -141,11 +142,34 @@ export class Conn {
     );
   }
 
+  /** Acknowledge one expected SQL error from this attempt. Call only after
+   * any partial effects have been undone. Admission and retry failures are
+   * owned by the attempt, not recoverable by its body. */
+  recoverStatement(
+    error: unknown,
+    expected: (error: StoreError) => boolean,
+  ): void {
+    this.check();
+    if (
+      !(error instanceof StoreError) || this.failures?.get(error) !== 1 ||
+      error.conflict || isStoragePressure(error) ||
+      error.requiredWriteBytes !== undefined || !expected(error)
+    ) throw error;
+    this.failures.delete(error);
+  }
+
   private track<T>(result: Promise<T>): Promise<T> {
     this.pending.add(result);
-    const settled = () => this.pending.delete(result);
-    // Observe both outcomes even when the callback abandons the promise.
-    void result.then(settled, settled);
+    // An attempt must see failures even when they settle before the body
+    // returns. Keep the errors, not the settled statements or their rows.
+    void result.then(
+      () => this.pending.delete(result),
+      (reason) => {
+        const failures = this.failures ??= new Map();
+        failures.set(reason, (failures.get(reason) ?? 0) + 1);
+        this.pending.delete(result);
+      },
+    );
     return result;
   }
 
@@ -164,9 +188,11 @@ export class Conn {
       : result;
   }
 
-  drain(): Promise<PromiseSettledResult<unknown>[]> {
+  async drain(): Promise<{ reason: unknown } | undefined> {
     this.active = false;
-    return Promise.allSettled(this.pending);
+    await Promise.allSettled(this.pending);
+    const first = this.failures?.keys().next();
+    if (first && !first.done) return { reason: first.value };
   }
 }
 
@@ -542,14 +568,12 @@ export class Db {
         await this.ffi.begin(handle, options.mode ?? 'concurrent');
         if (options.admit) connection.admit(options.admit);
         const result = await fn(connection);
-        const pending = await connection.drain();
+        const failed = await connection.drain();
         // A body cannot turn a refused first write into a successful commit
         // by handling its statement error locally.
         await admission;
         if (refused) throw refused;
-        for (const outcome of pending) {
-          if (outcome.status === 'rejected') throw outcome.reason;
-        }
+        if (failed) throw failed.reason;
         const commit = () =>
           commitAdmitted(checks, () => this.ffi.commit(handle!));
         if (this.admission) {

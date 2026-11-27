@@ -54,9 +54,7 @@ type CacheBlob = {
 type RegisteredBlob = CacheBlob & { inode: bigint; device: string };
 type Reclaimable = {
   path: string;
-  inode: bigint;
   device: string;
-  physicalDevice: string;
   bytes: number;
   blob: RegisteredBlob;
 };
@@ -240,6 +238,7 @@ export class Capacity {
       // retain those entries from the live ledger rather than installing a
       // stale scan (or charging a partly written file as well as its grant).
       const changed = this.changes = new Set<string>();
+      const scan = this.ledger.beginScan();
       for (const claim of this.claims) {
         for (const path of claim.paths) changed.add(path);
       }
@@ -247,9 +246,7 @@ export class Capacity {
       const priorFailure = this.settlementFailure;
       try {
         const fresh = await this.inventory();
-        for (const path of changed) {
-          fresh.ledger.set(path, this.ledger.paths.get(path));
-        }
+        scan.merge(fresh.ledger, changed);
         this.ledger = fresh.ledger;
         const reclaimable = new Map<string, number>();
         for (const entry of this.reclaimable()) {
@@ -270,6 +267,7 @@ export class Capacity {
         }
         return fresh;
       } finally {
+        scan.close();
         this.changes = undefined;
         this.scanning = undefined;
       }
@@ -338,18 +336,32 @@ export class Capacity {
     return this.oldest([...this.cache].flatMap(([path, blob]) => {
       const entry = this.ledger.paths.get(path);
       return entry && entry.inode === blob.inode &&
-          entry.physicalDevice === blob.device && entry.links === 1n &&
-          !entry.directory && !entry.symlink && blob.unleased()
+          entry.physicalDevice === blob.device && !entry.directory &&
+          !entry.symlink && blob.unleased() &&
+          // Removing another name can leave this alias with a stale nlink.
+          (entry.links === 1n || this.singleCacheLink(path, blob))
         ? [{
           path,
           blob,
-          inode: entry.inode,
           device: entry.device,
-          physicalDevice: blob.device,
           bytes: entry.bytes,
         }]
         : [];
     }));
+  }
+
+  private singleCacheLink(path: string, blob: RegisteredBlob): boolean {
+    try {
+      const file = lstatSync(path, { bigint: true });
+      return file.isFile() && file.nlink === 1n && file.ino === blob.inode &&
+        String(file.dev) === blob.device;
+    } catch (error) {
+      if (
+        missing(error) || (error instanceof Error && 'code' in error &&
+          (error.code === 'EACCES' || error.code === 'EPERM'))
+      ) return false;
+      throw storageFailure(error);
+    }
   }
 
   private evict(entry: Reclaimable): boolean {
@@ -359,11 +371,7 @@ export class Capacity {
     const { path, blob } = entry;
     if (this.cache.get(path) !== blob || !blob.unleased()) return false;
     try {
-      const file = lstatSync(path, { bigint: true });
-      if (
-        !file.isFile() || file.nlink !== 1n || file.ino !== entry.inode ||
-        String(file.dev) !== entry.physicalDevice
-      ) return false;
+      if (!this.singleCacheLink(path, blob)) return false;
       Deno.removeSync(path);
     } catch (error) {
       if (

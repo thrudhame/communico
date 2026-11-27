@@ -466,9 +466,20 @@ export class MediaCache {
     await this.locked(async () => {
       const rows = [];
       for (const row of await listCachedMedia(this.db)) {
-        if (this.capacity && !this.registered.has(row.cache_key)) {
+        const current = this.capacity
+          ? this.registered.get(row.cache_key)?.row
+          : row;
+        if (!current) {
           await deleteCachedMedia(this.db, row.cache_key);
-        } else rows.push(row);
+        } else rows.push(current);
+      }
+      if (this.capacity) {
+        // Recency updates can succeed in memory but not on disk. Reorder
+        // the managed rows as well as using them for the expiry threshold.
+        rows.sort((a, b) =>
+          a.accessed_ms - b.accessed_ms ||
+          (a.cache_key < b.cache_key ? -1 : a.cache_key > b.cache_key ? 1 : 0)
+        );
       }
       let total = rows.reduce((n, r) => n + r.size, 0);
       const scopes = { remote: 0, thumbnail: 0 };
