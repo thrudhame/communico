@@ -16,35 +16,13 @@ import { pathfinder } from '@pathfinder/pathfinder';
 import type { Scope } from '#engine/facade/capabilities.ts';
 import { federationPolicy } from '#engine/federation/policy.ts';
 import { requestFailure } from '#engine/request-diagnostics.ts';
-import { join } from '@std/path';
-import type { Capacity } from '#engine/store/capacity.ts';
-
-async function routeProcessScratch(
-  dataRoot: string,
-  capacity: Capacity,
-): Promise<void> {
-  const scratch = join(dataRoot, '.scratch');
-  await capacity.ensureDirectory(scratch, 0o700);
-  if (!(await Deno.lstat(scratch)).isDirectory) {
-    throw new Error('facade scratch root is not a directory');
-  }
-  // TEMP databases and in-place VACUUM use TURSO_TMPDIR. Sorter spill uses
-  // the process temp directory instead. Both must stay in the inventory.
-  Deno.env.set('TURSO_TMPDIR', scratch);
-  Deno.env.set('TMPDIR', scratch);
-  capacity.setScratchRoot(scratch);
-}
 
 export async function startFacade(
   lifetime: ServerLifetime,
   fail: (error: unknown) => void,
 ) {
   prepareAppRecovery();
-  const runtime = await openFacadeRuntime(
-    undefined,
-    undefined,
-    routeProcessScratch,
-  );
+  const runtime = await openFacadeRuntime();
   let link: Awaited<ReturnType<typeof startLinkTransport>> | undefined;
   const servers: Deno.HttpServer[] = [];
   let composed = false;

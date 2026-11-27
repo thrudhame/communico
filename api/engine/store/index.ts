@@ -33,6 +33,7 @@ import { type GateStats } from '#engine/store/gate.ts';
 import { Turso } from '#engine/store/ffi.ts';
 import { databaseFiles, serverDirectory } from '#engine/store/layout.ts';
 import { type Lease, Pool, type SnapshotSource } from '#engine/store/pool.ts';
+import { routeStoreScratch } from '#engine/store/scratch.ts';
 import {
   ensureWatermarks,
   startupHooks,
@@ -83,6 +84,7 @@ export class Store implements StartupStore {
     private readonly ownership: number,
     private readonly admission: Admission,
     readonly capacity?: import('./capacity.ts').Capacity,
+    private readonly restoreScratch?: () => void,
   ) {
     this.serverOperations = operations(
       (fn, options) => this.run(() => this.serverDb.tx(fn, options)),
@@ -432,6 +434,7 @@ export class Store implements StartupStore {
       await this.serverDb.close();
       await this.ffi.unlockStore(this.ownership);
       this.ffi.close();
+      this.restoreScratch?.();
       if (failure !== undefined) throw failure;
     })());
   }
@@ -442,7 +445,6 @@ export async function openStore(
   options: {
     schemas?: StoreSchemas;
     capacityOwner?: import('./capacity.ts').Capacity;
-    beforeOpen?(dataRoot: string): Promise<void>;
     beforeStartup?(store: Store): Promise<unknown>;
   } = {},
 ): Promise<Store> {
@@ -450,6 +452,7 @@ export async function openStore(
   let serverDb: Db | undefined;
   let pool: Pool | undefined;
   let ownership: number | undefined;
+  let restoreScratch: (() => void) | undefined;
   const admission = new Admission();
   try {
     checkBuildInfo(await ffi.buildInfo());
@@ -459,9 +462,11 @@ export async function openStore(
     await assertNoPromotion(config.dir);
     if (options.capacityOwner) {
       await options.capacityOwner.ensureDirectory(config.dir, 0o700);
+      restoreScratch = await routeStoreScratch(
+        config.dir,
+        options.capacityOwner,
+      );
     } else await Deno.mkdir(config.dir, { recursive: true, mode: 0o700 });
-    // The data root is canonical and locked; no database has opened yet.
-    await options.beforeOpen?.(config.dir);
     await sweep(config.dir, options.capacityOwner);
     await sweep(join(config.dir, 'rooms'), options.capacityOwner);
     await sweep(join(config.dir, 'tenants'), options.capacityOwner);
@@ -518,6 +523,7 @@ export async function openStore(
       ownership,
       admission,
       options.capacityOwner,
+      restoreScratch,
     );
     // The composition root binds runtime authority before a recovery hook may
     // project data or schedule owner-specific intents. Failure unwinds the pool.
@@ -530,6 +536,7 @@ export async function openStore(
       await serverDb?.close();
       if (ownership !== undefined) await ffi.unlockStore(ownership);
       ffi.close();
+      restoreScratch?.();
     } catch {
       // Unwinding must not mask the startup error thrown below.
     }
