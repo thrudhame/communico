@@ -23,6 +23,28 @@ export type MediaMeta = {
   size_bytes?: number;
 };
 
+// Local-only export intent. The immutable metadata and bytes are referenced,
+// not duplicated. No link type or home-copy result exists at this phase.
+export const MEDIA_EXPORTS_SQL = `
+CREATE TABLE media_exports(
+  media_id TEXT PRIMARY KEY NOT NULL REFERENCES media(media_id),
+  issuer TEXT NOT NULL,
+  sha256 TEXT NOT NULL
+);
+`;
+
+export async function recordMediaExport(
+  conn: Conn,
+  mediaId: string,
+  issuer: string,
+  sha256: string,
+): Promise<void> {
+  await conn.execute(
+    'INSERT INTO media_exports (media_id, issuer, sha256) VALUES (?, ?, ?)',
+    [mediaId, issuer, sha256],
+  );
+}
+
 // --- conn-level rows (bound on TenantTx) -----------------------------------
 
 export async function insertMedia(

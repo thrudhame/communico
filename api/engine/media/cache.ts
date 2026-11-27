@@ -142,7 +142,10 @@ export class MediaCache {
   }
 
   private register(row: CachedMedia): void {
-    if (!this.capacity || !this.canonicalDirectory) return;
+    if (
+      !this.capacity || !this.canonicalDirectory ||
+      this.registered.has(row.cache_key)
+    ) return;
     const blob = {
       get accessedMs() {
         return row.accessed_ms;

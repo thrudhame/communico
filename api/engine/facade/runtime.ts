@@ -109,11 +109,12 @@ export async function openFacadeRuntime(
     capacityOwner: capacity,
   });
   const server = await store.server();
-  // Own reclaimable bytes even when this facade phase has no media routes.
+  // One owner inventories reclaimable bytes before ingress and serves the
+  // local thumbnail cache once the tenant is mounted.
   const mediaCache = new MediaCache(
     server,
     config().media.root,
-    undefined,
+    config().media.maxvariants,
     capacity,
   );
   const journal = new Journal(
@@ -564,6 +565,7 @@ export async function openFacadeRuntime(
     tls,
     notices,
     capabilities: caps,
+    localMediaCache: caps.service('media') ? mediaCache : undefined,
     pairings,
     verificationKeys: async () => (await keyOwner()).verificationKeys(),
     requestSigner: async () => (await keyOwner()).requestSigner(),

@@ -104,11 +104,12 @@ export class MediaService {
     private db: Db,
     private tenant: Tenant,
     private capacity?: Capacity,
+    private localCache?: MediaCache,
   ) {}
   private cacheOwner(): Promise<MediaCache> {
     if (this.cache === null) {
       const owner = (async () => {
-        const cache = new MediaCache(
+        const cache = this.localCache ?? new MediaCache(
           this.db,
           config().media.root,
           config().media.maxvariants,
@@ -124,7 +125,7 @@ export class MediaService {
           }, config().media.cleanupseconds * 1000);
           return cache;
         } catch (error) {
-          await cache.close();
+          if (!this.localCache) await cache.close();
           throw error;
         }
       })();
@@ -141,7 +142,7 @@ export class MediaService {
     if (this.cache !== null) {
       const cache = await this.cache;
       if (this.timer !== null) clearInterval(this.timer);
-      await cache.close();
+      if (!this.localCache) await cache.close();
     }
   }
   async download(
@@ -166,6 +167,9 @@ export class MediaService {
         );
       }
       return response;
+    }
+    if (this.localCache) {
+      throw new MatrixError(404, 'M_NOT_FOUND', 'Unknown local media');
     }
     if (!config().federation.enabled) {
       throw new MatrixError(502, 'M_UNKNOWN', 'federation disabled');
@@ -229,7 +233,7 @@ export class MediaService {
   ): Promise<Response> {
     signal?.throwIfAborted();
     assertMxc(origin, mediaId);
-    if (legacy && origin !== serverName()) {
+    if ((legacy || this.localCache) && origin !== serverName()) {
       throw new MatrixError(404, 'M_NOT_FOUND', 'Unknown media');
     }
     if (origin !== serverName()) {

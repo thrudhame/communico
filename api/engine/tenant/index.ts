@@ -929,6 +929,8 @@ function bind(
       byId: (mediaId: string) => media.mediaById(conn, mediaId),
       markUploaded: (mediaId: string, meta: media.MediaMeta) =>
         media.markMediaUploaded(conn, mediaId, meta),
+      recordExport: (mediaId: string, issuer: string, sha256: string) =>
+        media.recordMediaExport(conn, mediaId, issuer, sha256),
     },
     delayedEvents: {
       newId: () => delayedEvents.newId(conn),

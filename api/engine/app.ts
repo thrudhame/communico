@@ -21,6 +21,8 @@ import {
 } from '#engine/profile-fanout.ts';
 import { drainResources } from '#engine/lifetime.ts';
 import { MediaService } from '#engine/media/service.ts';
+import type { MediaCache } from '#engine/media/cache.ts';
+import { recoverLocalUploads } from '#engine/media.ts';
 import { installRuleMigration } from '#engine/client/rule-migration.ts';
 import {
   type EduQueues,
@@ -132,6 +134,7 @@ export type ReplicaAccess = {
   deviceLists?(edus: EduState): Promise<DeviceListService | undefined>;
   pushSender?(): Promise<PushSender | undefined>;
   delayedEvents?(tenant: Tenant): Promise<DelayedEvents | undefined>;
+  localMediaCache?: MediaCache;
   sender?(): Promise<Sender | undefined>;
   releaseServices?(): Promise<void>;
   ingress?(deps: TransactionDeps): Promise<TransactionIngress>;
@@ -319,11 +322,21 @@ export async function openReplicaApp(
   };
   const federationContacts = new PendingContacts(server);
   let stopRuleMigration: (() => void) | undefined;
+  let media: MediaService | undefined;
   try {
     const federationEdus = eduState(server, tenant.serverName, store);
     const deviceLists = await replica.deviceLists?.(federationEdus);
     const pushSender = await replica.pushSender?.();
     const grantedTenant = { ...tenant, signer: () => replica.signer };
+    if (replica.localMediaCache) {
+      await recoverLocalUploads(grantedTenant, store.capacity);
+      media = new MediaService(
+        server,
+        grantedTenant,
+        store.capacity,
+        replica.localMediaCache,
+      );
+    }
     stopRuleMigration = await installRuleMigration(store, grantedTenant);
     const delayedEvents = await replica.delayedEvents?.(grantedTenant);
     const app: App = {
@@ -350,7 +363,7 @@ export async function openReplicaApp(
         return pushSender ?? unavailable('push');
       },
       get media() {
-        return unavailable('media');
+        return media ?? unavailable('media');
       },
       get delayedEvents() {
         return delayedEvents ?? unavailable('delayed');
@@ -358,6 +371,7 @@ export async function openReplicaApp(
       close: () =>
         drainResources([
           () => federationContacts.close(),
+          () => media?.close(),
           () => stopRuleMigration?.(),
           () => store.close(),
         ]),
@@ -371,6 +385,7 @@ export async function openReplicaApp(
     await drainResources([
       () => stopRuleMigration?.(),
       () => federationContacts.close(),
+      () => media?.close(),
       async () => {
         await replica.releaseServices?.();
       },

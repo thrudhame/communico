@@ -408,13 +408,13 @@ Deno.test('F2 manifest enables delivered auth, registers and device keys without
   );
   for (
     const service of [
-      'media',
       'link-client',
     ]
   ) {
     assertEquals(facade.service(service), false);
   }
   assertEquals(facade.service('delayed'), true);
+  assertEquals(facade.service('media'), true);
 });
 
 Deno.test('F2 backup manifest enables all replica reads while every write stays home-only', async () => {

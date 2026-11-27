@@ -54,6 +54,7 @@ export async function startFacade(
           deviceLists: runtime.deviceLists,
           pushSender: runtime.pushSender,
           delayedEvents: runtime.delayedEvents,
+          localMediaCache: runtime.localMediaCache,
           sender: runtime.sender,
           releaseServices: runtime.releaseServices,
           ingress: runtime.ingress,
