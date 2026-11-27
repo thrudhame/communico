@@ -1,6 +1,7 @@
 // One owner for disk publication, deduplication, cleanup and serving leases.
 // Network/disk work is never repeated by a retrying database transaction.
 import type { Database as Db } from '#engine/store/db.ts';
+import type { Capacity, Reservation } from '#engine/store/capacity.ts';
 import {
   type CachedMedia,
   cachedMedia,
@@ -11,6 +12,8 @@ import {
   touchCachedMedia,
 } from '#engine/server/media.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
+import { isStoragePressure, storageFailure } from '#engine/store/pressure.ts';
+import { withStorageHold } from '#engine/store/holds.ts';
 import { abortable } from '#engine/net/abort.ts';
 
 export type Retention = {
@@ -57,11 +60,18 @@ export class MediaCache {
   private pending = new Map<string, Pending>();
   private variants = new Map<string, Set<string>>();
   private leases = new Map<string, number>();
+  private registered = new Map<string, { row: CachedMedia; forget(): void }>();
+  private canonicalDirectory?: string;
   private controller = new AbortController();
   private active = 0;
   private waiters: (() => void)[] = [];
   readonly directory: string;
-  constructor(private db: Db, root: string, private maxVariants = 32) {
+  constructor(
+    private db: Db,
+    root: string,
+    private maxVariants = 32,
+    private capacity?: Capacity,
+  ) {
     this.directory = root + '/cache';
   }
   private locked<T>(fn: () => Promise<T>): Promise<T> {
@@ -69,14 +79,35 @@ export class MediaCache {
     this.lane = next.catch(() => {});
     return next;
   }
-  async start(): Promise<void> {
-    await Deno.mkdir(this.directory, { recursive: true });
+  async start({ inventoryOnly = false } = {}): Promise<void> {
+    if (!inventoryOnly) {
+      if (this.capacity) await this.capacity.ensureDirectory(this.directory);
+      else await Deno.mkdir(this.directory, { recursive: true });
+    }
+    let directoryPresent = true;
+    if (this.capacity) {
+      try {
+        // The inventory uses canonical roots and never follows child links.
+        if (!(await Deno.lstat(this.directory)).isDirectory) {
+          if (!inventoryOnly) {
+            throw new Error('invalid managed cache directory');
+          }
+          directoryPresent = false;
+        } else this.canonicalDirectory = await Deno.realPath(this.directory);
+      } catch (error) {
+        if (!(inventoryOnly && error instanceof Deno.errors.NotFound)) {
+          throw error;
+        }
+        directoryPresent = false;
+      }
+    }
     const rows = await listCachedMedia(this.db);
     const known = new Set<string>();
     for (const row of rows) {
       if (!BLOB.test(row.blob)) {
         throw new Error('invalid media cache blob identity');
       }
+      if (!directoryPresent) continue;
       try {
         const stat = await Deno.lstat(this.directory + '/' + row.blob);
         if (!stat.isFile || stat.size !== row.size) {
@@ -85,8 +116,15 @@ export class MediaCache {
         known.add(row.blob);
       } catch (error) {
         if (!(error instanceof Deno.errors.NotFound)) throw error;
-        await deleteCachedMedia(this.db, row.cache_key);
       }
+    }
+    // Verify the entire index before making any entry eligible for eviction.
+    for (const row of rows) {
+      if (known.has(row.blob)) this.register(row);
+    }
+    if (inventoryOnly) return;
+    for (const row of rows) {
+      if (!known.has(row.blob)) await deleteCachedMedia(this.db, row.cache_key);
     }
     for await (const entry of Deno.readDir(this.directory)) {
       if (
@@ -94,7 +132,9 @@ export class MediaCache {
           /^[a-f0-9]{64}-[a-f0-9-]{36}\.part$/.test(entry.name)) &&
         !known.has(entry.name)
       ) {
-        await Deno.remove(this.directory + '/' + entry.name);
+        const path = this.directory + '/' + entry.name;
+        if (this.capacity) await this.capacity.remove(path);
+        else await Deno.remove(path);
       }
     }
   }
@@ -105,9 +145,35 @@ export class MediaCache {
       [...this.pending.values()].map((entry) => entry.run),
     );
     await this.lane;
+    for (const blob of this.registered.values()) blob.forget();
+    this.registered.clear();
   }
+
+  private register(row: CachedMedia): void {
+    if (!this.capacity || !this.canonicalDirectory) return;
+    const blob = {
+      get accessedMs() {
+        return row.accessed_ms;
+      },
+      unleased: () =>
+        !this.leases.has(row.blob) &&
+        !this.pending.has(row.cache_key),
+      removed: () => this.registered.delete(row.cache_key),
+    };
+    const forget = this.capacity.registerCacheBlob(
+      this.canonicalDirectory + '/' + row.blob,
+      blob,
+    );
+    this.registered.set(row.cache_key, { row, forget });
+  }
+
+  private async find(key: string): Promise<CachedMedia | null> {
+    if (this.capacity) return this.registered.get(key)?.row ?? null;
+    return await cachedMedia(this.db, key);
+  }
+
   async get(id: CacheIdentity): Promise<CachedMedia | null> {
-    return await cachedMedia(this.db, await mediaCacheKey(id));
+    return await this.find(await mediaCacheKey(id));
   }
   async fetch(
     id: CacheIdentity,
@@ -117,6 +183,7 @@ export class MediaCache {
       signal: AbortSignal,
     ) => Promise<ByteMetadata>,
     signal?: AbortSignal,
+    maxBytes?: number,
   ): Promise<CachedMedia> {
     if (!Number.isSafeInteger(maxConcurrent) || maxConcurrent <= 0) {
       throw new Error('invalid media concurrency');
@@ -127,7 +194,7 @@ export class MediaCache {
     if (prior) {
       if (prior.controller.signal.aborted) {
         await abortable(signal, () => prior.run.catch(() => {}));
-        return await this.fetch(id, maxConcurrent, producer, signal);
+        return await this.fetch(id, maxConcurrent, producer, signal, maxBytes);
       }
       return await this.subscribe(prior, signal);
     }
@@ -141,6 +208,7 @@ export class MediaCache {
       maxConcurrent,
       producer,
       AbortSignal.any([this.controller.signal, controller.signal]),
+      maxBytes,
     );
     const entry: Pending = { run, controller, users: 0, settled: false };
     this.pending.set(key, entry);
@@ -176,6 +244,7 @@ export class MediaCache {
       signal: AbortSignal,
     ) => Promise<ByteMetadata>,
     signal: AbortSignal,
+    maxBytes?: number,
   ): Promise<CachedMedia> {
     while (this.active >= maxConcurrent) {
       let wake: (() => void) | undefined;
@@ -199,18 +268,22 @@ export class MediaCache {
     const part = this.directory + '/' + stem + '.part';
     const blob = stem + '.blob';
     let file: Deno.FsFile | null = null;
+    let space: Reservation | undefined;
     let renamed = false;
     const media = JSON.stringify([id.origin, id.mediaId]);
     let reservation: Set<string> | undefined;
     try {
       const hit = await this.locked(async () => {
-        const hit = await cachedMedia(this.db, key);
+        const hit = await this.find(key);
         if (hit || id.scope !== 'thumbnail') return hit;
         const reserved = this.variants.get(media) ?? new Set<string>();
-        if (
-          await thumbnailVariantCount(this.db, id.origin, id.mediaId) +
-              reserved.size >= this.maxVariants
-        ) {
+        const variants = this.capacity
+          ? [...this.registered.values()].filter(({ row }) =>
+            row.scope === 'thumbnail' && row.origin === id.origin &&
+            row.media_id === id.mediaId
+          ).length
+          : await thumbnailVariantCount(this.db, id.origin, id.mediaId);
+        if (variants + reserved.size >= this.maxVariants) {
           throw new MatrixError(
             429,
             'M_LIMIT_EXCEEDED',
@@ -223,6 +296,14 @@ export class MediaCache {
         return null;
       });
       if (hit) return hit;
+      if (this.capacity) {
+        if (maxBytes === undefined) {
+          throw new Error('media size bound required');
+        }
+        space = await this.capacity.reserveStaging(part, maxBytes, signal);
+        space.track(this.directory + '/' + blob);
+      }
+      signal.throwIfAborted();
       file = await Deno.open(part, {
         createNew: true,
         write: true,
@@ -233,6 +314,13 @@ export class MediaCache {
       // validation and fsync are complete; writable.close alone cannot publish.
       const output = new WritableStream<Uint8Array>({
         async write(chunk) {
+          if (maxBytes !== undefined && chunk.length > maxBytes - size) {
+            throw new MatrixError(
+              413,
+              'M_TOO_LARGE',
+              'Media exceeds its size limit',
+            );
+          }
           let offset = 0;
           while (offset < chunk.length) {
             const n = await file!.write(chunk.subarray(offset));
@@ -242,7 +330,11 @@ export class MediaCache {
           size += chunk.length;
         },
       });
-      const meta = await producer(output, signal);
+      const meta = await (space
+        ? withStorageHold(() =>
+          producer(output, signal)
+        )
+        : producer(output, signal));
       signal.throwIfAborted();
       if (meta.size !== size) {
         throw new Error('media cache byte count mismatch');
@@ -253,6 +345,9 @@ export class MediaCache {
       file = null;
       await Deno.rename(part, this.directory + '/' + blob);
       renamed = true;
+      // Published bytes now belong to the inventory. Do not hold a staging
+      // claim while acquiring another claim to commit the cache index row.
+      space?.release();
       signal.throwIfAborted();
       const now = Date.now();
       const row: CachedMedia = {
@@ -269,19 +364,28 @@ export class MediaCache {
         accessed_ms: now,
       };
       await this.locked(async () => {
+        // Pressure eviction unlinks without a transaction so it can free
+        // space even when nothing can be written. Replace any stale row.
+        if (this.capacity && await cachedMedia(this.db, key)) {
+          await deleteCachedMedia(this.db, key);
+        }
         await publishCachedMedia(this.db, row);
+        this.register(row);
         reservation?.delete(key);
       });
       return row;
     } catch (error) {
       file?.close();
-      await Deno.remove(renamed ? this.directory + '/' + blob : part).catch(
-        (e) => {
-          if (!(e instanceof Deno.errors.NotFound)) throw e;
-        },
-      );
-      throw error;
+      const path = renamed ? this.directory + '/' + blob : part;
+      await (this.capacity ? this.capacity.remove(path) : Deno.remove(path))
+        .catch(
+          (e) => {
+            if (!(e instanceof Deno.errors.NotFound)) throw e;
+          },
+        );
+      throw storageFailure(error);
     } finally {
+      space?.release();
       reservation?.delete(key);
       if (this.variants.get(media)?.size === 0) this.variants.delete(media);
       this.active--;
@@ -290,21 +394,34 @@ export class MediaCache {
   }
   async open(row: CachedMedia): Promise<ReadableStream<Uint8Array>> {
     return await this.locked(async () => {
-      const current = await cachedMedia(this.db, row.cache_key);
+      const current = this.capacity
+        ? this.registered.get(row.cache_key)?.row
+        : await cachedMedia(this.db, row.cache_key);
       if (current?.blob !== row.blob) {
         throw new MatrixError(404, 'M_NOT_FOUND', 'Media evicted');
       }
       if (!BLOB.test(row.blob)) {
         throw new Error('invalid media cache blob identity');
       }
-      const file = await Deno.open(this.directory + '/' + row.blob, {
-        read: true,
-      });
+      // Mark before the asynchronous open; pressure eviction doesn't take
+      // this lane because serving also writes the access timestamp.
       this.leases.set(row.blob, (this.leases.get(row.blob) ?? 0) + 1);
+      let file: Deno.FsFile | undefined;
       try {
-        await touchCachedMedia(this.db, row.cache_key, Date.now());
+        file = await Deno.open(this.directory + '/' + row.blob, { read: true });
+        const now = Date.now();
+        try {
+          // The serving lease already protects the file; recency is best
+          // effort under pressure and stays current in the live cache index.
+          await withStorageHold(() =>
+            touchCachedMedia(this.db, row.cache_key, now)
+          );
+        } catch (error) {
+          if (!isStoragePressure(error)) throw error;
+        }
+        current.accessed_ms = now;
       } catch (error) {
-        file.close();
+        file?.close();
         this.release(row.blob);
         throw error;
       }
@@ -312,7 +429,7 @@ export class MediaCache {
       const close = () => {
         if (!closed) {
           closed = true;
-          file.close();
+          file!.close();
           this.release(row.blob);
         }
       };
@@ -320,7 +437,7 @@ export class MediaCache {
         async pull(controller) {
           try {
             const chunk = new Uint8Array(16384);
-            const n = await file.read(chunk);
+            const n = await file!.read(chunk);
             if (n === null) {
               close();
               controller.close();
@@ -343,15 +460,32 @@ export class MediaCache {
     const active = (p: Retention) =>
       p.maxagedays > 0 || p.unopenedday > 0 || p.maxbytes > 0;
     if (
-      policy.maxbytes <= 0 && !active(policy.remote) &&
+      !this.capacity && policy.maxbytes <= 0 && !active(policy.remote) &&
       !active(policy.thumbnail)
     ) return;
     await this.locked(async () => {
-      const rows = await listCachedMedia(this.db);
+      const rows = [];
+      for (const row of await listCachedMedia(this.db)) {
+        const current = this.capacity
+          ? this.registered.get(row.cache_key)?.row
+          : row;
+        if (!current) {
+          await deleteCachedMedia(this.db, row.cache_key);
+        } else rows.push(current);
+      }
+      if (this.capacity) {
+        // Recency updates can succeed in memory but not on disk. Reorder
+        // the managed rows as well as using them for the expiry threshold.
+        rows.sort((a, b) =>
+          a.accessed_ms - b.accessed_ms ||
+          (a.cache_key < b.cache_key ? -1 : a.cache_key > b.cache_key ? 1 : 0)
+        );
+      }
       let total = rows.reduce((n, r) => n + r.size, 0);
       const scopes = { remote: 0, thumbnail: 0 };
       for (const row of rows) scopes[row.scope] += row.size;
       for (const row of rows) {
+        if (this.capacity && !this.registered.has(row.cache_key)) continue;
         const p = policy[row.scope];
         const expired = (p.maxagedays > 0 &&
           row.created_ms <= now - p.maxagedays * 86400000) ||
@@ -364,10 +498,19 @@ export class MediaCache {
           throw new Error('invalid media cache blob identity');
         }
         // Remove metadata first. A crash leaves only an unreachable orphan.
-        await deleteCachedMedia(this.db, row.cache_key);
-        await Deno.remove(this.directory + '/' + row.blob).catch((e) => {
-          if (!(e instanceof Deno.errors.NotFound)) throw e;
-        });
+        this.leases.set(row.blob, 1);
+        try {
+          await deleteCachedMedia(this.db, row.cache_key);
+          this.registered.get(row.cache_key)?.forget();
+          this.registered.delete(row.cache_key);
+          const path = this.directory + '/' + row.blob;
+          await (this.capacity ? this.capacity.remove(path) : Deno.remove(path))
+            .catch((e) => {
+              if (!(e instanceof Deno.errors.NotFound)) throw e;
+            });
+        } finally {
+          this.release(row.blob);
+        }
         total -= row.size;
         scopes[row.scope] -= row.size;
       }

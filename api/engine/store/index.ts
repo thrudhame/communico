@@ -33,6 +33,7 @@ import { type GateStats } from '#engine/store/gate.ts';
 import { Turso } from '#engine/store/ffi.ts';
 import { databaseFiles, serverDirectory } from '#engine/store/layout.ts';
 import { type Lease, Pool, type SnapshotSource } from '#engine/store/pool.ts';
+import { routeStoreScratch } from '#engine/store/scratch.ts';
 import {
   ensureWatermarks,
   startupHooks,
@@ -82,6 +83,8 @@ export class Store implements StartupStore {
     private readonly pool: Pool,
     private readonly ownership: number,
     private readonly admission: Admission,
+    readonly capacity?: import('./capacity.ts').Capacity,
+    private readonly restoreScratch?: () => void,
   ) {
     this.serverOperations = operations(
       (fn, options) => this.run(() => this.serverDb.tx(fn, options)),
@@ -91,6 +94,12 @@ export class Store implements StartupStore {
 
   server(): Promise<Database> {
     return Promise.resolve(this.serverOperations);
+  }
+
+  capacityStatus() {
+    return this.run(async () =>
+      await this.capacity?.status((path) => this.ffi.quotaEnforced(path))
+    );
   }
 
   serverRevision(): string | undefined {
@@ -146,7 +155,7 @@ export class Store implements StartupStore {
   // no-replace publication. Shutdown drains this maintenance operation too.
   publishSnapshot(source: string, destination: string): Promise<void> {
     if (this.stopped) return Promise.reject(new Error('store is closed'));
-    return this.maintain(publish(this.ffi, source, destination));
+    return this.maintain(publish(this.ffi, source, destination, this.capacity));
   }
 
   // Accepted work owns a lifetime independently of the short commit/publication
@@ -274,11 +283,10 @@ export class Store implements StartupStore {
   private async captureSnapshot(
     destination: string,
   ): Promise<{ files: SnapshotFile[]; pauseMs: number; native: BuildInfo }> {
-    const staging = await Deno.makeTempDir({
-      dir: dirname(dirname(this.serverDb.path)),
-      prefix: '.backup-',
-      suffix: '.new',
-    });
+    const staging = join(this.directory, `.backup-${crypto.randomUUID()}.new`);
+    const makeStage = () => Deno.mkdir(staging, { mode: 0o700 });
+    if (this.capacity) await this.capacity.withMetadata(staging, 1, makeStage);
+    else await makeStage();
     const sources = new Map<string, SnapshotSource>();
     const readers: {
       file: SnapshotFile;
@@ -347,7 +355,12 @@ export class Store implements StartupStore {
       for (const { file, reader, release } of readers) {
         try {
           const path = join(staging, file.path);
-          await Deno.mkdir(dirname(path), { recursive: true, mode: 0o700 });
+          if (this.capacity) {
+            await this.capacity.ensureDirectory(dirname(path), 0o700);
+          } else {await Deno.mkdir(dirname(path), {
+              recursive: true,
+              mode: 0o700,
+            });}
           await reader.export(path);
         } catch (error) {
           try {
@@ -369,7 +382,7 @@ export class Store implements StartupStore {
       // release failure must not turn an already-published cut into a rejection.
       await releaseSources();
       const native = await this.ffi.buildInfo();
-      await publish(this.ffi, staging, destination);
+      await publish(this.ffi, staging, destination, this.capacity);
       return {
         files: readers.map(({ file }) => file),
         pauseMs,
@@ -377,7 +390,9 @@ export class Store implements StartupStore {
       };
     } catch (error) {
       const cleanup = await Promise.allSettled([releaseSources()]);
-      cleanup.push(...await Promise.allSettled([removeOwned(staging)]));
+      cleanup.push(
+        ...await Promise.allSettled([removeOwned(staging, this.capacity)]),
+      );
       const errors = cleanup.flatMap((result) =>
         result.status === 'rejected' ? [result.reason] : []
       );
@@ -419,6 +434,7 @@ export class Store implements StartupStore {
       await this.serverDb.close();
       await this.ffi.unlockStore(this.ownership);
       this.ffi.close();
+      this.restoreScratch?.();
       if (failure !== undefined) throw failure;
     })());
   }
@@ -428,6 +444,7 @@ export async function openStore(
   config: StoreConfig,
   options: {
     schemas?: StoreSchemas;
+    capacityOwner?: import('./capacity.ts').Capacity;
     beforeStartup?(store: Store): Promise<unknown>;
   } = {},
 ): Promise<Store> {
@@ -435,6 +452,7 @@ export async function openStore(
   let serverDb: Db | undefined;
   let pool: Pool | undefined;
   let ownership: number | undefined;
+  let restoreScratch: (() => void) | undefined;
   const admission = new Admission();
   try {
     checkBuildInfo(await ffi.buildInfo());
@@ -442,10 +460,18 @@ export async function openStore(
     await Deno.mkdir(dirname(config.dir), { recursive: true, mode: 0o700 });
     ownership = await ffi.lockStore(await ownershipPath(config.dir));
     await assertNoPromotion(config.dir);
-    await Deno.mkdir(config.dir, { recursive: true, mode: 0o700 });
-    await sweep(config.dir);
-    await sweep(join(config.dir, 'rooms'));
-    await sweep(join(config.dir, 'tenants'));
+    // Abandoned, unpublished trees can be removed without a write grant.
+    // Reclaim them under the ownership lock before reserving scratch metadata.
+    await sweep(config.dir, options.capacityOwner);
+    await sweep(join(config.dir, 'rooms'), options.capacityOwner);
+    await sweep(join(config.dir, 'tenants'), options.capacityOwner);
+    if (options.capacityOwner) {
+      await options.capacityOwner.ensureDirectory(config.dir, 0o700);
+      restoreScratch = await routeStoreScratch(
+        config.dir,
+        options.capacityOwner,
+      );
+    } else await Deno.mkdir(config.dir, { recursive: true, mode: 0o700 });
     const serverProvider: SchemaProvider = {
       version: (options.schemas?.server ?? EMPTY_SCHEMA).version,
       migrations: options.schemas?.server?.migrations,
@@ -462,9 +488,9 @@ export async function openStore(
       if (!(error instanceof Deno.errors.NotFound)) throw error;
     }
     if (!present) {
-      await Deno.mkdir(config.dir, { recursive: true });
       await createDatabase(ffi, config.dir, 'server', {
         checkpointlogbytes: config.checkpointlogbytes,
+        capacity: options.capacityOwner,
         schema: (db) => applySchema(db, serverProvider),
         verify: (db) => checkSchema(db, serverProvider),
       });
@@ -474,17 +500,33 @@ export async function openStore(
       serverPath,
       config.checkpointlogbytes,
       admission,
+      options.capacityOwner,
     );
     await ensureSchema(serverDb, serverProvider);
-    pool = new Pool(ffi, config.dir, {
-      checkpointlogbytes: config.checkpointlogbytes,
-      maxopenfiles: config.maxopenfiles,
-      idleseconds: config.idleseconds,
-    }, {
-      rooms: options.schemas?.room,
-      tenants: options.schemas?.tenant,
-    }, admission);
-    const store = new Store(ffi, serverDb, pool, ownership, admission);
+    pool = new Pool(
+      ffi,
+      config.dir,
+      {
+        checkpointlogbytes: config.checkpointlogbytes,
+        maxopenfiles: config.maxopenfiles,
+        idleseconds: config.idleseconds,
+      },
+      {
+        rooms: options.schemas?.room,
+        tenants: options.schemas?.tenant,
+      },
+      admission,
+      options.capacityOwner,
+    );
+    const store = new Store(
+      ffi,
+      serverDb,
+      pool,
+      ownership,
+      admission,
+      options.capacityOwner,
+      restoreScratch,
+    );
     // The composition root binds runtime authority before a recovery hook may
     // project data or schedule owner-specific intents. Failure unwinds the pool.
     await options.beforeStartup?.(store);
@@ -496,6 +538,7 @@ export async function openStore(
       await serverDb?.close();
       if (ownership !== undefined) await ffi.unlockStore(ownership);
       ffi.close();
+      restoreScratch?.();
     } catch {
       // Unwinding must not mask the startup error thrown below.
     }

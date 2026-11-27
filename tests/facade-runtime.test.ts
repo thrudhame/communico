@@ -2401,6 +2401,13 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
     });
     // Real processes exchange live observations over the existing home-initiated
     // link. Ordinary/sliding consumers, not a durable journal ACK, prove receipt.
+    // Keep the selected auth cut finite while testing best-effort live input.
+    // Periodic auth refreshes otherwise keep superseding admission during the
+    // input lifetime. Hold the next page outside the producer transaction,
+    // then drain any auth record that already made it to the facade.
+    const liveAuth = await home.holdPublication('stream:auth:' + user);
+    await liveAuth.held();
+    await finiteTail(edge, tls.dir + '/facade-auth.sock', ['auth:' + user]);
     const livePresence = 'presence/' + encodeURIComponent(user) + '/status';
     const liveTyping = roomPath + '/typing/' + encodeURIComponent(user);
     const liveMark = edge.observations.mark();
@@ -2558,6 +2565,7 @@ Deno.test('cold F2 link workers export account cuts and recover facade authority
           e: { type: string; content: { user_ids?: string[] } },
         ) => e.type === 'm.typing' && e.content.user_ids?.includes(user)),
     );
+    await liveAuth.release();
     // The live consumers above serve applied publications while home runs.
     // A separate cold reopen proves private data and upgrade retry retention.
     const backupSuffix = {

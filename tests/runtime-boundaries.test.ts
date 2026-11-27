@@ -28,10 +28,13 @@ Deno.test('runtime boundaries: defaults are mandatory even with every environmen
   assert(error.message.includes('missing defaults file'));
 });
 
-Deno.test('runtime boundaries: every numeric leaf rejects negative and unsafe values', () => {
+Deno.test('runtime boundaries: every numeric leaf rejects out-of-range and unsafe values', () => {
   for (const [path, type] of leaves(SCHEMA)) {
     if (type !== 'int') continue;
-    for (const value of [-1, Number.MAX_SAFE_INTEGER + 1]) {
+    const key = path.join('.');
+    // -1 is the explicit default-budget sentinel, not an invalid value.
+    const belowMinimum = key === 'facade.storagebudgetbytes' ? -2 : -1;
+    for (const value of [belowMinimum, Number.MAX_SAFE_INTEGER + 1]) {
       const error = assertThrows(
         () =>
           loadConfig({
@@ -41,9 +44,9 @@ Deno.test('runtime boundaries: every numeric leaf rejects negative and unsafe va
           }),
         Error,
         undefined,
-        path.join('.'),
+        key,
       );
-      assert(error.message.includes(path.join('.')), path.join('.'));
+      assert(error.message.includes(key), key);
     }
   }
   for (
@@ -64,10 +67,11 @@ Deno.test('runtime boundaries: every numeric leaf rejects negative and unsafe va
       })
     );
   }
-  loadConfig({
+  const { config } = loadConfig({
     defaultsPath,
     configPath: null,
     env: {
+      COMMUNICO_FACADE_STORAGEBUDGETBYTES: '-1',
       COMMUNICO_MEDIA_CLEANUPSECONDS: '2147483',
       COMMUNICO_MEDIA_THUMBNAILMS: '2147483647',
       COMMUNICO_TURN_TTL: '0',
@@ -76,6 +80,7 @@ Deno.test('runtime boundaries: every numeric leaf rejects negative and unsafe va
       COMMUNICO_PEEKING_MAXTIMEOUTMS: '0',
     },
   });
+  assertEquals(config.facade.storagebudgetbytes, -1);
 });
 
 Deno.test('runtime boundaries: native results never silently round integers', async () => {

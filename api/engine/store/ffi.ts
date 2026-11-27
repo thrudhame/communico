@@ -12,6 +12,9 @@ export class StoreError extends Error {
     readonly code: number,
     message: string,
     readonly lastError: string,
+    readonly requiredWriteBytes?: number,
+    readonly openNeedsAllocation = false,
+    readonly osErrno?: number,
   ) {
     super(message);
     this.name = 'StoreError';
@@ -29,11 +32,46 @@ export class StoreError extends Error {
       this.message === 'Write-write conflict' &&
       this.lastError === 'Error("Write-write conflict")');
   }
+
+  get storageFull(): boolean {
+    return (this.code & 255) === 13 ||
+      (this.code === 10 &&
+        /^IoError\((StorageFull|QuotaExceeded), /.test(this.lastError));
+  }
 }
+
+type OwnedCheckpoint =
+  & { peakBytes: number }
+  & (
+    { rows: Row[]; error?: never } | {
+      rows?: never;
+      error: { code: number; message: string; lastError: string };
+    }
+  );
 
 const definitions = {
   ffi_open: { parameters: ['buffer'], result: 'pointer', nonblocking: true },
+  ffi_quota_enforced: {
+    parameters: ['buffer'],
+    result: 'pointer',
+    nonblocking: true,
+  },
+  ffi_open_bounded: {
+    parameters: ['buffer', 'u64', 'u64', 'u32', 'buffer'],
+    result: 'pointer',
+    nonblocking: true,
+  },
   ffi_connect: { parameters: ['u32'], result: 'pointer', nonblocking: true },
+  ffi_connect_bounded: {
+    parameters: ['u32'],
+    result: 'pointer',
+    nonblocking: true,
+  },
+  ffi_set_limit: {
+    parameters: ['u32', 'u64', 'u64', 'u64', 'u32'],
+    result: 'pointer',
+    nonblocking: true,
+  },
   ffi_exec: {
     parameters: ['u32', 'buffer'],
     result: 'pointer',
@@ -70,14 +108,23 @@ const definitions = {
     nonblocking: true,
   },
   ffi_commit: { parameters: ['u32'], result: 'pointer', nonblocking: true },
-  ffi_rollback: { parameters: ['u32'], result: 'pointer', nonblocking: true },
+  ffi_rollback: {
+    parameters: ['u32', 'bool'],
+    result: 'pointer',
+    nonblocking: true,
+  },
   ffi_checkpoint: {
     parameters: ['u32', 'u32'],
     result: 'pointer',
     nonblocking: true,
   },
+  ffi_owned_checkpoint: {
+    parameters: ['u32'],
+    result: 'pointer',
+    nonblocking: true,
+  },
   ffi_close: {
-    parameters: ['u32', 'u32'],
+    parameters: ['u32', 'u32', 'bool'],
     result: 'pointer',
     nonblocking: true,
   },
@@ -134,7 +181,14 @@ export class Turso {
           new Deno.UnsafePointerView(pointer).getCString(),
         );
         if (reply.code !== 0) {
-          throw new StoreError(reply.code, reply.message, reply.last_error);
+          throw new StoreError(
+            reply.code,
+            reply.message,
+            reply.last_error,
+            reply.required_write_bytes ?? undefined,
+            reply.open_needs_allocation ?? false,
+            reply.os_errno ?? undefined,
+          );
         }
         return reply.value as T;
       } finally {
@@ -145,16 +199,56 @@ export class Turso {
     }
   }
 
-  async open(path: string): Promise<number> {
+  async open(
+    path: string,
+    ceiling?: {
+      blockSize: number;
+      bytes: number;
+      creates?: number;
+      scratchRoot?: string;
+    },
+  ): Promise<number> {
     const handle = await this.value<number>(() =>
-      this.library.symbols.ffi_open(bytes(path))
+      ceiling
+        ? this.library.symbols.ffi_open_bounded(
+          bytes(path),
+          BigInt(ceiling.blockSize),
+          BigInt(ceiling.bytes),
+          ceiling.creates ?? 0,
+          ceiling.scratchRoot === undefined ? null : bytes(ceiling.scratchRoot),
+        )
+        : this.library.symbols.ffi_open(bytes(path))
     );
     this.files++;
     return handle;
   }
 
-  connect(file: number): Promise<number> {
-    return this.value(() => this.library.symbols.ffi_connect(file));
+  connect(file: number, bounded = false): Promise<number> {
+    return this.value(() =>
+      bounded
+        ? this.library.symbols.ffi_connect_bounded(file)
+        : this.library.symbols.ffi_connect(file)
+    );
+  }
+
+  setLimit(
+    connection: number,
+    { blockSize, bytes, creates = 0 }: {
+      blockSize: number;
+      bytes: number;
+      creates?: number;
+    },
+    undoBytes: number,
+  ): Promise<void> {
+    return this.value(() =>
+      this.library.symbols.ffi_set_limit(
+        connection,
+        BigInt(blockSize),
+        BigInt(bytes),
+        BigInt(undoBytes),
+        creates,
+      )
+    );
   }
 
   exec(connection: number, sql: string): Promise<void> {
@@ -193,7 +287,7 @@ export class Turso {
   }
 
   async unlockStore(handle: number): Promise<void> {
-    await this.value(() => this.library.symbols.ffi_close(handle, 2));
+    await this.value(() => this.library.symbols.ffi_close(handle, 2, false));
     this.files--;
   }
 
@@ -253,8 +347,10 @@ export class Turso {
     return this.value(() => this.library.symbols.ffi_commit(connection));
   }
 
-  rollback(connection: number): Promise<void> {
-    return this.value(() => this.library.symbols.ffi_rollback(connection));
+  rollback(connection: number, ownedCheckpoint = false): Promise<void> {
+    return this.value(() =>
+      this.library.symbols.ffi_rollback(connection, ownedCheckpoint)
+    );
   }
 
   checkpoint(connection: number, mode: CheckpointMode): Promise<Row[]> {
@@ -266,12 +362,22 @@ export class Turso {
     );
   }
 
-  closeConnection(connection: number): Promise<void> {
-    return this.value(() => this.library.symbols.ffi_close(connection, 1));
+  ownedCheckpoint(connection: number): Promise<OwnedCheckpoint> {
+    return this.value(() =>
+      this.library.symbols.ffi_owned_checkpoint(connection)
+    );
   }
 
-  async closeFile(file: number): Promise<void> {
-    await this.value(() => this.library.symbols.ffi_close(file, 0));
+  closeConnection(connection: number, ownedCheckpoint = false): Promise<void> {
+    return this.value(() =>
+      this.library.symbols.ffi_close(connection, 1, ownedCheckpoint)
+    );
+  }
+
+  async closeFile(file: number, bounded = false): Promise<void> {
+    await this.value(() =>
+      this.library.symbols.ffi_close(file, bounded ? 3 : 0, false)
+    );
     this.files--;
   }
 
@@ -284,5 +390,11 @@ export class Turso {
 
   buildInfo(): Promise<BuildInfo> {
     return this.value(() => this.library.symbols.ffi_build_info());
+  }
+
+  quotaEnforced(path: string): Promise<boolean> {
+    return this.value(() =>
+      this.library.symbols.ffi_quota_enforced(bytes(path))
+    );
   }
 }

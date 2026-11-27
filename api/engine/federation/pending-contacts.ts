@@ -1,4 +1,5 @@
 import type { Database } from '#engine/store/db.ts';
+import { isStoragePressure } from '#engine/store/pressure.ts';
 import { lookupPeer, type PendingRow, recordPending } from './peers.ts';
 
 type Writer<T> = {
@@ -10,7 +11,8 @@ type Writer<T> = {
 /** Application-owned operator diagnostics, not an authentication commit barrier.
  * An abrupt crash can lose every accepted contact still queued or in an
  * uncommitted flush (no fixed count bound). Orderly close drains them before
- * storage closes; failures remain owned and are reported by drain/close.
+ * storage closes. Non-storage failures are reported by drain/close; storage
+ * refusal is reported but must not turn diagnostic work into a shutdown error.
  * The injected merge preserves the caller's facts; only persistence queues.
  * Business outcomes must keep their own durable transaction barriers.
  */
@@ -33,12 +35,21 @@ export class ContactObservations<T> {
       active.pending = active.pending === undefined
         ? observation
         : this.merge(active.pending, observation);
-      return;
+      if (
+        active.error === undefined || !isStoragePressure(active.error.cause)
+      ) {
+        return;
+      }
+      // Renew deferred diagnostics when another observation arrives after a
+      // real storage refusal. The original batch is still owned by this writer.
+      active.error = undefined;
     }
-    const writer: Writer<T> = {
-      pending: observation,
-      task: Promise.resolve(),
-    };
+    const writer: Writer<T> = active == null
+      ? {
+        pending: observation,
+        task: Promise.resolve(),
+      }
+      : active;
     this.writers.set(key, writer);
     // The owner retains and observes every flush, including its error. Only
     // diagnostic persistence runs here; signatures and request work never queue.
@@ -77,6 +88,10 @@ export class ContactObservations<T> {
   }
 
   async drain(): Promise<void> {
+    await this.flush(false);
+  }
+
+  private async flush(closing: boolean): Promise<void> {
     // Include contacts accepted while an earlier flush was running. Closing
     // stops admission first; a normal explicit drain includes overlapping work.
     while (this.writers.size > 0) {
@@ -85,19 +100,23 @@ export class ContactObservations<T> {
       const errors = writers.flatMap((writer) =>
         writer.error === undefined ? [] : [writer.error.cause]
       );
-      if (errors.length === 1) throw errors[0];
-      if (errors.length > 1) {
+      const failures = closing
+        ? errors.filter((error) => !isStoragePressure(error))
+        : errors;
+      if (failures.length === 1) throw failures[0];
+      if (failures.length > 1) {
         throw new AggregateError(
-          errors,
+          failures,
           'contact diagnostics failed',
         );
       }
+      if (closing) return;
     }
   }
 
   close(): Promise<void> {
     this.closing = true;
-    if (this.closed === undefined) this.closed = this.drain();
+    if (this.closed === undefined) this.closed = this.flush(true);
     return this.closed;
   }
 }

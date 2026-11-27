@@ -17,6 +17,8 @@ shutdowngraceseconds = 10
 # Synapse MAX_REQUEST_SIZE: 200 x 64 KiB = 12.5 MiB. Must be positive.
 # Media uploads retain media.maxbytes. COMMUNICO_SERVER_MAXREQUESTBYTES
 maxrequestbytes = 13107200
+# Optional Matrix admin_contact URI for client resource-limit responses.
+admincontact = ""
 
 [admin]
 # Local operator API. Empty means admin.sock beside the resolved store root.
@@ -67,6 +69,9 @@ reconnectmaxseconds = 10
 # COMMUNICO_FACADE_OUTBOUND / REPLICATEROOMS
 outbound = "direct"
 replicaterooms = "local"
+# COMMUNICO_FACADE_STORAGEBUDGETBYTES: -1 = 99% per filesystem,
+# 0 = no software cap, positive = aggregate cap in bytes.
+storagebudgetbytes = -1
 # Zero is unlimited. Age flags work, never evicts acknowledged undrained work.
 # COMMUNICO_FACADE_MAILBOXMAXBYTES / MAILBOXMAXAGEDAYS / MAXOFFLINEDAYS
 mailboxmaxbytes = 0

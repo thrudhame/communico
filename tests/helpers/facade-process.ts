@@ -487,6 +487,7 @@ export async function facadeProcess(
   config: string,
   ready: string,
   heldPublications: string[] = [],
+  options: { probeScratch?: string } = {},
 ) {
   const observations = new FacadeObservations();
   const initialHolds = new Set(heldPublications);
@@ -501,6 +502,10 @@ export async function facadeProcess(
       COMMUNICO_CONFIG: config,
       DENO_NO_PROMPT: '1',
       FACADE_TEST_HOLDS: JSON.stringify(heldPublications),
+      FACADE_TEST_PROBE_SCRATCH: options.probeScratch ?? '',
+      ...(options.probeScratch
+        ? { TURSO_TMPDIR: Deno.env.get('TMPDIR') ?? '.' }
+        : {}),
       ...listeners.env,
     },
     stdin: 'piped',

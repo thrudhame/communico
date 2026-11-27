@@ -1,3 +1,5 @@
+import { withStorageHold } from '#engine/store/holds.ts';
+
 // Common commit/publication admission. Transaction bodies, connection waits and
 // maintenance keep running; no native commit or final file publication crosses
 // the cut. Accepted operation lifetime is owned separately by the Store.
@@ -14,7 +16,7 @@ export class Admission {
     }
     this.active++;
     try {
-      return await fn();
+      return await withStorageHold(fn);
     } finally {
       this.active--;
       if (this.active === 0) {
@@ -37,7 +39,7 @@ export class Admission {
             this.drained.push(resolve);
           });
         }
-        const value = await fn();
+        const value = await withStorageHold(fn);
         return { value, pauseMs: performance.now() - started };
       } finally {
         this.paused = false;

@@ -102,7 +102,7 @@ Deno.test('advertised version behavioral checklist executes at the real consumer
         '--allow-write',
         '--allow-run',
         '--allow-ffi',
-        '--allow-sys=uid,umask,ca',
+        '--allow-sys=uid,umask,ca,statfs',
         '--junit-path=' + dir + '/results.xml',
         ...files.map((file) => `tests/${file}.test.ts`),
       ],

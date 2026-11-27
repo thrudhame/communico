@@ -185,6 +185,7 @@ export class Pool {
     private readonly options: PoolOptions,
     providers: Partial<Record<FileKind, SchemaProvider>> = {},
     private readonly admission?: Admission,
+    private readonly capacity?: import('./capacity.ts').Capacity,
   ) {
     this.providers = {
       rooms: providers.rooms ?? EMPTY_SCHEMA,
@@ -274,6 +275,7 @@ export class Pool {
         path,
         this.options.checkpointlogbytes,
         this.admission,
+        this.capacity,
       );
       const rows = await db.query('SELECT value FROM id');
       if (
@@ -392,6 +394,7 @@ export class Pool {
             files.database,
             this.options.checkpointlogbytes,
             this.admission,
+            this.capacity,
           );
         } catch (error) {
           if (error instanceof Deno.errors.NotFound) continue;
@@ -451,10 +454,12 @@ export class Pool {
       throw new Deno.errors.NotFound(`removed ${kind} database: ${id}`);
     }
     const provider = this.providers[kind];
-    await Deno.mkdir(parent, { recursive: true });
+    if (this.capacity) await this.capacity.ensureDirectory(parent);
+    else await Deno.mkdir(parent, { recursive: true });
     let result!: T;
     await createDatabase(this.ffi, parent, key, {
       checkpointlogbytes: this.options.checkpointlogbytes,
+      capacity: this.capacity,
       discardOnFailure: true,
       publication: this.admission,
       schema: async (db) => {
@@ -611,7 +616,9 @@ export class Pool {
               if (!info.isDirectory) {
                 throw new Error(`not a database directory: ${dir}`);
               }
-              await Deno.remove(dir, { recursive: true });
+              if (this.capacity) {
+                await this.capacity.remove(dir, { recursive: true });
+              } else await Deno.remove(dir, { recursive: true });
             } catch (error) {
               if (!(error instanceof Deno.errors.NotFound)) throw error;
             }
@@ -656,10 +663,12 @@ export class Pool {
           `no ${kind} database for ${JSON.stringify(id)}: ${files.database}`,
         );
       }
-      await Deno.mkdir(parent, { recursive: true });
+      if (this.capacity) await this.capacity.ensureDirectory(parent);
+      else await Deno.mkdir(parent, { recursive: true });
       const provider = this.providers[kind];
       await createDatabase(this.ffi, parent, key, {
         checkpointlogbytes: this.options.checkpointlogbytes,
+        capacity: this.capacity,
         publication: this.admission,
         schema: async (db) => {
           await recordId(db, id);
@@ -676,6 +685,7 @@ export class Pool {
       files.database,
       this.options.checkpointlogbytes,
       this.admission,
+      this.capacity,
     );
     try {
       await checkId(db, id);

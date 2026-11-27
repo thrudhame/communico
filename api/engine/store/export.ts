@@ -3,6 +3,14 @@
 import { dirname, join } from '@std/path';
 import { type Row, type Turso, type Value } from '#engine/store/ffi.ts';
 import { publish, removeOwned } from '#engine/store/files.ts';
+import type { Capacity } from './capacity.ts';
+import {
+  NO_GROWTH,
+  openNative,
+  shortfall,
+  writeFrames,
+} from './native-reservation.ts';
+import { storageFailure } from './pressure.ts';
 
 export type ReadSnapshot = {
   export(destination: string): Promise<void>;
@@ -16,33 +24,118 @@ export type PreparedSnapshot = {
 
 const identifier = (name: string) => '"' + name.replaceAll('"', '""') + '"';
 
+class GrowCheckpoint extends Error {
+  constructor(readonly bytes: number) {
+    super();
+  }
+}
+
 export async function exportSnapshot(
   ffi: Turso,
   reader: number,
   schema: Row[],
   destination: string,
+  capacity?: Capacity,
+  root = dirname(destination),
 ): Promise<void> {
-  const staging = await Deno.makeTempDir({
-    dir: dirname(destination),
-    prefix: '.logical-',
-    suffix: '.new',
-  });
+  let checkpointBytes = 0;
+  for (;;) {
+    try {
+      return await exportStage(
+        ffi,
+        reader,
+        schema,
+        destination,
+        root,
+        capacity,
+        checkpointBytes,
+      );
+    } catch (error) {
+      if (!(error instanceof GrowCheckpoint)) throw storageFailure(error);
+      checkpointBytes = error.bytes;
+    }
+  }
+}
+
+async function exportStage(
+  ffi: Turso,
+  reader: number,
+  schema: Row[],
+  destination: string,
+  root: string,
+  capacity: Capacity | undefined,
+  checkpointBytes: number,
+): Promise<void> {
+  const staging = join(root, `.logical-${crypto.randomUUID()}.new`);
+  const makeStage = () => Deno.mkdir(staging, { mode: 0o700 });
+  if (capacity) await capacity.withMetadata(staging, 1, makeStage);
+  else await makeStage();
   let file: number | undefined;
   let writer: number | undefined;
+  const path = join(staging, 'data.db');
+  const closeWriter = async () => {
+    const handle = writer!;
+    writer = undefined;
+    await ffi.closeConnection(handle);
+  };
+  const write = async (
+    sql: string,
+    values?: readonly Value[],
+  ) => {
+    const handle = writer!;
+    let requested = writeFrames(sql, values);
+    for (;;) {
+      const grant = await capacity?.reserveNative(path, 2, requested);
+      try {
+        if (grant) await ffi.setLimit(handle, grant, grant.undoBytes);
+        await ffi.begin(handle, 'deferred');
+        try {
+          if (values) await ffi.execute(handle, sql, values);
+          else await ffi.exec(handle, sql);
+          await ffi.commit(handle);
+        } catch (error) {
+          try {
+            await ffi.rollback(handle);
+          } catch (rollback) {
+            throw new AggregateError(
+              [error, rollback],
+              'snapshot write rollback failed',
+            );
+          }
+          const bytes = shortfall(error, grant);
+          if (bytes === undefined) throw error;
+          await ffi.setLimit(handle, NO_GROWTH, 0);
+          requested = bytes;
+          continue;
+        }
+        if (grant) await ffi.setLimit(handle, NO_GROWTH, 0);
+        return;
+      } catch (error) {
+        await closeWriter();
+        throw error;
+      } finally {
+        grant?.release();
+      }
+    }
+  };
   try {
-    const path = join(staging, 'data.db');
-    (await Deno.open(path, { createNew: true, write: true, mode: 0o600 }))
-      .close();
-    file = await ffi.open(path);
-    writer = await ffi.connect(file);
-    await ffi.query(writer, 'PRAGMA mvcc_checkpoint_threshold=-1');
+    const create = async () =>
+      (await Deno.open(path, { createNew: true, write: true, mode: 0o600 }))
+        .close();
+    if (capacity) await capacity.withMetadata(path, 1, create);
+    else await create();
+    file = await openNative(ffi, path, capacity);
+    writer = await ffi.connect(file, !!capacity);
+    if (!capacity) {
+      await ffi.query(writer, 'PRAGMA mvcc_checkpoint_threshold=-1');
+    }
     const objects = schema.filter((row) =>
       typeof row.sql === 'string' && typeof row.name === 'string' &&
       !row.name.startsWith('sqlite_') &&
       !row.name.startsWith('__turso_internal_')
     );
     for (const table of objects.filter((row) => row.type === 'table')) {
-      await ffi.exec(writer, String(table.sql));
+      await write(String(table.sql));
       const name = identifier(String(table.name));
       const columns = await ffi.query(reader, `PRAGMA table_info(${name})`);
       const names = columns.map((row) => String(row.name));
@@ -72,44 +165,63 @@ export async function exportSnapshot(
         if (rows.length === 0) break;
         // Commit bounded pages: neither JS nor the native target transaction
         // retains a write set proportional to the entire source database.
-        await ffi.begin(writer, 'deferred');
-        try {
-          // One native statement owns the entire page. Crossing the async FFI
-          // boundary per row multiplies scheduling/serialization overhead by
-          // the source population even though both sides already own a page.
-          await ffi.execute(
-            writer,
-            insert + rows.map(() => parameters).join(','),
-            rows.flatMap((row) => selected.map((_, n) => row[`c${n}`])),
-          );
-          await ffi.commit(writer);
-        } catch (error) {
-          await ffi.rollback(writer);
-          throw error;
-        }
+        // One native statement owns the entire page; no FFI crossing per row.
+        await write(
+          insert + rows.map(() => parameters).join(','),
+          rows.flatMap((row) => selected.map((_, n) => row[`c${n}`])),
+        );
         last = rows.at(-1)!.c0;
       }
     }
     for (const object of objects.filter((row) => row.type !== 'table')) {
-      await ffi.exec(writer, String(object.sql));
+      await write(String(object.sql));
     }
-    const checkpoint = await ffi.checkpoint(writer, 'TRUNCATE');
-    if (checkpoint.some((row) => Number(row.busy ?? 0) !== 0)) {
-      throw new Error('private snapshot target checkpoint is busy');
-    }
-    await ffi.closeConnection(writer);
-    writer = undefined;
-    await ffi.closeFile(file);
-    file = undefined;
-    await publish(ffi, path, destination);
-  } finally {
+    // A private checkpoint must book its own writes. Seed from the target's
+    // DB and log, not from the source DB or the filesystem's free space.
+    const size = async (file: string) =>
+      await Deno.stat(file)
+        .then((stat) => stat.size, (error) => {
+          if (error instanceof Deno.errors.NotFound) return 0;
+          throw error;
+        });
+    const grant = capacity && await capacity.reserveNative(
+      path,
+      2,
+      Math.max(
+        checkpointBytes,
+        writeFrames('PRAGMA wal_checkpoint(TRUNCATE)') + await size(path) +
+          await size(`${path}-log`),
+      ),
+    );
     try {
-      if (writer !== undefined) await ffi.closeConnection(writer);
+      if (grant) await ffi.setLimit(writer, grant, grant.undoBytes);
+      const checkpoint = await ffi.checkpoint(writer, 'TRUNCATE');
+      if (checkpoint.some((row) => Number(row.busy ?? 0) !== 0)) {
+        throw new Error('private snapshot target checkpoint is busy');
+      }
+      await closeWriter();
+    } catch (error) {
+      const bytes = shortfall(error, grant);
+      if (bytes !== undefined) throw new GrowCheckpoint(bytes);
+      throw error;
     } finally {
       try {
-        if (file !== undefined) await ffi.closeFile(file);
+        if (writer !== undefined) await closeWriter();
       } finally {
-        await removeOwned(staging);
+        grant?.release();
+      }
+    }
+    await ffi.closeFile(file, !!capacity);
+    file = undefined;
+    await publish(ffi, path, destination, capacity);
+  } finally {
+    try {
+      if (writer !== undefined) await closeWriter();
+    } finally {
+      try {
+        if (file !== undefined) await ffi.closeFile(file, !!capacity);
+      } finally {
+        await removeOwned(staging, capacity);
       }
     }
   }

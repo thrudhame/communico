@@ -15,6 +15,7 @@ export const SCHEMA = {
     port: 'int',
     shutdowngraceseconds: 'int',
     maxrequestbytes: 'int',
+    admincontact: 'string',
   },
   admin: {
     socket: 'string',
@@ -36,6 +37,7 @@ export const SCHEMA = {
     reconnectmaxseconds: 'int',
     outbound: 'string',
     replicaterooms: 'string',
+    storagebudgetbytes: 'int',
     mailboxmaxbytes: 'int',
     mailboxmaxagedays: 'int',
     maxofflinedays: 'int',

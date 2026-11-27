@@ -8,12 +8,16 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use turso::{Connection, Database, Value};
+mod checkpoint;
 
 #[derive(Debug)]
 struct Failure {
     code: i32,
     message: String,
     last_error: String,
+    required_write_bytes: Option<u64>,
+    open_needs_allocation: bool,
+    os_errno: Option<i32>,
 }
 
 type Result<T> = std::result::Result<T, Failure>;
@@ -25,6 +29,9 @@ impl Failure {
             code: 21,
             last_error: message.clone(),
             message,
+            required_write_bytes: None,
+            open_needs_allocation: false,
+            os_errno: None,
         }
     }
 }
@@ -41,6 +48,7 @@ impl From<turso::Error> for Failure {
             turso::Error::DatabaseFull(_) => 13,
             turso::Error::NotAdb(_) => 26,
             turso::Error::Corrupt(_) => 11,
+            turso::Error::IoError(kind, _) if exhausted(*kind) => 13,
             turso::Error::IoError(..) => 10,
             _ => 1,
         };
@@ -48,15 +56,27 @@ impl From<turso::Error> for Failure {
             code,
             message: error.to_string(),
             last_error: format!("{error:?}"),
+            required_write_bytes: None,
+            open_needs_allocation: false,
+            os_errno: None,
         }
     }
 }
 
+fn exhausted(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+    )
+}
+
 struct File {
     database: Arc<Database>,
+    checkpoint: Arc<checkpoint::Observer>,
     references: usize,
     connecting: usize,
     path: PathBuf,
+    managed: bool,
 }
 
 #[derive(Default)]
@@ -97,6 +117,7 @@ impl Drop for Connecting {
 }
 
 type SharedConnection = Arc<tokio::sync::Mutex<Connection>>;
+type ConnectionLimit = Option<Arc<checkpoint::Grant>>;
 
 #[derive(Default)]
 struct Handles {
@@ -104,7 +125,7 @@ struct Handles {
     files: HashMap<u32, File>,
     paths: HashMap<PathBuf, u32>,
     opening: HashMap<PathBuf, Arc<Opening>>,
-    connections: HashMap<u32, (u32, SharedConnection)>,
+    connections: HashMap<u32, (u32, SharedConnection, ConnectionLimit)>,
     locks: HashMap<u32, std::fs::File>,
 }
 
@@ -162,7 +183,10 @@ fn reply(call: impl FnOnce() -> Result<Json>) -> *mut c_char {
         let value = match call() {
             Ok(value) => json!({"code": 0, "value": value}),
             Err(error) => json!({"code": error.code, "message": error.message,
-                                 "last_error": error.last_error}),
+                                 "last_error": error.last_error,
+                                 "required_write_bytes": error.required_write_bytes,
+                                 "open_needs_allocation": error.open_needs_allocation,
+                                 "os_errno": error.os_errno}),
         };
         CString::new(value.to_string())
     }));
@@ -242,12 +266,50 @@ async fn query(connection: &Connection, sql: &str, parameters: Vec<Value>) -> Re
     Ok(json!(output))
 }
 
-fn connection(handle: u32) -> Result<SharedConnection> {
+fn connection(handle: u32) -> Result<(SharedConnection, ConnectionLimit)> {
     handles()?
         .connections
         .get(&handle)
-        .map(|(_, value)| value.clone())
+        .map(|(_, value, limit)| (value.clone(), limit.clone()))
         .ok_or_else(|| Failure::binding("invalid connection"))
+}
+
+#[no_mangle]
+pub extern "C" fn ffi_set_limit(
+    handle: u32,
+    block: u64,
+    bytes: u64,
+    undo: u64,
+    creates: u32,
+) -> *mut c_char {
+    reply(|| {
+        if block == 0 || undo > bytes {
+            return Err(Failure::binding("invalid native grant"));
+        }
+        let mut handles = handles()?;
+        let (_, _, limit) = handles
+            .connections
+            .get_mut(&handle)
+            .ok_or_else(|| Failure::binding("invalid connection"))?;
+        *limit = Some(Arc::new(checkpoint::Grant::new(
+            block, bytes, undo, creates,
+        )));
+        Ok(Json::Null)
+    })
+}
+
+fn run_limited<T: Send + 'static>(
+    limit: ConnectionLimit,
+    cleanup: bool,
+    work: impl std::future::Future<Output = Result<T>> + Send + 'static,
+) -> Result<T> {
+    let result = run(checkpoint::LIMIT.scope(limit.clone().map(|grant| (grant, cleanup)), work));
+    result.map_err(|mut error| {
+        if !cleanup {
+            error.required_write_bytes = limit.and_then(|grant| grant.required_write_bytes());
+        }
+        error
+    })
 }
 
 fn canonical_file(path: &str) -> Result<PathBuf> {
@@ -272,20 +334,133 @@ fn canonical_file(path: &str) -> Result<PathBuf> {
 
 #[no_mangle]
 pub unsafe extern "C" fn ffi_open(path: *const c_char) -> *mut c_char {
-    reply(|| open_file(canonical_file(&text(path)?)?, initialize_database).map(|id| json!(id)))
+    reply(|| {
+        open_file(
+            canonical_file(&text(path)?)?,
+            None,
+            false,
+            |name, observer| initialize_database(name, observer, false),
+        )
+        .map(|id| json!(id))
+    })
 }
 
-fn initialize_database(name: String) -> Result<Database> {
+/// Query enforcement on this filesystem, not the limit assigned to an identity.
+/// Unsupported kernels/filesystems and denied probes report no detected quota.
+#[no_mangle]
+pub unsafe extern "C" fn ffi_quota_enforced(path: *const c_char) -> *mut c_char {
+    reply(|| Ok(json!(quota_enforced(Path::new(&text(path)?)))))
+}
+
+fn quota_enforced(_path: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        // O_PATH selects the actual filesystem without opening file contents
+        // or needing access to its block device (e.g. inside a container).
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+            .open(_path)
+        else {
+            return false;
+        };
+        // Linux uapi dqblk_xfs.h: fs_quota_statv v1 is a fixed 160 bytes;
+        // qs_flags is a native-endian u16 at offset 2. Querying any supported
+        // quota type returns flags for all three types.
+        const Q_XGETQSTATV: libc::c_uint = (b'X' as libc::c_uint) << 8 | 8;
+        const ENFORCED: u16 = (1 << 1) | (1 << 3) | (1 << 5);
+        for kind in 0..3 {
+            let mut status = [0u8; 160];
+            status[0] = 1;
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_quotactl_fd,
+                    file.as_raw_fd(),
+                    (Q_XGETQSTATV << 8) | kind,
+                    0 as libc::c_uint,
+                    status.as_mut_ptr(),
+                )
+            };
+            if rc == 0 {
+                return u16::from_ne_bytes([status[2], status[3]]) & ENFORCED != 0;
+            }
+        }
+    }
+    false
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn ffi_open_bounded(
+    path: *const c_char,
+    block: u64,
+    bytes: u64,
+    creates: u32,
+    scratch_root: *const c_char,
+) -> *mut c_char {
+    reply(|| {
+        if block == 0 {
+            return Err(Failure::binding("invalid native grant"));
+        }
+        let scratch = if scratch_root.is_null() {
+            None
+        } else {
+            Some(
+                std::fs::canonicalize(text(scratch_root)?)
+                    .map_err(|e| Failure::binding(e.to_string()))?,
+            )
+        };
+        open_file(
+            canonical_file(&text(path)?)?,
+            scratch,
+            true,
+            |name, observer| {
+                let grant = Arc::new(checkpoint::Grant::new(block, bytes, 0, creates));
+                observer.limit_open(Some(grant.clone()));
+                let result = initialize_database(name, observer.clone(), true);
+                observer.limit_open(None);
+                result.map_err(|mut error| {
+                    error.required_write_bytes = grant.required_write_bytes();
+                    error.open_needs_allocation = error.code == 13 && grant.refused_allocation();
+                    error
+                })
+            },
+        )
+        .map(|id| json!(id))
+    })
+}
+
+fn initialize_database(
+    name: String,
+    observer: Arc<checkpoint::Observer>,
+    managed: bool,
+) -> Result<Database> {
     run(async move {
-        let database = turso::Builder::new_local(&name).build().await?;
+        let io = turso_core::io::PlatformIO::new().map_err(|e| Failure::binding(e.to_string()))?;
+        let database = turso::Builder::new_local(&name)
+            .with_io_impl(Arc::new(checkpoint::ObservedIo(io, observer)))
+            .build()
+            .await?;
         let connection = database.connect()?;
         query(&connection, "PRAGMA journal_mode=mvcc", vec![]).await?;
         query(&connection, "PRAGMA synchronous=FULL", vec![]).await?;
+        if managed {
+            // A group leader can write a peer's frame under its task-local
+            // grant, then report the peer's refusal after writing its own.
+            // Keep one log pwrite + sync per managed commit, and leave all
+            // checkpoint writes to the explicit maintenance path.
+            query(&connection, "PRAGMA mvcc_group_commit=off", vec![]).await?;
+            query(&connection, "PRAGMA mvcc_checkpoint_threshold=-1", vec![]).await?;
+        }
         Ok(database)
     })
 }
 
-fn open_file(path: PathBuf, initialize: impl FnOnce(String) -> Result<Database>) -> Result<u32> {
+fn open_file(
+    path: PathBuf,
+    scratch: Option<PathBuf>,
+    managed: bool,
+    initialize: impl FnOnce(String, Arc<checkpoint::Observer>) -> Result<Database>,
+) -> Result<u32> {
     let reservation = loop {
         let mut handles = handles()?;
         if let Some(handle) = handles.paths.get(&path).copied() {
@@ -293,6 +468,11 @@ fn open_file(path: PathBuf, initialize: impl FnOnce(String) -> Result<Database>)
                 .files
                 .get_mut(&handle)
                 .ok_or_else(|| Failure::binding("missing file handle"))?;
+            if file.managed != managed {
+                return Err(Failure::binding(
+                    "database already open in a different capacity mode",
+                ));
+            }
             file.references += 1;
             return Ok(handle);
         }
@@ -321,7 +501,8 @@ fn open_file(path: PathBuf, initialize: impl FnOnce(String) -> Result<Database>)
         .to_str()
         .ok_or_else(|| Failure::binding("non-UTF8 path"))?
         .to_owned();
-    let database = Arc::new(initialize(name)?);
+    let checkpoint = Arc::new(checkpoint::Observer::new(&name, scratch));
+    let database = Arc::new(initialize(name, checkpoint.clone())?);
     let handle = {
         let mut handles = handles()?;
         let handle = handles.id()?;
@@ -330,9 +511,11 @@ fn open_file(path: PathBuf, initialize: impl FnOnce(String) -> Result<Database>)
             handle,
             File {
                 database,
+                checkpoint,
                 references: 1,
                 connecting: 0,
                 path,
+                managed,
             },
         );
         handle
@@ -347,12 +530,87 @@ mod registry_tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
+    fn decoded(pointer: *mut c_char) -> Json {
+        let result = unsafe { text(pointer) }.unwrap();
+        unsafe { ffi_free(pointer) };
+        serde_json::from_str(&result).unwrap()
+    }
+
+    #[test]
+    fn same_mode_shares_but_mixed_mode_cannot_borrow_a_handle() {
+        let dir = PathBuf::from(std::env::var("TMPDIR").unwrap())
+            .join(format!("registry-mode-{}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        for managed in [false, true] {
+            let path = CString::new(
+                dir.join(if managed { "managed" } else { "plain" })
+                    .to_str()
+                    .unwrap(),
+            )
+            .unwrap();
+            let open = |bounded| unsafe {
+                decoded(if bounded {
+                    ffi_open_bounded(path.as_ptr(), 4096, 1024 * 1024, 3, std::ptr::null())
+                } else {
+                    ffi_open(path.as_ptr())
+                })
+            };
+            let first = open(managed);
+            assert_eq!(first["code"], 0, "{first}");
+            let id = first["value"].as_u64().unwrap() as u32;
+            assert_eq!(open(managed), first);
+            let mixed = open(!managed);
+            if mixed["code"] == 0 {
+                decoded(ffi_close(mixed["value"].as_u64().unwrap() as u32, 0, false));
+            }
+            for _ in 0..2 {
+                assert_eq!(decoded(ffi_close(id, 0, false))["code"], 0);
+            }
+            assert_eq!(mixed["code"], 21, "{mixed}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn native_io_distinguishes_quota_from_other_io_errors() {
+        use std::io::ErrorKind;
+        for kind in [ErrorKind::StorageFull, ErrorKind::QuotaExceeded] {
+            assert_eq!(
+                Failure::from(turso::Error::IoError(kind, "pwrite")).code,
+                13
+            );
+        }
+        assert_eq!(
+            Failure::from(turso::Error::IoError(ErrorKind::PermissionDenied, "pwrite")).code,
+            10
+        );
+    }
+
+    #[test]
+    fn publication_distinguishes_errno_without_reclassifying_io() {
+        for (errno, code) in [
+            (libc::EDQUOT, 13),
+            (libc::ENOSPC, 13),
+            (libc::EEXIST, 19),
+            (libc::EACCES, 10),
+        ] {
+            let failure =
+                publication_failure(std::io::Error::from_raw_os_error(errno)).unwrap_err();
+            assert_eq!(failure.code, code);
+            assert!(failure.last_error.contains(&format!("code: {errno},")));
+        }
+        assert_eq!(
+            publication_failure(std::io::Error::from_raw_os_error(libc::EXDEV)).unwrap(),
+            json!(false)
+        );
+    }
+
     #[test]
     fn slow_open_does_not_block_unrelated_registry_work() {
         let (entered, ready) = mpsc::channel();
         let (release, held) = mpsc::channel();
         let slow = std::thread::spawn(move || {
-            open_file(PathBuf::from("slow-registry-test"), |_| {
+            open_file(PathBuf::from("slow-registry-test"), None, false, |_, _| {
                 entered.send(()).unwrap();
                 held.recv().unwrap();
                 Err(Failure::binding("injected initialization failure"))
@@ -361,7 +619,7 @@ mod registry_tests {
         ready.recv_timeout(Duration::from_secs(5)).unwrap();
         let (completed, result) = mpsc::channel();
         let fast = std::thread::spawn(move || {
-            let outcome = open_file(PathBuf::from("other-registry-test"), |_| {
+            let outcome = open_file(PathBuf::from("other-registry-test"), None, false, |_, _| {
                 Err(Failure::binding("independent initialization"))
             });
             completed.send(outcome.is_err()).unwrap();
@@ -382,7 +640,7 @@ mod registry_tests {
         let (entered, ready) = mpsc::channel();
         let (release, held) = mpsc::channel();
         let first = std::thread::spawn(move || {
-            open_file(PathBuf::from("same-registry-test"), |_| {
+            open_file(PathBuf::from("same-registry-test"), None, false, |_, _| {
                 entered.send(()).unwrap();
                 held.recv().unwrap();
                 Err(Failure::binding("first initialization fails"))
@@ -391,7 +649,7 @@ mod registry_tests {
         ready.recv_timeout(Duration::from_secs(5)).unwrap();
         let (entered_second, second_ready) = mpsc::channel();
         let second = std::thread::spawn(move || {
-            open_file(PathBuf::from("same-registry-test"), |_| {
+            open_file(PathBuf::from("same-registry-test"), None, false, |_, _| {
                 entered_second.send(()).unwrap();
                 Err(Failure::binding("retry initialization fails"))
             })
@@ -413,11 +671,14 @@ mod registry_tests {
         let dir = std::path::PathBuf::from(std::env::var("TMPDIR").unwrap())
             .join(format!("registry-connect-{}", std::process::id()));
         std::fs::create_dir(&dir).unwrap();
-        let handle = open_file(dir.join("data.db"), initialize_database).unwrap();
+        let handle = open_file(dir.join("data.db"), None, false, |name, observer| {
+            initialize_database(name, observer, false)
+        })
+        .unwrap();
         let (entered, ready) = mpsc::channel();
         let (release, held) = mpsc::channel();
         let connecting = std::thread::spawn(move || {
-            connect_file(handle, |connection| {
+            connect_file(handle, None, |connection| {
                 entered.send(()).unwrap();
                 held.recv().unwrap();
                 Ok(connection)
@@ -426,7 +687,7 @@ mod registry_tests {
         ready.recv_timeout(Duration::from_secs(5)).unwrap();
         let (completed, result) = mpsc::channel();
         let closing = std::thread::spawn(move || {
-            let pointer = ffi_close(handle, 0);
+            let pointer = ffi_close(handle, 0, false);
             let result = unsafe { text(pointer) }.unwrap();
             unsafe { ffi_free(pointer) };
             completed
@@ -437,8 +698,8 @@ mod registry_tests {
         release.send(()).unwrap();
         let connection = connecting.join().unwrap().unwrap();
         closing.join().unwrap();
-        unsafe { ffi_free(ffi_close(connection, 1)) };
-        unsafe { ffi_free(ffi_close(handle, 0)) };
+        unsafe { ffi_free(ffi_close(connection, 1, false)) };
+        unsafe { ffi_free(ffi_close(handle, 0, false)) };
         std::fs::remove_dir_all(dir).unwrap();
         assert_eq!(close_result.unwrap()["code"], 21);
     }
@@ -446,9 +707,19 @@ mod registry_tests {
 
 #[no_mangle]
 pub extern "C" fn ffi_connect(handle: u32) -> *mut c_char {
+    connect(handle, None)
+}
+
+#[no_mangle]
+pub extern "C" fn ffi_connect_bounded(handle: u32) -> *mut c_char {
+    connect(handle, Some(Arc::new(checkpoint::Grant::new(1, 0, 0, 0))))
+}
+
+fn connect(handle: u32, limit: ConnectionLimit) -> *mut c_char {
     reply(|| {
-        connect_file(handle, |connection| {
-            run(async move {
+        let startup_limit = limit.clone();
+        connect_file(handle, limit, |connection| {
+            run_limited(startup_limit, false, async move {
                 query(&connection, "PRAGMA synchronous=FULL", vec![]).await?;
                 Ok(connection)
             })
@@ -459,6 +730,7 @@ pub extern "C" fn ffi_connect(handle: u32) -> *mut c_char {
 
 fn connect_file(
     handle: u32,
+    limit: ConnectionLimit,
     initialize: impl FnOnce(Connection) -> Result<Connection>,
 ) -> Result<u32> {
     let (database, connecting) = {
@@ -470,13 +742,17 @@ fn connect_file(
         file.connecting += 1;
         (file.database.clone(), Connecting(handle))
     };
-    let connection = initialize(database.connect()?)?;
+    let connection = checkpoint::LIMIT
+        .sync_scope(limit.clone().map(|grant| (grant, false)), || {
+            initialize(database.connect()?)
+        })?;
     let id = {
         let mut handles = handles()?;
         let id = handles.id()?;
-        handles
-            .connections
-            .insert(id, (handle, Arc::new(tokio::sync::Mutex::new(connection))));
+        handles.connections.insert(
+            id,
+            (handle, Arc::new(tokio::sync::Mutex::new(connection)), limit),
+        );
         id
     };
     drop(connecting);
@@ -486,9 +762,9 @@ fn connect_file(
 #[no_mangle]
 pub unsafe extern "C" fn ffi_exec(handle: u32, sql: *const c_char) -> *mut c_char {
     reply(|| {
-        let connection = connection(handle)?;
+        let (connection, limit) = connection(handle)?;
         let sql = text(sql)?;
-        run(async move {
+        run_limited(limit, false, async move {
             connection.lock().await.execute_batch(sql).await?;
             Ok(Json::Null)
         })
@@ -513,8 +789,8 @@ pub unsafe extern "C" fn ffi_vacuum_into(handle: u32, staging: *const c_char) ->
             "VACUUM INTO '/proc/self/fd/{}/data.db'",
             directory.as_raw_fd()
         );
-        let connection = connection(handle)?;
-        run(async move {
+        let (connection, limit) = connection(handle)?;
+        run_limited(limit, false, async move {
             let connection = connection.lock().await;
             if !connection.is_autocommit()? {
                 return Err(Failure::binding("backup snapshot requires autocommit"));
@@ -550,13 +826,25 @@ pub unsafe extern "C" fn ffi_rename_noreplace(
         if renameat2(-100, source.as_ptr(), -100, destination.as_ptr(), 1) == 0 {
             return Ok(json!(true));
         }
-        let error = std::io::Error::last_os_error();
-        if error.raw_os_error() == Some(18) {
-            return Ok(json!(false));
-        }
-        Err(Failure::binding(format!(
-            "no-replace publication failed: {error}"
-        )))
+        publication_failure(std::io::Error::last_os_error())
+    })
+}
+
+fn publication_failure(error: std::io::Error) -> Result<Json> {
+    let os_errno = error.raw_os_error();
+    let code = match os_errno {
+        Some(libc::EXDEV) => return Ok(json!(false)),
+        Some(libc::EEXIST) => 19,
+        _ if exhausted(error.kind()) => 13,
+        _ => 10,
+    };
+    Err(Failure {
+        code,
+        message: format!("no-replace publication failed: {error}"),
+        last_error: format!("{error:?}"),
+        required_write_bytes: None,
+        open_needs_allocation: false,
+        os_errno,
     })
 }
 
@@ -604,10 +892,10 @@ pub unsafe extern "C" fn ffi_execute(
     params: *const c_char,
 ) -> *mut c_char {
     reply(|| {
-        let connection = connection(handle)?;
+        let (connection, limit) = connection(handle)?;
         let sql = text(sql)?;
         let params = parameters(text(params)?)?;
-        run(async move {
+        run_limited(limit, false, async move {
             let count = connection
                 .lock()
                 .await
@@ -625,16 +913,20 @@ pub unsafe extern "C" fn ffi_query(
     params: *const c_char,
 ) -> *mut c_char {
     reply(|| {
-        let connection = connection(handle)?;
+        let (connection, limit) = connection(handle)?;
         let sql = text(sql)?;
         let params = parameters(text(params)?)?;
-        run(async move { query(&*connection.lock().await, &sql, params).await })
+        run_limited(limit, false, async move {
+            query(&*connection.lock().await, &sql, params).await
+        })
     })
 }
 
 fn control(handle: u32, sql: &'static str) -> Result<Json> {
-    let connection = connection(handle)?;
-    run(async move { query(&*connection.lock().await, sql, vec![]).await })
+    let (connection, limit) = connection(handle)?;
+    run_limited(limit, false, async move {
+        query(&*connection.lock().await, sql, vec![]).await
+    })
 }
 
 #[no_mangle]
@@ -658,16 +950,20 @@ pub extern "C" fn ffi_commit(handle: u32) -> *mut c_char {
 }
 
 #[no_mangle]
-pub extern "C" fn ffi_rollback(handle: u32) -> *mut c_char {
+pub extern "C" fn ffi_rollback(handle: u32, owned_checkpoint: bool) -> *mut c_char {
     reply(|| {
-        let connection = connection(handle)?;
-        run(async move {
-            let connection = connection.lock().await;
-            if !connection.is_autocommit()? {
-                query(&connection, "ROLLBACK", vec![]).await?;
-            }
-            Ok(Json::Null)
-        })
+        let (connection, limit) = connection(handle)?;
+        run_limited(
+            if owned_checkpoint { None } else { limit },
+            true,
+            async move {
+                let connection = connection.lock().await;
+                if !connection.is_autocommit()? {
+                    query(&connection, "ROLLBACK", vec![]).await?;
+                }
+                Ok(Json::Null)
+            },
+        )
     })
 }
 
@@ -688,7 +984,41 @@ pub extern "C" fn ffi_checkpoint(handle: u32, mode: u32) -> *mut c_char {
 }
 
 #[no_mangle]
-pub extern "C" fn ffi_close(handle: u32, kind: u32) -> *mut c_char {
+pub extern "C" fn ffi_owned_checkpoint(handle: u32) -> *mut c_char {
+    reply(|| {
+        let (connection, observer) = {
+            let handles = handles()?;
+            let (file, connection, _) = handles
+                .connections
+                .get(&handle)
+                .ok_or_else(|| Failure::binding("invalid connection"))?;
+            let observer = handles
+                .files
+                .get(file)
+                .ok_or_else(|| Failure::binding("invalid database"))?
+                .checkpoint
+                .clone();
+            (connection.clone(), observer)
+        };
+        run(async move {
+            let connection = connection.lock().await;
+            let _measurement = observer.begin();
+            let result = query(&connection, "PRAGMA wal_checkpoint(TRUNCATE)", vec![]).await;
+            let peak = observer.sample();
+            // Report the peak even if the pager failed. JS owns rollback and
+            // decides whether this connection is safe to return to the pool.
+            Ok(match result {
+                Ok(rows) => json!({"peakBytes": peak, "rows": rows}),
+                Err(error) => json!({"peakBytes": peak, "error": {
+                    "code": error.code, "message": error.message, "lastError": error.last_error,
+                }}),
+            })
+        })
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn ffi_close(handle: u32, kind: u32, owned_checkpoint: bool) -> *mut c_char {
     reply(|| {
         let mut handles = handles()?;
         match kind {
@@ -699,25 +1029,38 @@ pub extern "C" fn ffi_close(handle: u32, kind: u32) -> *mut c_char {
                     .ok_or_else(|| Failure::binding("invalid store lock"))?;
             }
             1 => {
-                handles
+                let (_, connection, limit) = handles
                     .connections
                     .remove(&handle)
                     .ok_or_else(|| Failure::binding("invalid connection"))?;
+                drop(handles);
+                return run_limited(
+                    if owned_checkpoint { None } else { limit },
+                    true,
+                    async move {
+                        drop(connection);
+                        Ok(Json::Null)
+                    },
+                );
             }
-            0 => {
+            0 | 3 => {
                 let file = handles
                     .files
                     .get(&handle)
                     .ok_or_else(|| Failure::binding("invalid database"))?;
                 if file.references == 1
                     && (file.connecting > 0
-                        || handles.connections.values().any(|(id, _)| *id == handle))
+                        || handles.connections.values().any(|(id, _, _)| *id == handle))
                 {
                     return Err(Failure::binding("database has live connections"));
                 }
                 if file.references == 1 {
                     let path = file.path.clone();
-                    handles.files.remove(&handle);
+                    // Final drop is cleanup, not an implicit checkpoint or a
+                    // second opportunity to grow files after a grant ended.
+                    let limit =
+                        (kind == 3).then(|| (Arc::new(checkpoint::Grant::new(1, 0, 0, 0)), true));
+                    checkpoint::LIMIT.sync_scope(limit, || drop(handles.files.remove(&handle)));
                     handles.paths.remove(&path);
                 } else if let Some(file) = handles.files.get_mut(&handle) {
                     file.references -= 1;

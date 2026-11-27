@@ -4,12 +4,22 @@ import { config, serverName } from '#engine/config.ts';
 import { MatrixError } from '#engine/matrix-error.ts';
 import { splitId } from '#engine/ids.ts';
 import { drainResources } from '#engine/lifetime.ts';
+import { MediaCache } from '#engine/media/cache.ts';
 import { ContactObservations } from '#engine/federation/pending-contacts.ts';
 import { inboxFailure, workerFailure } from '#engine/request-diagnostics.ts';
 import { productionKeyResolver } from '#engine/federation/keyresolver.ts';
 import { openRoom, roomSchema } from '#engine/room/index.ts';
 import { serverSchema } from '#engine/server/schema.ts';
-import { openStore, type StoreConfig } from '#engine/store/index.ts';
+import {
+  openStore,
+  type Store,
+  type StoreConfig,
+} from '#engine/store/index.ts';
+import { Capacity } from '#engine/store/capacity.ts';
+import {
+  isStoragePressure,
+  StoragePressureError,
+} from '#engine/store/pressure.ts';
 import { type Tenant, tenantSchema } from '#engine/tenant/index.ts';
 import { capabilities } from './capabilities.ts';
 import { FacadeKeys } from './control.ts';
@@ -96,11 +106,42 @@ export async function openFacadeRuntime(
     server: serverName(),
     node: settings.nodeid,
   };
+  const cap = settings.storagebudgetbytes;
+  const mediaRoot = config().media.root;
+  const capacity = new Capacity(
+    [storeConfig.dir, mediaRoot],
+    cap === -1 ? undefined : cap === 0 ? null : cap,
+  );
+  // openStore runs this after the server schema check and before recovery. Even
+  // a facade with no media routes owns its verified, reclaimable cache.
+  let prepared!: {
+    binding: Awaited<ReturnType<typeof bindRole>>;
+    server: Awaited<ReturnType<Store['server']>>;
+    mediaCache: MediaCache;
+  };
   const store = await openStore(storeConfig, {
     schemas: { server: serverSchema, tenant: tenantSchema, room: roomSchema },
-    beforeStartup: (store) => bindRole(store, identity),
+    beforeStartup: async (store) => {
+      const binding = await bindRole(store, identity);
+      const server = await store.server();
+      const mediaCache = new MediaCache(server, mediaRoot, undefined, capacity);
+      prepared = { binding, server, mediaCache };
+      await mediaCache.start({ inventoryOnly: true });
+    },
+    capacityOwner: capacity,
+  }).catch(async (error: unknown) => {
+    // Inventory-only cache teardown unregisters entries without using the DB,
+    // which openStore has already closed if a recovery hook failed.
+    await prepared?.mediaCache.close();
+    if (isStoragePressure(error)) {
+      throw new StoragePressureError(
+        error,
+        'Facade startup blocked by storage pressure. Cache reclamation requires a readable database and verified identity and cache index. Free filesystem space or increase the configured storage budget as appropriate, then retry.',
+      );
+    }
+    throw error;
   });
-  const server = await store.server();
+  const { binding, server, mediaCache } = prepared;
   const journal = new Journal(
     server,
     LINK_SUPPORTED,
@@ -408,14 +449,13 @@ export async function openFacadeRuntime(
     }
   };
   try {
-    const binding = await bindRole(store, identity);
     if (binding.initialized) {
       node = await loadNode(server, identity.server, identity.node);
     }
     await acceptConfigured();
     await refresh();
   } catch (error) {
-    await store.close();
+    await drainResources([() => mediaCache.close(), () => store.close()]);
     throw error;
   }
   if (caps.service('link-inbox')) {
@@ -865,6 +905,10 @@ export async function openFacadeRuntime(
         incarnation: node?.incarnation ?? null,
         keyId: node?.keyId ?? null,
         matrix: false,
+        capacity: {
+          ...await store.capacityStatus(),
+          coldStartReclamation: 'after-identity-and-cache-index' as const,
+        },
         scopes: active ? await (await roomOwner()).scopes(active.id) : [],
         streams: active ? await journal.streams('home', 'in') : [],
         keyRoster: active
@@ -953,7 +997,11 @@ export async function openFacadeRuntime(
         await deactivation?.close();
         await profileFanout?.close();
         await releaseServices();
-        await drainResources([() => contacts.close(), () => store.close()]);
+        await drainResources([
+          () => contacts.close(),
+          () => mediaCache.close(),
+          () => store.close(),
+        ]);
       })(),
   };
 }

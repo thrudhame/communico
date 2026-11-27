@@ -808,6 +808,29 @@ ids shown only while the running sender owns the request. PDU expiry is derived
 from its queued timestamp and configured lifespan; reject-invite jobs have no
 expiry in the current core. CLI punctuation uses ASCII.
 
+### Facade storage pressure
+
+On the admin socket, `POST /v1/facade/status` reports capacity per filesystem.
+If the filesystem runs out of space during a checkpoint, WAL blocks can remain
+allocated. Status reports `filesystemFull` and `checkpoint.retainedWalBytes`;
+those bytes count as protected until a scheduled retry succeeds. Cache eviction
+can make room for the retry. On cold startup, the facade can reclaim indexed
+cache only after it opens the database and verifies its identity and cache
+index (`capacity.coldStartReclamation`). A clean database can open without a
+growth reservation. If opening needs space it cannot reserve, startup fails
+with retryable storage pressure before the admin socket is available. Free
+space on the affected filesystem or increase the configured budget as
+appropriate, then retry. Do not delete database or WAL files. Confirmed data
+is not lost.
+
+Native temporary files live in `.scratch` under the facade store.
+`capacity.scratch.currentBytes` is sampled on status reads.
+`capacity.scratch.observedPeakBytes` is the largest sample taken at a checkpoint
+or status read. The observed peak can miss spills between samples. Scratch is
+not fenced: it can use physical space reserved for another write. If that
+fills the filesystem, the affected write fails with a retryable storage error;
+retry once space is available. Confirmed data is not lost.
+
 ### Content reports
 
 Authenticated clients can report events in rooms they are currently joined to,

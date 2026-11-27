@@ -9,10 +9,29 @@ import {
   type Value,
 } from '#engine/store/ffi.ts';
 import { Gate } from '#engine/store/gate.ts';
+import { isReadQuery } from '#engine/store/read-sql.ts';
+import {
+  isStoragePressure,
+  StorageBusyError,
+  storageFailure,
+  StoragePressureError,
+} from '#engine/store/pressure.ts';
+import {
+  storageHeld,
+  storageScope,
+  withStorageHold,
+} from '#engine/store/holds.ts';
 import { commitAdmitted, type CommitCheck } from '#engine/store/commit.ts';
 import type { Admission } from '#engine/store/admission.ts';
+import type { Capacity, NativeReservation } from '#engine/store/capacity.ts';
 import { databaseFiles } from '#engine/store/layout.ts';
 import { publish } from '#engine/store/files.ts';
+import {
+  NO_GROWTH,
+  openNative,
+  shortfall,
+  writeFrames,
+} from '#engine/store/native-reservation.ts';
 import {
   exportSnapshot,
   type PreparedSnapshot,
@@ -44,15 +63,32 @@ export type ConflictStats = {
 
 const TRANSACTION_ATTEMPTS = 20;
 
+class DeferNativeWrite extends Error {
+  constructor(readonly bytes: number) {
+    super();
+  }
+}
+
+type Attempt<T> =
+  | { kind: 'committed'; value: T }
+  | { kind: 'retry'; error: StoreError | StoragePressureError }
+  | { kind: 'deferred'; bytes: number };
+
 export class Conn {
   private active = true;
+  private readonly pending = new Set<Promise<unknown>>();
+  private failures?: Map<unknown, number>;
   private writeVersion = 0;
 
   constructor(
     private readonly ffi: Turso,
     private readonly handle: number,
     private readonly checks = new Set<CommitCheck>(),
-    private readonly beginWrite = () => {},
+    private readonly beginWrite: (
+      sql: string,
+      values: readonly Value[],
+    ) => void | Promise<void> = () => {},
+    private readonly writeFailed?: (error: unknown) => void,
   ) {}
 
   /** Retain a dependency for this attempt's actual native commit. */
@@ -70,13 +106,10 @@ export class Conn {
 
   query(sql: string, values: readonly Value[] = []): Promise<Row[]> {
     this.check();
-    // query also accepts row-producing writes (for example RETURNING).
-    // WITH can lead to a SELECT or DML. Err toward a write for any ambiguous
-    // statement (including keywords inside strings/comments).
-    const readOnly = /^\s*(SELECT|WITH)\b[^;]*;?\s*$/is.test(sql) &&
-      !/\b(INSERT|UPDATE|DELETE|REPLACE)\b/i.test(sql);
-    if (!readOnly) this.beginWrite();
-    return this.ffi.query(this.handle, sql, values);
+    const query = () => this.ffi.query(this.handle, sql, values);
+    return this.track(
+      isReadQuery(sql) ? query() : this.write(sql, values, query),
+    );
   }
 
   /** Successful affected-row writes in this attempt, not global database work.
@@ -88,21 +121,78 @@ export class Conn {
 
   execute(sql: string, values: readonly Value[] = []): Promise<number> {
     this.check();
-    this.beginWrite();
-    return this.ffi.execute(this.handle, sql, values).then((affected) => {
-      if (affected > 0) this.writeVersion++;
-      return affected;
-    });
+    return this.track(
+      this.write(
+        sql,
+        values,
+        () => this.ffi.execute(this.handle, sql, values),
+      ).then(
+        (affected) => {
+          if (affected > 0) this.writeVersion++;
+          return affected;
+        },
+      ),
+    );
   }
 
   exec(sql: string): Promise<void> {
     this.check();
-    this.beginWrite();
-    return this.ffi.exec(this.handle, sql);
+    return this.track(
+      this.write(sql, [], () => this.ffi.exec(this.handle, sql)),
+    );
   }
 
-  release(): void {
+  /** Acknowledge one expected SQL error from this attempt. Call only after
+   * any partial effects have been undone. Admission and retry failures are
+   * owned by the attempt, not recoverable by its body. */
+  recoverStatement(
+    error: unknown,
+    expected: (error: StoreError) => boolean,
+  ): void {
+    this.check();
+    if (
+      !(error instanceof StoreError) || this.failures?.get(error) !== 1 ||
+      error.conflict || isStoragePressure(error) ||
+      error.requiredWriteBytes !== undefined || !expected(error)
+    ) throw error;
+    this.failures.delete(error);
+  }
+
+  private track<T>(result: Promise<T>): Promise<T> {
+    this.pending.add(result);
+    // An attempt must see failures even when they settle before the body
+    // returns. Keep the errors, not the settled statements or their rows.
+    void result.then(
+      () => this.pending.delete(result),
+      (reason) => {
+        const failures = this.failures ??= new Map();
+        failures.set(reason, (failures.get(reason) ?? 0) + 1);
+        this.pending.delete(result);
+      },
+    );
+    return result;
+  }
+
+  private write<T>(
+    sql: string,
+    values: readonly Value[],
+    run: () => Promise<T>,
+  ): Promise<T> {
+    const admitted = this.beginWrite(sql, values);
+    const result = admitted ? admitted.then(run) : run();
+    return this.writeFailed
+      ? result.catch((error) => {
+        this.writeFailed!(error);
+        throw error;
+      })
+      : result;
+  }
+
+  async drain(): Promise<{ reason: unknown } | undefined> {
     this.active = false;
+    await Promise.allSettled(this.pending);
+    const first = this.failures?.keys().next();
+    if (first && !first.done) return { reason: first.value };
   }
 }
 
@@ -162,16 +252,72 @@ export class Db {
     private readonly handle: number,
     checkpointlogbytes: number,
     private readonly admission?: Admission,
+    private readonly capacity?: Capacity,
+    private readonly privateDatabase = false,
   ) {
     this.gate = new Gate(path, checkpointlogbytes, async (started) => {
-      const connection = await this.acquire();
+      if (this.capacity && this.privateDatabase) {
+        // A staging database has no owned-checkpoint exception. Its journal
+        // is part of the private tree and can survive until publication.
+        return;
+      }
+      const lease = await this.capacity?.tryCheckpoint(path);
+      if (this.capacity && !lease) return;
+      let outcome: 'full' | 'completed' | undefined;
+      let connection: number | undefined;
+      let reusable = true;
       try {
-        const result = this.ffi.checkpoint(connection, 'TRUNCATE');
+        connection = await this.acquire();
+        if (!lease) {
+          const result = this.ffi.checkpoint(connection, 'TRUNCATE');
+          started();
+          return await result;
+        }
+        const result = this.ffi.ownedCheckpoint(connection);
         started();
-        return await result;
+        const { rows, error, peakBytes } = await result;
+        lease.observe(peakBytes);
+        if (error) {
+          const failure = new StoreError(
+            error.code,
+            error.message,
+            error.lastError,
+          );
+          if (failure.storageFull) outcome = 'full';
+          try {
+            await this.ffi.rollback(connection, true);
+          } catch (rollback) {
+            reusable = false;
+            if (!failure.storageFull) {
+              throw new AggregateError(
+                [failure, rollback],
+                'checkpoint and rollback failed',
+              );
+            }
+          }
+          // COMMIT already succeeded: ENOSPC in maintenance must neither
+          // replay the transaction nor report its confirmed write as refused.
+          if (failure.storageFull) return;
+          throw failure;
+        }
+        if (!rows.some((row) => Number(row.busy ?? 0) !== 0)) {
+          outcome = 'completed';
+        }
+        return rows;
       } finally {
-        this.idle.push(connection);
-        this.notify();
+        try {
+          if (connection !== undefined) {
+            if (reusable) this.idle.push(connection);
+            else {
+              this.connections--;
+              await this.ffi.closeConnection(connection, true);
+            }
+          }
+        } finally {
+          lease?.finish(outcome);
+          await this.capacity?.observeScratch()?.catch(() => {});
+          this.notify();
+        }
       }
     });
   }
@@ -181,6 +327,8 @@ export class Db {
     path: string,
     checkpointlogbytes: number,
     admission?: Admission,
+    capacity?: Capacity,
+    privateDatabase = false,
   ): Promise<Db> {
     path = resolve(path);
     if (path !== databaseFiles(dirname(path)).database) {
@@ -197,33 +345,52 @@ export class Db {
       const db = await existing;
       if (db.closingTask !== undefined) {
         await db.closingTask;
-        return await this.open(ffi, path, checkpointlogbytes, admission);
+        return await this.open(
+          ffi,
+          path,
+          checkpointlogbytes,
+          admission,
+          capacity,
+          privateDatabase,
+        );
       }
       if (
         db.ffi !== ffi || db.gate.threshold !== checkpointlogbytes ||
-        (admission !== undefined && db.admission !== admission)
+        db.privateDatabase !== privateDatabase ||
+        (admission !== undefined && db.admission !== admission) ||
+        (capacity !== undefined && db.capacity !== capacity)
       ) {
         throw new Error('database already owned by another library');
       }
       db.references++;
       return db;
     }
-    const opened = ffi.open(path).then(async (handle) => {
-      const db = new Db(ffi, path, handle, checkpointlogbytes, admission);
+    const opened = openNative(ffi, path, capacity).then(async (handle) => {
+      const db = new Db(
+        ffi,
+        path,
+        handle,
+        checkpointlogbytes,
+        admission,
+        capacity,
+        privateDatabase,
+      );
       try {
         const connection = await db.acquire();
         try {
           // File admission owns checkpoints. Native auto-checkpoint runs inside
           // COMMIT, before the gate can drain peers, and makes unrelated begins
           // exhaust their conflict retries while maintenance holds its lock.
-          await ffi.query(connection, 'PRAGMA mvcc_checkpoint_threshold=-1');
+          if (!capacity) {
+            await ffi.query(connection, 'PRAGMA mvcc_checkpoint_threshold=-1');
+          }
         } finally {
           db.idle.push(connection);
         }
         return db;
       } catch (error) {
         await db.shutdown();
-        throw error;
+        throw storageFailure(error);
       }
     });
     this.openFiles.set(path, opened);
@@ -250,7 +417,7 @@ export class Db {
       if (this.connections < 8) {
         this.connections++;
         try {
-          return await this.ffi.connect(this.handle);
+          return await this.ffi.connect(this.handle, !!this.capacity);
         } catch (error) {
           this.connections--;
           this.notify();
@@ -268,7 +435,8 @@ export class Db {
   // A body may run more than once. Use only its Conn and attempt-local
   // values; never perform network I/O, notify listeners, or mutate captured
   // state. Return effects as values and publish them only after tx resolves.
-  // Only native write-write/busy conflicts retry, after a successful rollback.
+  // Native conflicts and temporarily held capacity retry after rollback. A
+  // managed transaction waiting for a grant owns neither slot nor file gate.
   async tx<T>(
     fn: (connection: Conn) => Promise<T>,
     options: { mode?: BeginMode; admit?: CommitCheck } = {},
@@ -277,23 +445,63 @@ export class Db {
       throw new Error('database is closing or closed');
     }
     this.users++;
+    const held = this.capacity !== undefined && storageHeld();
     try {
-      for (let attempt = 1;; attempt++) {
-        const result = await this.attempt(fn, options);
-        if (result.committed) return result.value;
-        this.conflictCounters.conflicts++;
-        if (attempt === TRANSACTION_ATTEMPTS) {
-          this.conflictCounters.exhausted++;
-          throw new StoreConflictError(this.path, attempt, result.error);
+      let requested: number | undefined;
+      for (let attempt = 1;;) {
+        const result = await (this.capacity
+          ? storageScope(async () => {
+            const grant = requested !== undefined
+              ? await this.capacity!.reserveNative(this.path, 2, requested)
+              : undefined;
+            try {
+              return await withStorageHold(() =>
+                this.attempt(fn, options, grant, !held)
+              );
+            } finally {
+              // The attempt normally releases before leaving its file gate;
+              // also cover failure before the attempt could enter the gate.
+              grant?.release();
+            }
+          })
+          : this.attempt(fn, options));
+        if (result.kind === 'committed') return result.value;
+        if (result.kind === 'deferred') {
+          requested = result.bytes;
+          continue;
         }
-        this.conflictCounters.retries++;
+        const error = result.error;
+        if (held && error instanceof StorageBusyError) throw error;
+        if (
+          error instanceof StoragePressureError &&
+          !(error instanceof StorageBusyError)
+        ) {
+          if (
+            attempt < TRANSACTION_ATTEMPTS &&
+            await this.capacity?.reclaimAfterFull(this.path)
+          ) {
+            attempt++;
+            continue;
+          }
+          throw error;
+        }
+        if (error instanceof StoreError) this.conflictCounters.conflicts++;
+        if (attempt === TRANSACTION_ATTEMPTS) {
+          if (error instanceof StorageBusyError) throw error;
+          this.conflictCounters.exhausted++;
+          throw new StoreConflictError(this.path, attempt, error);
+        }
+        if (error instanceof StoreError) this.conflictCounters.retries++;
         // Equal jitter avoids synchronized writers and caps every wait at 50ms.
         const cap = Math.min(50, 2 ** (attempt - 1));
         const started = performance.now();
         await new Promise((wake) =>
           setTimeout(wake, cap / 2 + Math.random() * cap / 2)
         );
-        this.conflictCounters.backoffMs += performance.now() - started;
+        if (error instanceof StoreError) {
+          this.conflictCounters.backoffMs += performance.now() - started;
+        }
+        attempt++;
       }
     } finally {
       this.users--;
@@ -304,27 +512,68 @@ export class Db {
   private async attempt<T>(
     fn: (connection: Conn) => Promise<T>,
     options: { mode?: BeginMode; admit?: CommitCheck },
-  ): Promise<
-    { committed: true; value: T } | { committed: false; error: StoreError }
-  > {
+    grant?: NativeReservation,
+    canDefer = false,
+  ): Promise<Attempt<T>> {
     await this.gate.enter();
     let handle: number | undefined;
     let connection: Conn | undefined;
     let reusable = true;
     let committed = false;
     let writing = false;
+    let lease = grant;
+    let admission: Promise<void> | undefined;
     try {
       handle = await this.acquire();
       const checks = new Set<CommitCheck>();
-      connection = new Conn(this.ffi, handle, checks, () => {
-        if (writing) return;
-        writing = true;
-        this.writers++;
-      });
+      let refused: DeferNativeWrite | undefined;
+      connection = new Conn(
+        this.ffi,
+        handle,
+        checks,
+        (sql, values) => {
+          if (!writing) {
+            writing = true;
+            this.writers++;
+          }
+          // A read-only attempt starts (and ends) under a zero-growth guard.
+          // Only a write-capable statement can book space.
+          if (this.capacity) {
+            return admission ??= (async () => {
+              if (!lease) {
+                const bytes = writeFrames(sql, values);
+                try {
+                  lease = await this.capacity!.tryReserveNative(
+                    this.path,
+                    2,
+                    bytes,
+                  );
+                } catch (error) {
+                  if (canDefer && error instanceof StorageBusyError) {
+                    throw new DeferNativeWrite(bytes);
+                  }
+                  throw error;
+                }
+              }
+              await this.ffi.setLimit(handle!, lease, lease.undoBytes);
+            })();
+          }
+        },
+        (error) => {
+          const bytes = shortfall(error, lease);
+          if (bytes !== undefined) refused = new DeferNativeWrite(bytes);
+        },
+      );
       try {
         await this.ffi.begin(handle, options.mode ?? 'concurrent');
         if (options.admit) connection.admit(options.admit);
         const result = await fn(connection);
+        const failed = await connection.drain();
+        // A body cannot turn a refused first write into a successful commit
+        // by handling its statement error locally.
+        await admission;
+        if (refused) throw refused;
+        if (failed) throw failed.reason;
         const commit = () =>
           commitAdmitted(checks, () => this.ffi.commit(handle!));
         if (this.admission) {
@@ -334,29 +583,57 @@ export class Db {
         }
         if (writing) this.revision++;
         committed = true;
-        return { committed: true, value: result };
+        return { kind: 'committed', value: result };
       } catch (error) {
+        // Admission is part of the issued write promise. Drain before any
+        // rollback, limit reset or release; a late setLimit must not target
+        // a recycled handle. The original body failure owns this outcome.
+        await connection.drain();
         try {
           await this.ffi.rollback(handle);
         } catch (rollback) {
           reusable = false;
-          throw new AggregateError(
+          const failure = new AggregateError(
             [error, rollback],
             'transaction and rollback failed',
           );
+          throw isStoragePressure(error)
+            ? new StoragePressureError(failure)
+            : failure;
         }
-        if (error instanceof StoreError && error.conflict) {
-          return { committed: false, error };
+        const bytes = error instanceof DeferNativeWrite
+          ? error.bytes
+          : shortfall(error, lease);
+        if (bytes !== undefined) return { kind: 'deferred', bytes };
+        if (
+          error instanceof StorageBusyError ||
+          (error instanceof StoreError && error.conflict)
+        ) {
+          return { kind: 'retry', error };
         }
-        throw error;
+        if (this.capacity && error instanceof StoreError && error.storageFull) {
+          // Only retry a native full outcome known to have rolled back, never
+          // a failure reported by maintenance after a successful COMMIT.
+          return { kind: 'retry', error: new StoragePressureError(error) };
+        }
+        throw storageFailure(error);
       }
     } finally {
       if (writing) this.writers--;
-      connection?.release();
       try {
         if (handle !== undefined) {
-          if (reusable) this.idle.push(handle);
-          else {
+          if (reusable) {
+            try {
+              if (lease) await this.ffi.setLimit(handle, NO_GROWTH, 0);
+              this.idle.push(handle);
+              handle = undefined;
+            } finally {
+              if (handle !== undefined) {
+                this.connections--;
+                await this.ffi.closeConnection(handle);
+              }
+            }
+          } else {
             try {
               await this.ffi.closeConnection(handle);
             } finally {
@@ -365,6 +642,7 @@ export class Db {
           }
         }
       } finally {
+        lease?.release();
         this.notify();
         // Maintenance errors after COMMIT must never replay a committed body.
         await this.gate.leave(committed);
@@ -424,7 +702,7 @@ export class Db {
       })();
     try {
       releaseGate = await this.gate.retain();
-      handle = await this.ffi.connect(this.handle);
+      handle = await this.ffi.connect(this.handle, !!this.capacity);
       return {
         pin: async () => {
           if (released || pinned) {
@@ -455,11 +733,15 @@ export class Db {
                     new TypeError('backup destination is the source database'),
                   );
                 }
-                return exporting = exportSnapshot(
-                  this.ffi,
-                  handle!,
-                  schema,
-                  destination,
+                return exporting = withStorageHold(() =>
+                  exportSnapshot(
+                    this.ffi,
+                    handle!,
+                    schema,
+                    destination,
+                    this.capacity,
+                    dirname(dirname(this.path)),
+                  )
                 );
               },
               release,
@@ -492,6 +774,17 @@ export class Db {
     }
     if (resolve(destination) === this.path) {
       throw new TypeError('backup destination is the source database');
+    }
+    if (this.capacity) {
+      // Managed backups use the logical writer, whose target runs through
+      // the same observed IO as our ordinary databases.
+      const reader = await this.readSnapshot();
+      try {
+        await reader.export(destination);
+      } finally {
+        await reader.release();
+      }
+      return;
     }
     this.users++;
     let entered = false;
@@ -561,7 +854,13 @@ export class Db {
       this.idle.pop();
       this.connections--;
     }
-    await this.ffi.closeFile(this.handle);
+    await this.ffi.closeFile(this.handle, !!this.capacity);
+    this.capacity?.refresh(
+      this.path,
+      this.path + '-log',
+      this.path + '-wal',
+      dirname(this.path),
+    );
     this.closed = true;
     Db.openFiles.delete(this.path);
   }

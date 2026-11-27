@@ -1,6 +1,7 @@
 // Test-only entrypoint: production never imports it. Observe existing owner
 // completions after their transactions, without changing product scheduling.
 import { Journal } from '#engine/facade/journal.ts';
+import { Turso } from '#engine/store/ffi.ts';
 import { Pairings } from '#engine/facade/pairing.ts';
 import { AuthLinkHealth } from '#engine/facade/auth.ts';
 import { FacadeKeys } from '#engine/facade/control.ts';
@@ -39,6 +40,67 @@ import {
 
 const encoder = new TextEncoder();
 observeFixtureListeners();
+const probeScratch = Deno.env.get('FACADE_TEST_PROBE_SCRATCH');
+if (probeScratch) {
+  const open = Turso.prototype.open;
+  Turso.prototype.open = async function (path, ceiling) {
+    Turso.prototype.open = open;
+    if (
+      Deno.env.get('TURSO_TMPDIR') !== probeScratch ||
+      Deno.env.get('TMPDIR') !== probeScratch
+    ) {
+      throw new Error('scratch was not routed before the first native open');
+    }
+    const file = await open.call(this, path, ceiling);
+    try {
+      const connection = await this.connect(file);
+      try {
+        await this.exec(connection, 'PRAGMA temp_store = FILE');
+        await this.exec(connection, 'CREATE TEMP TABLE scratch_probe (id)');
+        let found = false;
+        for await (const entry of Deno.readDir(probeScratch)) {
+          if (!entry.isDirectory) continue;
+          for await (
+            const file of Deno.readDir(`${probeScratch}/${entry.name}`)
+          ) {
+            if (file.isFile && file.name === 'tursodb-temp.db') found = true;
+          }
+        }
+        if (!found) throw new Error('native TEMP database escaped scratch');
+      } finally {
+        await this.closeConnection(connection);
+      }
+      const bounded = await this.connect(file, true);
+      try {
+        // A read-only query has no native DB growth grant. Its sorter must
+        // nevertheless use the configured scratch tree and return all rows.
+        const result = await this.query(
+          bounded,
+          `WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 4096)
+           SELECT n FROM seq ORDER BY printf('%08d%04096d', 4097 - n, n)`,
+        );
+        if (
+          result.length !== 4096 || result[0].n !== 4096 ||
+          result.at(-1)?.n !== 1
+        ) {
+          throw new Error('cold scratch sorter lost or misordered rows');
+        }
+      } catch (error) {
+        throw new Error(
+          'cold scratch sorter failed with zero DB growth grant',
+          { cause: error },
+        );
+      } finally {
+        await this.closeConnection(bounded);
+      }
+      return file;
+    } catch (error) {
+      await this.closeFile(file);
+      throw error;
+    }
+  };
+}
+
 function emit(event: FacadeObservation) {
   const bytes = encoder.encode(
     observationPrefix + JSON.stringify(event) + '\n',
