@@ -126,7 +126,7 @@ Deno.test('facade capacity: local status exposes the default budget before pairi
   }
 });
 
-Deno.test('facade capacity: a completed statement samples scratch before the next status read', async () => {
+Deno.test('facade capacity: scratch peak samples checkpoints and status, not statements', async () => {
   const root = await Deno.makeTempDir({ prefix: 'facade-observed-scratch-' });
   const ffi = new Turso('./.native/libturso_ffi.so');
   const capacity = new Capacity([root]);
@@ -135,12 +135,24 @@ Deno.test('facade capacity: a completed statement samples scratch before the nex
     const scratch = `${root}/.scratch`;
     await Deno.mkdir(scratch);
     capacity.setScratchRoot(scratch);
-    db = await Db.open(ffi, root + '/data.db', MiB, undefined, capacity);
+    db = await Db.open(ffi, root + '/data.db', 65536, undefined, capacity);
+    await db.exec('CREATE TABLE receipt(body BLOB)');
     const spill = `${scratch}/live-spill`;
     await Deno.writeFile(spill, new Uint8Array(8192).fill(1));
     const bytes = Number((await lstat(spill, { bigint: true })).blocks * 512n);
     assert(bytes > 0);
+    const before = db.gate.stats().completed;
     assertEquals(await db.query('SELECT 1 AS id'), [{ id: 1 }]);
+    await Deno.remove(spill);
+    assertEquals(db.gate.stats().completed, before);
+    assertEquals((await capacity.status()).scratch, {
+      currentBytes: 0,
+      observedPeakBytes: 0,
+    });
+
+    await Deno.writeFile(spill, new Uint8Array(8192).fill(1));
+    await db.execute('INSERT INTO receipt VALUES (?)', [new Uint8Array(98304)]);
+    assertEquals(db.gate.stats().completed, before + 1);
     await Deno.remove(spill);
     assertEquals((await capacity.status()).scratch, {
       currentBytes: 0,

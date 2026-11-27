@@ -167,8 +167,7 @@ export class Capacity {
     return true;
   }
 
-  // At statement/checkpoint boundaries, sample just scratch rather than
-  // the whole store. Telemetry must not change the outcome of native work.
+  // Sample scratch at checkpoints and status reads, never on the SQL hot path.
   observeScratch(): Promise<number> | undefined {
     if (this.scratchRoot === undefined) return;
     return this.measureScratch(this.scratchRoot).then((bytes) => {

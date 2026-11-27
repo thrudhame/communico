@@ -85,7 +85,6 @@ export class Conn {
       sql: string,
       values: readonly Value[],
     ) => void | Promise<void> = () => {},
-    private readonly observeScratch?: () => Promise<unknown> | undefined,
     private readonly writeFailed?: (error: unknown) => void,
   ) {}
 
@@ -110,7 +109,7 @@ export class Conn {
     const readOnly = /^\s*(SELECT|WITH)\b[^;]*;?\s*$/is.test(sql) &&
       !/\b(INSERT|UPDATE|DELETE|REPLACE)\b/i.test(sql);
     const query = () => this.ffi.query(this.handle, sql, values);
-    return readOnly ? this.statement(query) : this.write(sql, values, query);
+    return readOnly ? query() : this.write(sql, values, query);
   }
 
   /** Successful affected-row writes in this attempt, not global database work.
@@ -145,21 +144,13 @@ export class Conn {
     run: () => Promise<T>,
   ): Promise<T> {
     const admitted = this.beginWrite(sql, values);
-    const result = admitted
-      ? admitted.then(() => this.statement(run))
-      : this.statement(run);
+    const result = admitted ? admitted.then(run) : run();
     return this.writeFailed
       ? result.catch((error) => {
         this.writeFailed!(error);
         throw error;
       })
       : result;
-  }
-
-  private statement<T>(run: () => Promise<T>): Promise<T> {
-    const result = run();
-    const observe = this.observeScratch;
-    return observe ? result.finally(() => observe()?.catch(() => {})) : result;
   }
 
   release(): void {
@@ -527,7 +518,6 @@ export class Db {
             })();
           }
         },
-        this.capacity && (() => this.capacity!.observeScratch()),
         (error) => {
           const bytes = shortfall(error, lease);
           if (bytes !== undefined) refused = new DeferNativeWrite(bytes);
