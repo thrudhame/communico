@@ -126,6 +126,147 @@ Deno.test('facade capacity: local status exposes the default budget before pairi
   }
 });
 
+Deno.test('facade capacity: incremental admission never walks managed roots', async () => {
+  const root = await Deno.makeTempDir({ prefix: 'facade-ledger-' });
+  const capacity = new Capacity([root], 2 ** 20);
+  const readDir = Deno.readDir;
+  let walks = 0;
+  try {
+    await Deno.writeFile(root + '/retained', new Uint8Array(8192));
+    await capacity.status();
+    Deno.readDir = (path) => {
+      walks++;
+      return readDir(path);
+    };
+    for (let i = 0; i < 4; i++) {
+      const path = root + '/staged-' + i;
+      const lease = await capacity.reserveStaging(path, 8192);
+      try {
+        await Deno.writeFile(path, new Uint8Array(8192));
+      } finally {
+        lease.release();
+      }
+    }
+    assertEquals(walks, 0);
+  } finally {
+    Deno.readDir = readDir;
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test('facade capacity: incremental usage matches a fresh inventory after mixed writes', async () => {
+  const root = await Deno.makeTempDir({ prefix: 'facade-ledger-drift-' });
+  const ffi = new Turso('./.native/libturso_ffi.so');
+  const capacity = new Capacity([root], 64 * 2 ** 20);
+  let db: Db | undefined;
+  try {
+    const preload = root + '/preload';
+    await Deno.writeFile(preload, new Uint8Array(4096).fill(1));
+    await Deno.link(preload, preload + '-link');
+    await capacity.initialize();
+    const old = await createDatabase(ffi, root, 'old', {
+      capacity,
+      checkpointlogbytes: 2 ** 20,
+      schema: (db) => db.exec('CREATE TABLE data (payload BLOB)'),
+      verify: () => Promise.resolve(),
+    });
+    const path = await createDatabase(ffi, root, 'retained', {
+      capacity,
+      checkpointlogbytes: 2 ** 20,
+      schema: (db) => db.exec('CREATE TABLE data (payload BLOB)'),
+      verify: () => Promise.resolve(),
+    });
+    db = await Db.open(ffi, path + '/data.db', 2 ** 20, undefined, capacity);
+    await db.execute('INSERT INTO data VALUES (?)', [
+      new Uint8Array(145000).fill(8),
+    ]);
+    await assertRejects(
+      () =>
+        db!.tx(async (tx) => {
+          await tx.execute('INSERT INTO data VALUES (?)', [
+            new Uint8Array(80000).fill(9),
+          ]);
+          throw new Error('forced rollback');
+        }),
+      Error,
+      'forced rollback',
+    );
+    await capacity.remove(old, { recursive: true });
+    await capacity.remove(preload);
+    await capacity.ensureDirectory(root + '/media/subdir');
+    const part = root + '/media/subdir/blob.part';
+    const final = root + '/media/subdir/blob';
+    const lease = await capacity.reserveStaging(part, 64 * 1024);
+    try {
+      lease.track(final);
+      await Deno.writeFile(part, new Uint8Array(28000).fill(1));
+      await Deno.rename(part, final);
+    } finally {
+      lease.release();
+    }
+    const accounted = capacity.accountedBytes();
+    const fresh = await new Capacity([root]).status();
+    assertEquals(accounted, fresh.filesystems[0].usedBytes);
+    assertEquals(await db.query('SELECT length(payload) AS size FROM data'), [{
+      size: 145000,
+    }]);
+  } finally {
+    await db?.close();
+    ffi.close();
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
+Deno.test('facade capacity: incremental grants continue during a status walk', async () => {
+  const root = await Deno.makeTempDir({ prefix: 'facade-ledger-scan-' });
+  const capacity = new Capacity([root], 2 ** 20);
+  const blocked = Promise.withResolvers<void>();
+  const resume = Promise.withResolvers<void>();
+  const readDir = Deno.readDir;
+  let status: ReturnType<Capacity['status']> | undefined;
+  let grant: ReturnType<Capacity['reserveStaging']> | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await capacity.initialize();
+    Deno.readDir = async function* (path) {
+      if (path === root) {
+        blocked.resolve();
+        await resume.promise;
+      }
+      yield* readDir(path);
+    };
+    status = capacity.status();
+    await blocked.promise;
+    await Deno.writeFile(root + '/external', new Uint8Array(4096).fill(1));
+    const owned = root + '/owned';
+    grant = capacity.reserveStaging(owned, 8192);
+    const lease = await Promise.race([
+      grant,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error('grant blocked by inventory')),
+          1000,
+        );
+      }),
+    ]);
+    try {
+      await Deno.writeFile(owned, new Uint8Array(8192).fill(1));
+    } finally {
+      lease.release();
+    }
+    resume.resolve();
+    const fresh = await status;
+    assertEquals(capacity.accountedBytes(), fresh.filesystems[0].usedBytes);
+  } finally {
+    clearTimeout(timer);
+    Deno.readDir = readDir;
+    resume.resolve();
+    await (await grant?.catch(() => undefined))?.release();
+    await status?.catch(() => undefined);
+    await Deno.remove(root, { recursive: true });
+  }
+});
+
 Deno.test('facade capacity: scratch peak samples checkpoints and status, not statements', async () => {
   const root = await Deno.makeTempDir({ prefix: 'facade-observed-scratch-' });
   const ffi = new Turso('./.native/libturso_ffi.so');
@@ -1647,6 +1788,8 @@ Deno.test('facade capacity: signed federation refuses on storage exhaustion and 
     edge = await facadeProcess(facadeConfig, 'facade: link/local admin ready');
     port = await edge.port('client');
     await Deno.writeFile(filler, new Uint8Array(budget).fill(1));
+    // External allocation is picked up at the explicit reconciliation boundary.
+    assertEquals((await local()).status, 200);
     const rejected = await call('PUT', path + 'retry', body);
     assertEquals(
       rejected.status,

@@ -124,7 +124,9 @@ export class MediaCache {
           /^[a-f0-9]{64}-[a-f0-9-]{36}\.part$/.test(entry.name)) &&
         !known.has(entry.name)
       ) {
-        await Deno.remove(this.directory + '/' + entry.name);
+        const path = this.directory + '/' + entry.name;
+        if (this.capacity) await this.capacity.remove(path);
+        else await Deno.remove(path);
       }
     }
   }
@@ -291,6 +293,7 @@ export class MediaCache {
           throw new Error('media size bound required');
         }
         space = await this.capacity.reserveStaging(part, maxBytes);
+        space.track(this.directory + '/' + blob);
       }
       signal.throwIfAborted();
       file = await Deno.open(part, {
@@ -365,11 +368,13 @@ export class MediaCache {
       return row;
     } catch (error) {
       file?.close();
-      await Deno.remove(renamed ? this.directory + '/' + blob : part).catch(
-        (e) => {
-          if (!(e instanceof Deno.errors.NotFound)) throw e;
-        },
-      );
+      const path = renamed ? this.directory + '/' + blob : part;
+      await (this.capacity ? this.capacity.remove(path) : Deno.remove(path))
+        .catch(
+          (e) => {
+            if (!(e instanceof Deno.errors.NotFound)) throw e;
+          },
+        );
       throw storageFailure(error);
     } finally {
       space?.release();
@@ -471,9 +476,11 @@ export class MediaCache {
           await deleteCachedMedia(this.db, row.cache_key);
           this.registered.get(row.cache_key)?.forget();
           this.registered.delete(row.cache_key);
-          await Deno.remove(this.directory + '/' + row.blob).catch((e) => {
-            if (!(e instanceof Deno.errors.NotFound)) throw e;
-          });
+          const path = this.directory + '/' + row.blob;
+          await (this.capacity ? this.capacity.remove(path) : Deno.remove(path))
+            .catch((e) => {
+              if (!(e instanceof Deno.errors.NotFound)) throw e;
+            });
         } finally {
           this.release(row.blob);
         }

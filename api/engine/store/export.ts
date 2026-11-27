@@ -66,15 +66,10 @@ async function exportStage(
   capacity: Capacity | undefined,
   checkpointBytes: number,
 ): Promise<void> {
-  const makeStage = () =>
-    Deno.makeTempDir({
-      dir: root,
-      prefix: '.logical-',
-      suffix: '.new',
-    });
-  const staging = capacity
-    ? await capacity.withMetadata(root, 1, makeStage)
-    : await makeStage();
+  const staging = join(root, `.logical-${crypto.randomUUID()}.new`);
+  const makeStage = () => Deno.mkdir(staging, { mode: 0o700 });
+  if (capacity) await capacity.withMetadata(staging, 1, makeStage);
+  else await makeStage();
   let file: number | undefined;
   let writer: number | undefined;
   const path = join(staging, 'data.db');
@@ -226,7 +221,7 @@ async function exportStage(
       try {
         if (file !== undefined) await ffi.closeFile(file, !!capacity);
       } finally {
-        await removeOwned(staging);
+        await removeOwned(staging, capacity);
       }
     }
   }

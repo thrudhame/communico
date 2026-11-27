@@ -809,6 +809,12 @@ export class Db {
       this.connections--;
     }
     await this.ffi.closeFile(this.handle, !!this.capacity);
+    this.capacity?.refresh(
+      this.path,
+      this.path + '-log',
+      this.path + '-wal',
+      dirname(this.path),
+    );
     this.closed = true;
     Db.openFiles.delete(this.path);
   }

@@ -82,6 +82,7 @@ Deno.test('contact observations resume after a capacity grant releases and close
     assertEquals(reported, []);
     const filler = `${dir}/filler`;
     await Deno.writeFile(filler, new Uint8Array(budget).fill(1));
+    await capacity.status();
     contacts.observe('edge', 2);
     const error = await assertRejects(
       () => contacts.drain(),
@@ -89,11 +90,12 @@ Deno.test('contact observations resume after a capacity grant releases and close
     );
     assertEquals(error instanceof StorageBusyError, false);
     assertEquals(reported, [error]);
-    await Deno.remove(filler);
+    await capacity.remove(filler);
     contacts.observe('edge', 3);
     await contacts.drain();
     assertEquals(persisted, [1, 3]);
     await Deno.writeFile(filler, new Uint8Array(budget).fill(1));
+    await capacity.status();
     contacts.observe('edge', 4);
     await contacts.close();
     assertEquals(persisted, [1, 3]);

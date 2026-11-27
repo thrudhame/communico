@@ -4,9 +4,14 @@ import {
   storageHold,
   withStorageHold,
 } from '#engine/store/holds.ts';
-import { lstatSync } from 'node:fs';
+import { type BigIntStats, lstatSync } from 'node:fs';
 import { dirname, join, relative, resolve, SEPARATOR } from '@std/path';
 import { databaseFiles } from '#engine/store/layout.ts';
+import {
+  type Allocation,
+  CapacityLedger,
+  contains,
+} from './capacity-ledger.ts';
 import {
   StorageBusyError,
   storageFailure,
@@ -24,7 +29,12 @@ type Space = {
 export type CapacityProbe = (path: string) => Space | Promise<Space>;
 type QuotaProbe = (path: string) => Promise<boolean>;
 
-type Claim = { device: string; bytes: number; inodes: number };
+type Claim = {
+  device: string;
+  bytes: number;
+  inodes: number;
+  paths: Set<string>;
+};
 type NativeFrame = { offset: number; length: number };
 type Footprint = {
   bytes: number;
@@ -33,6 +43,7 @@ type Footprint = {
   files?: readonly number[];
   frames?: readonly NativeFrame[];
   undo?: boolean;
+  native?: boolean;
 };
 type CacheBlob = {
   accessedMs: number;
@@ -48,7 +59,10 @@ type Reclaimable = {
   bytes: number;
   blob: RegisteredBlob;
 };
-export type Reservation = { release(): void };
+export type Reservation = {
+  track(...paths: string[]): void;
+  release(): void;
+};
 export type NativeReservation = Reservation & {
   blockSize: number;
   bytes: number;
@@ -97,9 +111,25 @@ export class Capacity {
   private lane: Promise<unknown> = Promise.resolve();
   private fifo: Promise<unknown> = Promise.resolve();
   private readonly claims = new Set<Claim>();
+  private readonly claimsByDevice = new Map<string, Claim>();
+  private reserved = 0;
+  private ledger = new CapacityLedger();
+  private readonly locations = new Map<
+    string,
+    Awaited<ReturnType<typeof ancestor>>
+  >();
+  private rootPaths: readonly string[] = [];
+  private initialized?: Promise<void>;
+  private scanning?: Promise<Awaited<ReturnType<Capacity['inventory']>>>;
+  private changes?: Set<string>;
+  private settlementFailure?: { cause: unknown };
   private readonly cache = new Map<string, RegisteredBlob>();
   private released = Promise.withResolvers<void>();
-  private checkpointActive?: { device?: string; peakOvershootBytes: number };
+  private checkpointActive?: {
+    device?: string;
+    peakOvershootBytes: number;
+    paths: string[];
+  };
   private readonly checkpointPeaks = new Map<string, number>();
   private readonly checkpointFailures = new Map<string, string>();
   private scratchRoot?: string;
@@ -110,6 +140,120 @@ export class Capacity {
     private readonly budget?: number | null,
     private readonly probe?: CapacityProbe,
   ) {}
+
+  initialize(): Promise<void> {
+    return this.initialized ??= (async () => {
+      const roots = await Promise.all(this.roots.map(ancestor));
+      this.rootPaths = roots.map((at) => at.target);
+      for (const root of roots) this.locations.set(root.target, root);
+      this.ledger = (await this.inventory()).ledger;
+    })();
+  }
+
+  accountedBytes(): number {
+    return this.ledger.total;
+  }
+
+  private managed(path: string): boolean {
+    return this.rootPaths.some((root) => contains(root, path));
+  }
+
+  private path(path: string): string {
+    path = resolve(path);
+    for (let i = 0; i < this.roots.length; i++) {
+      const root = resolve(this.roots[i]);
+      if (contains(root, path)) {
+        return resolve(this.rootPaths[i], relative(root, path));
+      }
+    }
+    return path;
+  }
+
+  /** Settle the bounded set of files/parents the operation could mutate.
+   * Settlement is synchronous so another grant sees either the reservation
+   * or the allocated bytes, never a gap between the two. */
+  refresh(...paths: string[]): void {
+    for (const input of new Set(paths)) {
+      const path = this.path(input);
+      if (!this.managed(path)) continue;
+      this.changes?.add(path);
+      try {
+        const entry = lstatSync(path, { bigint: true });
+        const location = this.ledger.location(dirname(path));
+        const physicalDevice = String(entry.dev);
+        const existing = this.ledger.paths.get(path);
+        const device = existing?.physicalDevice === physicalDevice
+          ? existing.device
+          : location?.allocation.physicalDevice === physicalDevice
+          ? location.allocation.device
+          : String(physicalDevice);
+        this.ledger.set(path, allocation(entry, device));
+      } catch (error) {
+        if (missing(error)) this.ledger.set(path);
+        else this.settlementFailure = { cause: error };
+      }
+    }
+  }
+
+  async remove(path: string, options?: Deno.RemoveOptions): Promise<void> {
+    await this.initialize();
+    path = this.path(path);
+    const affected = options?.recursive
+      ? [...this.ledger.paths.keys()].filter((key) => contains(path, key))
+      : [path];
+    try {
+      await Deno.remove(path, options);
+    } finally {
+      this.refresh(...affected, dirname(path));
+    }
+  }
+
+  /** Account for an owned rename without reading its descendants again. */
+  moved(source: string, destination: string): void {
+    source = this.path(source);
+    destination = this.path(destination);
+    const entries = this.ledger.paths.get(source)?.directory
+      ? [...this.ledger.paths].filter(([key]) => contains(source, key))
+      : [...this.ledger.paths].filter(([key]) => key === source);
+    for (const [key, entry] of entries) {
+      const to = resolve(destination, relative(source, key));
+      this.changes?.add(key);
+      this.changes?.add(to);
+      if (this.managed(to)) this.ledger.set(to, entry);
+      this.ledger.set(key);
+    }
+    this.refresh(source, destination, dirname(source), dirname(destination));
+  }
+
+  private async reconcile() {
+    await this.initialize();
+    return await (this.scanning ??= (async () => {
+      // Neither this walk nor a paused observer holds the admission lane.
+      // Grants register mutation paths at admission and again at settlement;
+      // retain those entries from the live ledger rather than installing a
+      // stale scan (or charging a partly written file as well as its grant).
+      const changed = this.changes = new Set<string>();
+      for (const claim of this.claims) {
+        for (const path of claim.paths) changed.add(path);
+      }
+      for (const path of this.checkpointActive?.paths ?? []) changed.add(path);
+      const priorFailure = this.settlementFailure;
+      try {
+        const fresh = await this.inventory();
+        for (const path of changed) {
+          fresh.ledger.set(path, this.ledger.paths.get(path));
+        }
+        this.ledger = fresh.ledger;
+        if (this.settlementFailure === priorFailure) {
+          this.settlementFailure = undefined;
+        }
+        return fresh;
+      } finally {
+        this.changes = undefined;
+        this.scanning = undefined;
+      }
+    })());
+  }
 
   private notifyRelease(): void {
     this.released.resolve();
@@ -140,6 +284,22 @@ export class Capacity {
     );
   }
 
+  private reclaimable(): Reclaimable[] {
+    return this.oldest([...this.cache].flatMap(([path, blob]) => {
+      const entry = this.ledger.paths.get(path);
+      return entry && entry.inode === blob.inode && blob.unleased()
+        ? [{
+          path,
+          blob,
+          inode: entry.inode,
+          device: entry.device,
+          physicalDevice: blob.device,
+          bytes: entry.bytes,
+        }]
+        : [];
+    }));
+  }
+
   private evict(entry: Reclaimable): boolean {
     // No await between checking the serving lease/identity and unlinking.
     // This path cannot take the cache lane or write its DB: the reservation
@@ -163,6 +323,7 @@ export class Capacity {
       throw storageFailure(error);
     }
     this.cache.delete(path);
+    this.refresh(path, dirname(path));
     blob.removed();
     return true;
   }
@@ -284,6 +445,10 @@ export class Capacity {
     hold: () => () => void,
   ): Promise<NativeReservation> {
     const result = this.lane.then(async () => {
+      await this.initialize();
+      if (this.settlementFailure) {
+        throw new StoragePressureError(this.settlementFailure.cause);
+      }
       const { promise: released } = this.released;
       if (this.checkpointActive) throw new StorageBusyError(released);
       if (
@@ -300,22 +465,26 @@ export class Capacity {
       ) {
         throw new RangeError('invalid storage footprint');
       }
-      // Releases can race the inventory scan. Include every claim that was
-      // alive before scanning, even if its new blocks aren't visible yet.
-      const outstanding = [...this.claims];
-      const at = await ancestor(path);
-      const roots = await Promise.all(this.roots.map(ancestor));
-      if (
-        !publication && !roots.some((root) => contains(root.target, at.target))
-      ) {
+      path = this.path(path);
+      const managed = this.managed(path);
+      if (!publication && !managed) {
         throw new Error('reservation outside capacity roots');
       }
+      const at = this.ledger.location(path);
+      const root = this.rootPaths.find((root) => contains(root, path));
+      const location = at
+        ? { path: at.path, device: at.allocation.device }
+        : (root && this.locations.get(root)) || await ancestor(path);
+      const pending = this.claimsByDevice.get(String(location.device));
+      const sampledBytes = pending?.bytes ?? 0;
+      const sampledInodes = pending?.inodes ?? 0;
+      const sample = () =>
+        this.probe?.(path) ?? physicalSpace(location.path, location.device);
       const explicit = typeof this.budget === 'number';
-      let space = await this.space(at);
+      let space = await sample();
       const { blockSize } = space;
       const device = String(space.device);
       const metadata = footprint.metadataBlocks * blockSize;
-      const local = outstanding.filter((claim) => claim.device === device);
       const work = [footprint.bytes, ...(footprint.files ?? [])].reduce(
         (sum, size) => sum + Math.ceil(size / blockSize) * blockSize,
         0,
@@ -328,19 +497,13 @@ export class Capacity {
       const undoBytes = footprint.undo ? work : 0;
       const data = work + undoBytes;
       const needs = data + metadata;
-      let snap = await this.inventory();
       const budgetRemaining = () => {
-        const disk = snap.filesystems.find((disk) => disk.device === device);
-        if (!disk && !publication) {
-          throw new Error('reservation device outside capacity roots');
-        }
         const used = explicit
-          ? snap.filesystems.reduce((sum, disk) => sum + disk.usedBytes, 0)
-          : disk?.usedBytes ?? 0;
+          ? this.accountedBytes()
+          : this.ledger.used(device);
         const budget = this.budget === null
           ? Infinity
-          : disk?.budgetBytes ?? this.budget ??
-            Math.floor(space.totalBytes * 0.99);
+          : this.budget ?? Math.floor(space.totalBytes * 0.99);
         return budget - used;
       };
       let budgetLeft = budgetRemaining();
@@ -350,7 +513,7 @@ export class Capacity {
       let software = needs - budgetLeft;
       if (this.checkpointActive) throw new StorageBusyError(released);
       if (physical > 0 || software > 0 || inodes > 0) {
-        const eligible = this.oldest(snap.reclaimable);
+        const eligible = this.reclaimable();
         const here = eligible.filter((entry) => entry.device === device);
         const blocks = (entries: Reclaimable[]) =>
           entries.reduce((sum, entry) => sum + entry.bytes, 0);
@@ -372,8 +535,7 @@ export class Capacity {
           if (explicit || entry.device === device) software -= entry.bytes;
           if (physical <= 0 && software <= 0 && inodes <= 0) break;
         }
-        space = await this.space(at);
-        snap = await this.inventory();
+        space = await sample();
         budgetLeft = budgetRemaining();
         inodesLeft = space.freeInodes ?? Infinity;
         if (this.checkpointActive) throw new StorageBusyError(released);
@@ -382,27 +544,60 @@ export class Capacity {
           footprint.inodes > inodesLeft
         ) throw new StoragePressureError();
       }
+      const local = this.claimsByDevice.get(device) ?? { bytes: 0, inodes: 0 };
       const available = Math.min(
-        space.freeBytes - claimedBytes(local),
-        budgetLeft - claimedBytes(explicit ? outstanding : local),
+        space.freeBytes - Math.max(local.bytes, sampledBytes),
+        budgetLeft - (explicit ? this.reserved : local.bytes),
       );
       if (
         this.checkpointActive || needs > available ||
-        footprint.inodes > inodesLeft -
-            local.reduce((sum, claim) => sum + claim.inodes, 0)
+        footprint.inodes > inodesLeft - Math.max(local.inodes, sampledInodes)
       ) throw new StorageBusyError(released);
-      const claim = {
+      const paths = new Set([path, dirname(path)]);
+      if (footprint.native) {
+        paths.add(path + '-log');
+        paths.add(path + '-wal');
+      }
+      const claim: Claim = {
         device,
         bytes: needs,
         inodes: footprint.inodes,
+        paths,
       };
       const unhold = hold();
       this.claims.add(claim);
+      this.reserved += needs;
+      const totals = this.claimsByDevice.get(device) ??
+        { device, bytes: 0, inodes: 0, paths: new Set<string>() };
+      totals.bytes += needs;
+      totals.inodes += footprint.inodes;
+      this.claimsByDevice.set(device, totals);
+      const track = (...inputs: string[]) => {
+        for (const input of inputs) {
+          const key = this.path(input);
+          paths.add(key);
+          paths.add(dirname(key));
+          this.changes?.add(key);
+          this.changes?.add(dirname(key));
+        }
+      };
+      track(...paths);
       return {
+        track,
         release: () => {
           if (this.claims.delete(claim)) {
-            unhold();
-            this.notifyRelease();
+            try {
+              this.refresh(...paths);
+            } finally {
+              this.reserved -= needs;
+              totals.bytes -= needs;
+              totals.inodes -= footprint.inodes;
+              if (!totals.bytes && !totals.inodes) {
+                this.claimsByDevice.delete(device);
+              }
+              unhold();
+              this.notifyRelease();
+            }
           }
         },
         blockSize,
@@ -444,7 +639,7 @@ export class Capacity {
   async withMetadata<T>(
     path: string,
     inodes: number,
-    write: () => Promise<T>,
+    write: (lease: Reservation) => Promise<T>,
   ): Promise<T> {
     // Reserve the inode and worst-case directory entry/index updates. Rename
     // also needs destination metadata even when it moves no file payload.
@@ -454,7 +649,7 @@ export class Capacity {
       metadataBlocks: 8,
     });
     try {
-      return await withStorageHold(write);
+      return await withStorageHold(() => write(lease));
     } catch (error) {
       throw storageFailure(error);
     } finally {
@@ -473,6 +668,9 @@ export class Capacity {
       inodes: parts.length,
       metadataBlocks: parts.length * 5,
     });
+    for (let path = target; path !== at.original; path = dirname(path)) {
+      lease.track(path);
+    }
     try {
       await Deno.mkdir(target, { recursive: true, mode });
     } catch (error) {
@@ -486,11 +684,10 @@ export class Capacity {
    * after rollback and release of its reservation, never inside Turso IO. */
   reclaimAfterFull(path: string): Promise<boolean> {
     const result = this.lane.then(async () => {
+      await this.initialize();
       if (this.checkpointActive || this.cache.size === 0) return false;
-      const device = String((await this.space(await ancestor(path))).device);
-      const { reclaimable } = await this.inventory();
-      if (this.checkpointActive) return false;
-      return this.oldest(reclaimable).some((entry) =>
+      const device = this.ledger.location(this.path(path))?.allocation.device;
+      return this.reclaimable().some((entry) =>
         (entry.device === device || typeof this.budget === 'number') &&
         this.evict(entry)
       );
@@ -508,35 +705,38 @@ export class Capacity {
   > {
     // Never wait for a claim while its writer may be waiting on this file gate.
     if (this.checkpointActive || this.claims.size !== 0) return;
+    const files = databaseFiles(dirname(path));
+    const paths = [files.database, files.log, files.wal, dirname(path)].map((
+      file,
+    ) => this.path(file));
     const active: NonNullable<Capacity['checkpointActive']> = {
       peakOvershootBytes: 0,
+      paths,
     };
     this.checkpointActive = active;
+    for (const file of paths) this.changes?.add(file);
     try {
-      const files = databaseFiles(dirname(path));
-      const device = active.device = String(
-        (await this.space(await ancestor(path))).device,
-      );
-      let { filesystems, reclaimable } = await this.inventory();
+      const space = await this.space(await ancestor(path));
+      const device = active.device = String(space.device);
       if (
         this.checkpointFailures.has(files.wal) &&
-        this.oldest(reclaimable).some((entry) =>
+        this.reclaimable().some((entry) =>
           entry.device === device && this.evict(entry)
         )
-      ) ({ filesystems } = await this.inventory());
-      await this.observeScratch();
-      const disk = filesystems.find((disk) => disk.device === device);
-      if (!disk) throw new Error('checkpoint outside capacity roots');
+      ) this.notifyRelease();
+      const budget = this.budget === null
+        ? Infinity
+        : this.budget ?? Math.floor(space.totalBytes * 0.99);
       const dbBytes = await allocated(files.database) +
         await allocated(files.log) + await allocated(files.wal);
       const used = typeof this.budget === 'number'
-        ? filesystems.reduce((sum, filesystem) => sum + filesystem.usedBytes, 0)
-        : disk.usedBytes;
+        ? this.ledger.total
+        : this.ledger.used(device);
       return {
         observe: (peak) => {
           active.peakOvershootBytes = Math.max(
             active.peakOvershootBytes,
-            used - dbBytes + peak - (disk.budgetBytes ?? Infinity),
+            used - dbBytes + peak - budget,
           );
         },
         finish: (outcome) => {
@@ -546,9 +746,14 @@ export class Capacity {
           if (outcome === 'completed') {
             this.checkpointFailures.delete(files.wal);
           }
-          this.checkpointPeaks.set(device, active.peakOvershootBytes);
-          this.checkpointActive = undefined;
-          this.notifyRelease();
+          try {
+            this.refresh(...paths);
+            this.checkpointPeaks.set(device, active.peakOvershootBytes);
+          } finally {
+            this.checkpointActive = undefined;
+            this.notifyRelease();
+            void this.reconcile().catch(() => {});
+          }
         },
       };
     } catch (error) {
@@ -559,6 +764,7 @@ export class Capacity {
   }
 
   private async inventory(quotaPaths?: Map<FilesystemCapacity, string>) {
+    const ledger = new CapacityLedger();
     const filesystems = new Map<string, FilesystemCapacity>();
     const reclaimable: Reclaimable[] = [];
     const seen = new Set<string>();
@@ -602,8 +808,6 @@ export class Capacity {
         const entry = await lstat(path, { bigint: true });
         const device = String(entry.dev);
         const identity = `${device}:${entry.ino}`;
-        if (seen.has(identity)) return;
-        seen.add(identity);
         // Never follow entries that link out of a managed root. The inode's
         // allocation belongs to the parent even when its target is elsewhere.
         const disk = entry.isSymbolicLink() || device === parentDevice
@@ -612,6 +816,9 @@ export class Capacity {
             await this.space({ path, device, original: path, target: path }),
             path,
           );
+        ledger.set(path, allocation(entry, disk.device));
+        if (seen.has(identity)) return;
+        seen.add(identity);
         const bytes = Number(entry.blocks * 512n);
         disk.usedBytes += bytes;
         const blob = this.cache.get(path);
@@ -671,14 +878,16 @@ export class Capacity {
         overshoot,
       );
     }
-    return { filesystems: disks, reclaimable };
+    return { filesystems: disks, reclaimable, ledger };
   }
 
   async status(probeQuota?: QuotaProbe) {
-    const paths = probeQuota && new Map<FilesystemCapacity, string>();
-    const { filesystems } = await this.inventory(paths);
-    if (probeQuota && paths) {
-      await Promise.all([...paths].map(async ([disk, path]) => {
+    const { filesystems } = await this.reconcile();
+    if (probeQuota) {
+      await Promise.all(filesystems.map(async (disk) => {
+        const path = [...this.ledger.paths].find(([, entry]) =>
+          entry.device === disk.device
+        )?.[0] ?? this.rootPaths[0];
         disk.quotaBackstop = await probeQuota(path);
       }));
     }
@@ -693,6 +902,17 @@ export class Capacity {
   }
 }
 
+function allocation(entry: BigIntStats, device: string): Allocation {
+  return {
+    device,
+    physicalDevice: String(entry.dev),
+    inode: entry.ino,
+    bytes: Number(entry.blocks * 512n),
+    directory: entry.isDirectory(),
+    symlink: entry.isSymbolicLink(),
+  };
+}
+
 function nativeFootprint(
   creates: number,
   bytes: number | readonly NativeFrame[],
@@ -704,17 +924,8 @@ function nativeFootprint(
     inodes: creates,
     metadataBlocks: creates * 5,
     undo,
+    native: true,
   };
-}
-
-function claimedBytes(claims: readonly Claim[]): number {
-  return claims.reduce((sum, claim) => sum + claim.bytes, 0);
-}
-
-function contains(root: string, path: string): boolean {
-  const suffix = relative(root, path);
-  return suffix !== '..' && !suffix.startsWith(`..${SEPARATOR}`) &&
-    resolve(root, suffix) === path;
 }
 
 async function ancestor(target: string) {

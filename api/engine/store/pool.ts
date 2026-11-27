@@ -616,7 +616,9 @@ export class Pool {
               if (!info.isDirectory) {
                 throw new Error(`not a database directory: ${dir}`);
               }
-              await Deno.remove(dir, { recursive: true });
+              if (this.capacity) {
+                await this.capacity.remove(dir, { recursive: true });
+              } else await Deno.remove(dir, { recursive: true });
             } catch (error) {
               if (!(error instanceof Deno.errors.NotFound)) throw error;
             }

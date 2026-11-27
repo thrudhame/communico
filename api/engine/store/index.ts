@@ -281,15 +281,10 @@ export class Store implements StartupStore {
   private async captureSnapshot(
     destination: string,
   ): Promise<{ files: SnapshotFile[]; pauseMs: number; native: BuildInfo }> {
-    const makeStage = () =>
-      Deno.makeTempDir({
-        dir: this.directory,
-        prefix: '.backup-',
-        suffix: '.new',
-      });
-    const staging = this.capacity
-      ? await this.capacity.withMetadata(this.directory, 1, makeStage)
-      : await makeStage();
+    const staging = join(this.directory, `.backup-${crypto.randomUUID()}.new`);
+    const makeStage = () => Deno.mkdir(staging, { mode: 0o700 });
+    if (this.capacity) await this.capacity.withMetadata(staging, 1, makeStage);
+    else await makeStage();
     const sources = new Map<string, SnapshotSource>();
     const readers: {
       file: SnapshotFile;
@@ -393,7 +388,9 @@ export class Store implements StartupStore {
       };
     } catch (error) {
       const cleanup = await Promise.allSettled([releaseSources()]);
-      cleanup.push(...await Promise.allSettled([removeOwned(staging)]));
+      cleanup.push(
+        ...await Promise.allSettled([removeOwned(staging, this.capacity)]),
+      );
       const errors = cleanup.flatMap((result) =>
         result.status === 'rejected' ? [result.reason] : []
       );
@@ -465,9 +462,9 @@ export async function openStore(
     } else await Deno.mkdir(config.dir, { recursive: true, mode: 0o700 });
     // The data root is canonical and locked; no database has opened yet.
     await options.beforeOpen?.(config.dir);
-    await sweep(config.dir);
-    await sweep(join(config.dir, 'rooms'));
-    await sweep(join(config.dir, 'tenants'));
+    await sweep(config.dir, options.capacityOwner);
+    await sweep(join(config.dir, 'rooms'), options.capacityOwner);
+    await sweep(join(config.dir, 'tenants'), options.capacityOwner);
     const serverProvider: SchemaProvider = {
       version: (options.schemas?.server ?? EMPTY_SCHEMA).version,
       migrations: options.schemas?.server?.migrations,

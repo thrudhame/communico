@@ -160,7 +160,10 @@ export async function uploadMedia(
     } catch (error) {
       // A refused metadata write keeps the old pending row (if any). Remove
       // this attempt's unpublished bytes before unlocking that upload ID.
-      if (isStoragePressure(error)) await Deno.remove(key);
+      if (isStoragePressure(error)) {
+        if (options.capacity) await options.capacity.remove(key);
+        else await Deno.remove(key);
+      }
       throw error;
     }
     return { mediaId, sizeBytes };
@@ -182,9 +185,11 @@ async function storeUploadBody(
   capacity?: Capacity,
 ): Promise<number> {
   await capacity?.ensureDirectory(root, 0o700);
-  const lease = await capacity?.reserveStaging(`${root}/${mediaId}`, limit);
+  const partPath = `${root}/${mediaId}.${crypto.randomUUID()}.part`;
+  const lease = await capacity?.reserveStaging(partPath, limit);
+  lease?.track(`${root}/${mediaId}`);
   try {
-    const write = () => writeUploadBody(stream, root, mediaId, limit);
+    const write = () => writeUploadBody(stream, root, mediaId, limit, partPath);
     return await (lease ? withStorageHold(write) : write());
   } finally {
     // On successful publication inventory accounts for the final file. Release
@@ -198,8 +203,8 @@ async function writeUploadBody(
   root: string,
   mediaId: string,
   limit: number,
+  partPath: string,
 ): Promise<number> {
-  const partPath = `${root}/${mediaId}.${crypto.randomUUID()}.part`;
   const finalPath = `${root}/${mediaId}`;
   let file: Deno.FsFile | null = await Deno.open(partPath, {
     createNew: true,

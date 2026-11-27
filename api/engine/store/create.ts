@@ -210,6 +210,7 @@ export async function createDatabase(
     await options.beforeRename?.(temporary, final);
     const rename = async () => {
       await Deno.rename(temporary, final);
+      options.capacity?.moved(temporary, final);
       await sync(parent);
     };
     const publish = () => options.publication?.run(rename) ?? rename();
@@ -221,7 +222,9 @@ export async function createDatabase(
   } catch (error) {
     if (options.discardOnFailure || options.capacity) {
       try {
-        await Deno.remove(temporary, { recursive: true });
+        if (options.capacity) {
+          await options.capacity.remove(temporary, { recursive: true });
+        } else await Deno.remove(temporary, { recursive: true });
         await sync(parent);
       } catch (cleanup) {
         if (!(cleanup instanceof Deno.errors.NotFound)) {
@@ -236,13 +239,17 @@ export async function createDatabase(
   }
 }
 
-export async function sweep(parent: string): Promise<string[]> {
+export async function sweep(
+  parent: string,
+  capacity?: Capacity,
+): Promise<string[]> {
   const removed: string[] = [];
   try {
     for await (const entry of Deno.readDir(parent)) {
       if (!entry.isDirectory || !entry.name.endsWith('.new')) continue;
       const path = join(parent, entry.name);
-      await Deno.remove(path, { recursive: true });
+      if (capacity) await capacity.remove(path, { recursive: true });
+      else await Deno.remove(path, { recursive: true });
       removed.push(path);
     }
   } catch (error) {
