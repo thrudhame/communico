@@ -1731,6 +1731,123 @@ const publish = (
     size,
   );
 
+Deno.test('facade capacity R1: full startup reconciles a blob evicted during the scan', async () => {
+  await mediaFixture({}, async (writer, root, capacity, db) => {
+    const evicted = cacheId('evicted-during-start');
+    const survivor = cacheId('survives-start');
+    const first = await publish(writer, evicted, 4);
+    const last = await publish(writer, survivor, 8);
+    await db.execute('UPDATE media_cache SET accessed_ms=0 WHERE cache_key=?', [
+      first.cache_key,
+    ]);
+    await writer.close();
+    const cache = new MediaCache(db, root, undefined, capacity);
+    const lstat = Deno.lstat;
+    const entered = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    try {
+      await cache.start({ inventoryOnly: true });
+      Deno.lstat = async (path) => {
+        const stat = await lstat(path);
+        if (path === `${cache.directory}/${last.blob}`) {
+          entered.resolve();
+          await resume.promise;
+        }
+        return stat;
+      };
+      const starting = cache.start();
+      try {
+        assert(
+          await Promise.race([
+            entered.promise.then(() => true),
+            starting.then(() => false),
+          ]),
+        );
+        assert(await capacity.reclaimAfterFull(cache.directory));
+        assertEquals(await cache.get(evicted), null);
+      } finally {
+        resume.resolve();
+        await starting;
+      }
+      assertEquals(await cache.get(evicted), null);
+      assertEquals((await cache.get(survivor))?.blob, last.blob);
+      assertEquals(await db.query('SELECT blob FROM media_cache'), [{
+        blob: last.blob,
+      }]);
+      assertEquals(
+        await new Response(await cache.open(last)).text(),
+        'IIIIIIII',
+      );
+    } finally {
+      Deno.lstat = lstat;
+      await cache.close();
+    }
+  });
+});
+
+Deno.test('facade capacity R1: full startup forgets rejected inventory registrations', async () => {
+  await mediaFixture({}, async (writer, root, capacity, db) => {
+    const rejected = cacheId('invalid-between-starts');
+    const survivor = cacheId('valid-between-starts');
+    const first = await publish(writer, rejected, 4);
+    const last = await publish(writer, survivor, 8);
+    await writer.close();
+    const cache = new MediaCache(db, root, undefined, capacity);
+    try {
+      await cache.start({ inventoryOnly: true });
+      assertEquals((await cache.get(rejected))?.blob, first.blob);
+      await Deno.truncate(`${cache.directory}/${first.blob}`, 2);
+      await cache.start();
+      assertEquals(await cache.get(rejected), null);
+      assertEquals(
+        await new Response(await cache.open(last)).text(),
+        'IIIIIIII',
+      );
+      assertEquals(await db.query('SELECT blob FROM media_cache'), [{
+        blob: last.blob,
+      }]);
+    } finally {
+      await cache.close();
+    }
+  });
+});
+
+Deno.test('facade capacity R1: close drains admitted maintenance and rejects later maintenance', async () => {
+  await mediaFixture({}, async (cache, _root, _capacity, db) => {
+    const retention = { maxagedays: 0, unopenedday: 0, maxbytes: 0 };
+    const policy = { maxbytes: 0, remote: retention, thumbnail: retention };
+    const query = db.query;
+    const entered = Promise.withResolvers<void>();
+    const resume = Promise.withResolvers<void>();
+    const calls: string[] = [];
+    db.query = async (...args) => {
+      calls.push('query');
+      entered.resolve();
+      await resume.promise;
+      return await query.apply(db, args);
+    };
+    const cleanup = cache.cleanup(policy).then(() => calls.push('cleaned'));
+    let close: Promise<number> | undefined;
+    try {
+      assert(
+        await Promise.race([
+          entered.promise.then(() => true),
+          cleanup.then(() => false),
+        ]),
+      );
+      close = cache.close().then(() => calls.push('closed'));
+      resume.resolve();
+      await close;
+      await cache.cleanup(policy);
+      assertEquals(calls, ['query', 'cleaned', 'closed']);
+    } finally {
+      resume.resolve();
+      await Promise.allSettled([cleanup, close]);
+      db.query = query;
+    }
+  });
+});
+
 Deno.test('facade capacity: quota detection reports only the matching filesystem', async () => {
   const probe = (path: string) => ({
     device: path.endsWith('/media') ? 2 : 1,
