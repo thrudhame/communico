@@ -7,9 +7,8 @@ import {
 } from '#engine/preview/cidr.ts';
 import { UpstreamError } from '#engine/net/upstream-error.ts';
 
-// Synapse's URL-preview exclusions, independent of configurable preview and
-// Location policy. A facade must not make private-network connections even if
-// the operator changes those lists.
+// Synapse's URL-preview exclusions plus facade-specific exclusions,
+// independent of configurable preview and Location policy.
 const defaults = [
   '0.0.0.0/8',
   '127.0.0.0/8',
@@ -28,6 +27,10 @@ const defaults = [
   '240.0.0.0/4',
   '::/128',
   '::1/128',
+  // NAT64 destinations can alias other addresses; do not dial the standard
+  // translation ranges. Operators can exclude custom prefixes in homecidrs.
+  '64:ff9b::/96',
+  '64:ff9b:1::/48',
   'fe80::/10',
   'fc00::/7',
   'fec0::/10',
