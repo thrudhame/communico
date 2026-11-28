@@ -21,6 +21,7 @@ import {
   LinkError,
   LIVE_ACTIVITY_CAPABILITY,
   type LiveActivity,
+  MEDIA_COPY_CAPABILITY,
   negotiate,
   object,
   recordOf,
@@ -29,6 +30,7 @@ import {
   text,
 } from './protocol.ts';
 import { LINK_PREFIX, LinkClient, type LinkTls } from './transport.ts';
+import type { MediaCopyRoute } from './media-copy.ts';
 
 export type Hello = {
   revision: number;
@@ -36,6 +38,7 @@ export type Hello = {
   incoming: Heads[];
   outgoing: Heads[];
   exportAcks: Heads[];
+  mediaCopy?: true;
 };
 export type Cuts = { received: Cut; applied: Cut };
 
@@ -246,7 +249,34 @@ export class JournalClient {
     ) {
       this.#domainReaderVersion = 2;
     } else this.#domainReaderVersion ??= 1;
-    return hello;
+    const mediaCopy = readers.some((entry) =>
+      entry.type === MEDIA_COPY_CAPABILITY.type &&
+      entry.version === MEDIA_COPY_CAPABILITY.version
+    );
+    return mediaCopy ? { ...hello, mediaCopy: true } : hello;
+  }
+
+  async pullMedia(
+    route: MediaCopyRoute,
+    fields: Record<string, unknown>,
+    signal?: AbortSignal,
+  ) {
+    const required = [...LINK_CAPABILITIES, MEDIA_COPY_CAPABILITY];
+    const value = await this.call(route, { ...fields, required }, signal);
+    if (
+      !negotiate(value, this.peer.server, LINK_SUPPORTED).required.some((
+        entry,
+      ) =>
+        entry.type === MEDIA_COPY_CAPABILITY.type &&
+        entry.version === MEDIA_COPY_CAPABILITY.version
+      )
+    ) {
+      throw new LinkError(
+        'LINK_CAPABILITY_MISMATCH',
+        'media copy response not negotiated',
+      );
+    }
+    return value;
   }
 
   /** Both legs use a receiver challenge from this attempt, never from a

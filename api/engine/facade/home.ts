@@ -38,6 +38,7 @@ import { DeviceOperations, isKeyStream } from './devices.ts';
 import { isToDeviceStream, ToDeviceOperations } from './todevice.ts';
 import { MembershipOperations, startMembershipExports } from './membership.ts';
 import { ActivityExchange } from './activity.ts';
+import { HomeMediaCopies } from './media-copy.ts';
 
 export async function startHomeLinks(
   app: App,
@@ -45,6 +46,11 @@ export async function startHomeLinks(
     Promise.resolve(false),
 ) {
   const settings = config().facade;
+  const media = new HomeMediaCopies(app.tenant, config().media.root);
+  const limits = {
+    maxItems: settings.batchmaxitems,
+    maxBytes: settings.batchmaxbytes,
+  };
   if (!capabilities(config().server.role).service('link-client')) {
     throw new LinkError(
       'LINK_IDENTITY_MISMATCH',
@@ -238,10 +244,18 @@ export async function startHomeLinks(
         activity: settings.phase === 'f2'
           ? new ActivityExchange(app.store, app.tenant, pairings)
           : undefined,
-        limits: {
-          maxItems: settings.batchmaxitems,
-          maxBytes: settings.batchmaxbytes,
-        },
+        limits,
+        copyMedia: settings.phase === 'f2'
+          ? (signal) =>
+            media.reconcile(
+              node,
+              (route, fields, signal) =>
+                client.pullMedia(route, fields, signal),
+              limits,
+              (error) => failed(node, error),
+              signal,
+            )
+          : undefined,
         // The configuration owner already validates this enum at load.
         notify: settings.notify as 'websocket' | 'sse' | 'poll',
         pollseconds: settings.pollseconds,

@@ -145,6 +145,10 @@ export const ROUTED_INGRESS_CAPABILITY: Capability = {
   type: 'ingress',
   version: 3,
 };
+export const MEDIA_COPY_CAPABILITY: Capability = {
+  type: 'media-copy',
+  version: 1,
+};
 export const LINK_SUPPORTED: readonly Capability[] = [
   ...LINK_CAPABILITIES,
   OWNER_CONTROL_CAPABILITY,
@@ -166,6 +170,7 @@ export const LINK_SUPPORTED: readonly Capability[] = [
   MEMBERSHIP_OPERATION_CAPABILITY,
   ROUTED_INGRESS_CAPABILITY,
   OWNER_INGRESS_CAPABILITY,
+  MEDIA_COPY_CAPABILITY,
 ];
 
 function bad(message: string): never {

@@ -34,6 +34,7 @@ import {
 } from './identity.ts';
 import { Journal } from './journal.ts';
 import { linkHandler } from './link.ts';
+import { FacadeMediaExports } from './media-copy.ts';
 import { ActivityExchange } from './activity.ts';
 import { NoticeHub } from './notices.ts';
 import { Pairings, pairingStatus } from './pairing.ts';
@@ -957,6 +958,13 @@ export async function openFacadeRuntime(
           maxItems: settings.batchmaxitems,
           maxBytes: settings.batchmaxbytes,
         },
+        mediaExports: settings.phase === 'f2'
+          ? () =>
+            tenant && new FacadeMediaExports(tenant, mediaRoot, identity.node, {
+              maxItems: settings.batchmaxitems,
+              maxBytes: settings.batchmaxbytes,
+            })
+          : undefined,
         notices,
         changed: refresh,
         received: () => {
