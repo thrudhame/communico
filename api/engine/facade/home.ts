@@ -39,6 +39,7 @@ import { isToDeviceStream, ToDeviceOperations } from './todevice.ts';
 import { MembershipOperations, startMembershipExports } from './membership.ts';
 import { ActivityExchange } from './activity.ts';
 import { HomeMediaCopies } from './media-copy.ts';
+import { HomeMediaWants } from './media-wants.ts';
 
 export async function startHomeLinks(
   app: App,
@@ -47,6 +48,7 @@ export async function startHomeLinks(
 ) {
   const settings = config().facade;
   const media = new HomeMediaCopies(app.tenant, config().media.root);
+  const wants = new HomeMediaWants(app.tenant, config().media.root);
   const limits = {
     maxItems: settings.batchmaxitems,
     maxBytes: settings.batchmaxbytes,
@@ -245,6 +247,16 @@ export async function startHomeLinks(
           ? new ActivityExchange(app.store, app.tenant, pairings)
           : undefined,
         limits,
+        deliverMedia: settings.phase === 'f2'
+          ? (signal) =>
+            wants.reconcile(
+              (route, fields, signal) =>
+                client.pushMedia(route, fields, signal),
+              limits,
+              (error) => failed(node, error),
+              signal,
+            )
+          : undefined,
         copyMedia: settings.phase === 'f2'
           ? (signal) =>
             media.reconcile(

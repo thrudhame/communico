@@ -15,6 +15,7 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import { isStoragePressure, storageFailure } from '#engine/store/pressure.ts';
 import { withStorageHold } from '#engine/store/holds.ts';
 import { abortable } from '#engine/net/abort.ts';
+import { lstatSync } from 'node:fs';
 
 export type Retention = {
   maxagedays: number;
@@ -55,12 +56,44 @@ type Pending = {
   users: number;
   settled: boolean;
 };
+
+export type OriginalLease = Disposable & { file: Deno.FsFile };
+
+export function leasedReadable(lease: OriginalLease) {
+  let closed = false;
+  const close = () => {
+    if (closed) return;
+    closed = true;
+    lease[Symbol.dispose]();
+  };
+  const { file } = lease;
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        const chunk = new Uint8Array(16384);
+        const n = await file.read(chunk);
+        if (n === null) {
+          close();
+          controller.close();
+        } else controller.enqueue(chunk.subarray(0, n));
+      } catch (error) {
+        close();
+        controller.error(error);
+      }
+    },
+    cancel: close,
+  });
+}
+
 export class MediaCache {
   private lane: Promise<unknown> = Promise.resolve();
   private pending = new Map<string, Pending>();
   private variants = new Map<string, Set<string>>();
   private leases = new Map<string, number>();
   private registered = new Map<string, { row: CachedMedia; forget(): void }>();
+  private originals = new Map<string, { accessedMs: number; forget(): void }>();
+  private originalPairing?: string;
+  private retiring = new Map<string, { pending: number; revoked: boolean }>();
   private canonicalDirectory?: string;
   private controller = new AbortController();
   private active = 0;
@@ -68,7 +101,7 @@ export class MediaCache {
   readonly directory: string;
   constructor(
     private db: Db,
-    root: string,
+    private root: string,
     private maxVariants = 32,
     private capacity?: Capacity,
   ) {
@@ -177,6 +210,103 @@ export class MediaCache {
     await this.lane;
     for (const blob of this.registered.values()) blob.forget();
     this.registered.clear();
+    this.bindOriginals(undefined);
+  }
+
+  bindOriginals(pairing: string | undefined) {
+    if (pairing && this.retiring.has(pairing)) return;
+    if (pairing === this.originalPairing) return;
+    this.originalPairing = pairing;
+    for (const blob of this.originals.values()) blob.forget();
+    this.originals.clear();
+  }
+
+  retireOriginals(pairing: string) {
+    const fence = this.retiring.get(pairing) ?? { pending: 0, revoked: false };
+    fence.pending++;
+    this.retiring.set(pairing, fence);
+    if (this.originalPairing === pairing) this.bindOriginals(undefined);
+    return (revoked: boolean) => {
+      fence.revoked ||= revoked;
+      fence.pending--;
+      if (fence.pending || fence.revoked) return false;
+      this.retiring.delete(pairing);
+      return true;
+    };
+  }
+
+  private originalPath(id: string) {
+    if (!/^[A-Za-z0-9_-]+$/.test(id)) throw new Error('invalid media ID');
+    return `${this.root}/${id}`;
+  }
+
+  pinOriginal(id: string): Disposable {
+    this.leases.set(id, (this.leases.get(id) ?? 0) + 1);
+    return { [Symbol.dispose]: () => this.release(id) };
+  }
+
+  async openOriginal(id: string): Promise<OriginalLease | null> {
+    const path = this.originalPath(id);
+    // Acquire before open, even if not yet registered: a concurrent home
+    // confirmation must not admit a file with an untracked reader.
+    const pin = this.pinOriginal(id);
+    let file;
+    try {
+      const before = lstatSync(path, { bigint: true });
+      if (!before.isFile()) throw new Deno.errors.NotFound();
+      file = await Deno.open(path, { read: true });
+    } catch (error) {
+      pin[Symbol.dispose]();
+      if (
+        error instanceof Deno.errors.NotFound ||
+        (error instanceof Error && 'code' in error && error.code === 'ENOENT')
+      ) return null;
+      throw error;
+    }
+    const original = this.originals.get(id);
+    if (original) original.accessedMs = Date.now();
+    let closed = false;
+    return {
+      file,
+      [Symbol.dispose]: () => {
+        if (closed) return;
+        closed = true;
+        try {
+          file.close();
+        } finally {
+          pin[Symbol.dispose]();
+        }
+      },
+    };
+  }
+
+  async verifyOriginal(
+    id: string,
+    pairing: string,
+    accessedMs: number,
+    matches: (file: Deno.FsFile) => Promise<boolean>,
+  ): Promise<void> {
+    if (
+      !this.capacity || pairing !== this.originalPairing ||
+      this.originals.has(id)
+    ) return;
+    using lease = await this.openOriginal(id);
+    if (!lease) return;
+    const file = await lease.file.stat();
+    if (!file.isFile || !await matches(lease.file)) return;
+    const canonical = await Deno.realPath(this.root) + '/' + id;
+    const current = Deno.lstatSync(canonical);
+    if (
+      !current.isFile || current.ino !== file.ino || current.dev !== file.dev ||
+      pairing !== this.originalPairing || this.originals.has(id)
+    ) return;
+    const blob = {
+      accessedMs,
+      unleased: () => !this.leases.has(id),
+      removed: () => this.originals.delete(id),
+    };
+    const forget = this.capacity.registerCacheBlob(canonical, blob);
+    this.originals.set(id, Object.assign(blob, { forget }));
   }
 
   private register(row: CachedMedia): void {
@@ -465,29 +595,15 @@ export class MediaCache {
         this.release(row.blob);
         throw error;
       }
-      let closed = false;
-      const close = () => {
-        if (!closed) {
-          closed = true;
-          file!.close();
-          this.release(row.blob);
-        }
-      };
-      return new ReadableStream<Uint8Array>({
-        async pull(controller) {
+      return leasedReadable({
+        file,
+        [Symbol.dispose]: () => {
           try {
-            const chunk = new Uint8Array(16384);
-            const n = await file!.read(chunk);
-            if (n === null) {
-              close();
-              controller.close();
-            } else controller.enqueue(chunk.subarray(0, n));
-          } catch (error) {
-            close();
-            controller.error(error);
+            file.close();
+          } finally {
+            this.release(row.blob);
           }
         },
-        cancel: close,
       });
     });
   }

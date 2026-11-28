@@ -158,7 +158,7 @@ export class MediaService {
     signal?.throwIfAborted();
     assertMxc(origin, mediaId);
     if (origin === serverName()) {
-      const response = await serveMedia(origin, mediaId);
+      const response = await serveMedia(origin, mediaId, signal);
       if (filename !== null) {
         response.headers.set(
           'Content-Disposition',
@@ -246,7 +246,7 @@ export class MediaService {
       });
     } else {
       // Validate current local upload state even on a derived-cache hit.
-      const original = await serveMedia(origin, mediaId);
+      const original = await serveMedia(origin, mediaId, signal);
       await original.body?.cancel();
     }
     const cache = await this.cacheOwner();
@@ -271,7 +271,7 @@ export class MediaService {
           const bytes = await this.thumbnails.render(
             async () => {
               if (origin === serverName()) {
-                const original = await serveMedia(origin, mediaId);
+                const original = await serveMedia(origin, mediaId, signal);
                 return await boundedBytes(original.body!, policy.maxbytes);
               }
               // Remote thumbnail inputs are buffered only *after* obtaining a worker

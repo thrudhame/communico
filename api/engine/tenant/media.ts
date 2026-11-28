@@ -49,6 +49,128 @@ CREATE TABLE media_home_copies(
 );
 `;
 
+export const MEDIA_WANTS_SQL = `
+CREATE TABLE media_wants(
+  media_id TEXT PRIMARY KEY NOT NULL,
+  demand TEXT NOT NULL,
+  manifest TEXT,
+  bytes INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE media_backing(
+  media_id TEXT PRIMARY KEY NOT NULL REFERENCES media(media_id),
+  pairing TEXT NOT NULL,
+  fingerprint TEXT NOT NULL
+);
+`;
+
+export async function wantedMedia(conn: Conn, id: string) {
+  const [row] = await conn.query(
+    'SELECT * FROM media_wants WHERE media_id = ?',
+    [id],
+  );
+  return row
+    ? {
+      demand: String(row.demand),
+      manifest: row.manifest == null ? null : String(row.manifest),
+      bytes: Number(row.bytes),
+    }
+    : null;
+}
+
+export async function wantMedia(conn: Conn, id: string, demand: string) {
+  await conn.execute(
+    'INSERT INTO media_wants(media_id, demand) VALUES (?, ?) ON CONFLICT DO NOTHING',
+    [id, demand],
+  );
+  return (await wantedMedia(conn, id))!;
+}
+
+export async function listWantedMedia(
+  conn: Conn,
+  after: string,
+  limit: number,
+) {
+  const rows = await conn.query(
+    'SELECT media_id, demand FROM media_wants WHERE media_id > ? ORDER BY media_id LIMIT ?',
+    [after, limit],
+  );
+  return rows.map((row) => ({
+    id: String(row.media_id),
+    demand: String(row.demand),
+  }));
+}
+
+export async function stageWantedMedia(
+  conn: Conn,
+  id: string,
+  manifest: string,
+  bytes: number,
+) {
+  await conn.execute(
+    'UPDATE media_wants SET manifest = ?, bytes = ? WHERE media_id = ?',
+    [manifest, bytes, id],
+  );
+}
+
+export async function finishMediaWant(conn: Conn, id: string) {
+  await conn.execute('DELETE FROM media_wants WHERE media_id = ?', [id]);
+}
+
+export async function mediaBacking(conn: Conn, id: string) {
+  const [row] = await conn.query(
+    'SELECT pairing, fingerprint FROM media_backing WHERE media_id = ?',
+    [id],
+  );
+  return row
+    ? { pairing: String(row.pairing), fingerprint: String(row.fingerprint) }
+    : null;
+}
+
+// Complete local originals with proof from the current home. Keep the proof
+// and uploaded row when capacity evicts the bytes. A staged cut is not proof.
+export async function backedMedia(
+  conn: Conn,
+  pairing: string,
+  issuer: string,
+) {
+  const rows = await conn.query(
+    `SELECT m.*, b.fingerprint FROM media m JOIN media_backing b USING(media_id)
+     WHERE b.pairing = ? AND m.state = 'uploaded'
+     AND NOT EXISTS (SELECT 1 FROM media_wants w WHERE w.media_id = m.media_id)
+     UNION
+     SELECT m.*, c.fingerprint FROM media m JOIN media_exports e USING(media_id)
+     JOIN media_export_confirmations c USING(media_id)
+     WHERE c.pairing = ? AND e.issuer = ? AND m.state = 'uploaded'
+     AND NOT EXISTS (SELECT 1 FROM media_wants w WHERE w.media_id = m.media_id)`,
+    [pairing, pairing, issuer],
+  );
+  return rows.map((row) => ({
+    row: rowOf(row),
+    mark: String(row.fingerprint),
+  }));
+}
+
+export async function exportConfirmation(conn: Conn, id: string) {
+  const [row] = await conn.query(
+    'SELECT fingerprint FROM media_export_confirmations WHERE media_id = ? LIMIT 1',
+    [id],
+  );
+  return row ? String(row.fingerprint) : null;
+}
+
+export async function recordMediaBacking(
+  conn: Conn,
+  id: string,
+  pairing: string,
+  fingerprint: string,
+) {
+  await conn.execute(
+    `INSERT INTO media_backing(media_id, pairing, fingerprint) VALUES (?, ?, ?)
+     ON CONFLICT(media_id) DO UPDATE SET pairing = excluded.pairing`,
+    [id, pairing, fingerprint],
+  );
+}
+
 export type ExportRow = MediaRow & { sha256: string };
 
 function exportRow(row: Parameters<typeof rowOf>[0]): ExportRow {
@@ -146,6 +268,14 @@ export async function finishMediaCopy(
   row: MediaRow,
   sha256: string,
 ) {
+  await insertCopiedMedia(conn, row);
+  await conn.execute(
+    'UPDATE media_home_copies SET complete = 1, staged_bytes = ?, prefix_sha256 = ? WHERE media_id = ?',
+    [row.size_bytes, sha256, row.media_id],
+  );
+}
+
+export async function insertCopiedMedia(conn: Conn, row: MediaRow) {
   await conn.execute(
     `INSERT INTO media(media_id, localpart, state, content_type, filename, size_bytes, created_ms, uploaded_ms)
      VALUES (?, ?, 'uploaded', ?, ?, ?, ?, ?)`,
@@ -158,10 +288,6 @@ export async function finishMediaCopy(
       row.created_ms,
       row.uploaded_ms,
     ],
-  );
-  await conn.execute(
-    'UPDATE media_home_copies SET complete = 1, staged_bytes = ?, prefix_sha256 = ? WHERE media_id = ?',
-    [row.size_bytes, sha256, row.media_id],
   );
 }
 

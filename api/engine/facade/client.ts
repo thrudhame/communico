@@ -22,6 +22,7 @@ import {
   LIVE_ACTIVITY_CAPABILITY,
   type LiveActivity,
   MEDIA_COPY_CAPABILITY,
+  MEDIA_WANTS_CAPABILITY,
   negotiate,
   object,
   recordOf,
@@ -39,6 +40,7 @@ export type Hello = {
   outgoing: Heads[];
   exportAcks: Heads[];
   mediaCopy?: true;
+  mediaWants?: true;
 };
 export type Cuts = { received: Cut; applied: Cut };
 
@@ -253,7 +255,40 @@ export class JournalClient {
       entry.type === MEDIA_COPY_CAPABILITY.type &&
       entry.version === MEDIA_COPY_CAPABILITY.version
     );
-    return mediaCopy ? { ...hello, mediaCopy: true } : hello;
+    const mediaWants = readers.some((entry) =>
+      entry.type === MEDIA_WANTS_CAPABILITY.type &&
+      entry.version === MEDIA_WANTS_CAPABILITY.version
+    );
+    return {
+      ...hello,
+      ...(mediaCopy ? { mediaCopy: true } as const : {}),
+      ...(mediaWants ? { mediaWants: true } as const : {}),
+    };
+  }
+
+  async pushMedia(
+    route: import('./media-wants.ts').MediaWantRoute,
+    fields: Record<string, unknown>,
+    signal: AbortSignal,
+  ) {
+    const value = await this.call(route, {
+      ...fields,
+      required: [...LINK_CAPABILITIES, MEDIA_WANTS_CAPABILITY],
+    }, signal);
+    if (
+      !negotiate(value, this.peer.server, LINK_SUPPORTED).required.some((
+        entry,
+      ) =>
+        entry.type === MEDIA_WANTS_CAPABILITY.type &&
+        entry.version === MEDIA_WANTS_CAPABILITY.version
+      )
+    ) {
+      throw new LinkError(
+        'LINK_CAPABILITY_MISMATCH',
+        'media wants response not negotiated',
+      );
+    }
+    return value;
   }
 
   async pullMedia(

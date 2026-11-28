@@ -112,6 +112,7 @@ export class ReplicaReadiness {
   async wait<T>(
     read: (observe: ObserveCut) => Promise<T>,
     request: AbortSignal,
+    remoteDeadline?: AbortSignal,
   ): Promise<T> {
     const signal = AbortSignal.any([request, this.#closed.signal]);
     while (true) {
@@ -159,8 +160,15 @@ export class ReplicaReadiness {
             throw error;
           }
           if (needsHome && !receiving()) {
-            if (!this.health.canDeliver(pairing)) throw error;
-            off = this.health.onDeliveryLoss(pairing, wake);
+            if (remoteDeadline?.aborted || !this.health.canDeliver(pairing)) {
+              throw error;
+            }
+            const delivery = this.health.onDeliveryLoss(pairing, wake);
+            remoteDeadline?.addEventListener('abort', wake, { once: true });
+            off = () => {
+              delivery();
+              remoteDeadline?.removeEventListener('abort', wake);
+            };
           }
         }
         await promise;
