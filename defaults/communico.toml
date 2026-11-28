@@ -60,6 +60,9 @@ linkport = 8449
 linkcert = ""
 linkkey = ""
 linkcacerts = []
+# Extra home addresses to exclude from facade media and preview connections.
+# Learned home link addresses and the built-in exclusions apply independently.
+homecidrs = []
 # Notices are hints; periodic durable head checks always run.
 # COMMUNICO_FACADE_NOTIFY / POLLSECONDS / RECONNECTMAXSECONDS
 notify = "websocket"

@@ -42,6 +42,7 @@ export type FederationRequest = {
   // The side-effect owner can durably record uncertainty before any request
   // bytes can leave. Discovery, signing and ACL refusal precede this boundary.
   beforeDispatch?: () => void | Promise<void>;
+  checkAddress?: (ip: string) => void;
   // Typed scope from the owner, never inferred from paths or mixed /send bodies.
   room?: { store: Store; id: string; participation?: boolean };
 };
@@ -123,7 +124,12 @@ export async function federationRequestRaw(
     }
     await assertRoomAcl(req.room.store, req.room.id, req.destination);
   }
-  const endpoint = await resolve(server, req.destination, req.signal);
+  const endpoint = await resolve(
+    server,
+    req.destination,
+    req.signal,
+    req.checkAddress,
+  );
   const origin = signer.serverName;
   const obj: Record<string, unknown> = {
     method: req.method,
@@ -178,6 +184,7 @@ export async function federationRequestRaw(
     timeoutMs: config().federation.timeoutms,
     maxBytes,
     signal: req.signal,
+    checkAddress: req.checkAddress,
     sink: (status, headers) =>
       status >= 200 && status < 300 && req.sink !== undefined
         ? req.sink(status, headers)

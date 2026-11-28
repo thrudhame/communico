@@ -353,10 +353,14 @@ export function loadConfig(opts: {
     );
   }
 
-  for (const section of ['preview', 'push', 'media']) {
+  for (const section of ['preview', 'push', 'media', 'facade']) {
     const p = built[section] as Record<string, unknown> | undefined;
     if (!p) continue;
-    for (const leaf of ['blocklist', 'allowlist']) {
+    for (
+      const leaf of section === 'facade'
+        ? ['homecidrs']
+        : ['blocklist', 'allowlist']
+    ) {
       const list = p[leaf];
       if (!Array.isArray(list)) continue;
       for (const item of list) {

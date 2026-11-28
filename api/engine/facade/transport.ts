@@ -86,7 +86,7 @@ export async function startLinkTransport(options: {
   hostname: string;
   port: number;
   tls: LinkTls;
-  authorize(pin: string): Promise<boolean>;
+  authorize(pin: string, address: string | undefined): Promise<boolean>;
   handle(request: Request, peerPin: string): Promise<Response>;
 }): Promise<{ url: string; close(): Promise<void> }> {
   const sockets = new Set<Duplex>();
@@ -126,7 +126,9 @@ export async function startLinkTransport(options: {
         const tls = incoming.socket as TLSSocket;
         const raw = tls.getPeerCertificate()?.raw;
         const pin = raw && tls.authorized ? certificatePin(raw) : '';
-        if (closing || !pin || !await options.authorize(pin)) {
+        if (
+          closing || !pin || !await options.authorize(pin, tls.remoteAddress)
+        ) {
           throw new LinkError(
             'LINK_IDENTITY_MISMATCH',
             'home TLS pin mismatch',
@@ -221,7 +223,9 @@ export async function startLinkTransport(options: {
         const pin = raw && socket.authorized ? certificatePin(raw) : '';
         // Fresh admission per request, before reading the body. Do not cache a
         // pending/enrolled/revoked authority decision on a keep-alive socket.
-        if (closing || !pin || !await options.authorize(pin)) {
+        if (
+          closing || !pin || !await options.authorize(pin, socket.remoteAddress)
+        ) {
           outgoing.writeHead(403, { connection: 'close' });
           outgoing.end('{"code":"LINK_IDENTITY_MISMATCH"}');
           return;

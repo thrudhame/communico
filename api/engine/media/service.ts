@@ -2,6 +2,7 @@
 // transport and the shared CA-only TLS owner for untrusted external Locations.
 import { config, serverName } from '#engine/config.ts';
 import { admit } from '#engine/federation/gate.ts';
+import { splitServerName } from '#engine/federation/server-name.ts';
 import {
   caCertsPem,
   FederationHttpError,
@@ -105,6 +106,7 @@ export class MediaService {
     private tenant: Tenant,
     private capacity?: Capacity,
     private localCache?: MediaCache,
+    private checkAddress?: (ip: string) => void,
   ) {}
   private cacheOwner(): Promise<MediaCache> {
     if (this.cache === null) {
@@ -168,9 +170,6 @@ export class MediaService {
       }
       return response;
     }
-    if (this.localCache) {
-      throw new MatrixError(404, 'M_NOT_FOUND', 'Unknown local media');
-    }
     if (!config().federation.enabled) {
       throw new MatrixError(502, 'M_UNKNOWN', 'federation disabled');
     }
@@ -233,7 +232,7 @@ export class MediaService {
   ): Promise<Response> {
     signal?.throwIfAborted();
     assertMxc(origin, mediaId);
-    if ((legacy || this.localCache) && origin !== serverName()) {
+    if (legacy && origin !== serverName()) {
       throw new MatrixError(404, 'M_NOT_FOUND', 'Unknown media');
     }
     if (origin !== serverName()) {
@@ -347,6 +346,16 @@ export class MediaService {
     parentSignal: AbortSignal,
     thumbnail?: Thumbnail,
   ): Promise<ByteMetadata> {
+    if (this.checkAddress) {
+      const local = splitServerName(serverName());
+      const foreign = splitServerName(origin);
+      const host = (value: string) => value.toLowerCase().replace(/\.$/, '');
+      if (
+        host(local.host) === host(foreign.host) && local.port === foreign.port
+      ) {
+        throw new MatrixError(404, 'M_NOT_FOUND', 'Unknown local media');
+      }
+    }
     const policy = config().media;
     const signal = upstreamDeadline(parentSignal, policy.timeoutms);
     const writer = output.getWriter();
@@ -379,6 +388,7 @@ export class MediaService {
             encodeURIComponent(mediaId) + query,
           body: null,
           maxBytes: policy.maxbytes + MEDIA_ENVELOPE_LIMIT,
+          checkAddress: this.checkAddress,
           signal,
           sink: (status, headers) => {
             if (status !== 200) {
@@ -413,6 +423,7 @@ export class MediaService {
               'allow_remote=false',
             body: null,
             maxBytes: policy.maxbytes,
+            checkAddress: this.checkAddress,
             signal,
             sink: (status, headers) => {
               if (status !== 200) {
@@ -443,6 +454,7 @@ export class MediaService {
           maxRedirects: policy.maxredirects,
           blocklist: policy.blocklist,
           allowlist: policy.allowlist,
+          checkAddress: this.checkAddress,
           caCerts: caCertsPem(),
         });
       }

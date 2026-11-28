@@ -487,7 +487,8 @@ export async function facadeProcess(
   config: string,
   ready: string,
   heldPublications: string[] = [],
-  options: { probeScratch?: string; importMap?: string } = {},
+  options: { probeScratch?: string; importMap?: string; entrypoint?: string } =
+    {},
 ) {
   const observations = new FacadeObservations();
   const initialHolds = new Set(heldPublications);
@@ -497,7 +498,7 @@ export async function facadeProcess(
     args: [
       ...metadata.tasks.start.split(' ').slice(1, -1),
       ...(options.importMap ? ['--import-map', options.importMap] : []),
-      'tests/fixtures/facade-child.ts',
+      options.entrypoint ?? 'tests/fixtures/facade-child.ts',
     ],
     env: {
       COMMUNICO_CONFIG: config,

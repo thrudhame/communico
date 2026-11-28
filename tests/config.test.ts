@@ -81,6 +81,7 @@ linkport = 8449
 linkcert = ""
 linkkey = ""
 linkcacerts = []
+homecidrs = []
 notify = "websocket"
 pollseconds = 5
 reconnectmaxseconds = 10
@@ -968,7 +969,7 @@ Deno.test('public directory settings use complete defaults and strict leaf-wise 
   }
 });
 
-Deno.test('148 leaves total across the sections (the surface tripwire)', async () => {
+Deno.test('149 leaves total across the sections (the surface tripwire)', async () => {
   const dir = await writeTree({ 'defaults/communico.toml': FULL });
   const loaded = loadConfig({
     defaultsPath: `${dir}/defaults/communico.toml`,
@@ -990,7 +991,7 @@ Deno.test('148 leaves total across the sections (the surface tripwire)', async (
     ['server', 6],
     ['admin', 2],
     ['backup', 2],
-    ['facade', 23],
+    ['facade', 24],
     ['wellknown', 7],
     ['turn', 5],
     ['matrixrtc', 1],
@@ -1011,7 +1012,7 @@ Deno.test('148 leaves total across the sections (the surface tripwire)', async (
   ]);
   assertEquals(
     counts.reduce((total, [, n]) => total + n, 0),
-    148,
+    149,
     'the whole config surface includes discovery, TURN, HTTP administrators, backup and facade role',
   );
 });

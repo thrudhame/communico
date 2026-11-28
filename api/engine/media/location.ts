@@ -18,6 +18,7 @@ export type LocationPolicy = {
   timeoutMs: number;
   maxRedirects: number;
   blocklist: string[];
+  checkAddress?: (ip: string) => void;
   allowlist: string[];
   caCerts: string[];
 };
@@ -80,6 +81,7 @@ export async function fetchLocation(
       });
     }
     for (const ip of ips) {
+      policy.checkAddress?.(ip);
       if (
         !parseIp(ip) ||
         (!allowed.some((c) => cidrContains(c, ip)) &&
@@ -94,6 +96,7 @@ export async function fetchLocation(
     let size = 0;
     const opts: DialOpts = {
       connectIp: ips[0],
+      checkAddress: policy.checkAddress,
       port: url.port ? Number(url.port) : 443,
       sni: parseIp(host) ? null : host,
       hostHeader: url.host,

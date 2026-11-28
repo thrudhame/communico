@@ -32,6 +32,7 @@ export type Http1Request = {
   timeoutMs: number;
   maxBytes: number;
   signal?: AbortSignal;
+  checkAddress?: (ip: string) => void;
 };
 
 export type Http1Response = {
@@ -451,6 +452,7 @@ export async function http1Request(
     req.timeoutMs,
   );
   try {
+    req.checkAddress?.(req.connectIp);
     if (req.tls !== null) {
       await networkOperation('tls', ac.signal, async () => {
         const connection = new TlsConnection({

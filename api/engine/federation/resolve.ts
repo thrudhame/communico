@@ -137,6 +137,7 @@ export function resetCaCertsForTests(): void {
 async function defaultWellKnownGet(
   host: string,
   signal?: AbortSignal,
+  checkAddress?: (ip: string) => void,
 ): Promise<{ mServer: string | null; maxAgeMs: number | null }> {
   return await wellKnownGet(
     host,
@@ -147,6 +148,7 @@ async function defaultWellKnownGet(
       }, signal),
     caCertsPem,
     signal,
+    checkAddress,
   );
 }
 
@@ -496,12 +498,13 @@ export async function resolve(
   server: Db,
   name: string,
   signal?: AbortSignal,
+  checkAddress?: (ip: string) => void,
 ): Promise<Endpoint> {
   const deps: ResolveDeps = {
     dnsA: (h) => defaultDns(h, 'A', signal),
     dnsAAAA: (h) => defaultDns(h, 'AAAA', signal),
     dnsSrv: (h) => defaultSrv(h, signal),
-    wellKnownGet: (h) => defaultWellKnownGet(h, signal),
+    wellKnownGet: (h) => defaultWellKnownGet(h, signal, checkAddress),
     lookupPeer: (n) => lookupPeer(server, n),
   };
   return await resolveWith(name, deps, signal);

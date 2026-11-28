@@ -494,8 +494,12 @@ const PRESENCE_OBSERVATIONS_SQL = `
 CREATE TABLE presence_observations(user_id TEXT NOT NULL,node TEXT NOT NULL,incarnation TEXT NOT NULL,device_id TEXT NOT NULL,generation INTEGER NOT NULL CHECK(generation>=0),presence TEXT NOT NULL CHECK(presence IN ('online','unavailable','offline')),last_active_ms INTEGER NOT NULL,last_sync_ms INTEGER NOT NULL,PRIMARY KEY(user_id,node,incarnation,device_id));
 `;
 
+const FACADE_HOME_ADDRESSES_SQL = `
+CREATE TABLE facade_home_addresses(address TEXT PRIMARY KEY NOT NULL);
+`;
+
 export const serverSchema: SchemaProvider = {
-  version: 61,
+  version: 62,
   apply: async (db) => {
     await db.exec(SERVER_SCHEMA_SQL);
     await db.exec(DEVICE_CHANGES_SQL);
@@ -563,6 +567,7 @@ export const serverSchema: SchemaProvider = {
     await db.exec(PRESENCE_FRESHNESS_SQL);
     await db.exec(PRESENCE_OBSERVATIONS_SQL);
     await db.exec(DIRECTORY_RANK_SQL);
+    await db.exec(FACADE_HOME_ADDRESSES_SQL);
     await initDirectoryRankState(db, true);
   },
   migrations: {
@@ -666,5 +671,6 @@ INSERT INTO device_publication_predecessors SELECT DISTINCT p.subject,p.destinat
         WHERE s.peer='home' AND s.direction='in' AND s.source='home' AND s.stream='directory' AND v.ready=1`,
       );
     },
+    61: (conn) => conn.exec(FACADE_HOME_ADDRESSES_SQL),
   },
 };

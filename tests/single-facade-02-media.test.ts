@@ -190,7 +190,7 @@ Deno.test('single facade media: F2 admits local upload and origin read without h
         new Request(`https://logical.test/_matrix/${prefix}/preview_url`),
         () => true,
       )?.status,
-      404,
+      undefined,
     );
   }
 });
@@ -213,6 +213,7 @@ Deno.test('single facade media: offline wire upload and signed cold read', async
           `[store]\ndir="${tls.dir}/${side}-store"\n` +
           `[admin]\nsocket="${socket(side)}"\n` +
           `[media]\nroot="${tls.dir}/${side}-media"\nmaxbytes=64\n` +
+          `[preview]\nenabled=true\nblocklist=[]\nallowlist=["127.0.0.0/8"]\n` +
           `[federation]\nenabled=true\nport=0\ncert="${tls.dir}/${side}.crt"\nkey="${tls.dir}/${side}.key"\n` +
           `[facade]\nphase="f2"\nnodeid="edge_a"\nurl="https://127.0.0.1:0"\nlinkport=0\nlinkcert="${tls.dir}/${side}.crt"\nlinkkey="${tls.dir}/${side}.key"\nlinkcacerts=["${tls.dir}/ca.crt"]\npollseconds=1\nreconnectmaxseconds=1\n` +
           (side === 'home'
@@ -506,15 +507,28 @@ Deno.test('single facade media: offline wire upload and signed cold read', async
       assert(multipart.endsWith(`\r\n\r\n${expected}\r\n--${boundary}--\r\n`));
     }
 
-    await test.step('foreign media cannot open an outbound path or queue home work', async () => {
+    await test.step('private addresses cannot be dialed or queue home work', async () => {
       for (const route of ['download', 'thumbnail']) {
         const result = await request(
           `/_matrix/client/v1/media/${route}/${target}/${directId}?width=32&height=32`,
         );
         assertEquals([result.status, (await result.json()).errcode], [
-          404,
-          'M_NOT_FOUND',
+          502,
+          'M_UNKNOWN',
         ]);
+      }
+      for (const route of ['client/v1/media', 'media/v3']) {
+        const path = `/_matrix/${route}/preview_url?url=${
+          encodeURIComponent(`http://${target}/preview`)
+        }`;
+        const result = await request(path);
+        assertEquals([result.status, (await result.json()).errcode], [
+          403,
+          'M_FORBIDDEN',
+        ]);
+        const anonymous = await request(path, 'GET', undefined, false);
+        assertEquals(anonymous.status, 401);
+        await anonymous.body?.cancel();
       }
       await edge!.stop();
       await homeProbe!.shutdown();
@@ -523,6 +537,12 @@ Deno.test('single facade media: offline wire upload and signed cold read', async
       const after = await facadeStore();
       try {
         assertEquals(await outbound(after), outboundBefore);
+        assertEquals(
+          await (await after.server()).query(
+            'SELECT address FROM facade_home_addresses ORDER BY address',
+          ),
+          [{ address: '127.0.0.1' }],
+        );
         assertEquals(
           (await getMedia(await openTenant(after, 'logical.test'), foreignId))
             ?.state,

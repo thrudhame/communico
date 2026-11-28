@@ -18,6 +18,7 @@ export type GuardOpts = {
   blocklist: string[];
   allowlist: string[];
   acceptLanguage: string | null;
+  checkAddress?: (ip: string) => void;
 };
 
 export type GuardedBody = {
@@ -103,6 +104,7 @@ async function hopGet(
     });
   }
   for (const ip of addrs) {
+    opts.checkAddress?.(ip);
     if (blocked(ip, block, allow)) {
       throw new UpstreamError('validation', {
         phase: 'preview-policy',
@@ -119,6 +121,7 @@ async function hopGet(
   }
   const res = await http1Request({
     connectIp: ip,
+    checkAddress: opts.checkAddress,
     port,
     tls: https ? { sni: parsed.hostname, caCerts: [] } : null,
     hostHeader: hostHeader(parsed, https),

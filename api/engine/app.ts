@@ -135,6 +135,7 @@ export type ReplicaAccess = {
   pushSender?(): Promise<PushSender | undefined>;
   delayedEvents?(tenant: Tenant): Promise<DelayedEvents | undefined>;
   localMediaCache?: MediaCache;
+  mediaEgress?: (ip: string) => void;
   sender?(): Promise<Sender | undefined>;
   releaseServices?(): Promise<void>;
   ingress?(deps: TransactionDeps): Promise<TransactionIngress>;
@@ -335,6 +336,7 @@ export async function openReplicaApp(
         grantedTenant,
         store.capacity,
         replica.localMediaCache,
+        replica.mediaEgress,
       );
     }
     stopRuleMigration = await installRuleMigration(store, grantedTenant);

@@ -16,12 +16,15 @@ import { dialNodeTls } from './dial-node-tls.ts';
 import { isIpLiteral, splitServerName } from './server-name.ts';
 
 type Answer = { mServer: string | null; maxAgeMs: number | null };
-const cache = new Map<
+type DiscoveryCache = Map<
   string,
   { answer: Answer; expiresMs: number; failure?: unknown }
->();
+>;
+const ordinaryCache: DiscoveryCache = new Map();
+let guardedCaches = new WeakMap<(ip: string) => void, DiscoveryCache>();
 export function resetWellKnownCache(): void {
-  cache.clear();
+  ordinaryCache.clear();
+  guardedCaches = new WeakMap();
 }
 
 // Cache-Control is a case-insensitive list, with quoted directive values. A
@@ -99,8 +102,15 @@ export async function wellKnownGet(
   addresses: (host: string) => AsyncIterable<string>,
   caCerts: () => string[],
   signal?: AbortSignal,
+  checkAddress?: (ip: string) => void,
 ): Promise<Answer> {
   signal?.throwIfAborted();
+  let cache = ordinaryCache;
+  if (checkAddress) {
+    const existing = guardedCaches.get(checkAddress);
+    cache = existing === undefined ? new Map() : existing;
+    guardedCaches.set(checkAddress, cache);
+  }
   const hit = cache.get(host);
   if (hit !== undefined && hit.expiresMs > Date.now()) return hit.answer;
   let headers: Headers | null = null, started = Date.now();
@@ -134,6 +144,7 @@ export async function wellKnownGet(
         timeoutMs: fed.timeoutms,
         maxBytes: fed.maxbytes,
         signal,
+        checkAddress,
       };
       let res: Http1Response | undefined;
       if (url.protocol === 'https:') {
@@ -165,8 +176,9 @@ export async function wellKnownGet(
             signal?.throwIfAborted();
             if (
               !(error instanceof UpstreamError) ||
-              error.category !== 'transport' ||
-              error.context.phase !== 'connect'
+              (error.context.phase !== 'egress-policy' &&
+                (error.category !== 'transport' ||
+                  error.context.phase !== 'connect'))
             ) throw error;
             failure = error;
             next = await ips.next();

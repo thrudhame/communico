@@ -32,6 +32,7 @@ export const SCHEMA = {
     linkcert: 'string',
     linkkey: 'string',
     linkcacerts: 'list',
+    homecidrs: 'list',
     notify: 'string',
     pollseconds: 'int',
     reconnectmaxseconds: 'int',
