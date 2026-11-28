@@ -266,7 +266,9 @@ export class Pairings {
     private readonly pin: string,
     private readonly node?: NodeIdentity,
     private readonly supported: readonly Capability[] = LINK_SUPPORTED,
-    private readonly retiring?: (pairing: string) => void,
+    private readonly retiring?: (
+      pairing: string,
+    ) => (revoked: boolean) => void | Promise<void>,
   ) {
     this.key = keyOf({ keyId: signer.keyId, publicKey });
     pinOf(pin);
@@ -614,29 +616,40 @@ export class Pairings {
       revocation.body.node !== this.node.node
     ) refused('wrong revocation authority');
     await verify(revocation, row.context.home);
-    await changeSigningAuthority(this.db, async (conn) => {
-      const current = await entry(conn, row.id);
-      if (current.revocation) {
-        if (!equal(current.revocation, revocation)) collision();
-        return;
+    let finish: ReturnType<NonNullable<typeof this.retiring>> | undefined;
+    try {
+      await changeSigningAuthority(this.db, async (conn) => {
+        const current = await entry(conn, row.id);
+        if (current.revocation) {
+          if (!equal(current.revocation, revocation)) collision();
+          return;
+        }
+        const [control] = await conn.query(
+          'SELECT revision FROM facade_control WHERE singleton=1',
+        );
+        if (revocation.body.revision <= Number(control.revision)) {
+          refused('regressing control revision');
+        }
+        // Fence before the first mutation, once across native write retries.
+        finish ??= this.retiring?.(row.id);
+        await conn.execute(
+          'UPDATE facade_control SET revision=? WHERE singleton=1',
+          [revocation.body.revision],
+        );
+        await conn.execute(
+          "UPDATE facade_pairings SET state='revoked',revision=?,revocation_json=? WHERE id=?",
+          [revocation.body.revision, canonicalJson(revocation), row.id],
+        );
+      });
+    } catch (error) {
+      try {
+        await finish?.(false);
+      } catch (recovery) {
+        throw new AggregateError([error, recovery], 'facade retirement failed');
       }
-      const [control] = await conn.query(
-        'SELECT revision FROM facade_control WHERE singleton=1',
-      );
-      if (revocation.body.revision <= Number(control.revision)) {
-        refused('regressing control revision');
-      }
-      // Stop relying on remote retention before the authority can change.
-      this.retiring?.(row.id);
-      await conn.execute(
-        'UPDATE facade_control SET revision=? WHERE singleton=1',
-        [revocation.body.revision],
-      );
-      await conn.execute(
-        "UPDATE facade_pairings SET state='revoked',revision=?,revocation_json=? WHERE id=?",
-        [revocation.body.revision, canonicalJson(revocation), row.id],
-      );
-    });
+      throw error;
+    }
+    await finish?.(true);
   }
 
   async status(): Promise<

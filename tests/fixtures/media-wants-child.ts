@@ -1,14 +1,58 @@
 import { theApp } from '#engine/app.ts';
+import { Pairings } from '#engine/facade/pairing.ts';
 import {
   type ObserveCut,
   ReplicaCutPending,
   ReplicaReadiness,
 } from '#engine/facade/readiness.ts';
 import { LINK_PREFIX, LinkClient } from '#engine/facade/transport.ts';
+import { Conn } from '#engine/store/db.ts';
 import { StoragePressureError } from '#engine/store/pressure.ts';
 import { beforeFacadePublication } from '#tests/helpers/facade-process.ts';
 
 const control = Deno.env.get('COMMUNICO_CONFIG') + '.media-wants';
+const marker = (suffix: string) => {
+  try {
+    return Deno.readTextFileSync(`${control}.${suffix}`);
+  } catch (error) {
+    if (!(error instanceof Deno.errors.NotFound)) throw error;
+  }
+};
+const rollback = new Error('fixture rolls back retirement');
+const execute = Conn.prototype.execute;
+Conn.prototype.execute = async function (sql, values) {
+  if (sql.startsWith('INSERT INTO media_wants(')) {
+    const target = marker('deny-want');
+    if (target !== undefined && target === values?.[0]) {
+      Deno.writeTextFileSync(`${control}.denied`, `${target}\n`, {
+        append: true,
+      });
+      throw new StoragePressureError();
+    }
+  }
+  if (
+    sql === 'UPDATE facade_control SET revision=? WHERE singleton=1' &&
+    marker('fail-retire') === 'once'
+  ) {
+    await beforeFacadePublication('wanted-retire-rollback');
+    await execute.call(this, sql, values);
+    Deno.removeSync(`${control}.fail-retire`);
+    throw rollback;
+  }
+  return await execute.call(this, sql, values);
+};
+const retire = Pairings.prototype.retire;
+Pairings.prototype.retire = async function (raw, pin) {
+  try {
+    return await retire.call(this, raw, pin);
+  } catch (error) {
+    if (error !== rollback) throw error;
+    // Let the test observe the rolled back authority before replaying the
+    // same signed revocation. Only the injected failure is handled here.
+    await beforeFacadePublication('wanted-retire-retry');
+    return await retire.call(this, raw, pin);
+  }
+};
 const wait = ReplicaReadiness.prototype.wait;
 ReplicaReadiness.prototype.wait = function <T>(
   read: (observe: ObserveCut) => Promise<T>,

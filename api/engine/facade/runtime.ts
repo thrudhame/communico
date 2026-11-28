@@ -87,6 +87,24 @@ import {
   deviceListService,
 } from '#engine/federation/device-lists.ts';
 
+async function restoreMediaOriginals(
+  store: Store,
+  cache: MediaCache,
+  server: string,
+  node: string,
+  pairing: string,
+  running = () => true,
+) {
+  const db = await store.tenant(server);
+  const originals = await db.tx((conn) => backedMedia(conn, pairing, node));
+  if (!running()) return;
+  cache.bindOriginals(pairing);
+  for (const { row, mark } of originals) {
+    if (!running()) return;
+    await admitHomeBackedOriginal(cache, row, server, pairing, mark);
+  }
+}
+
 export async function openFacadeRuntime(
   storeConfig: StoreConfig = config().store,
   apply: (journal: Journal, stream: Stream) => Promise<boolean> = () =>
@@ -159,20 +177,13 @@ export async function openFacadeRuntime(
         !(await store.tenants()).includes(identity.server)
       ) return;
       const pairing = grant.body.transcript.body.context.id;
-      const db = await store.tenant(identity.server);
-      const originals = await db.tx((conn) =>
-        backedMedia(conn, pairing, node.node)
+      await restoreMediaOriginals(
+        store,
+        mediaCache,
+        identity.server,
+        node.node,
+        pairing,
       );
-      mediaCache.bindOriginals(pairing);
-      for (const { row, mark } of originals) {
-        await admitHomeBackedOriginal(
-          mediaCache,
-          row,
-          identity.server,
-          pairing,
-          mark,
-        );
-      }
     },
     capacityOwner: capacity,
   }).catch(async (error: unknown) => {
@@ -238,7 +249,7 @@ export async function openFacadeRuntime(
     roomExports = undefined;
     roomBinding = undefined;
   };
-  const pairings = () => {
+  function pairings() {
     if (!node) {
       throw new LinkError(
         'LINK_UNPAIRED',
@@ -254,10 +265,35 @@ export async function openFacadeRuntime(
         pin,
         node,
         LINK_SUPPORTED,
-        (pairing) => mediaCache.retireOriginals(pairing),
+        (pairing) => {
+          const finish = mediaCache.retireOriginals(pairing);
+          return async (revoked) => {
+            if (
+              !finish(revoked) || closed || !caps.service('media') || !tenant
+            ) return;
+            const grant = await (await pairings()).active().catch((error) => {
+              if (
+                error instanceof LinkError && error.code === 'LINK_UNPAIRED'
+              ) return;
+              throw error;
+            });
+            const context = grant?.body.transcript.body.context;
+            if (
+              context?.id !== pairing || context.url !== settings.url || closed
+            ) return;
+            await restoreMediaOriginals(
+              store,
+              mediaCache,
+              identity.server,
+              identity.node,
+              pairing,
+              () => !closed,
+            );
+          };
+        },
       ),
     );
-  };
+  }
   const keyOwner = async () => {
     const owner = await pairings();
     return new FacadeKeys(server, node!.signer(), node!.publicKey, owner);

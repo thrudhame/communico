@@ -93,7 +93,7 @@ export class MediaCache {
   private registered = new Map<string, { row: CachedMedia; forget(): void }>();
   private originals = new Map<string, { accessedMs: number; forget(): void }>();
   private originalPairing?: string;
-  private retiring = new Set<string>();
+  private retiring = new Map<string, { pending: number; revoked: boolean }>();
   private canonicalDirectory?: string;
   private controller = new AbortController();
   private active = 0;
@@ -222,8 +222,17 @@ export class MediaCache {
   }
 
   retireOriginals(pairing: string) {
-    this.retiring.add(pairing);
+    const fence = this.retiring.get(pairing) ?? { pending: 0, revoked: false };
+    fence.pending++;
+    this.retiring.set(pairing, fence);
     if (this.originalPairing === pairing) this.bindOriginals(undefined);
+    return (revoked: boolean) => {
+      fence.revoked ||= revoked;
+      fence.pending--;
+      if (fence.pending || fence.revoked) return false;
+      this.retiring.delete(pairing);
+      return true;
+    };
   }
 
   private originalPath(id: string) {

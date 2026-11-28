@@ -1,4 +1,5 @@
 import { assert, assertEquals, assertRejects } from '@std/assert';
+import { drainResources } from '#engine/lifetime.ts';
 import { adminCall } from './admin-client.ts';
 import { facadeProcess } from './helpers/facade-process.ts';
 import { fixtureLink } from './helpers/fixture-listeners.ts';
@@ -27,7 +28,36 @@ type Trace = Partial<Demand> & {
   wanted?: Demand[];
 };
 
-Deno.test('05-media-wants: home fulfills a legacy MXC and refills an evicted upload', async () => {
+async function disposeFixture(...steps: (() => void | Promise<void>)[]) {
+  await drainResources(steps);
+}
+
+Deno.test('05-media-wants: all fixture disposers run even when one rejects', async () => {
+  const called: string[] = [];
+  await assertRejects(
+    () =>
+      disposeFixture(
+        () => {
+          called.push('cancel');
+        },
+        () => {
+          called.push('home');
+          return Promise.reject(new Error('fixture disposer failure'));
+        },
+        () => {
+          called.push('facade');
+        },
+        () => {
+          called.push('TLS');
+        },
+      ),
+    Error,
+    'fixture disposer failure',
+  );
+  assertEquals(called, ['cancel', 'home', 'facade', 'TLS']);
+});
+
+Deno.test('05-media-wants: home fulfills a legacy MXC and refills an evicted upload', async (t) => {
   const tls = await facadeTls();
   const file = (side: string) => `${tls.dir}/${side}.toml`;
   const socket = (side: string) => `${tls.dir}/${side}.sock`;
@@ -68,6 +98,7 @@ Deno.test('05-media-wants: home fulfills a legacy MXC and refills an evicted upl
       await Deno.writeTextFile(
         file(side),
         `[server]\nname="${server}"\nrole="${side}"\nport=0\n` +
+          'admincontact="mailto:admin@logical.test"\n' +
           `[store]\ndir="${tls.dir}/${side}-store"\n` +
           `[admin]\nsocket="${socket(side)}"\n` +
           `[media]\nroot="${tls.dir}/${side}-media"\ntimeoutms=5000\n` +
@@ -243,8 +274,34 @@ Deno.test('05-media-wants: home fulfills a legacy MXC and refills an evicted upl
       assertEquals(result.headers.get('content-type'), 'text/plain');
     };
     await exact(await download(), bytes);
-    await expect503(await request(edgePort, absentPath, { headers }));
     await expect503(await request(edgePort, pendingPath, { headers }));
+    await t.step(
+      'pressure on a new wanted read stays retryable with admin contact',
+      async () => {
+        const denied = 'not-an-upload';
+        await Deno.writeTextFile(`${control}.deny-want`, denied);
+        try {
+          // Repeating the refusal proves the first attempt did not leave a row.
+          for (let attempt = 0; attempt < 2; attempt++) {
+            const response = await request(edgePort, absentPath, { headers });
+            const body = await response.json();
+            assertEquals(response.status, 503);
+            assertEquals(body, {
+              errcode: 'M_UNAVAILABLE',
+              error: 'Media unavailable; try again later',
+            });
+          }
+          assertEquals(
+            await maybeText(`${control}.denied`),
+            `${denied}\n`.repeat(2),
+          );
+        } finally {
+          await Deno.remove(`${control}.deny-want`);
+        }
+      },
+    );
+    await expect503(await request(edgePort, absentPath, { headers }));
+    const resumedAt = (await trace()).length;
     home = await startHome();
     for (
       const [wantedPath, status, errcode] of [
@@ -263,6 +320,11 @@ Deno.test('05-media-wants: home fulfills a legacy MXC and refills an evicted upl
         return true;
       }, `no authoritative ${status} for ${wantedPath}`);
     }
+    const resumed = (await trace()).slice(resumedAt).flatMap(({ wanted }) =>
+      wanted ?? []
+    );
+    assert(resumed.some(({ id }) => id === 'not-an-upload'));
+    assert(resumed.some(({ id }) => id === pendingPath.split('/').at(-1)));
     const served = async (load: () => Promise<Response>, body: string) => {
       await until(async () => {
         const result = await load();
@@ -332,10 +394,49 @@ Deno.test('05-media-wants: home fulfills a legacy MXC and refills an evicted upl
       undefined,
       'facade attempted to initiate an outbound pair link',
     );
+    await t.step(
+      'retirement fences originals until outcome and only rollback restores them',
+      async () => {
+        const reclaimable = async () => {
+          const response = await adminCall(socket('facade'), 'facade/status');
+          assertEquals(response.status, 200);
+          return response.body.result.capacity.filesystems[0].reclaimableBytes;
+        };
+        const held = await edge!.holdPublication('wanted-retire-rollback');
+        const retry = await edge!.holdPublication('wanted-retire-retry');
+        const before = await reclaimable();
+        assert(before >= edgeBytes.length);
+        await Deno.writeTextFile(`${control}.fail-retire`, 'once');
+        const revoked = await adminCall(socket('home'), 'facade/revoke', {
+          id: paired.body.result.id,
+        });
+        assertEquals(revoked.status, 200);
+        await held.held();
+        try {
+          assertEquals(await reclaimable(), 0);
+        } finally {
+          await held.release();
+        }
+        await retry.held();
+        try {
+          assertEquals(await reclaimable(), before);
+        } finally {
+          await retry.release();
+        }
+        await edge!.observations.wait((event) =>
+          event.kind === 'pairing' && event.id === paired.body.result.id &&
+          event.state === 'revoked'
+        );
+        assertEquals(await reclaimable(), 0);
+        assertEquals(await Deno.readTextFile(original), edgeBytes);
+      },
+    );
   } finally {
-    cancel.abort();
-    await home?.dispose();
-    await edge?.dispose();
-    await tls.close();
+    await disposeFixture(
+      () => cancel.abort(),
+      () => home?.dispose(),
+      () => edge?.dispose(),
+      () => tls.close(),
+    );
   }
 });

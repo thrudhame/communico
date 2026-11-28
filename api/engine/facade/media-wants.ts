@@ -6,6 +6,7 @@ import { MatrixError } from '#engine/matrix-error.ts';
 import { mediaIssuedBy, mediaReservationExpires } from '#engine/media.ts';
 import type { MediaCache } from '#engine/media/cache.ts';
 import type { Capacity } from '#engine/store/capacity.ts';
+import { isStoragePressure } from '#engine/store/pressure.ts';
 import type { Tenant } from '#engine/tenant/index.ts';
 import type { PageLimits } from './journal.ts';
 import {
@@ -25,7 +26,7 @@ import {
   sizeOf,
   syncDir,
 } from './media-copy.ts';
-import { integer, object, text } from './protocol.ts';
+import { integer, LinkError, object, text } from './protocol.ts';
 import { ReplicaCutPending, type ReplicaReadiness } from './readiness.ts';
 
 export const MEDIA_WANT_ROUTES = [
@@ -51,6 +52,12 @@ type Reader = { demand: string; answer?: Answer };
 const unavailable = () =>
   new MatrixError(503, 'M_UNAVAILABLE', 'Media unavailable; try again later');
 const stream = (id: string) => `media-want:${id}`;
+
+class WantedCutReset extends LinkError {
+  constructor(message: string) {
+    super('LINK_DIVERGED', message);
+  }
+}
 
 export class FacadeMediaWants {
   private readonly lanes = new Map<string, Promise<unknown>>();
@@ -121,8 +128,8 @@ export class FacadeMediaWants {
               want && manifest && owner === pairing &&
               want.bytes === manifest.size
             ) {
-              await this.apply(pairing, manifest);
-              return;
+              if (await this.apply(pairing, manifest) === 'published') return;
+              // Recovery reset the cut, not the demand. Wait for new bytes.
             }
             const row = await this.tenant.tx((tx) => tx.media.byId(id));
             if (row?.state === 'uploaded' && !manifest) {
@@ -148,13 +155,24 @@ export class FacadeMediaWants {
                 'Content is not yet available',
               );
             }
-            if (!reader) {
+            let held = want;
+            if (!held) {
               const demand = crypto.randomUUID();
               if (
                 sizeOf([{ id, demand }]) > this.limits.maxBytes
               ) throw unavailable();
-              const held = want ??
-                await this.tenant.tx((tx) => tx.media.want(id, demand));
+              try {
+                held = await this.tenant.tx((tx) => tx.media.want(id, demand));
+              } catch (error) {
+                if (isStoragePressure(error)) throw unavailable();
+                throw error;
+              }
+            }
+            if (reader) {
+              // Publication can consume the previous demand before we open the
+              // original. Follow the current token if capacity reclaimed it.
+              reader.demand = held.demand;
+            } else {
               reader = { demand: held.demand };
               readers = this.readers.get(id) ?? new Set<Reader>();
               readers.add(reader);
@@ -300,6 +318,17 @@ export class FacadeMediaWants {
       }
       const part = this.part(id);
       await this.capacity.ensureDirectory(this.root);
+      if (offset) {
+        using prefix = await openExisting(part);
+        if (!prefix || (await prefix.stat()).size < offset) {
+          await this.capacity.withMetadata(part, 0, async (space) => {
+            space.track(part);
+            await this.discardPart(part);
+          });
+          await this.resetCut(id);
+          throw new WantedCutReset('wanted stage lost its durable prefix');
+        }
+      }
       const space = await this.capacity.reserveStaging(part, bytes.length);
       try {
         using file = await Deno.open(part, {
@@ -308,12 +337,6 @@ export class FacadeMediaWants {
           read: true,
           write: true,
         });
-        if ((await file.stat()).size < offset) {
-          await this.tenant.tx((tx) =>
-            tx.media.stageWant(id, held.want!.manifest!, 0)
-          );
-          return diverged('wanted stage lost its durable prefix');
-        }
         await file.truncate(offset);
         await file.seek(offset, Deno.SeekMode.Start);
         for (let written = 0; written < bytes.length;) {
@@ -333,7 +356,7 @@ export class FacadeMediaWants {
           await this.tenant.tx((tx) =>
             tx.media.stageWant(id, held.want!.manifest!, end)
           );
-          await this.apply(pairing, m);
+          await this.applyForExchange(pairing, m);
         } finally {
           done();
         }
@@ -344,9 +367,11 @@ export class FacadeMediaWants {
       );
       return { offset: end };
     }).catch((error) => {
-      // An apply/admission failure is not absence and does not consume demand.
-      for (const reader of this.readers.get(id) ?? []) {
-        if (reader.demand === demand) reader.answer = 'unavailable';
+      // A reset is a refusal of this wire ACK, not an answer to the reader.
+      if (!(error instanceof WantedCutReset)) {
+        for (const reader of this.readers.get(id) ?? []) {
+          if (reader.demand === demand) reader.answer = 'unavailable';
+        }
       }
       this.readiness.applied(pairing, stream(id));
       throw error;
@@ -356,10 +381,30 @@ export class FacadeMediaWants {
   private async publish(pairing: string, manifest: Manifest) {
     const done = this.readiness.receiving(pairing, stream(manifest.id));
     try {
-      await this.apply(pairing, manifest);
+      await this.applyForExchange(pairing, manifest);
     } finally {
       done();
     }
+  }
+
+  private async applyForExchange(pairing: string, m: Manifest) {
+    if (await this.apply(pairing, m) === 'reset') {
+      throw new WantedCutReset('whole wanted media digest or size changed');
+    }
+  }
+
+  private async discardPart(part: string) {
+    await Deno.remove(part).catch((error) => {
+      if (!(error instanceof Deno.errors.NotFound)) throw error;
+    });
+    await syncDir(this.root);
+  }
+
+  private async resetCut(id: string) {
+    await this.tenant.tx(async (tx) => {
+      const want = await tx.media.wanted(id);
+      await tx.media.stageWant(id, want!.manifest!, 0);
+    });
   }
 
   private async apply(pairing: string, m: Manifest) {
@@ -369,46 +414,47 @@ export class FacadeMediaWants {
     const part = this.part(m.id);
     using _pin = this.cache.pinOriginal(m.id);
     await this.capacity.ensureDirectory(this.root);
-    await this.capacity.withMetadata(final, 1, async (space) => {
-      space.track(part);
-      using existing = await openExisting(final);
-      if (existing) {
-        if (
-          (await existing.stat()).size !== m.size ||
-          (await hashPrefix(existing, m.size)).digest('hex') !== m.sha256
-        ) {
-          diverged('wanted publication conflicts with an existing file');
+    const installed = await this.capacity.withMetadata(
+      final,
+      1,
+      async (space) => {
+        space.track(part);
+        using existing = await openExisting(final);
+        if (existing) {
+          if (
+            (await existing.stat()).size !== m.size ||
+            (await hashPrefix(existing, m.size)).digest('hex') !== m.sha256
+          ) {
+            diverged('wanted publication conflicts with an existing file');
+          }
+        } else {
+          using file = m.size
+            ? await openExisting(part)
+            : await Deno.open(part, {
+              create: true,
+              truncate: true,
+              write: true,
+              mode: 0o600,
+            });
+          if (
+            !file || (await file.stat()).size !== m.size ||
+            (m.size
+                ? (await hashPrefix(file, m.size)).digest('hex')
+                : sha256('')) !== m.sha256
+          ) {
+            await this.discardPart(part);
+            return false;
+          }
+          if (!m.size) await file.sync();
+          await Deno.link(part, final);
         }
-      } else {
-        using file = m.size ? await openExisting(part) : await Deno.open(part, {
-          create: true,
-          truncate: true,
-          write: true,
-          mode: 0o600,
-        });
-        if (
-          !file || (await file.stat()).size !== m.size ||
-          (m.size
-              ? (await hashPrefix(file, m.size)).digest('hex')
-              : sha256('')) !== m.sha256
-        ) {
-          return;
-        }
-        if (!m.size) await file.sync();
-        await Deno.link(part, final);
-      }
-      await Deno.remove(part).catch((error) => {
-        if (!(error instanceof Deno.errors.NotFound)) throw error;
-      });
-      await syncDir(this.root);
-    });
-    using published = await openExisting(final);
-    if (!published) {
-      await this.tenant.tx(async (tx) => {
-        const want = await tx.media.wanted(m.id);
-        await tx.media.stageWant(m.id, want!.manifest!, 0);
-      });
-      return diverged('whole wanted media digest or size changed');
+        await this.discardPart(part);
+        return true;
+      },
+    );
+    if (!installed) {
+      await this.resetCut(m.id);
+      return 'reset';
     }
     await this.tenant.tx(async (tx) => {
       if (!await tx.media.byId(m.id)) {
@@ -425,6 +471,7 @@ export class FacadeMediaWants {
       fingerprint(m),
     );
     this.readiness.applied(pairing, stream(m.id));
+    return 'published';
   }
 }
 
