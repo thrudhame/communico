@@ -636,12 +636,14 @@ export async function facadeProcess(
         mark,
       );
       return {
-        held: () =>
+        held: (signal?: AbortSignal) =>
           observations.wait(
             (event) =>
               event.kind === 'publication' && event.name === name &&
               event.state === 'held',
             mark,
+            undefined,
+            signal,
           ),
         async release() {
           await send({ action: 'release', name });
