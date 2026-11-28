@@ -372,6 +372,35 @@ const F2_CLIENT_DATA: readonly Rule[] = [
   route('GET', /^\/_matrix\/client\/v3\/user\/[^/]+\/filter\/[^/]+$/, 'domain'),
 ];
 
+const F2_LOCAL_MEDIA: Rule[] = [
+  route('POST', literal('/_matrix/media/v1/create'), 'auth'),
+  route('POST', literal('/_matrix/media/v3/upload'), 'auth'),
+  route('PUT', /^\/_matrix\/media\/v3\/upload\/[^/]+\/[^/]+$/, 'auth'),
+  route('GET', literal('/_matrix/client/v1/media/config'), 'auth'),
+  route('GET', literal('/_matrix/media/v3/config'), 'auth'),
+  route(
+    'GET',
+    /^\/_matrix\/client\/v1\/media\/download\/[^/]+\/[^/]+(?:\/[^/]+)?$/,
+    'auth',
+  ),
+  route(
+    'GET',
+    /^\/_matrix\/media\/v3\/download\/[^/]+\/[^/]+(?:\/[^/]+)?$/,
+    'discovery',
+  ),
+  route(
+    'GET',
+    /^\/_matrix\/client\/v1\/media\/thumbnail\/[^/]+\/[^/]+$/,
+    'auth',
+  ),
+  route('GET', /^\/_matrix\/media\/v3\/thumbnail\/[^/]+\/[^/]+$/, 'discovery'),
+  route(
+    'GET',
+    /^\/_matrix\/federation\/v1\/media\/(?:download|thumbnail)\/[^/]+$/,
+    'ingress',
+  ),
+];
+
 const HOME_SERVICES = new Set([
   'recovery',
   'link-client',
@@ -400,7 +429,14 @@ export function capabilities(role: string, phase = 'f1') {
     service(name: string): boolean {
       if (
         role === 'facade' && phase === 'f2' &&
-        ['deactivation', 'device-lists', 'federation-sender', 'push', 'delayed']
+        [
+          'deactivation',
+          'device-lists',
+          'federation-sender',
+          'push',
+          'delayed',
+          'media',
+        ]
           .includes(
             name,
           )
@@ -424,6 +460,7 @@ export function capabilities(role: string, phase = 'f1') {
           ...F2_ROOMS,
           ...F2_MEMBERSHIP,
           ...F2_CLIENT_DATA,
+          ...F2_LOCAL_MEDIA,
         ]
         : F1_PUBLIC)
         .filter((rule) => rule.path.test(path));

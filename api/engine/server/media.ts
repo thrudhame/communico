@@ -85,6 +85,17 @@ export async function touchCachedMedia(
     key,
   ]);
 }
-export async function deleteCachedMedia(db: Db, key: string): Promise<void> {
-  await db.execute('DELETE FROM media_cache WHERE cache_key=?', [key]);
+export async function deleteCachedMedia(
+  db: Db,
+  key: string,
+  blob?: string,
+): Promise<void> {
+  if (blob === undefined) {
+    await db.execute('DELETE FROM media_cache WHERE cache_key=?', [key]);
+  } else {
+    await db.execute('DELETE FROM media_cache WHERE cache_key=? AND blob=?', [
+      key,
+      blob,
+    ]);
+  }
 }

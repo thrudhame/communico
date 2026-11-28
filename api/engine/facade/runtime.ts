@@ -124,7 +124,12 @@ export async function openFacadeRuntime(
     beforeStartup: async (store) => {
       const binding = await bindRole(store, identity);
       const server = await store.server();
-      const mediaCache = new MediaCache(server, mediaRoot, undefined, capacity);
+      const mediaCache = new MediaCache(
+        server,
+        mediaRoot,
+        config().media.maxvariants,
+        capacity,
+      );
       prepared = { binding, server, mediaCache };
       await mediaCache.start({ inventoryOnly: true });
     },
@@ -588,6 +593,7 @@ export async function openFacadeRuntime(
     tls,
     notices,
     capabilities: caps,
+    localMediaCache: caps.service('media') ? mediaCache : undefined,
     pairings,
     verificationKeys: async () => (await keyOwner()).verificationKeys(),
     requestSigner: async () => (await keyOwner()).requestSigner(),
